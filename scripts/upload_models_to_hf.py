@@ -39,10 +39,10 @@ MODELS_DIR = ROOT / "models"
 
 USER = "welcomyou"
 COLLECTION_TITLE = "ScanIndex"
+# HF caps collection description at 150 chars
 COLLECTION_DESCRIPTION = (
-    "End-to-end OCR + KIE + searchable archive for Vietnamese administrative "
-    "documents. Each model in this collection is loaded by "
-    "https://github.com/welcomyou/scanindex at runtime."
+    "Models loaded by https://github.com/welcomyou/scanindex — "
+    "OCR, KIE, layout, tables, embedder for Vietnamese admin docs."
 )
 
 
@@ -189,26 +189,26 @@ PROTONX_CT2_README = _readme(
         "library_name": "ctranslate2",
         "pipeline_tag": "translation",
         "license": "apache-2.0",
-        "base_model": "protonx-models/protonx-legal-tc",
+        "base_model": "protonx-models/distilled-protonx-legal-tc",
         "language": ["vi"],
         "tags": [
             "ctranslate2", "ct2", "text2text-generation",
-            "vietnamese", "ocr-correction", "post-ocr", "distillation",
+            "vietnamese", "ocr-correction", "post-ocr",
         ],
     },
     """
-# Distilled protonx-legal-tc — CTranslate2 (Vietnamese OCR text correction)
+# distilled-protonx-legal-tc — CTranslate2 build (Vietnamese OCR text correction)
 
-Distilled + CTranslate2-converted version of [`protonx-models/protonx-legal-tc`](https://huggingface.co/protonx-models/protonx-legal-tc) for fast CPU OCR text correction on Vietnamese administrative documents.
+CTranslate2-converted version of [`protonx-models/distilled-protonx-legal-tc`](https://huggingface.co/protonx-models/distilled-protonx-legal-tc), optimised for fast CPU OCR text correction on Vietnamese administrative documents.
 
-The original protonx-legal-tc is a seq2seq model trained for legal-text correction. This distilled CT2 build is optimized for CPU inference and used by the [ScanIndex](https://github.com/welcomyou/scanindex) pipeline as the correction stage between OCR and PDF/DOCX export.
+The upstream `distilled-protonx-legal-tc` is a smaller student distilled from `protonx-legal-tc`. This repo only does the CT2 conversion + INT8 quantization — no further training. Used by the [ScanIndex](https://github.com/welcomyou/scanindex) pipeline as the correction stage between OCR and PDF/DOCX export.
 
-## Performance (ScanIndex internal benchmark)
+## Performance (ScanIndex internal benchmark, 13-page Vietnamese admin doc)
 
-| Variant | Time / 13 pages | Accuracy |
+| Variant | Time | Accuracy |
 |---|---|---|
-| protonx-legal-tc (CT2 OPTIMIZE, beam=1) | 14.5s | 99.561% |
-| **This distilled CT2 (beam=1)**         | **8.3s** | **99.550%** |
+| `protonx-legal-tc` — CT2 OPTIMIZE, beam=1 | 14.5s | 99.561% |
+| **This repo** (`distilled-protonx-legal-tc` CT2 INT8, beam=1) | **8.3s** | **99.550%** |
 
 42% faster, 0.011 pp accuracy drop — recommended trade-off for CPU.
 
@@ -520,11 +520,10 @@ BUNDLE_SOURCES = ["orientation"]
 UPSTREAM_LINEAGE = [
     "microsoft/layoutlmv3-base",
     "intfloat/multilingual-e5-small",
-    "protonx-models/protonx-legal-tc",
+    "protonx-models/distilled-protonx-legal-tc",
     "juliozhao/DocLayout-YOLO-DocStructBench",
     "microsoft/table-transformer-detection",
     "microsoft/table-transformer-structure-recognition-v1.1-all",
-    "ds4sd/docling-models",
     "BAAI/bge-reranker-v2-m3",
 ]
 
@@ -580,17 +579,19 @@ def _effective_size_mb(roots: List[Path]) -> float:
     return total / 1e6
 
 
-def _push_repo(api, spec: RepoSpec, dry_run: bool, log: Callable) -> bool:
+def _push_repo(api, spec: RepoSpec, dry_run: bool, log: Callable,
+               readmes_only: bool = False) -> bool:
     log(f"\n=== {spec.repo_id} ===")
     sources = _check_sources(spec.sources)
     if not sources:
         log("  (no sources on disk — skipping)")
         return False
 
-    total_mb = _effective_size_mb(sources)
-    for p in sources:
-        log(f"  source: {p.relative_to(MODELS_DIR)}/")
-    log(f"  size:   {total_mb:.1f} MB (after ignore patterns)")
+    if not readmes_only:
+        total_mb = _effective_size_mb(sources)
+        for p in sources:
+            log(f"  source: {p.relative_to(MODELS_DIR)}/")
+        log(f"  size:   {total_mb:.1f} MB (after ignore patterns)")
 
     if dry_run:
         log("  (dry-run)")
@@ -610,6 +611,10 @@ def _push_repo(api, spec: RepoSpec, dry_run: bool, log: Callable) -> bool:
         )
     finally:
         readme_tmp.unlink(missing_ok=True)
+
+    if readmes_only:
+        log("  README updated (folder upload skipped)")
+        return True
 
     for src in sources:
         api.upload_folder(
@@ -710,6 +715,15 @@ def _build_collection(dry_run: bool, log: Callable) -> bool:
         return False
 
 
+def _safe_print(msg: str) -> None:
+    """Console print that survives non-cp1252 chars on Windows."""
+    try:
+        print(msg)
+    except UnicodeEncodeError:
+        enc = sys.stdout.encoding or "utf-8"
+        print(msg.encode(enc, errors="replace").decode(enc, errors="replace"))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dry-run", action="store_true")
@@ -717,6 +731,10 @@ def main() -> int:
                         help="Upload only this repo_id (skips bundle + collection)")
     parser.add_argument("--skip-bundle", action="store_true")
     parser.add_argument("--skip-collection", action="store_true")
+    parser.add_argument("--collection-only", action="store_true",
+                        help="Only build/update the Collection (skip all uploads)")
+    parser.add_argument("--readmes-only", action="store_true",
+                        help="Re-upload only README.md for each repo (skip model files)")
     args = parser.parse_args()
 
     try:
@@ -730,7 +748,11 @@ def main() -> int:
         return 1
 
     api = HfApi() if not args.dry_run else None
-    log = print
+    log = _safe_print
+
+    if args.collection_only:
+        _build_collection(args.dry_run, log)
+        return 0
 
     targets = STANDALONE
     if args.only:
@@ -741,7 +763,8 @@ def main() -> int:
 
     ok_count = 0
     for spec in targets:
-        ok_count += int(_push_repo(api, spec, args.dry_run, log))
+        ok_count += int(_push_repo(api, spec, args.dry_run, log,
+                                   readmes_only=args.readmes_only))
 
     if not args.only and not args.skip_bundle:
         _push_bundle(api, args.dry_run, log)
