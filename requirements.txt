@@ -3,6 +3,7 @@ tkinterdnd2>=0.4.3
 pypdf>=6.6.0
 selenium>=4.39.0
 webdriver-manager>=4.0.2
+huggingface_hub>=0.24.0
 ctranslate2>=4.6.0
 transformers>=4.40.0
 torch --index-url https://download.pytorch.org/whl/cpu

@@ -1,110 +1,123 @@
 """
-OFFLINE MODEL DOWNLOADER for Lightweight OCR
-============================================
-Run this script ONCE on a machine with internet.
-It will populate the 'models' and 'drivers' directories.
+OFFLINE MODEL DOWNLOADER for ScanIndex
+======================================
+Run ONCE after `git clone`. Populates `models/` and `drivers/`.
+
+Models are pulled from a single Hugging Face bundle repo (default
+`welcomyou/scanindex-models`) plus Google's CDN for the Chrome ScreenAI
+OCR engine.
 """
+from __future__ import annotations
+
+import argparse
 import os
-import sys
 import shutil
+import sys
+from pathlib import Path
 
-# Setup relative paths
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-MODELS_DIR = os.path.join(BASE_DIR, "models")
-DRIVERS_DIR = os.path.join(BASE_DIR, "drivers")
+ROOT = Path(__file__).resolve().parent.parent
+MODELS_DIR = ROOT / "models"
+DRIVERS_DIR = ROOT / "drivers"
 
-def download_chromedriver():
-    """Download ChromeDriver to drivers/ folder"""
-    print("\n[task] Downloading ChromeDriver...")
+HF_REPO_DEFAULT = "welcomyou/scanindex-models"
+
+
+def download_chromedriver() -> bool:
+    print("\n[task] ChromeDriver -> drivers/")
     try:
         from webdriver_manager.chrome import ChromeDriverManager
-        # WDM installs to cache, we assume latest
-        driver_path = ChromeDriverManager().install()
-        print(f"  -> Found/Downloaded at: {driver_path}")
-        
-        # Copy to local drivers/ folder for bundling
-        os.makedirs(DRIVERS_DIR, exist_ok=True)
-        target_path = os.path.join(DRIVERS_DIR, "chromedriver.exe")
-        
-        shutil.copy2(driver_path, target_path)
-        print(f"  -> Copied to: {target_path}")
+    except ImportError:
+        print("  -> SKIP (pip install webdriver-manager)")
+        return False
+    try:
+        src = ChromeDriverManager().install()
+        DRIVERS_DIR.mkdir(parents=True, exist_ok=True)
+        dst = DRIVERS_DIR / "chromedriver.exe"
+        shutil.copy2(src, dst)
+        print(f"  -> {dst}")
         return True
     except Exception as e:
-        print(f"  -> Error: {e}")
+        print(f"  -> ERROR: {e}")
         return False
 
-def download_doclayout_yolo_model():
-    """Download DocLayout-YOLO model for layout analysis"""
-    print("\n[task] Downloading DocLayout-YOLO model...")
 
-    target_path = os.path.join(MODELS_DIR, "doclayout_yolo_docstructbench_imgsz1024.pt")
-    if os.path.exists(target_path):
-        size_mb = os.path.getsize(target_path) / 1024 / 1024
-        print(f"  -> Already exists ({size_mb:.1f} MB), skipping.")
-        return True
-
+def download_model_bundle(repo_id: str) -> bool:
+    print(f"\n[task] Model bundle <- {repo_id}")
     try:
-        from huggingface_hub import hf_hub_download
-        path = hf_hub_download(
-            repo_id="juliozhao/DocLayout-YOLO-DocStructBench",
-            filename="doclayout_yolo_docstructbench_imgsz1024.pt",
-            local_dir=MODELS_DIR,
+        from huggingface_hub import snapshot_download
+    except ImportError:
+        print("  -> SKIP (pip install huggingface_hub)")
+        return False
+    try:
+        MODELS_DIR.mkdir(parents=True, exist_ok=True)
+        path = snapshot_download(
+            repo_id=repo_id,
+            repo_type="model",
+            local_dir=str(MODELS_DIR),
+            local_dir_use_symlinks=False,
         )
-        size_mb = os.path.getsize(path) / 1024 / 1024
-        print(f"  -> Downloaded to: {path} ({size_mb:.1f} MB)")
+        print(f"  -> {path}")
         return True
     except Exception as e:
-        print(f"  -> Error: {e}")
-        print("  -> (Layout analysis will be disabled without this model)")
+        print(f"  -> ERROR: {e}")
         return False
 
 
-def download_archive_models():
-    """Pre-download Kho lưu trữ models so the portable build can run offline.
-
-    E5-small mix50 ONNX must already exist under models/archive_models/.
-    """
-    print("\n[task] Checking Kho lưu trữ models (Vietnamese embedding ONNX)...")
-    target_dir = os.path.join(MODELS_DIR, "archive_models")
-    os.makedirs(target_dir, exist_ok=True)
-    os.environ["TRANSFORMERS_CACHE"] = target_dir
-    os.environ["HF_HOME"] = target_dir
-
+def download_screen_ai() -> bool:
+    print("\n[task] Chrome ScreenAI <- Google CDN")
     try:
-        onnx_dir = os.path.join(target_dir, "e5-small-mix50-v2-onnx-fp32")
-        onnx_model = os.path.join(onnx_dir, "model.onnx")
-        if os.path.exists(onnx_model):
-            print(f"  -> Embedding ONNX exists: {onnx_model}")
-        else:
-            print(
-                "  -> Missing E5 mix50 ONNX. Copy the trained artifact to "
-                f"{onnx_dir} before building a portable offline package."
-            )
+        sys.path.insert(0, str(ROOT))
+        from scanindex.core.ocr.screen_ai_downloader import (
+            check_screen_ai, install_screen_ai,
+        )
+    except Exception as e:
+        print(f"  -> SKIP (cannot import downloader: {e})")
+        return False
+    try:
+        target = MODELS_DIR / "screen_ai"
+        target.mkdir(parents=True, exist_ok=True)
+        status = check_screen_ai(str(target))
 
-        print(f"  -> Archive model dir checked: {target_dir}")
+        def _progress(done, total):
+            if total:
+                pct = 100 * done / total
+                print(f"\r  -> downloading {done/1e6:5.1f}/{total/1e6:5.1f} MB  {pct:5.1f}%",
+                      end="", flush=True)
+
+        lib_path, model_path, _ = install_screen_ai(
+            str(target), status, progress_callback=_progress,
+        )
+        print(f"\n  -> {model_path}")
         return True
     except Exception as e:
-        print(f"  -> Error: {e}")
-        print("  -> (Kho lưu trữ search will require internet on first launch.)")
-        import traceback
-        traceback.print_exc()
+        print(f"\n  -> ERROR: {e}")
         return False
 
 
-def main():
-    print(f"Initializing download to: {BASE_DIR}")
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--repo-id", default=HF_REPO_DEFAULT,
+                        help="HF model bundle repo (default: %(default)s)")
+    parser.add_argument("--skip-driver", action="store_true")
+    parser.add_argument("--skip-bundle", action="store_true")
+    parser.add_argument("--skip-screen-ai", action="store_true")
+    args = parser.parse_args()
 
-    # 1. Driver
-    download_chromedriver()
+    print(f"Project root: {ROOT}")
 
-    # 2. DocLayout-YOLO model
-    download_doclayout_yolo_model()
+    results = {}
+    if not args.skip_driver:
+        results["chromedriver"] = download_chromedriver()
+    if not args.skip_bundle:
+        results["model bundle"] = download_model_bundle(args.repo_id)
+    if not args.skip_screen_ai:
+        results["screen_ai"] = download_screen_ai()
 
-    # 4. Kho lưu trữ models
-    download_archive_models()
-
-    print("\nDone! Ready to build.")
+    print("\nSummary:")
+    for k, v in results.items():
+        print(f"  {k:14s} {'OK' if v else 'FAILED'}")
+    return 0 if all(results.values()) else 2
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
