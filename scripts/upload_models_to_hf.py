@@ -516,16 +516,13 @@ BUNDLE_REPO = f"{USER}/scanindex-models"
 BUNDLE_SOURCES = ["orientation"]
 
 
-# Upstream lineage to also pin in the Collection (extra context for visitors)
-UPSTREAM_LINEAGE = [
-    "microsoft/layoutlmv3-base",
-    "intfloat/multilingual-e5-small",
-    "protonx-models/distilled-protonx-legal-tc",
-    "juliozhao/DocLayout-YOLO-DocStructBench",
-    "microsoft/table-transformer-detection",
-    "microsoft/table-transformer-structure-recognition-v1.1-all",
-    "BAAI/bge-reranker-v2-m3",
-]
+# NOTE: Upstream models (microsoft/layoutlmv3-base, intfloat/multilingual-e5-small,
+# protonx-models/distilled-protonx-legal-tc, juliozhao/DocLayout-YOLO-DocStructBench,
+# microsoft/table-transformer-{detection,structure-recognition-v1.1-all},
+# BAAI/bge-reranker-v2-m3) are intentionally NOT pinned in the Collection.
+# Their lineage is already surfaced by HuggingFace via the `base_model:` field
+# in each child repo's frontmatter — re-pinning them in the Collection makes
+# it look like ScanIndex is republishing them, which we are not.
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -701,7 +698,6 @@ def _build_collection(dry_run: bool, log: Callable) -> bool:
         slug = coll.slug
         items = [(s.repo_id, "model") for s in STANDALONE]
         items.append((BUNDLE_REPO, "model"))
-        items.extend((m, "model") for m in UPSTREAM_LINEAGE)
         for repo_id, item_type in items:
             try:
                 add_collection_item(slug, repo_id, item_type, exists_ok=True)
