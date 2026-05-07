@@ -73,13 +73,31 @@ Output ở `dist/Lightweight_OCR/`. Spec: [Lightweight_OCR.spec](Lightweight_OCR
 
 ## Models
 
-Bundle ở [welcomyou/scanindex-models](https://huggingface.co/welcomyou/scanindex-models). Mô tả từng model + license đính kèm trong README của repo HF đó.
+Tổng hợp ở Collection [welcomyou/scanindex](https://huggingface.co/collections/welcomyou/scanindex). Gồm:
 
-Để tự upload bản model mới sau khi retrain:
+| Repo | Vai trò trong pipeline |
+|---|---|
+| [welcomyou/layoutlmv3-vn-admin-kie](https://huggingface.co/welcomyou/layoutlmv3-vn-admin-kie) | KIE LayoutLMv3 fine-tune |
+| [welcomyou/e5-small-vn-archive-mix50](https://huggingface.co/welcomyou/e5-small-vn-archive-mix50) | Embedder cho search Kho lưu trữ |
+| [welcomyou/distilled-protonx-vn-correction-ct2](https://huggingface.co/welcomyou/distilled-protonx-vn-correction-ct2) | Correction CTranslate2 |
+| [welcomyou/lightgbm-vn-page-splitter](https://huggingface.co/welcomyou/lightgbm-vn-page-splitter) | Tách văn bản trong batch scan |
+| [welcomyou/doclayout-yolo-onnx-dynamic](https://huggingface.co/welcomyou/doclayout-yolo-onnx-dynamic) | Layout YOLO (dynamic axes ONNX) |
+| [welcomyou/gmft-tatr-onnx](https://huggingface.co/welcomyou/gmft-tatr-onnx) | Bảng — TATR detection + structure |
+| [welcomyou/docling-tableformer-v1-onnx-stepcache](https://huggingface.co/welcomyou/docling-tableformer-v1-onnx-stepcache) | Bảng — Docling TableFormer (stepcache) |
+| [welcomyou/scanindex-models](https://huggingface.co/welcomyou/scanindex-models) | Bundle: PaddleOCR orientation + `manifest.json` |
+
+Hai model nằm ngoài HF (lý do license / kích thước):
+
+- Chrome ScreenAI OCR — auto download từ Google CDN bởi [scanindex/core/ocr/screen_ai_downloader.py](scanindex/core/ocr/screen_ai_downloader.py)
+- BAAI/bge-reranker-v2-m3 — pull lazy từ upstream khi user dùng search "Accurate"
+
+Upload model sau khi retrain:
 
 ```powershell
 huggingface-cli login
-python scripts\upload_models_to_hf.py
+python scripts\upload_models_to_hf.py            # tất cả
+python scripts\upload_models_to_hf.py --only welcomyou/layoutlmv3-vn-admin-kie   # 1 repo
+python scripts\upload_models_to_hf.py --dry-run  # xem trước
 ```
 
 ## Settings
