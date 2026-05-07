@@ -535,6 +535,11 @@ UPSTREAM_LINEAGE = [
 IGNORE_PATTERNS = [
     "*.pyc", "__pycache__/*", ".cache/*", ".locks/*",
     "*.tmp", "*.partial", "*.lock",
+    # Training-only artifacts — runtime uses ONNX/CT2 model.bin/LightGBM .txt
+    # so these are unnecessary in published repos
+    "*.safetensors", "*.pt", "*.ckpt",
+    "optimizer.pt", "scheduler.pt", "training_args.bin",
+    "rng_state.pth", "trainer_state.json",
 ]
 
 
@@ -549,6 +554,32 @@ def _check_sources(sources: List[str]) -> List[Path]:
     return ok
 
 
+def _is_ignored(rel_path: str) -> bool:
+    import fnmatch
+    parts = rel_path.replace("\\", "/").split("/")
+    for pat in IGNORE_PATTERNS:
+        if "/" in pat:
+            if fnmatch.fnmatch(rel_path.replace("\\", "/"), pat):
+                return True
+        else:
+            if any(fnmatch.fnmatch(part, pat) for part in parts):
+                return True
+    return False
+
+
+def _effective_size_mb(roots: List[Path]) -> float:
+    total = 0
+    for root in roots:
+        for f in root.rglob("*"):
+            if not f.is_file():
+                continue
+            rel = f.relative_to(root).as_posix()
+            if _is_ignored(rel):
+                continue
+            total += f.stat().st_size
+    return total / 1e6
+
+
 def _push_repo(api, spec: RepoSpec, dry_run: bool, log: Callable) -> bool:
     log(f"\n=== {spec.repo_id} ===")
     sources = _check_sources(spec.sources)
@@ -556,12 +587,10 @@ def _push_repo(api, spec: RepoSpec, dry_run: bool, log: Callable) -> bool:
         log("  (no sources on disk — skipping)")
         return False
 
-    total_mb = sum(
-        f.stat().st_size for p in sources for f in p.rglob("*") if f.is_file()
-    ) / 1e6
+    total_mb = _effective_size_mb(sources)
     for p in sources:
         log(f"  source: {p.relative_to(MODELS_DIR)}/")
-    log(f"  size:   {total_mb:.1f} MB")
+    log(f"  size:   {total_mb:.1f} MB (after ignore patterns)")
 
     if dry_run:
         log("  (dry-run)")
