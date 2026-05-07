@@ -1,0 +1,321 @@
+﻿{
+    "generated_from":  "D:\\App\\ocrtool\\train_kie",
+    "note":  "Artifacts are stored under each method folder, not under root train_kie/artifacts.",
+    "files":  [
+                  {
+                      "method":  "lightgbm",
+                      "relative_path":  "lightgbm/artifacts/final_model/ADDRESSEE.joblib",
+                      "size_bytes":  468343
+                  },
+                  {
+                      "method":  "lightgbm",
+                      "relative_path":  "lightgbm/artifacts/final_model/ADDRESSEE.meta.json",
+                      "size_bytes":  1845
+                  },
+                  {
+                      "method":  "lightgbm",
+                      "relative_path":  "lightgbm/artifacts/final_model/candidate_filters.json",
+                      "size_bytes":  1449
+                  },
+                  {
+                      "method":  "lightgbm",
+                      "relative_path":  "lightgbm/artifacts/final_model/DOC_NUMBER_SYMBOL.joblib",
+                      "size_bytes":  35830
+                  },
+                  {
+                      "method":  "lightgbm",
+                      "relative_path":  "lightgbm/artifacts/final_model/DOC_NUMBER_SYMBOL.meta.json",
+                      "size_bytes":  1839
+                  },
+                  {
+                      "method":  "lightgbm",
+                      "relative_path":  "lightgbm/artifacts/final_model/DOC_SUBJECT.joblib",
+                      "size_bytes":  436388
+                  },
+                  {
+                      "method":  "lightgbm",
+                      "relative_path":  "lightgbm/artifacts/final_model/DOC_SUBJECT.meta.json",
+                      "size_bytes":  1836
+                  },
+                  {
+                      "method":  "lightgbm",
+                      "relative_path":  "lightgbm/artifacts/final_model/ISSUE_ORG_NAME.joblib",
+                      "size_bytes":  473415
+                  },
+                  {
+                      "method":  "lightgbm",
+                      "relative_path":  "lightgbm/artifacts/final_model/ISSUE_ORG_NAME.meta.json",
+                      "size_bytes":  1838
+                  },
+                  {
+                      "method":  "lightgbm",
+                      "relative_path":  "lightgbm/artifacts/final_model/ISSUE_ORG_SUPERIOR.joblib",
+                      "size_bytes":  937665
+                  },
+                  {
+                      "method":  "lightgbm",
+                      "relative_path":  "lightgbm/artifacts/final_model/ISSUE_ORG_SUPERIOR.meta.json",
+                      "size_bytes":  1856
+                  },
+                  {
+                      "method":  "lightgbm",
+                      "relative_path":  "lightgbm/artifacts/final_model/manifest.json",
+                      "size_bytes":  671
+                  },
+                  {
+                      "method":  "lightgbm",
+                      "relative_path":  "lightgbm/artifacts/final_model/PLACE_DATE.joblib",
+                      "size_bytes":  126608
+                  },
+                  {
+                      "method":  "lightgbm",
+                      "relative_path":  "lightgbm/artifacts/final_model/PLACE_DATE.meta.json",
+                      "size_bytes":  1835
+                  },
+                  {
+                      "method":  "lightgbm",
+                      "relative_path":  "lightgbm/artifacts/final_model/RECIPIENTS.joblib",
+                      "size_bytes":  464801
+                  },
+                  {
+                      "method":  "lightgbm",
+                      "relative_path":  "lightgbm/artifacts/final_model/RECIPIENTS.meta.json",
+                      "size_bytes":  1835
+                  },
+                  {
+                      "method":  "lightgbm",
+                      "relative_path":  "lightgbm/artifacts/final_model/REGIME_HEADER.joblib",
+                      "size_bytes":  35869
+                  },
+                  {
+                      "method":  "lightgbm",
+                      "relative_path":  "lightgbm/artifacts/final_model/REGIME_HEADER.meta.json",
+                      "size_bytes":  1850
+                  },
+                  {
+                      "method":  "lightgbm",
+                      "relative_path":  "lightgbm/artifacts/final_model/SIGNER_NAME.joblib",
+                      "size_bytes":  147239
+                  },
+                  {
+                      "method":  "lightgbm",
+                      "relative_path":  "lightgbm/artifacts/final_model/SIGNER_NAME.meta.json",
+                      "size_bytes":  1834
+                  },
+                  {
+                      "method":  "lightgbm",
+                      "relative_path":  "lightgbm/artifacts/final_model/SIGNER_ROLE.joblib",
+                      "size_bytes":  645425
+                  },
+                  {
+                      "method":  "lightgbm",
+                      "relative_path":  "lightgbm/artifacts/final_model/SIGNER_ROLE.meta.json",
+                      "size_bytes":  1836
+                  },
+                  {
+                      "method":  "lightgbm",
+                      "relative_path":  "lightgbm/artifacts/final_model/thresholds.json",
+                      "size_bytes":  299
+                  },
+                  {
+                      "method":  "lightgbm",
+                      "relative_path":  "lightgbm/artifacts/final_model/threshold_tuning.json",
+                      "size_bytes":  5135
+                  },
+                  {
+                      "method":  "layoutlmv3_fontgray_norm",
+                      "relative_path":  "layoutlmv3_fontgray_norm/artifacts/checkpoint-34000/config.json",
+                      "size_bytes":  2177
+                  },
+                  {
+                      "method":  "layoutlmv3_fontgray_norm",
+                      "relative_path":  "layoutlmv3_fontgray_norm/artifacts/checkpoint-34000/merges.txt",
+                      "size_bytes":  456318
+                  },
+                  {
+                      "method":  "layoutlmv3_fontgray_norm",
+                      "relative_path":  "layoutlmv3_fontgray_norm/artifacts/checkpoint-34000/model.safetensors",
+                      "size_bytes":  503954732
+                  },
+                  {
+                      "method":  "layoutlmv3_fontgray_norm",
+                      "relative_path":  "layoutlmv3_fontgray_norm/artifacts/checkpoint-34000/optimizer.pt",
+                      "size_bytes":  1002047563
+                  },
+                  {
+                      "method":  "layoutlmv3_fontgray_norm",
+                      "relative_path":  "layoutlmv3_fontgray_norm/artifacts/checkpoint-34000/rng_state.pth",
+                      "size_bytes":  14645
+                  },
+                  {
+                      "method":  "layoutlmv3_fontgray_norm",
+                      "relative_path":  "layoutlmv3_fontgray_norm/artifacts/checkpoint-34000/scheduler.pt",
+                      "size_bytes":  1465
+                  },
+                  {
+                      "method":  "layoutlmv3_fontgray_norm",
+                      "relative_path":  "layoutlmv3_fontgray_norm/artifacts/checkpoint-34000/special_tokens_map.json",
+                      "size_bytes":  957
+                  },
+                  {
+                      "method":  "layoutlmv3_fontgray_norm",
+                      "relative_path":  "layoutlmv3_fontgray_norm/artifacts/checkpoint-34000/tokenizer.json",
+                      "size_bytes":  3558740
+                  },
+                  {
+                      "method":  "layoutlmv3_fontgray_norm",
+                      "relative_path":  "layoutlmv3_fontgray_norm/artifacts/checkpoint-34000/tokenizer_config.json",
+                      "size_bytes":  1469
+                  },
+                  {
+                      "method":  "layoutlmv3_fontgray_norm",
+                      "relative_path":  "layoutlmv3_fontgray_norm/artifacts/checkpoint-34000/trainer_state.json",
+                      "size_bytes":  255303
+                  },
+                  {
+                      "method":  "layoutlmv3_fontgray_norm",
+                      "relative_path":  "layoutlmv3_fontgray_norm/artifacts/checkpoint-34000/training_args.bin",
+                      "size_bytes":  5905
+                  },
+                  {
+                      "method":  "layoutlmv3_fontgray_norm",
+                      "relative_path":  "layoutlmv3_fontgray_norm/artifacts/checkpoint-34000/vocab.json",
+                      "size_bytes":  798293
+                  },
+                  {
+                      "method":  "layoutlmv3_fontgray_norm",
+                      "relative_path":  "layoutlmv3_fontgray_norm/artifacts/final_model/config.json",
+                      "size_bytes":  2177
+                  },
+                  {
+                      "method":  "layoutlmv3_fontgray_norm",
+                      "relative_path":  "layoutlmv3_fontgray_norm/artifacts/final_model/FINAL_MODEL_MANIFEST.json",
+                      "size_bytes":  1482
+                  },
+                  {
+                      "method":  "layoutlmv3_fontgray_norm",
+                      "relative_path":  "layoutlmv3_fontgray_norm/artifacts/final_model/label_list.json",
+                      "size_bytes":  418
+                  },
+                  {
+                      "method":  "layoutlmv3_fontgray_norm",
+                      "relative_path":  "layoutlmv3_fontgray_norm/artifacts/final_model/layoutlmv3_fontgray_config.json",
+                      "size_bytes":  968
+                  },
+                  {
+                      "method":  "layoutlmv3_fontgray_norm",
+                      "relative_path":  "layoutlmv3_fontgray_norm/artifacts/final_model/layoutlmv3_fontgray_norm_final_epoch25.int8.onnx",
+                      "size_bytes":  125767355
+                  },
+                  {
+                      "method":  "layoutlmv3_fontgray_norm",
+                      "relative_path":  "layoutlmv3_fontgray_norm/artifacts/final_model/merges.txt",
+                      "size_bytes":  456318
+                  },
+                  {
+                      "method":  "layoutlmv3_fontgray_norm",
+                      "relative_path":  "layoutlmv3_fontgray_norm/artifacts/final_model/model.safetensors",
+                      "size_bytes":  503954732
+                  },
+                  {
+                      "method":  "layoutlmv3_fontgray_norm",
+                      "relative_path":  "layoutlmv3_fontgray_norm/artifacts/final_model/special_tokens_map.json",
+                      "size_bytes":  957
+                  },
+                  {
+                      "method":  "layoutlmv3_fontgray_norm",
+                      "relative_path":  "layoutlmv3_fontgray_norm/artifacts/final_model/tokenizer.json",
+                      "size_bytes":  3558740
+                  },
+                  {
+                      "method":  "layoutlmv3_fontgray_norm",
+                      "relative_path":  "layoutlmv3_fontgray_norm/artifacts/final_model/tokenizer_config.json",
+                      "size_bytes":  1469
+                  },
+                  {
+                      "method":  "layoutlmv3_fontgray_norm",
+                      "relative_path":  "layoutlmv3_fontgray_norm/artifacts/final_model/vocab.json",
+                      "size_bytes":  798293
+                  },
+                  {
+                      "method":  "lilt_xlmr",
+                      "relative_path":  "lilt_xlmr/artifacts/run2/config.json",
+                      "size_bytes":  2006
+                  },
+                  {
+                      "method":  "lilt_xlmr",
+                      "relative_path":  "lilt_xlmr/artifacts/run2/label_list.json",
+                      "size_bytes":  417
+                  },
+                  {
+                      "method":  "lilt_xlmr",
+                      "relative_path":  "lilt_xlmr/artifacts/run2/model.onnx",
+                      "size_bytes":  1133284690
+                  },
+                  {
+                      "method":  "lilt_xlmr",
+                      "relative_path":  "lilt_xlmr/artifacts/run2/sentencepiece.bpe.model",
+                      "size_bytes":  5069051
+                  },
+                  {
+                      "method":  "lilt_xlmr",
+                      "relative_path":  "lilt_xlmr/artifacts/run2/special_tokens_map.json",
+                      "size_bytes":  964
+                  },
+                  {
+                      "method":  "lilt_xlmr",
+                      "relative_path":  "lilt_xlmr/artifacts/run2/tokenizer.json",
+                      "size_bytes":  17082734
+                  },
+                  {
+                      "method":  "lilt_xlmr",
+                      "relative_path":  "lilt_xlmr/artifacts/run2/tokenizer_config.json",
+                      "size_bytes":  1178
+                  },
+                  {
+                      "method":  "lilt_phobert",
+                      "relative_path":  "lilt_phobert/artifacts/run2/added_tokens.json",
+                      "size_bytes":  22
+                  },
+                  {
+                      "method":  "lilt_phobert",
+                      "relative_path":  "lilt_phobert/artifacts/run2/bpe.codes",
+                      "size_bytes":  1135173
+                  },
+                  {
+                      "method":  "lilt_phobert",
+                      "relative_path":  "lilt_phobert/artifacts/run2/config.json",
+                      "size_bytes":  2026
+                  },
+                  {
+                      "method":  "lilt_phobert",
+                      "relative_path":  "lilt_phobert/artifacts/run2/label_list.json",
+                      "size_bytes":  417
+                  },
+                  {
+                      "method":  "lilt_phobert",
+                      "relative_path":  "lilt_phobert/artifacts/run2/model.onnx",
+                      "size_bytes":  561889616
+                  },
+                  {
+                      "method":  "lilt_phobert",
+                      "relative_path":  "lilt_phobert/artifacts/run2/special_tokens_map.json",
+                      "size_bytes":  965
+                  },
+                  {
+                      "method":  "lilt_phobert",
+                      "relative_path":  "lilt_phobert/artifacts/run2/tokenizer_config.json",
+                      "size_bytes":  1203
+                  },
+                  {
+                      "method":  "lilt_phobert",
+                      "relative_path":  "lilt_phobert/artifacts/run2/vocab.txt",
+                      "size_bytes":  895321
+                  },
+                  {
+                      "method":  "vilayoutxlm_plain",
+                      "relative_path":  "vilayoutxlm_plain/artifacts/run1/README.md",
+                      "size_bytes":  924
+                  }
+              ]
+}

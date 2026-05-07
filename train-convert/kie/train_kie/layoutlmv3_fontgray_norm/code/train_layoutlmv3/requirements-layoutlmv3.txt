@@ -1,0 +1,7 @@
+torch>=2.4
+transformers>=4.49
+accelerate>=0.26
+numpy>=1.26
+onnx>=1.16
+onnxruntime>=1.17
+onnxscript>=0.7

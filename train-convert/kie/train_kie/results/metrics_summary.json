@@ -1,0 +1,67 @@
+{
+  "chosen": {
+    "default_production": "lightgbm_final",
+    "deep_layout_instance_model": "layoutlmv3_fontgray_norm_final_epoch25"
+  },
+  "metrics": {
+    "lightgbm_final": {
+      "method_folder": "train_kie/lightgbm",
+      "artifact_path": "train_kie/lightgbm/artifacts/final_model",
+      "test_word_f1": 0.9364,
+      "test_exact": 0.8655,
+      "batch0027_f1": 0.9808,
+      "batch0027_exact": 0.9213,
+      "batch0027_errors": 129,
+      "cpu_ms_per_page": 111
+    },
+    "layoutlmv3_base": {
+      "method_folder": "train_kie/layoutlmv3_base",
+      "artifact_path": null,
+      "test_word_f1": 0.9734,
+      "test_span_f1": 0.9347,
+      "test_exact": 0.9125,
+      "batch0027_word_f1": 0.9961,
+      "batch0027_span_f1": 0.9749,
+      "batch0027_exact": 0.9589,
+      "batch0027_errors": 83,
+      "cpu_int8_ms_per_page": 683.6
+    },
+    "layoutlmv3_fontgray_norm_epoch25": {
+      "method_folder": "train_kie/layoutlmv3_fontgray_norm",
+      "artifact_path": "train_kie/layoutlmv3_fontgray_norm/artifacts/final_model",
+      "checkpoint_path": "train_kie/layoutlmv3_fontgray_norm/artifacts/checkpoint-34000",
+      "test_word_f1": 0.978,
+      "test_span_f1": 0.9425,
+      "test_exact": 0.9225,
+      "batch0027_word_f1": 0.9926,
+      "batch0027_span_f1": 0.9871,
+      "batch0027_exact": 0.981,
+      "batch0027_errors": 38,
+      "cpu_int8_ms_per_page": 658.0
+    },
+    "lilt_xlmr": {
+      "method_folder": "train_kie/lilt_xlmr",
+      "artifact_path": "train_kie/lilt_xlmr/artifacts/run2",
+      "test_f1": 0.7646,
+      "status": "rejected"
+    },
+    "lilt_phobert": {
+      "method_folder": "train_kie/lilt_phobert",
+      "artifact_path": "train_kie/lilt_phobert/artifacts/run2",
+      "test_f1": 0.7727,
+      "status": "rejected"
+    },
+    "vilayoutxlm_plain_int8": {
+      "method_folder": "train_kie/vilayoutxlm_plain",
+      "artifact_path": null,
+      "full_test_word_f1": 0.96687,
+      "full_test_span_f1": 0.88325,
+      "full_test_exact": 0.8151,
+      "batch0027_word_f1": 0.98702,
+      "batch0027_span_f1": 0.96371,
+      "batch0027_exact": 0.935,
+      "batch0027_errors": 104,
+      "cpu_int8_ms_per_page": 489
+    }
+  }
+}

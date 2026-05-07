@@ -1,0 +1,17 @@
+{
+  "repo_root": "D:/App/ocrtool",
+  "train_kie_root": "D:/App/ocrtool/train_kie",
+  "kie_project_root": "D:/tmp/Train_20260413_143844_kie",
+  "lightgbm_project_root": "D:/tmp/Train_20260413_143844_LightGBM",
+  "layoutlmv3_project_root": "D:/tmp/Train_20260413_143844_LayoutLMv3_fontgray_norm",
+  "vilayoutxlm_project_root": "D:/tmp/Train_20260413_143844_VILayoutXLM_plain",
+  "source_roots": {
+    "labeled_json": "${kie_project_root}/json_output_labeled",
+    "canonical_ocr": "${kie_project_root}/ocr",
+    "label_input": "${kie_project_root}/json_input"
+  },
+  "notes": [
+    "This is an example. Replace paths for another machine.",
+    "Training scripts should receive roots through CLI args or environment variables, not inline constants."
+  ]
+}

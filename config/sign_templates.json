@@ -1,0 +1,12 @@
+{
+  "Mặc định": {
+    "text": "Xác nhận sao tại kho lưu trữ\n{cn} - {org} \n{ou} - {unit_org}\n{issuer}",
+    "position": {
+      "page": 1,
+      "x": 0.0,
+      "y": 0.0,
+      "width": 292.0,
+      "height": 45.0
+    }
+  }
+}

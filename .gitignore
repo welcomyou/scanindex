@@ -1,0 +1,112 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.exe
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# --- Virtual Environments ---
+.venv*/
+venv/
+env/
+ENV/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# --- Project Specific ---
+# Chrome profile data and temporary files
+chrome_data/
+ocr_chrome_data*/
+# ScreenAI binaries (large versioned folder)
+140.14/
+# Local configuration
+settings.ini
+# Output/Input PDFs (ignore all except listed exceptions)
+*.pdf
+!test_dummy.pdf
+# Temporary debug files
+debug_screenshot.png
+*.log
+*debug_*.py
+*verify_*.py
+*check_*.py
+*log*.txt
+
+# --- IDEs & Editors ---
+.vscode/
+.idea/
+*.swp
+*.swo
+.project
+.pydevproject
+.settings/
+
+# --- Operating System ---
+.DS_Store
+Thumbs.db
+
+#----Model
+*.gguf
+*.docx
+mapping_docx_pdf.html
+segments_docx_v2.txt
+segments_pdf_v2.txt
+generate_mapping.py
+trainme2_comparison.csv
+trainme2_mapping_pdf_docx.csv
+trainme2_predicted_mapping.csv
+trainme2_segment_analysis.md
+inspect_pdf.py
+.hypothesis/unicode_data/15.0.0/charmap.json.gz
+.hypothesis/unicode_data/15.0.0/codec-utf-8.json.gz
+antigravity-img2table/extract_ground_truth.py
+antigravity-img2table/ground_truth.json
+antigravity-img2table/run_05kh.py
+antigravity-img2table/table_optimizer.py
+antigravity-checktable/optimization_result.json
+antigravity-checktable/optimize_accuracy.py
+dump_tables.py
+inspect_debug.py
+inspect_img2table.py
+run_final_gen.py
+debug_tables.txt
+temp/
+bin/
+drivers/
+reproduce_issue.py
+xxxxxx/
+.hf_cache/
+.pytest_cache/
+.cache/
+.codex_doc_analysis/
+.agent/
+ocr_groundtruth/
+*.onnx
+*.onnx_data
+repository/
+dictionaries/*
+models/
+!models/.gitkeep
+# Train artifacts (large checkpoints/model weights — keep scripts only)
+train-convert/**/artifacts/
+*.safetensors
+*.pt
+*.ckpt
+*.joblib

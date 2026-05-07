@@ -1,0 +1,5 @@
+{
+  "input_dir": "D:\\tmp\\Train_20260413_143844_kie\\json_input",
+  "output_dir": "D:\\tmp\\Train_20260413_143844_kie\\json_output_labeled",
+  "ocr_dir": "D:\\tmp\\Train_20260413_143844_kie\\ocr"
+}

@@ -1,0 +1,11 @@
+{
+  "page": 1,
+  "x": 0.0,
+  "y": 0.0,
+  "width": 292.0,
+  "height": 45.0,
+  "template_name": "Mặc định",
+  "convert_pdfa": true,
+  "tsa_enabled": true,
+  "tsa_url": "http://tsa.ca.gov.vn"
+}

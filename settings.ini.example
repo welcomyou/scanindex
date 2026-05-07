@@ -1,0 +1,52 @@
+[General]
+language = vi
+
+[OCR]
+waitperpage = 1
+comparisoninterval = 1.5
+; maxconcurrentocr = số trang OCR song song (= số worker process trong pool).
+; Mỗi worker giữ 1 DLL ScreenAI (~250MB). Khuyến nghị: 4 cho máy 12-16 hyperthread.
+maxconcurrentocr = 4
+; CorrectEnabled = bật/tắt module sửa chính tả ở mức toàn app.
+; True  -> tải Proton CT2 (~350MB) khi mở screen có dùng correction.
+; False -> không bao giờ tải module sửa chính tả; OCR chạy không qua correction.
+correctenabled = True
+exportenabled = True
+verboselog = False
+showlogpanel = True
+
+[Correction]
+model = protonx-models/protonx-legal-tc-[CTranslate2-OPTIMIZE]
+acceleration = CPU
+
+[TableExtraction]
+engine = hybrid
+device = cpu
+; maxexportworkers: 1 phù hợp máy <16GB RAM; tăng lên 2 nếu máy khỏe (mỗi worker ~1.2GB GMFT)
+maxexportworkers = 1
+
+[KIE]
+; Supported mode: layoutlmv3
+; Full-field LightGBM KIE is disabled; LightGBM is kept only for the archive splitter.
+mode = layoutlmv3
+
+[Repository]
+; Đường dẫn kho tra cứu (relative dùng base dir của app, hoặc absolute path).
+; Mặc định ./repository. Đổi để dùng ổ khác hoặc shared drive.
+path = repository
+; Toggle "Convert PDF/A-2b trước khi ký" ở step 3 lưu trong config/sign_settings.json
+; (key: convert_pdfa). Cần Ghostscript (gswin64c) trong PATH; auto-detect ở
+; C:\Program Files\gs\<version>\bin. PassThroughJPEGImages=true giữ nguyên ảnh
+; JPEG gốc (không re-encode).
+; Máy chủ cấp dấu thời gian TSA của step 3 lưu trong config/sign_settings.json
+; (keys: tsa_enabled, tsa_url), mặc định bật và dùng http://tsa.ca.gov.vn.
+
+[Catalog]
+; Danh mục Loại văn bản hiển thị trong combobox. Nếu không có mục này,
+; phần mềm dùng danh mục mặc định trong archive_doctype.py.
+documenttypesjson = ["Nghị quyết", "Quyết định", "Chỉ thị", "Kết luận", "Quy chế", "Quy định", "Thông cáo", "Thông báo", "Hướng dẫn", "Chương trình", "Kế hoạch", "Phương án", "Đề án", "Dự án", "Báo cáo", "Biên bản", "Tờ trình", "Hợp đồng", "Công điện", "Bản ghi nhớ", "Bản thỏa thuận", "Giấy ủy quyền", "Giấy mời", "Giấy giới thiệu", "Giấy nghỉ phép", "Phiếu gửi", "Phiếu chuyển", "Phiếu báo", "Bản sao y", "Bản trích sao", "Bản sao lục", "Công văn", "Khác"]
+catalogsjson = {"document_types": {"label": "Thể loại văn bản", "values": ["Bản ghi nhớ", "Bản sao lục", "Bản sao y", "Bản thỏa thuận", "Bản trích sao", "Báo cáo", "Biên bản", "Chỉ thị", "Chương trình", "Công điện", "Công văn", "Dự án", "Giấy giới thiệu", "Giấy mời", "Giấy nghỉ phép", "Giấy ủy quyền", "Hợp đồng", "Hướng dẫn", "Kế hoạch", "Kết luận", "Nghị quyết", "Phiếu báo", "Phiếu chuyển", "Phiếu gửi", "Phương án", "Quy chế", "Quy định", "Quyết định", "Thông báo", "Thông cáo", "Tờ trình", "Đề án", "Khác"], "system": true}}
+
+[Advanced]
+chromeprofiledir = xxxxxx
+
