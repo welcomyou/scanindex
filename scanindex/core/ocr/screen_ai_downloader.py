@@ -28,6 +28,77 @@ logger = logging.getLogger(__name__)
 COMPONENT_ID = "mfhmdacoffpmifoibamicehhklffanao"
 BASE_URL = "https://clients2.google.com/service/update2/crx"
 
+
+class ScreenAIIntegrityError(RuntimeError):
+    """Raised when ScreenAI binaries fail integrity verification."""
+
+
+# ── Authenticode verification (Windows-only) ────────────────────────
+# Verifies the extracted chrome_screen_ai.dll has a valid Authenticode
+# signature AND that the signer is Google LLC. Defense-in-depth on top
+# of the SHA256 check from Google's update XML — catches tampering of
+# the on-disk DLL after extraction (e.g. local malware modifying it).
+_GOOGLE_SIGNER_NEEDLES = ("Google LLC", "Google Inc")
+
+
+def _verify_authenticode_google_signed(file_path: str) -> None:
+    """Verify `file_path` is Authenticode-signed by Google LLC.
+
+    Windows-only. On other platforms this is a no-op (caller should rely
+    on the SHA256 check from Google's update XML for those builds).
+
+    Raises ScreenAIIntegrityError on any failure: invalid signature,
+    untrusted chain, or signer not Google.
+    """
+    if sys.platform != "win32":
+        logger.info("Authenticode verify skipped (non-Windows platform)")
+        return
+
+    import subprocess
+
+    # Single-quoted PowerShell strings escape ' as ''.
+    escaped = file_path.replace("'", "''")
+    ps_script = (
+        "$ErrorActionPreference='Stop';"
+        f"$sig = Get-AuthenticodeSignature -FilePath '{escaped}';"
+        "if ($sig.Status -ne 'Valid') {"
+        "  Write-Error (\"Authenticode status: \" + $sig.Status);"
+        "  exit 1;"
+        "}"
+        "Write-Output $sig.SignerCertificate.Subject"
+    )
+
+    try:
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive",
+             "-Command", ps_script],
+            capture_output=True, text=True, timeout=20,
+        )
+    except FileNotFoundError as e:
+        raise ScreenAIIntegrityError(
+            f"powershell.exe not available — cannot run Authenticode "
+            f"verification on {file_path}"
+        ) from e
+    except subprocess.TimeoutExpired as e:
+        raise ScreenAIIntegrityError(
+            f"Authenticode verification timed out for {file_path}"
+        ) from e
+
+    if result.returncode != 0:
+        raise ScreenAIIntegrityError(
+            f"Authenticode signature invalid for {file_path}\n"
+            f"  PowerShell stderr: {(result.stderr or '').strip()}\n"
+            f"  PowerShell stdout: {(result.stdout or '').strip()}"
+        )
+
+    subject = (result.stdout or "").strip()
+    if not any(needle in subject for needle in _GOOGLE_SIGNER_NEEDLES):
+        raise ScreenAIIntegrityError(
+            f"DLL not signed by Google. Subject:\n  {subject}"
+        )
+
+    logger.info(f"Authenticode OK ({subject})")
+
 # Library file name per platform
 LIBRARY_NAMES = {
     "win32":  "chrome_screen_ai.dll",
@@ -407,6 +478,7 @@ def install_screen_ai(model_dir, status, progress_callback=None, log_callback=No
 
     # Already local
     if status.status == ScreenAIStatus.FOUND_LOCAL:
+        _verify_authenticode_google_signed(status.lib_path)
         return status.lib_path, status.model_path, color_type
 
     # Copy from Chrome
@@ -418,8 +490,11 @@ def install_screen_ai(model_dir, status, progress_callback=None, log_callback=No
             shutil.copytree(status.chrome_path, dest, dirs_exist_ok=True)
             lib_path = os.path.join(dest, lib_name)
             if os.path.exists(lib_path):
+                _verify_authenticode_google_signed(lib_path)
                 log(f"ScreenAI ready: {dest}", "success")
                 return lib_path, dest, color_type
+        except ScreenAIIntegrityError:
+            raise
         except Exception as e:
             log(f"Copy failed: {e}. Will try downloading...", "error")
 
@@ -456,19 +531,26 @@ def install_screen_ai(model_dir, status, progress_callback=None, log_callback=No
         if not download_crx(tmp_path, _progress):
             raise RuntimeError("Failed to download ScreenAI from Google CDN")
 
-        # Verify SHA256 if available
+        # D — verify SHA256 announced by Google's update XML.
+        # Required: refuse to extract a CRX whose hash Google did not vouch for.
         expected_sha = update_info.get("sha256", "")
-        if expected_sha:
-            sha = hashlib.sha256()
-            with open(tmp_path, "rb") as f:
-                for chunk in iter(lambda: f.read(256 * 1024), b""):
-                    sha.update(chunk)
-            actual_sha = sha.hexdigest()
-            if actual_sha != expected_sha:
-                raise RuntimeError(
-                    f"SHA256 mismatch! Expected {expected_sha}, got {actual_sha}"
-                )
-            log("SHA256 verified OK", "debug")
+        if not expected_sha:
+            raise ScreenAIIntegrityError(
+                "Google update XML did not include hash_sha256; refusing to "
+                "extract an unverified CRX."
+            )
+        sha = hashlib.sha256()
+        with open(tmp_path, "rb") as f:
+            for chunk in iter(lambda: f.read(256 * 1024), b""):
+                sha.update(chunk)
+        actual_sha = sha.hexdigest()
+        if actual_sha != expected_sha:
+            raise ScreenAIIntegrityError(
+                f"CRX SHA256 mismatch.\n"
+                f"  Expected (from Google XML): {expected_sha}\n"
+                f"  Got (downloaded file):       {actual_sha}"
+            )
+        log(f"CRX SHA256 verified OK (Google announced: {expected_sha[:16]}...)", "info")
 
         # Extract
         # Try to determine version from manifest after extraction
@@ -496,6 +578,11 @@ def install_screen_ai(model_dir, status, progress_callback=None, log_callback=No
                 f"Library {lib_name} not found after extraction. "
                 f"Platform {sys.platform} may not be supported."
             )
+
+        # B — Authenticode verify the on-disk DLL is genuinely signed by
+        # Google. Catches post-extraction tampering that the SHA256 check
+        # above (D) cannot see.
+        _verify_authenticode_google_signed(lib_path)
 
         log(f"ScreenAI v{version} installed: {final_dir}", "success")
         return lib_path, final_dir, color_type
