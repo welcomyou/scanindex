@@ -639,7 +639,6 @@ def _push_bundle(api, dry_run: bool, log: Callable) -> bool:
         "bundle_paths": [str(p.name) for p in sources],
         "external_models": {
             "screen_ai":  "Google CDN — fetched by scanindex.core.ocr.screen_ai_downloader",
-            "reranker":   "BAAI/bge-reranker-v2-m3 — fetched by sentence_transformers",
         },
     }
     manifest_path = ROOT / ".hf_manifest.tmp.json"
