@@ -18,8 +18,8 @@ if str(SCRIPTS) not in sys.path:
 
 import benchmark_borderless_ctdar_current as ctdar_bench  # noqa: E402
 import benchmark_current_table_pipeline as gt_bench  # noqa: E402
-from rapidtable_structure_engine import detect_tables_structure_recognizer  # noqa: E402
-from table_anchored_merger import (  # noqa: E402
+from scanindex.core.tables.rapidtable_structure_engine import detect_tables_structure_recognizer  # noqa: E402
+from scanindex.core.tables.docx_exporter import (  # noqa: E402
     _text_from_table_cell_lines,
     get_lines_in_rect,
 )

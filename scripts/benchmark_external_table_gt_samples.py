@@ -20,7 +20,7 @@ if str(SCRIPTS) not in sys.path:
 
 import benchmark_current_table_pipeline as gt_bench  # noqa: E402
 from benchmark_groundtruth_engine_matrix import run_detector  # noqa: E402
-from table_anchored_merger import TextLine, detect_tables  # noqa: E402
+from scanindex.core.tables.docx_exporter import TextLine, detect_tables  # noqa: E402
 
 
 class QuietLogger:

@@ -35,12 +35,12 @@ from benchmark_external_pair_ensembles import (  # noqa: E402
 from benchmark_external_table_gt_samples import load_samples, shape_score  # noqa: E402
 from benchmark_groundtruth_engine_matrix import QuietLogger  # noqa: E402
 from benchmark_pair_ensembles import ENGINE_SPECS, group_by_page, run_engine  # noqa: E402
-from table_anchored_merger import (  # noqa: E402
+from scanindex.core.tables.docx_exporter import (  # noqa: E402
     _candidate_set_score,
     _layout_table_bboxes,
     _table_bbox,
 )
-from table_postprocess_v2 import table_ocr_fit_score  # noqa: E402
+from scanindex.core.tables.postprocess_v2 import table_ocr_fit_score  # noqa: E402
 
 
 TRIPLE_ENGINE_IDS = ("gmft_ocr", "docling_tableformer_ocr", "rapidtable_ocr")

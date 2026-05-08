@@ -126,7 +126,7 @@ def _ocr_groundtruth_pdf(
     import json
     import tempfile
 
-    import direct_ocr_engine
+    from scanindex.core.ocr import direct_engine as direct_ocr_engine
 
     out_dir = tempfile.mkdtemp(prefix="ocr_baseline_")
     out_pdf = os.path.join(out_dir, "baseline_ocr.pdf")

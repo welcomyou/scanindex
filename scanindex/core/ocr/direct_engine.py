@@ -533,7 +533,7 @@ def check_ocr_status():
     Check ScreenAI availability without downloading.
     Returns ScreenAIStatus for UI to decide next action.
     """
-    from screen_ai_downloader import check_screen_ai
+    from scanindex.core.ocr.screen_ai_downloader import check_screen_ai
     return check_screen_ai(_get_model_dir())
 
 
@@ -543,7 +543,7 @@ def install_ocr(status, progress_callback=None, log_callback=None):
     Call ONLY after user consents.
     Returns (lib_path, model_path, color_type).
     """
-    from screen_ai_downloader import install_screen_ai
+    from scanindex.core.ocr.screen_ai_downloader import install_screen_ai
     return install_screen_ai(
         _get_model_dir(), status,
         progress_callback=progress_callback,
@@ -553,7 +553,7 @@ def install_ocr(status, progress_callback=None, log_callback=None):
 
 def _find_screen_ai_paths():
     """Auto-detect DLL and model directory using downloader."""
-    from screen_ai_downloader import check_screen_ai, ScreenAIStatus
+    from scanindex.core.ocr.screen_ai_downloader import check_screen_ai, ScreenAIStatus
     status = check_screen_ai(_get_model_dir())
     if status.status == ScreenAIStatus.FOUND_LOCAL:
         return status.lib_path, status.model_path

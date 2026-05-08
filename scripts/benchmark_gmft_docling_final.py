@@ -32,10 +32,10 @@ from benchmark_external_pair_ensembles import (  # noqa: E402
     load_gt_text_grid,
 )
 from benchmark_external_table_gt_samples import load_samples, shape_score  # noqa: E402
-from docling_tableformer_engine import detect_tables_docling_tableformer  # noqa: E402
-from gmft_onnx_table_engine import detect_tables_gmft_onnx_on_layout_regions  # noqa: E402
-from table_anchored_merger import detect_tables  # noqa: E402
-from table_eval_metrics import compare_table_grid_lists  # noqa: E402
+from scanindex.core.tables.docling_tableformer_engine import detect_tables_docling_tableformer  # noqa: E402
+from scanindex.core.tables.gmft_onnx_table_engine import detect_tables_gmft_onnx_on_layout_regions  # noqa: E402
+from scanindex.core.tables.docx_exporter import detect_tables  # noqa: E402
+from scanindex.core.tables.eval_metrics import compare_table_grid_lists  # noqa: E402
 
 
 VARIANTS = [

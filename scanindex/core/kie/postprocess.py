@@ -1066,7 +1066,7 @@ def _format_doc_subject_text(text: str) -> str:
         norm = normalize_vn_text(line)
         if idx == 0 and _RE_STANDALONE_DOC_TITLE.fullmatch(norm):
             try:
-                from archive_doctype import detect_from_doc_subject
+                from scanindex.core.digitization.doctype import detect_from_doc_subject
                 line = detect_from_doc_subject(line) or line
             except Exception:
                 line = line[:1].upper() + line[1:].lower() if line else line
@@ -1849,7 +1849,7 @@ def _ensure_doc_type(annotation: dict[str, Any]) -> dict[str, Any]:
            for f in fields):
         return annotation
     try:
-        from archive_doctype import detect_doc_type
+        from scanindex.core.digitization.doctype import detect_doc_type
     except Exception:
         return annotation
     subj = ""

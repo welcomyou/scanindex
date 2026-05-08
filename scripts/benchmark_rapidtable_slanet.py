@@ -18,7 +18,7 @@ from docx import Document
 from lxml import html
 from rapid_table import EngineType, ModelType, RapidTable, RapidTableInput
 from rapidfuzz.distance import Levenshtein
-from table_anchored_merger import (
+from scanindex.core.tables.docx_exporter import (
     TableRegion,
     TextLine,
     clean_ocr_cell_text,

@@ -58,8 +58,8 @@ def _write_summary(path: Path, row: dict) -> None:
 
 def process_one(src: Path, summary_path: Path) -> dict:
     from scanindex.core.preprocessing import preprocessing
-    import direct_ocr_engine
-    from workers import run_export_task
+    from scanindex.core.ocr import direct_engine as direct_ocr_engine
+    from scanindex.core.tables.export_worker import run_export_task
 
     start = time.perf_counter()
     stem = src.stem

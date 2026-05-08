@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from table_anchored_merger import (  # noqa: E402
+from scanindex.core.tables.docx_exporter import (  # noqa: E402
     detect_tables,
     filter_false_positive_tables,
     postprocess_table_layout_grids,
@@ -334,7 +334,7 @@ def render_pdf_page(pdf_path: Path) -> Image.Image:
 
 def analyze_layout(page_image: Image.Image, conf: float) -> list[dict[str, Any]]:
     try:
-        from layout_analyzer import get_analyzer
+        from scanindex.core.tables.layout_analyzer import get_analyzer
 
         analyzer = get_analyzer()
         if analyzer is None:

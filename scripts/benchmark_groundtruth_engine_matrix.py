@@ -17,13 +17,13 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 import benchmark_current_table_pipeline as gt_bench  # noqa: E402
-from docling_tableformer_engine import detect_tables_docling_tableformer  # noqa: E402
-from docling_tableformer_v1_onnx_engine import (  # noqa: E402
+from scanindex.core.tables.docling_tableformer_engine import detect_tables_docling_tableformer  # noqa: E402
+from scanindex.core.tables.docling_tableformer_v1_onnx_engine import (  # noqa: E402
     detect_tables_docling_tableformer_v1_onnx,
 )
-from gmft_onnx_table_engine import detect_tables_gmft_onnx  # noqa: E402
-from rapidtable_structure_engine import detect_tables_structure_recognizer  # noqa: E402
-from table_anchored_merger import (  # noqa: E402
+from scanindex.core.tables.gmft_onnx_table_engine import detect_tables_gmft_onnx  # noqa: E402
+from scanindex.core.tables.rapidtable_structure_engine import detect_tables_structure_recognizer  # noqa: E402
+from scanindex.core.tables.docx_exporter import (  # noqa: E402
     _text_from_table_cell_lines,
     assign_ocr_lines_to_table_cells_by_geometry,
     detect_tables_img2table,

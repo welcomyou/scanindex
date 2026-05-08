@@ -253,7 +253,7 @@ class DetectorRunner:
     def _init_doclayout(self):
         if self._doclayout is None:
             t0 = time.perf_counter()
-            from layout_analyzer import get_analyzer
+            from scanindex.core.tables.layout_analyzer import get_analyzer
 
             self._doclayout = get_analyzer()
             self.init_times["doclayout"] = time.perf_counter() - t0
@@ -288,7 +288,7 @@ class DetectorRunner:
     def _init_gmft(self):
         if self._gmft_detector is None:
             t0 = time.perf_counter()
-            from gmft_onnx_table_engine import _models
+            from scanindex.core.tables.gmft_onnx_table_engine import _models
 
             self._gmft_detector = _models()[0]
             self.init_times["gmft"] = time.perf_counter() - t0

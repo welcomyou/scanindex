@@ -57,7 +57,7 @@ def ensure_ocr_pdf(raw_pdf: Path, ocr_pdf: Path, source_image: Path, force: bool
     if not force and ocr_pdf.exists() and Path(str(ocr_pdf) + ".json").exists():
         return {"ok": True, "cached": True, "ocr_sec": 0.0, "message": "cached"}
 
-    import direct_ocr_engine
+    from scanindex.core.ocr import direct_engine as direct_ocr_engine
 
     ocr_pdf.parent.mkdir(parents=True, exist_ok=True)
     logs: list[str] = []

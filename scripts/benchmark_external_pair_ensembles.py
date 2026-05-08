@@ -33,7 +33,7 @@ from benchmark_pair_ensembles import (  # noqa: E402
     combine_pair,
     run_engine,
 )
-from table_eval_metrics import compare_cell_grids
+from scanindex.core.tables.eval_metrics import compare_cell_grids
 
 
 class QuietLogger(gt_bench.QuietLogger):
@@ -65,7 +65,7 @@ def ensure_ocr_pdf(raw_pdf: Path, ocr_pdf: Path, source_image: Path, force: bool
     if not force and ocr_pdf.exists() and json_path.exists():
         return {"ok": True, "cached": True, "ocr_sec": 0.0, "message": "cached"}
 
-    import direct_ocr_engine
+    from scanindex.core.ocr import direct_engine as direct_ocr_engine
 
     ocr_pdf.parent.mkdir(parents=True, exist_ok=True)
     logs: list[str] = []

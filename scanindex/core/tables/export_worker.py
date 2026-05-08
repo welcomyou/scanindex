@@ -25,12 +25,8 @@ def run_export_task(src_pdf, final_docx, metadata=None):
         import sys
         import importlib
 
-        if 'table_anchored_merger' not in sys.modules:
-            if os.getcwd() not in sys.path:
-                sys.path.append(os.getcwd())
-            import table_anchored_merger
-        else:
-            import table_anchored_merger
+        from scanindex.core.tables import docx_exporter as table_anchored_merger
+        if 'scanindex.core.tables.docx_exporter' in sys.modules:
             try:
                 importlib.reload(table_anchored_merger)
             except Exception:

@@ -13,6 +13,7 @@ from train_layoutlmv3_style.common import (
     LABEL_LIST,
     PROJECT_SCHEMA_VERSION,
     STYLE_TYPE_VOCAB_SIZE,
+    assert_page1_lightgbm_guard_available,
     build_rows_for_doc_with_style,
     dataset_paths,
     ensure_project_dirs,
@@ -36,6 +37,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit-docs", type=int, help="Optional smoke-test limit.")
     parser.add_argument("--drop-serious-conflicts", action="store_true")
     parser.add_argument("--serious-conflict-threshold", type=int, default=10)
+    parser.add_argument(
+        "--include-selected-negative-pages",
+        action="store_true",
+        help=(
+            "Also export selected_pages that have no KIE labels as all-O negative pages. "
+            "Default skips them to avoid training false negatives."
+        ),
+    )
+    parser.add_argument(
+        "--no-page1-clean-negative",
+        dest="include_page1_clean_negative",
+        action="store_false",
+        default=True,
+        help=(
+            "Disable the default clean negative rule: when page 0 and a labeled signer page >= 2 exist, "
+            "export page 1 as an all-O body page."
+        ),
+    )
+    parser.add_argument(
+        "--no-page1-lightgbm-guard",
+        dest="require_page1_not_lightgbm_signer",
+        action="store_false",
+        default=True,
+        help=(
+            "Disable the LightGBM signer-page guard for the page-1 clean negative rule. "
+            "Default only exports page 1 negative when the signer_page selector does not mark it as a signer page."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -44,6 +73,8 @@ def main() -> None:
     dirs = ensure_project_dirs(args.project_root)
     paths = dataset_paths(args.project_root)
     context = load_source_context(args.source_root)
+    if args.include_page1_clean_negative and args.require_page1_not_lightgbm_signer:
+        assert_page1_lightgbm_guard_available()
     label_files = iter_label_files(context.source_root, limit_docs=args.limit_docs)
 
     stats: Counter = Counter()
@@ -74,10 +105,22 @@ def main() -> None:
             label_payload = read_json(label_path)
             ocr_doc = load_ocr_document(meta.source_canonical_json)
             conflict_before = stats["conflict_words"]
-            rows = build_rows_for_doc_with_style(meta, label_payload, ocr_doc, stats, conflict_rows)
+            rows = build_rows_for_doc_with_style(
+                meta,
+                label_payload,
+                ocr_doc,
+                stats,
+                conflict_rows,
+                include_selected_negative_pages=args.include_selected_negative_pages,
+                include_page1_clean_negative=args.include_page1_clean_negative,
+                require_page1_not_lightgbm_signer=args.require_page1_not_lightgbm_signer,
+            )
             doc_conflicts = stats["conflict_words"] - conflict_before
             if args.drop_serious_conflicts and doc_conflicts > args.serious_conflict_threshold:
                 stats["docs_dropped_serious_conflicts"] += 1
+                continue
+            if not rows:
+                stats["docs_skipped_no_exported_pages"] += 1
                 continue
             rows_by_split[meta.split].extend(rows)
             docs_by_split[meta.split].add(meta.doc_id)
@@ -126,8 +169,19 @@ def main() -> None:
         },
         "summary": summary,
         "build_stats": dict(stats),
+        "page_selection_policy": {
+            "default": "only_pages_with_resolved_kie_labels",
+            "include_selected_negative_pages": bool(args.include_selected_negative_pages),
+            "include_page1_clean_negative": bool(args.include_page1_clean_negative),
+            "page1_lightgbm_signer_guard": bool(
+                args.include_page1_clean_negative and args.require_page1_not_lightgbm_signer
+            ),
+        },
         "notes": [
             "BIO labels still come from labeled word_ids first; bbox overlap is fallback only.",
+            "By default, selected_pages without resolved KIE labels are skipped so unlabeled signer/recipient pages do not become false O labels.",
+            "Use --include-selected-negative-pages only for reviewed pages that truly contain no KIE.",
+            "By default, page 1 is added as one clean negative page when page 0 and a labeled signer page >= 2 are both present, and the LightGBM signer_page selector does not mark page 1 as a signer page.",
             "Style metadata is copied from canonical OCR word/line objects by exact word_id.",
             "This normalized output is intentionally separate from the first LayoutLMv3 run and the absolute-gray fontgray run.",
         ],

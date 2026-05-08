@@ -114,7 +114,7 @@ def compare_against_baseline(
     if not os.path.exists(user_pdf_path):
         raise FileNotFoundError(f"Không tìm thấy {user_pdf_path}")
 
-    import accuracy_baseline
+    from scanindex.core.ocr import accuracy_baseline
 
     log_cb("Đọc text gốc (groundtruth.txt nếu có, không thì docx)...")
     gt_text = accuracy_baseline.load_ground_truth_text()

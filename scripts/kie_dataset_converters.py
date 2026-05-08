@@ -8,7 +8,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from kie_json_utils import merge_bboxes, upgrade_ocr_data_in_place
+from scanindex.core.kie.json_utils import merge_bboxes, upgrade_ocr_data_in_place
 
 
 def load_canonical_json(path):

@@ -3013,7 +3013,7 @@ class ProcessingPipeline:
             return
 
         try:
-            import document_metadata_extractor
+            from scanindex.core.digitization import metadata_extractor as document_metadata_extractor
             metadata = document_metadata_extractor.extract_metadata(
                 json_path, log_callback=self.app.log
             )

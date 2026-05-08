@@ -17,25 +17,25 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 import benchmark_current_table_pipeline as gt_bench  # noqa: E402
-from docling_tableformer_engine import detect_tables_docling_tableformer  # noqa: E402
-from docling_tableformer_v1_onnx_engine import (  # noqa: E402
+from scanindex.core.tables.docling_tableformer_engine import detect_tables_docling_tableformer  # noqa: E402
+from scanindex.core.tables.docling_tableformer_v1_onnx_engine import (  # noqa: E402
     detect_tables_docling_tableformer_v1_onnx,
 )
-from docling_tableformer_v2_onnx_engine import (  # noqa: E402
+from scanindex.core.tables.docling_tableformer_v2_onnx_engine import (  # noqa: E402
     detect_tables_docling_tableformer_v2_onnx,
 )
-from docling_tableformer_v2_torch_engine import (  # noqa: E402
+from scanindex.core.tables.docling_tableformer_v2_torch_engine import (  # noqa: E402
     detect_tables_docling_tableformer_v2_torch,
 )
-from gmft_onnx_table_engine import detect_tables_gmft_onnx_on_layout_regions  # noqa: E402
-from table_anchored_merger import (  # noqa: E402
+from scanindex.core.tables.gmft_onnx_table_engine import detect_tables_gmft_onnx_on_layout_regions  # noqa: E402
+from scanindex.core.tables.docx_exporter import (  # noqa: E402
     _choose_docling_first_candidates,
     _group_tables_by_page,
     _layout_pages_with_tables,
     _mark_table_source,
     detect_tables,
 )
-from table_eval_metrics import compare_table_grid_lists  # noqa: E402
+from scanindex.core.tables.eval_metrics import compare_table_grid_lists  # noqa: E402
 
 
 Detector = Callable[

@@ -20,8 +20,8 @@ except Exception:
 from docx import Document
 from rapidfuzz.distance import Levenshtein
 
-from table_eval_metrics import compare_table_grid_lists
-from table_anchored_merger import (
+from scanindex.core.tables.eval_metrics import compare_table_grid_lists
+from scanindex.core.tables.docx_exporter import (
     TextLine,
     assign_ocr_lines_to_table_cells_by_geometry,
     create_docx_from_pdf,
@@ -34,7 +34,7 @@ from table_anchored_merger import (
     repair_continued_tables,
     split_stacked_tables,
 )
-from table_postprocess_v2 import postprocess_tables_v2
+from scanindex.core.tables.postprocess_v2 import postprocess_tables_v2
 
 
 class QuietLogger:
@@ -184,7 +184,7 @@ def prepare_pipeline_inputs(ocr_pdf: Path, logger: QuietLogger) -> tuple[list[Te
         layout_regions_by_page = load_layout_regions_by_page(json_path)
         if layout_regions_by_page:
             try:
-                from layout_analyzer import match_lines_to_regions
+                from scanindex.core.tables.layout_analyzer import match_lines_to_regions
 
                 for pg_num, regions in layout_regions_by_page.items():
                     pg_lines = [line for line in pdf_lines if line.page == pg_num]

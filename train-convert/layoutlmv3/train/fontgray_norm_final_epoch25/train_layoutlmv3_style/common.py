@@ -88,6 +88,10 @@ def load_ocr_document(canonical_json: str | Path):
     return base.load_ocr_document(canonical_json)
 
 
+def assert_page1_lightgbm_guard_available() -> None:
+    base.assert_page1_lightgbm_guard_available()
+
+
 def label_counts(rows: Iterable[dict[str, Any]]) -> Counter:
     return base.label_counts(rows)
 
@@ -295,8 +299,20 @@ def build_rows_for_doc_with_style(
     ocr_doc: Any,
     stats: Counter,
     conflict_rows: list[dict[str, Any]],
+    include_selected_negative_pages: bool = False,
+    include_page1_clean_negative: bool = True,
+    require_page1_not_lightgbm_signer: bool = True,
 ) -> list[dict[str, Any]]:
-    rows = base.build_rows_for_doc(meta, label_payload, ocr_doc, stats, conflict_rows)
+    rows = base.build_rows_for_doc(
+        meta,
+        label_payload,
+        ocr_doc,
+        stats,
+        conflict_rows,
+        include_selected_negative_pages=include_selected_negative_pages,
+        include_page1_clean_negative=include_page1_clean_negative,
+        require_page1_not_lightgbm_signer=require_page1_not_lightgbm_signer,
+    )
     out = [add_layoutlmv3_style_features(row) for row in rows]
     for row in out:
         ids = row.get("layoutlmv3_style_type_id", [])

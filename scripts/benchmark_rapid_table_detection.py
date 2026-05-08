@@ -30,7 +30,7 @@ from benchmark_rapidtable_slanet import (  # noqa: E402
     rapid_result_to_table,
     table_region_data,
 )
-from table_anchored_merger import extract_pdf_lines  # noqa: E402
+from scanindex.core.tables.docx_exporter import extract_pdf_lines  # noqa: E402
 
 
 def render_page_bgr(page: fitz.Page, dpi: int) -> np.ndarray:

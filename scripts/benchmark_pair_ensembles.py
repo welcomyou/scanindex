@@ -22,9 +22,9 @@ from benchmark_groundtruth_engine_matrix import (  # noqa: E402
     map_ocr_text_to_tables,
     run_detector,
 )
-from table_anchored_merger import _select_table_candidates_for_page  # noqa: E402
-from table_anchored_merger import _candidate_set_score, _layout_table_bboxes  # noqa: E402
-from table_postprocess_v2 import table_ocr_fit_score  # noqa: E402
+from scanindex.core.tables.docx_exporter import _select_table_candidates_for_page  # noqa: E402
+from scanindex.core.tables.docx_exporter import _candidate_set_score, _layout_table_bboxes  # noqa: E402
+from scanindex.core.tables.postprocess_v2 import table_ocr_fit_score  # noqa: E402
 
 
 ENGINE_SPECS: dict[str, dict[str, Any]] = {

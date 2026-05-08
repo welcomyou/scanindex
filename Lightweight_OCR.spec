@@ -33,41 +33,10 @@ add_data("dictionaries", "dictionaries")
 
 
 # Runtime modules that are imported lazily or dynamically by the PySide UI.
+# All business logic now lives under scanindex.* — root compatibility
+# wrappers were removed, so only the entry point stays bare.
 hiddenimports += [
-    "portable_utils",
-    "translations",
-    "workers",
-    "file_utils",
     "ocr_app",
-    "direct_ocr_engine",
-    "screen_ai_ocr",
-    "screen_ai_downloader",
-    "correction_engine",
-    "pdf_utils",
-    "pdf_text_extractor",
-    "pdf_a_converter",
-    "pdf_signer",
-    "win_cert_store",
-    "archive_doctype",
-    "archive_fuzzy",
-    "archive_output",
-    "archive_page_splitter",
-    "archive_pipeline",
-    "archive_session",
-    "document_metadata_extractor",
-    "docling_tableformer_engine",
-    "docling_tableformer_v1_onnx_engine",
-    "gmft_onnx_table_engine",
-    "kie_engine",
-    "kie_json_utils",
-    "kie_postprocess",
-    "kie_text_normalize",
-    "layout_analyzer",
-    "ocr_text_normalizer",
-    "pipeline_engine",
-    "table_anchored_merger",
-    "accuracy_metrics",
-    "accuracy_baseline",
 
     # ScanIndex packages
     "scanindex",

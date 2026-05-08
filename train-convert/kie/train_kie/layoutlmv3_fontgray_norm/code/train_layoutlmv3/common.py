@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import statistics
+import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime
@@ -62,6 +63,7 @@ FONT_STYLE_SPECIAL_TOKENS: list[str] = [
     "<style_plain>",
     "<style_emphasis>",
 ]
+_PAGE_SPLITTER_MODULE: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -141,6 +143,93 @@ def now_iso() -> str:
 def read_json(path: str | Path) -> Any:
     with Path(path).open("r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def _load_archive_page_splitter():
+    global _PAGE_SPLITTER_MODULE
+    if _PAGE_SPLITTER_MODULE is not None:
+        return _PAGE_SPLITTER_MODULE
+
+    errors: list[BaseException] = []
+    try:
+        from scanindex.core.digitization import page_splitter as archive_page_splitter
+
+        _PAGE_SPLITTER_MODULE = archive_page_splitter
+        return archive_page_splitter
+    except Exception as exc:
+        errors.append(exc)
+
+    current = Path(__file__).resolve()
+    for root in current.parents:
+        if not (root / "scanindex" / "core" / "digitization" / "page_splitter.py").exists():
+            continue
+        root_text = str(root)
+        if root_text not in sys.path:
+            sys.path.insert(0, root_text)
+        try:
+            from scanindex.core.digitization import page_splitter as archive_page_splitter
+
+            _PAGE_SPLITTER_MODULE = archive_page_splitter
+            return archive_page_splitter
+        except Exception as exc:
+            errors.append(exc)
+
+    detail = "; ".join(f"{type(exc).__name__}: {exc}" for exc in errors[-3:])
+    raise RuntimeError(
+        "Cannot import scanindex.core.digitization.page_splitter for the LightGBM signer-page guard. "
+        f"Import errors: {detail}"
+    ) from errors[-1]
+
+
+def assert_page1_lightgbm_guard_available() -> None:
+    page_splitter = _load_archive_page_splitter()
+    signer_model_path = getattr(page_splitter, "signer_model_path", None)
+    model_path = signer_model_path() if callable(signer_model_path) else None
+    if not model_path:
+        raise FileNotFoundError("LightGBM signer_page model not found under models/lightgbm_splitter/signer_page.")
+    repo_root = Path(page_splitter._repo_root()).resolve() if hasattr(page_splitter, "_repo_root") else Path.cwd().resolve()
+    expected_dir = (repo_root / "models" / "lightgbm_splitter" / "signer_page").resolve()
+    actual_path = Path(model_path).resolve()
+    if actual_path.parent != expected_dir:
+        raise FileNotFoundError(
+            "Refusing LightGBM signer_page fallback model. "
+            f"Expected model under {expected_dir}, got {actual_path}."
+        )
+    load_signer_model = getattr(page_splitter, "load_signer_model", None)
+    if not callable(load_signer_model):
+        raise RuntimeError("LightGBM signer-page selector has no load_signer_model() function.")
+    if load_signer_model() is None:
+        raise FileNotFoundError(f"LightGBM signer_page model could not be loaded: {model_path}")
+
+
+def _page1_lightgbm_signer_decision(canonical_json: str | Path) -> dict[str, Any]:
+    assert_page1_lightgbm_guard_available()
+    page_splitter = _load_archive_page_splitter()
+    result = page_splitter.predict_signer_page(str(canonical_json))
+    page_row: dict[str, Any] | None = None
+    for row in result.get("pages") or []:
+        try:
+            row_page_index = int(row.get("page_index"))
+        except Exception:
+            continue
+        if row_page_index == 1:
+            page_row = row
+            break
+    if page_row is None:
+        raise RuntimeError(f"LightGBM signer-page selector did not return page_index=1 for {canonical_json}")
+
+    signer_page_raw = result.get("signer_page")
+    signer_page = int(signer_page_raw) if signer_page_raw is not None else None
+    is_top_signer = signer_page == 1
+    return {
+        "signer_page": signer_page,
+        "signer_score": result.get("signer_score"),
+        "page1_score": page_row.get("score"),
+        "page1_passes_threshold": bool(page_row.get("passes_threshold")),
+        "page1_is_top_signer": bool(page_row.get("is_signer_page")) or is_top_signer,
+        "threshold": result.get("threshold"),
+        "model_path": result.get("model_path"),
+    }
 
 
 def write_json(path: str | Path, payload: Any) -> None:
@@ -936,6 +1025,9 @@ def build_rows_for_doc(
     ocr_doc: OCRDocument,
     stats: Counter,
     conflict_rows: list[dict[str, Any]],
+    include_selected_negative_pages: bool = False,
+    include_page1_clean_negative: bool = True,
+    require_page1_not_lightgbm_signer: bool = True,
 ) -> list[dict[str, Any]]:
     annotation = get_annotation_payload(label_payload)
     fields: list[dict[str, Any]] = []
@@ -944,9 +1036,44 @@ def build_rows_for_doc(
         if resolved:
             fields.append(resolved)
     label_pages = {int(field["page_index"]) for field in fields if _is_int_like(field.get("page_index"))}
-    selected_pages = set(meta.selected_pages) | label_pages
+    selected_pages = set(label_pages)
+
+    page1_clean_negative_pages: set[int] = set()
+    signer_pages = {
+        int(field["page_index"])
+        for field in fields
+        if field.get("label") in {"SIGNER_ROLE", "SIGNER_NAME"} and _is_int_like(field.get("page_index"))
+    }
+    if include_page1_clean_negative and 0 in label_pages and 1 not in label_pages and any(page >= 2 for page in signer_pages):
+        if 1 in ocr_doc.pages:
+            include_page1 = True
+            if require_page1_not_lightgbm_signer:
+                decision = _page1_lightgbm_signer_decision(meta.source_canonical_json)
+                stats["page1_clean_negative_lightgbm_guard_checked"] += 1
+                if decision["page1_is_top_signer"]:
+                    include_page1 = False
+                    stats["page1_clean_negative_skipped_lightgbm_top_signer"] += 1
+                elif decision["page1_passes_threshold"]:
+                    include_page1 = False
+                    stats["page1_clean_negative_skipped_lightgbm_threshold"] += 1
+                else:
+                    stats["page1_clean_negative_lightgbm_guard_passed"] += 1
+            if include_page1:
+                page1_clean_negative_pages.add(1)
+                selected_pages.add(1)
+                stats["page1_clean_negative_pages_included"] += 1
+        else:
+            stats["page1_clean_negative_pages_missing"] += 1
+
+    selected_negative_pages = set(meta.selected_pages) - label_pages - page1_clean_negative_pages
+    if include_selected_negative_pages:
+        selected_pages.update(meta.selected_pages)
+        stats["selected_negative_pages_included"] += len(selected_negative_pages)
+    else:
+        stats["selected_negative_pages_skipped"] += len(selected_negative_pages)
     if not selected_pages:
-        selected_pages = set(ocr_doc.pages)
+        stats["docs_without_labeled_kie_pages"] += 1
+        return []
     rows: list[dict[str, Any]] = []
     serious_conflicts_before = stats["conflict_words"]
     for page_index in sorted(selected_pages):

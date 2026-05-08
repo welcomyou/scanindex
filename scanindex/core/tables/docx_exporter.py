@@ -41,7 +41,7 @@ IMG2TABLE_AVAILABLE = False
 # GMFT-ONNX is part of the production DocLayout-anchored table pipeline.
 try:
     import importlib
-    _gmft_onnx_engine = importlib.import_module("gmft_onnx_table_engine")
+    _gmft_onnx_engine = importlib.import_module("scanindex.core.tables.gmft_onnx_table_engine")
     detect_tables_gmft_onnx = _gmft_onnx_engine.detect_tables_gmft_onnx
     detect_tables_gmft_onnx_on_layout_regions = _gmft_onnx_engine.detect_tables_gmft_onnx_on_layout_regions
     GMFT_ONNX_AVAILABLE = _gmft_onnx_engine.is_gmft_onnx_available()
