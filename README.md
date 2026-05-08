@@ -27,20 +27,21 @@ pip install -r requirements.txt
 pip install -r requirements_qt.txt
 ```
 
-### Tải model (~1.9 GB)
+### Tải model (~1.9 GB) — có verify SHA256
 
 ```powershell
 python scripts\download_offline_models.py
 ```
 
-Script này sẽ:
+Script kéo từng repo HF về `models/`, sau đó **verify SHA256 từng file** theo bảng cứng `MODELS_CONFIG` hardcode trong [scripts/download_offline_models.py](scripts/download_offline_models.py). Mỗi repo cũng pin `revision=<commit_sha>` — nếu HF account bị hijack, attacker push commit mới cũng không ảnh hưởng. Hash mismatch → script raise `ModelIntegrityError` và dừng.
 
-- Kéo bundle model từ Hugging Face
-  [`welcomyou/scanindex-models`](https://huggingface.co/welcomyou/scanindex-models)
-  về `models/`
-- Tải Chrome ScreenAI DLL từ Google CDN về `models/screen_ai/`
-  (license của Google không cho redistribute nên không bundle vào HF)
-- Copy `chromedriver.exe` vào `drivers/`
+ScreenAI tải từ Google CDN qua [scanindex/core/ocr/screen_ai_downloader.py](scanindex/core/ocr/screen_ai_downloader.py) (Chrome signed CRX channel; license Google không cho re-host trên HF).
+
+Sau khi retrain + re-upload model nào đó, regen lại hash anchor:
+
+```powershell
+python scripts\refresh_model_hashes.py --apply
+```
 
 ### Chạy
 
