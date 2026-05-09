@@ -50,9 +50,13 @@ def main():
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
     )
 
+    from scanindex.infra.version import get_version_short
+    _ver = get_version_short()
+
     app = QApplication(sys.argv)
     app.setApplicationName("ScanIndex")
-    app.setApplicationDisplayName("ScanIndex")
+    app.setApplicationDisplayName(f"ScanIndex {_ver}")
+    app.setApplicationVersion(_ver)
 
     # Show splash IMMEDIATELY so user sees feedback during the unavoidable
     # Python + Qt + main_window module import (~1.5s on cold start). The splash

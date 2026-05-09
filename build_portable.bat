@@ -79,6 +79,15 @@ if errorlevel 1 (
 )
 
 echo.
+echo Writing VERSION file from git describe...
+python -c "from scanindex.infra.version import get_version; open('VERSION','w',encoding='utf-8').write(get_version())"
+if errorlevel 1 (
+    echo   [WARN] Could not auto-derive version; bundle will fall back to _FALLBACK_VERSION at runtime.
+) else (
+    for /f "usebackq delims=" %%V in ("VERSION") do echo   [OK] VERSION = %%V
+)
+
+echo.
 echo Killing running processes...
 taskkill /F /IM "%APP_NAME%.exe" 2>nul
 taskkill /F /IM "%OLD_APP_NAME%.exe" 2>nul

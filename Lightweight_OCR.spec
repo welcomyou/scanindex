@@ -30,6 +30,10 @@ add_data("scanindex/core/repository/schema.sql", "scanindex/core/repository")
 add_data("settings.ini.example", ".")
 add_data("ignored_words.txt", ".")
 add_data("dictionaries", "dictionaries")
+# VERSION file is written by build_portable.bat (from `git describe`)
+# right before PyInstaller runs, so the bundled app reports the same
+# version as the git tag the build was made from.
+add_data("VERSION", ".")
 
 
 # Runtime modules that are imported lazily or dynamically by the PySide UI.

@@ -28,7 +28,7 @@ TRANSLATIONS = {
         "vi": """ScanIndex
 Thiết kế nghiệp vụ: Nguyễn Hồng Quân, Chuyên viên Phòng Chuyển đổi số - Cơ yếu, Văn phòng Thành ủy Thành phố Hồ Chí Minh.
 Phát triển và tích hợp: Nguyễn Hồng Quân, với hỗ trợ AI coding.
-Phiên bản: 1.0
+Phiên bản: {version}
 Cập nhật nội dung: 06/05/2026
 
 PHẦN MỀM SỬ DỤNG TRONG MÔI TRƯỜNG GIÁO DỤC, HÀNH CHÍNH CÔNG, TỔ CHỨC ĐẢNG, ĐOÀN THỂ.
@@ -62,8 +62,9 @@ CHỨC NĂNG CHÍNH
     • Tra cứu theo metadata, toàn văn và ngữ nghĩa bằng Tantivy + FAISS + embedding E5 ONNX; có chế độ rerank khi mô hình khả dụng.
     • Xem PDF, đoạn khớp và bộ lọc HSLTCQ ngay trong giao diện.
 
-6. Đo độ chính xác OCR:
-    • So sánh PDF OCR với ground truth bằng CER/WER để đánh giá chất lượng nhận dạng.
+6. Một số công cụ hỗ trợ:
+    • Đo độ chính xác OCR: so sánh PDF OCR với ground truth bằng CER/WER.
+    • Phát hiện file mật trong thư mục: OCR trang đầu hoặc các trang đầu văn bản do LightGBM xác định để tìm dấu MẬT/TỐI MẬT/TUYỆT MẬT.
 
 CÔNG NGHỆ CHÍNH
     • Giao diện: Python, PySide6/Qt.
@@ -78,7 +79,7 @@ Phần mềm ưu tiên xử lý cục bộ khi mô hình và phụ thuộc đã 
         "en": """ScanIndex
 Business design: Nguyen Hong Quan, Digital Transformation and Cryptography Specialist, HCMC Party Committee Office.
 Development and integration: Nguyen Hong Quan, with AI coding support.
-Version: 1.0
+Version: {version}
 Content updated: 06 May 2026
 
 THIS SOFTWARE IS INTENDED FOR USE IN EDUCATIONAL ENVIRONMENTS, PUBLIC ADMINISTRATION, PARTY ORGANIZATIONS, AND SOCIO-POLITICAL ORGANIZATIONS.
@@ -112,8 +113,9 @@ MAIN FEATURES
     • Searches metadata, full text, and semantics with Tantivy + FAISS + E5 ONNX embeddings; reranking is available when the model is installed.
     • Shows PDFs, matched snippets, and HSLTCQ filters inside the interface.
 
-6. OCR accuracy measurement:
-    • Compares OCR PDF output with ground truth using CER/WER metrics.
+6. Supporting tools:
+    • OCR accuracy measurement: compares OCR PDF output with ground truth using CER/WER metrics.
+    • Classified-file detection in a folder: OCRs first pages or LightGBM-selected document-start pages to find MẬT/TỐI MẬT/TUYỆT MẬT stamps.
 
 CORE TECHNOLOGY
     • Interface: Python, PySide6/Qt.
@@ -352,7 +354,7 @@ The software prioritizes local processing when models and dependencies are insta
 
     # About Tab
     "about_app_name": { "en": "ScanIndex", "vi": "ScanIndex" },
-    "about_version": { "en": "Version 1.0 — 31 Jan 2026", "vi": "Phiên bản 1.0 — 31/01/2026" },
+    "about_version": { "en": "Version {version}", "vi": "Phiên bản {version}" },
     "about_notice": {
         "en": "ONLY FOR EDUCATIONAL, PUBLIC ADMINISTRATION,\nPARTY, AND SOCIO-POLITICAL ORGANIZATIONS.\nNOT PERMITTED FOR COMMERCIAL USE.",
         "vi": "PHẦN MỀM SỬ DỤNG TRONG MÔI TRƯỜNG GIÁO DỤC,\nHÀNH CHÍNH CÔNG, TỔ CHỨC ĐẢNG, ĐOÀN THỂ.\nKHÔNG SỬ DỤNG CHO MỤC ĐÍCH THƯƠNG MẠI."

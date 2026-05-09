@@ -7,6 +7,12 @@ from PySide6.QtCore import Qt
 
 from scanindex.ui.theme import COLOR_TEXT_SECONDARY, FONT_UI, SP
 from scanindex.infra import translations
+from scanindex.infra.version import get_version
+
+
+def _render_about() -> str:
+    """Substitute {version} placeholder with current build version."""
+    return translations.get_text("txt_about_content").format(version=get_version())
 
 
 class AboutTab(QWidget):
@@ -26,8 +32,8 @@ class AboutTab(QWidget):
         self.text_edit.setStyleSheet(
             f"color: {COLOR_TEXT_SECONDARY}; background: transparent; border: none;"
         )
-        self.text_edit.setText(translations.get_text("txt_about_content"))
+        self.text_edit.setText(_render_about())
         layout.addWidget(self.text_edit)
 
     def update_texts(self):
-        self.text_edit.setText(translations.get_text("txt_about_content"))
+        self.text_edit.setText(_render_about())
