@@ -9,8 +9,17 @@ set "OLD_APP_NAME=Lightweight_OCR"
 set "ENTRYPOINT=ocr_app.py"
 set "SPEC_FILE=Lightweight_OCR.spec"
 set "VENV_DIR=.venv_build"
-set "DIST_DIR=dist\%APP_NAME%"
+
+REM Capture version from git tag (or fallback) so dist/ folder is named per release.
+REM Mirrors d:/App/asr-vn/build-portable/build_portable.py pattern:
+REM   DIST_DIR = dist/<app>-<version>/
+set "APP_VERSION="
+for /f "usebackq tokens=*" %%V in (`python -c "from scanindex.infra.version import get_version_short; print(get_version_short())" 2^>nul`) do set "APP_VERSION=%%V"
+if "%APP_VERSION%"=="" set "APP_VERSION=dev"
+
+set "DIST_DIR=dist\%APP_NAME%-%APP_VERSION%"
 set "OLD_DIST_DIR=dist\%OLD_APP_NAME%"
+set "LEGACY_DIST_DIR=dist\%APP_NAME%"
 set "MODE=%~1"
 set "INTERACTIVE=0"
 if "%INCLUDE_CORRECTION%"=="" set "INCLUDE_CORRECTION=1"
@@ -20,7 +29,9 @@ echo ===================================================
 echo   SCANINDEX - PORTABLE BUILD
 echo ===================================================
 echo.
-echo   App: %APP_NAME%  (%ENTRYPOINT%)
+echo   App:     %APP_NAME%  (%ENTRYPOINT%)
+echo   Version: %APP_VERSION%
+echo   Output:  %DIST_DIR%
 echo.
 
 if "%MODE%"=="" (
@@ -105,6 +116,10 @@ if exist "%DIST_DIR%" (
 if exist "%OLD_DIST_DIR%" (
     echo Cleaning old portable output %OLD_DIST_DIR%...
     rmdir /s /q "%OLD_DIST_DIR%"
+)
+if exist "%LEGACY_DIST_DIR%" (
+    echo Cleaning legacy unversioned %LEGACY_DIST_DIR%...
+    rmdir /s /q "%LEGACY_DIST_DIR%"
 )
 if exist "%DIST_DIR%" (
     echo ERROR: Cannot clean %DIST_DIR%. Close the app and retry.
