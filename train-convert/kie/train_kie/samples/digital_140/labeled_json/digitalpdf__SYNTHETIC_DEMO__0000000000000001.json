@@ -1,0 +1,253 @@
+{
+  "schema": "kie_vi_official_v3",
+  "status": "draft",
+  "source": "synthetic-demo",
+  "doc_id": "0000000000000001",
+  "relative_pdf_path": "digitalpdf/SYNTHETIC (DEMO).pdf",
+  "field_instances": [
+    {
+      "field_id": "f1",
+      "label": "REGIME_HEADER",
+      "page_index": 0,
+      "line_ids": [
+        "p0_l0"
+      ],
+      "word_ids": [
+        "p0_l0_w0",
+        "p0_l0_w1",
+        "p0_l0_w2",
+        "p0_l0_w3"
+      ],
+      "text": "ĐẢNG CỘNG SẢN DEMO",
+      "normalized_value": null,
+      "bbox": [
+        100.0,
+        50.0,
+        217.0,
+        68.0
+      ],
+      "confidence": null,
+      "source": "synthetic-demo",
+      "review_status": "draft"
+    },
+    {
+      "field_id": "f2",
+      "label": "ISSUE_ORG_SUPERIOR",
+      "page_index": 0,
+      "line_ids": [
+        "p0_l1"
+      ],
+      "word_ids": [
+        "p0_l1_w0",
+        "p0_l1_w1",
+        "p0_l1_w2",
+        "p0_l1_w3"
+      ],
+      "text": "ĐẢNG ỦY XÃ DEMO",
+      "normalized_value": null,
+      "bbox": [
+        100.0,
+        74.0,
+        208.0,
+        92.0
+      ],
+      "confidence": null,
+      "source": "synthetic-demo",
+      "review_status": "draft"
+    },
+    {
+      "field_id": "f3",
+      "label": "ISSUE_ORG_NAME",
+      "page_index": 0,
+      "line_ids": [
+        "p0_l2"
+      ],
+      "word_ids": [
+        "p0_l2_w0",
+        "p0_l2_w1",
+        "p0_l2_w2"
+      ],
+      "text": "VĂN PHÒNG DEMO",
+      "normalized_value": null,
+      "bbox": [
+        100.0,
+        98.0,
+        192.0,
+        116.0
+      ],
+      "confidence": null,
+      "source": "synthetic-demo",
+      "review_status": "draft"
+    },
+    {
+      "field_id": "f4",
+      "label": "DOC_NUMBER_SYMBOL",
+      "page_index": 0,
+      "line_ids": [
+        "p0_l3"
+      ],
+      "word_ids": [
+        "p0_l3_w0",
+        "p0_l3_w1"
+      ],
+      "text": "Số 99-BC/VPDM",
+      "normalized_value": null,
+      "bbox": [
+        100.0,
+        122.0,
+        194.0,
+        140.0
+      ],
+      "confidence": null,
+      "source": "synthetic-demo",
+      "review_status": "draft"
+    },
+    {
+      "field_id": "f5",
+      "label": "PLACE_DATE",
+      "page_index": 0,
+      "line_ids": [
+        "p0_l4"
+      ],
+      "word_ids": [
+        "p0_l4_w0",
+        "p0_l4_w1",
+        "p0_l4_w2",
+        "p0_l4_w3",
+        "p0_l4_w4",
+        "p0_l4_w5",
+        "p0_l4_w6"
+      ],
+      "text": "Demo, ngày 09 tháng 5 năm 2026",
+      "normalized_value": null,
+      "bbox": [
+        100.0,
+        146.0,
+        311.0,
+        164.0
+      ],
+      "confidence": null,
+      "source": "synthetic-demo",
+      "review_status": "draft"
+    },
+    {
+      "field_id": "f6",
+      "label": "DOC_SUBJECT",
+      "page_index": 0,
+      "line_ids": [
+        "p0_l5",
+        "p0_l6"
+      ],
+      "word_ids": [
+        "p0_l5_w0",
+        "p0_l5_w1",
+        "p0_l6_w0",
+        "p0_l6_w1",
+        "p0_l6_w2",
+        "p0_l6_w3",
+        "p0_l6_w4",
+        "p0_l6_w5",
+        "p0_l6_w6"
+      ],
+      "text": "BÁO CÁO\nVề việc minh hoạ pipeline KIE synthetic",
+      "normalized_value": null,
+      "bbox": [
+        100.0,
+        170.0,
+        361.0,
+        212.0
+      ],
+      "confidence": null,
+      "source": "synthetic-demo",
+      "review_status": "draft"
+    },
+    {
+      "field_id": "f7",
+      "label": "RECIPIENTS",
+      "page_index": 0,
+      "line_ids": [
+        "p0_l7",
+        "p0_l8"
+      ],
+      "word_ids": [
+        "p0_l7_w0",
+        "p0_l7_w1",
+        "p0_l8_w0",
+        "p0_l8_w1",
+        "p0_l8_w2",
+        "p0_l8_w3",
+        "p0_l8_w4"
+      ],
+      "text": "Nơi nhận:\n- Lưu Văn phòng Demo.",
+      "normalized_value": null,
+      "bbox": [
+        100.0,
+        218.0,
+        248.0,
+        260.0
+      ],
+      "confidence": null,
+      "source": "synthetic-demo",
+      "review_status": "draft"
+    },
+    {
+      "field_id": "f8",
+      "label": "SIGNER_ROLE",
+      "page_index": 0,
+      "line_ids": [
+        "p0_l9"
+      ],
+      "word_ids": [
+        "p0_l9_w0",
+        "p0_l9_w1",
+        "p0_l9_w2",
+        "p0_l9_w3"
+      ],
+      "text": "TRƯỞNG PHÒNG VĂN PHÒNG",
+      "normalized_value": null,
+      "bbox": [
+        100.0,
+        266.0,
+        245.0,
+        284.0
+      ],
+      "confidence": null,
+      "source": "synthetic-demo",
+      "review_status": "draft"
+    },
+    {
+      "field_id": "f9",
+      "label": "SIGNER_NAME",
+      "page_index": 0,
+      "line_ids": [
+        "p0_l10"
+      ],
+      "word_ids": [
+        "p0_l10_w0",
+        "p0_l10_w1"
+      ],
+      "text": "Demo Một",
+      "normalized_value": null,
+      "bbox": [
+        100.0,
+        290.0,
+        153.0,
+        308.0
+      ],
+      "confidence": null,
+      "source": "synthetic-demo",
+      "review_status": "draft"
+    }
+  ],
+  "relations": [
+    {
+      "relation_id": "r1",
+      "type": "signed_by",
+      "from_field_id": "f8",
+      "to_field_id": "f9",
+      "confidence": null,
+      "source": "synthetic-demo",
+      "review_status": "draft"
+    }
+  ]
+}

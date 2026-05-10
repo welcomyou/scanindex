@@ -1,0 +1,107 @@
+{
+  "doc_id": "0000000000000001",
+  "source_pdf": "source_pdf/SYNTHETIC (DEMO).pdf",
+  "relative_pdf_path": "digitalpdf/SYNTHETIC (DEMO).pdf",
+  "canonical_schema_version": "ocr_kie_document_v3",
+  "canonical_top_keys": [
+    "schema_version",
+    "engine",
+    "input_path",
+    "document",
+    "pipeline",
+    "annotations",
+    "pages"
+  ],
+  "page_count": 1,
+  "first_page_keys": [
+    "id",
+    "page_index",
+    "width",
+    "height",
+    "render_width",
+    "render_height",
+    "lines",
+    "words",
+    "kie_tokens",
+    "layout_regions"
+  ],
+  "first_page_word_count": 42,
+  "first_page_line_count": 11,
+  "labeled_schema": "kie_vi_official_v3",
+  "field_instances": [
+    {
+      "label": "REGIME_HEADER",
+      "page_index": 0,
+      "word_count": 4,
+      "line_count": 1,
+      "text": "ĐẢNG CỘNG SẢN DEMO"
+    },
+    {
+      "label": "ISSUE_ORG_SUPERIOR",
+      "page_index": 0,
+      "word_count": 4,
+      "line_count": 1,
+      "text": "ĐẢNG ỦY XÃ DEMO"
+    },
+    {
+      "label": "ISSUE_ORG_NAME",
+      "page_index": 0,
+      "word_count": 3,
+      "line_count": 1,
+      "text": "VĂN PHÒNG DEMO"
+    },
+    {
+      "label": "DOC_NUMBER_SYMBOL",
+      "page_index": 0,
+      "word_count": 2,
+      "line_count": 1,
+      "text": "Số 99-BC/VPDM"
+    },
+    {
+      "label": "PLACE_DATE",
+      "page_index": 0,
+      "word_count": 7,
+      "line_count": 1,
+      "text": "Demo, ngày 09 tháng 5 năm 2026"
+    },
+    {
+      "label": "DOC_SUBJECT",
+      "page_index": 0,
+      "word_count": 9,
+      "line_count": 2,
+      "text": "BÁO CÁO\nVề việc minh hoạ pipeline KIE synthetic"
+    },
+    {
+      "label": "RECIPIENTS",
+      "page_index": 0,
+      "word_count": 7,
+      "line_count": 2,
+      "text": "Nơi nhận:\n- Lưu Văn phòng Demo."
+    },
+    {
+      "label": "SIGNER_ROLE",
+      "page_index": 0,
+      "word_count": 4,
+      "line_count": 1,
+      "text": "TRƯỞNG PHÒNG VĂN PHÒNG"
+    },
+    {
+      "label": "SIGNER_NAME",
+      "page_index": 0,
+      "word_count": 2,
+      "line_count": 1,
+      "text": "Demo Một"
+    }
+  ],
+  "relations": [
+    {
+      "relation_id": "r1",
+      "type": "signed_by",
+      "from_field_id": "f8",
+      "to_field_id": "f9",
+      "confidence": null,
+      "source": "synthetic-demo",
+      "review_status": "draft"
+    }
+  ]
+}

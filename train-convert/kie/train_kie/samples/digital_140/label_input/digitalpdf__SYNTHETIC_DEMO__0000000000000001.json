@@ -1,0 +1,138 @@
+{
+  "doc_id": "0000000000000001",
+  "relative_pdf_path": "digitalpdf/SYNTHETIC (DEMO).pdf",
+  "schema": "kie_vi_official_v3",
+  "source": "synthetic-demo",
+  "candidates": [
+    {
+      "label": "REGIME_HEADER",
+      "text": "ĐẢNG CỘNG SẢN DEMO",
+      "line_id": "p0_l0",
+      "word_ids": [
+        "p0_l0_w0",
+        "p0_l0_w1",
+        "p0_l0_w2",
+        "p0_l0_w3"
+      ],
+      "page_index": 0
+    },
+    {
+      "label": "ISSUE_ORG_SUPERIOR",
+      "text": "ĐẢNG ỦY XÃ DEMO",
+      "line_id": "p0_l1",
+      "word_ids": [
+        "p0_l1_w0",
+        "p0_l1_w1",
+        "p0_l1_w2",
+        "p0_l1_w3"
+      ],
+      "page_index": 0
+    },
+    {
+      "label": "ISSUE_ORG_NAME",
+      "text": "VĂN PHÒNG DEMO",
+      "line_id": "p0_l2",
+      "word_ids": [
+        "p0_l2_w0",
+        "p0_l2_w1",
+        "p0_l2_w2"
+      ],
+      "page_index": 0
+    },
+    {
+      "label": "DOC_NUMBER_SYMBOL",
+      "text": "Số 99-BC/VPDM",
+      "line_id": "p0_l3",
+      "word_ids": [
+        "p0_l3_w0",
+        "p0_l3_w1"
+      ],
+      "page_index": 0
+    },
+    {
+      "label": "PLACE_DATE",
+      "text": "Demo, ngày 09 tháng 5 năm 2026",
+      "line_id": "p0_l4",
+      "word_ids": [
+        "p0_l4_w0",
+        "p0_l4_w1",
+        "p0_l4_w2",
+        "p0_l4_w3",
+        "p0_l4_w4",
+        "p0_l4_w5",
+        "p0_l4_w6"
+      ],
+      "page_index": 0
+    },
+    {
+      "label": "DOC_SUBJECT",
+      "text": "BÁO CÁO",
+      "line_id": "p0_l5",
+      "word_ids": [
+        "p0_l5_w0",
+        "p0_l5_w1"
+      ],
+      "page_index": 0
+    },
+    {
+      "label": "DOC_SUBJECT",
+      "text": "Về việc minh hoạ pipeline KIE synthetic",
+      "line_id": "p0_l6",
+      "word_ids": [
+        "p0_l6_w0",
+        "p0_l6_w1",
+        "p0_l6_w2",
+        "p0_l6_w3",
+        "p0_l6_w4",
+        "p0_l6_w5",
+        "p0_l6_w6"
+      ],
+      "page_index": 0
+    },
+    {
+      "label": "RECIPIENTS",
+      "text": "Nơi nhận:",
+      "line_id": "p0_l7",
+      "word_ids": [
+        "p0_l7_w0",
+        "p0_l7_w1"
+      ],
+      "page_index": 0
+    },
+    {
+      "label": "RECIPIENTS",
+      "text": "- Lưu Văn phòng Demo.",
+      "line_id": "p0_l8",
+      "word_ids": [
+        "p0_l8_w0",
+        "p0_l8_w1",
+        "p0_l8_w2",
+        "p0_l8_w3",
+        "p0_l8_w4"
+      ],
+      "page_index": 0
+    },
+    {
+      "label": "SIGNER_ROLE",
+      "text": "TRƯỞNG PHÒNG VĂN PHÒNG",
+      "line_id": "p0_l9",
+      "word_ids": [
+        "p0_l9_w0",
+        "p0_l9_w1",
+        "p0_l9_w2",
+        "p0_l9_w3"
+      ],
+      "page_index": 0
+    },
+    {
+      "label": "SIGNER_NAME",
+      "text": "Demo Một",
+      "line_id": "p0_l10",
+      "word_ids": [
+        "p0_l10_w0",
+        "p0_l10_w1"
+      ],
+      "page_index": 0
+    }
+  ]
+}
