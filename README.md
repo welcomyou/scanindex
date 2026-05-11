@@ -84,29 +84,28 @@ git tag v1.1.0          # → bundle dist\ScanIndex-1.1.0\
 | [scanindex/tools/](scanindex/tools/) | CLI tools |
 | [config/](config/) | Default `settings.ini`, sign templates |
 | [assets/](assets/) | Icon, mẫu MetaDuLieu.xlsx |
-| [scripts/](scripts/) | Download models, benchmark, tooling |
-| [tests/](tests/) | pytest |
-| [train-convert/](train-convert/) | Decision records + scripts để retrain / re-export model (artifacts không kèm) |
+| [scripts/](scripts/) | Download/upload models, refresh SHA256 anchor, benchmark, tooling |
+| [train-convert/](train-convert/) | Decision records + scripts để retrain / re-export model (artifacts và data train không kèm) |
+
+Tests đang gitignored — pytest chạy local từ working tree của developer, không ship lên repo public (test fixtures có thể chứa OCR văn bản hành chính thật).
 
 ## Models
 
-Tổng hợp ở Collection [welcomyou/scanindex](https://huggingface.co/collections/welcomyou/scanindex). Gồm:
+Tổng hợp ở Collection [welcomyou/scanindex](https://huggingface.co/collections/welcomyou/scanindex). 6 standalone + 1 bundle, đều pin SHA256 trong [scripts/download_offline_models.py](scripts/download_offline_models.py):
 
 | Repo | Vai trò trong pipeline |
 |---|---|
 | [welcomyou/layoutlmv3-vn-admin-kie](https://huggingface.co/welcomyou/layoutlmv3-vn-admin-kie) | KIE LayoutLMv3 fine-tune |
-| [welcomyou/e5-small-vn-archive-mix50](https://huggingface.co/welcomyou/e5-small-vn-archive-mix50) | Embedder cho search Kho lưu trữ |
 | [welcomyou/distilled-protonx-vn-correction-ct2](https://huggingface.co/welcomyou/distilled-protonx-vn-correction-ct2) | Correction CTranslate2 |
-| [welcomyou/lightgbm-vn-page-splitter](https://huggingface.co/welcomyou/lightgbm-vn-page-splitter) | Tách văn bản trong batch scan |
-| [welcomyou/doclayout-yolo-onnx-dynamic](https://huggingface.co/welcomyou/doclayout-yolo-onnx-dynamic) | Layout YOLO (dynamic axes ONNX) |
+| [welcomyou/lightgbm-vn-page-splitter](https://huggingface.co/welcomyou/lightgbm-vn-page-splitter) | Tách văn bản trong batch scan + chọn trang ký |
+| [welcomyou/doclayout-yolo-onnx-dynamic](https://huggingface.co/welcomyou/doclayout-yolo-onnx-dynamic) | Layout YOLO (dynamic axes ONNX, DocStructBench + DocLayNet) |
 | [welcomyou/gmft-tatr-onnx](https://huggingface.co/welcomyou/gmft-tatr-onnx) | Bảng — TATR detection + structure |
 | [welcomyou/docling-tableformer-v1-onnx-stepcache](https://huggingface.co/welcomyou/docling-tableformer-v1-onnx-stepcache) | Bảng — Docling TableFormer (stepcache) |
-| [welcomyou/scanindex-models](https://huggingface.co/welcomyou/scanindex-models) | Bundle: PaddleOCR orientation + `manifest.json` |
+| [welcomyou/scanindex-models](https://huggingface.co/welcomyou/scanindex-models) | Bundle nhỏ: PaddleOCR orientation classifier |
 
-Hai model nằm ngoài HF (lý do license / kích thước):
+Search Kho lưu trữ hiện chỉ dùng Tantivy + SQLite — không có dense embedder hay reranker trong production. Train-convert scripts cho E5 / cross-encoder vẫn ở [train-convert/archive-embedder/](train-convert/archive-embedder/) nếu cần revive sau.
 
-- Chrome ScreenAI OCR — auto download từ Google CDN bởi [scanindex/core/ocr/screen_ai_downloader.py](scanindex/core/ocr/screen_ai_downloader.py)
-- BAAI/bge-reranker-v2-m3 — pull lazy từ upstream khi user dùng search "Accurate"
+Chrome ScreenAI OCR DLL nằm ngoài HF (license Google không cho re-host) — auto download từ Google CDN bởi [scanindex/core/ocr/screen_ai_downloader.py](scanindex/core/ocr/screen_ai_downloader.py), kèm Authenticode verify để chắc DLL ký bởi Google LLC.
 
 Upload model sau khi retrain:
 
