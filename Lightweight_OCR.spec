@@ -7,10 +7,23 @@ Python packages and read-only in-bundle assets needed at import time.
 """
 
 import os
+import sys
 from PyInstaller.utils.hooks import collect_all
 
 
 block_cipher = None
+
+
+# Pick up the version from scanindex/infra/version.py so the COLLECT dir
+# matches build_portable.bat's DIST_DIR (`dist/ScanIndex-<version>`).
+sys.path.insert(0, os.getcwd())
+try:
+    from scanindex.infra.version import get_version_short
+    _APP_VERSION = get_version_short()
+except Exception:
+    _APP_VERSION = "dev"
+_APP_NAME = "ScanIndex"
+_COLLECT_NAME = f"{_APP_NAME}-{_APP_VERSION}"
 
 
 datas = []
@@ -135,6 +148,8 @@ hiddenimports += [
     "scanindex.ui.screens.home_screen",
     "scanindex.ui.screens.kho_luu_tru_screen",
     "scanindex.ui.screens.screen_base",
+    "scanindex.ui.screens.secret_file_scan_screen",
+    "scanindex.ui.screens.support_tools_screen",
     "scanindex.ui.signals",
     "scanindex.ui.splash_screen",
     "scanindex.ui.tabs",
@@ -366,5 +381,5 @@ coll = COLLECT(
     strip=False,
     upx=False,
     upx_exclude=[],
-    name="ScanIndex",
+    name=_COLLECT_NAME,
 )
