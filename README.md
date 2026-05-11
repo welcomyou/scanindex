@@ -91,19 +91,21 @@ Tests đang gitignored — pytest chạy local từ working tree của developer
 
 ## Models
 
-Tổng hợp ở Collection [welcomyou/scanindex](https://huggingface.co/collections/welcomyou/scanindex). 6 standalone + 1 bundle, đều pin SHA256 trong [scripts/download_offline_models.py](scripts/download_offline_models.py):
+Tổng hợp ở Collection [welcomyou/scanindex](https://huggingface.co/collections/welcomyou/scanindex). Pin SHA256 trong [scripts/download_offline_models.py](scripts/download_offline_models.py) cho các repo đang dùng:
 
-| Repo | Vai trò trong pipeline |
-|---|---|
-| [welcomyou/layoutlmv3-vn-admin-kie](https://huggingface.co/welcomyou/layoutlmv3-vn-admin-kie) | KIE LayoutLMv3 fine-tune |
-| [welcomyou/distilled-protonx-vn-correction-ct2](https://huggingface.co/welcomyou/distilled-protonx-vn-correction-ct2) | Correction CTranslate2 |
-| [welcomyou/lightgbm-vn-page-splitter](https://huggingface.co/welcomyou/lightgbm-vn-page-splitter) | Tách văn bản trong batch scan + chọn trang ký |
-| [welcomyou/doclayout-yolo-onnx-dynamic](https://huggingface.co/welcomyou/doclayout-yolo-onnx-dynamic) | Layout YOLO (dynamic axes ONNX, DocStructBench + DocLayNet) |
-| [welcomyou/gmft-tatr-onnx](https://huggingface.co/welcomyou/gmft-tatr-onnx) | Bảng — TATR detection + structure |
-| [welcomyou/docling-tableformer-v1-onnx-stepcache](https://huggingface.co/welcomyou/docling-tableformer-v1-onnx-stepcache) | Bảng — Docling TableFormer (stepcache) |
-| [welcomyou/scanindex-models](https://huggingface.co/welcomyou/scanindex-models) | Bundle nhỏ: PaddleOCR orientation classifier |
+| Repo | Vai trò | Trạng thái |
+|---|---|---|
+| [welcomyou/layoutlmv3-vn-admin-kie](https://huggingface.co/welcomyou/layoutlmv3-vn-admin-kie) | KIE LayoutLMv3 fine-tune | active |
+| [welcomyou/distilled-protonx-vn-correction-ct2](https://huggingface.co/welcomyou/distilled-protonx-vn-correction-ct2) | Correction CTranslate2 | active |
+| [welcomyou/lightgbm-vn-page-splitter](https://huggingface.co/welcomyou/lightgbm-vn-page-splitter) | Tách văn bản trong batch + chọn trang ký | active |
+| [welcomyou/doclayout-yolo-onnx-dynamic](https://huggingface.co/welcomyou/doclayout-yolo-onnx-dynamic) | Layout YOLO (dynamic ONNX, DocStructBench + DocLayNet) | active |
+| [welcomyou/gmft-tatr-onnx](https://huggingface.co/welcomyou/gmft-tatr-onnx) | Bảng — TATR detection + structure | active |
+| [welcomyou/docling-tableformer-v1-onnx-stepcache](https://huggingface.co/welcomyou/docling-tableformer-v1-onnx-stepcache) | Bảng — Docling TableFormer (stepcache) | active |
+| [welcomyou/scanindex-models](https://huggingface.co/welcomyou/scanindex-models) | Bundle nhỏ: PaddleOCR orientation classifier | active |
+| [welcomyou/e5-small-vn-archive-mix50](https://huggingface.co/welcomyou/e5-small-vn-archive-mix50) | Multilingual E5 embedder (semantic search) | **dormant** — code search đã chuyển sang Tantivy + SQLite, model giữ trên HF cho lần revive |
+| `BAAI/bge-reranker-v2-m3` (upstream) | Cross-encoder rerank cho semantic search | **dormant** — không wire trong UI hiện tại |
 
-Search Kho lưu trữ hiện chỉ dùng Tantivy + SQLite — không có dense embedder hay reranker trong production. Train-convert scripts cho E5 / cross-encoder vẫn ở [train-convert/archive-embedder/](train-convert/archive-embedder/) nếu cần revive sau.
+Mọi model semantic vẫn còn trên HF + train-convert scripts ([train-convert/archive-embedder/](train-convert/archive-embedder/)) để dễ bật lại sau. Bộ "dormant" không nằm trong `MODELS_CONFIG` nên `download_offline_models.py` không tự kéo.
 
 Chrome ScreenAI OCR DLL nằm ngoài HF (license Google không cho re-host) — auto download từ Google CDN bởi [scanindex/core/ocr/screen_ai_downloader.py](scanindex/core/ocr/screen_ai_downloader.py), kèm Authenticode verify để chắc DLL ký bởi Google LLC.
 
