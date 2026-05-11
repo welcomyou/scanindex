@@ -75,9 +75,9 @@ if "%MODE%"=="1" (
     call :check_dir "models\screen_ai" "ScreenAI models"
     call :check_dir "models\orientation" "Orientation ONNX"
     call :check_dir "models\doclayout_yolo_onnx_dynamic" "DocLayout-YOLO dynamic ONNX"
+    call :check_dir "models\doclayout_yolo_doclaynet_onnx_dynamic" "DocLayout-YOLO DocLayNet auxiliary ONNX"
     call :check_dir "models\lightgbm_splitter" "Archive page splitter"
     call :check_dir "models\layoutlmv3_fontgray_norm_final_epoch25" "LayoutLMv3 text KIE"
-    call :check_dir "models\archive_models\e5-small-mix50-v2-onnx-fp32" "Kho archive E5 ONNX embedding"
     if "%INCLUDE_CORRECTION%"=="1" call :check_dir "models\distilled_ct2" "Distilled Proton CT2"
 )
 
@@ -244,17 +244,6 @@ call :copy_file_quiet "%SRC%\tokenizer_config.json" "%DST%\tokenizer_config.json
 call :copy_file_quiet "%SRC%\special_tokens_map.json" "%DST%\special_tokens_map.json"
 call :copy_file_quiet "%SRC%\vocab.json" "%DST%\vocab.json"
 call :copy_file_quiet "%SRC%\merges.txt" "%DST%\merges.txt"
-goto :eof
-
-:copy_archive_embedder
-set "ROOT=models\archive_models"
-if not exist "%ROOT%\" goto :eof
-if exist "%ROOT%\e5-small-mix50-v2-onnx-fp32\model.onnx" (
-    call :copy_dir "%ROOT%\e5-small-mix50-v2-onnx-fp32" "%DIST_DIR%\models\archive_models\e5-small-mix50-v2-onnx-fp32" "Kho E5 mix50 ONNX fp32 embedding"
-)
-if exist "%ROOT%\e5-small-mix50-v2-onnx-int8\model_quantized.onnx" (
-    call :copy_dir "%ROOT%\e5-small-mix50-v2-onnx-int8" "%DIST_DIR%\models\archive_models\e5-small-mix50-v2-onnx-int8" "Kho E5 mix50 ONNX int8 embedding"
-)
 goto :eof
 
 :fail

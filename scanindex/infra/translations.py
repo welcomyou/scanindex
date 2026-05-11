@@ -59,7 +59,7 @@ CHỨC NĂNG CHÍNH
 
 5. Kho lưu trữ và tra cứu:
     • Nhập PDF đã số hóa vào Kho nội bộ, lưu SQLite.
-    • Tra cứu theo metadata, toàn văn và ngữ nghĩa bằng Tantivy + FAISS + embedding E5 ONNX; có chế độ rerank khi mô hình khả dụng.
+    • Tra cứu metadata và toàn văn bằng Tantivy, SQLite và bộ lọc cấu trúc.
     • Xem PDF, đoạn khớp và bộ lọc HSLTCQ ngay trong giao diện.
 
 6. Một số công cụ hỗ trợ:
@@ -70,7 +70,7 @@ CÔNG NGHỆ CHÍNH
     • Giao diện: Python, PySide6/Qt.
     • PDF/OCR: ScreenAI DLL, PyMuPDF, pypdf/pikepdf, OpenCV.
     • Layout & bảng: DocLayout-YOLO ONNX, GMFT-ONNX, Docling TableFormer v1 ONNX, PyMuPDF, python-docx.
-    • AI/KIE/tìm kiếm: CTranslate2, Transformers/ONNX Runtime, LayoutLMv3, LightGBM, E5 ONNX, FAISS, Tantivy, SQLite.
+    • AI/KIE/tìm kiếm: CTranslate2, Transformers/ONNX Runtime, LayoutLMv3, LightGBM, Tantivy, SQLite.
     • Ký số: pyHanko, Windows CSP/CNG, TSA, Ghostscript PDF/A.
 
 GHI CHÚ
@@ -110,7 +110,7 @@ MAIN FEATURES
 
 5. Archive repository and search:
     • Imports digitized PDFs into a local SQLite-backed repository.
-    • Searches metadata, full text, and semantics with Tantivy + FAISS + E5 ONNX embeddings; reranking is available when the model is installed.
+    • Searches metadata and full text with Tantivy, SQLite, and structured filters.
     • Shows PDFs, matched snippets, and HSLTCQ filters inside the interface.
 
 6. Supporting tools:
@@ -121,7 +121,7 @@ CORE TECHNOLOGY
     • Interface: Python, PySide6/Qt.
     • PDF/OCR: ScreenAI DLL, PyMuPDF, pypdf/pikepdf, OpenCV.
     • Layout & tables: DocLayout-YOLO ONNX, GMFT-ONNX, Docling TableFormer v1 ONNX, PyMuPDF, python-docx.
-    • AI/KIE/search: CTranslate2, Transformers/ONNX Runtime, LayoutLMv3, LightGBM, E5 ONNX, FAISS, Tantivy, SQLite.
+    • AI/KIE/search: CTranslate2, Transformers/ONNX Runtime, LayoutLMv3, LightGBM, Tantivy, SQLite.
     • Digital signing: pyHanko, Windows CSP/CNG, TSA, Ghostscript PDF/A.
 
 NOTE
@@ -173,6 +173,10 @@ The software prioritizes local processing when models and dependencies are insta
     "tooltip_metadata": {
         "en": "View document metadata",
         "vi": "Xem thông tin văn bản"
+    },
+    "tooltip_open_output_folder": {
+        "en": "Open output folder",
+        "vi": "M\u1edf th\u01b0 m\u1ee5c ch\u1ee9a file"
     },
     # Metadata fields
     "chk_metadata": {
@@ -232,6 +236,22 @@ The software prioritizes local processing when models and dependencies are insta
     "lbl_language": {
         "en": "Language:",
         "vi": "Ngôn ngữ:"
+    },
+    "lbl_theme": {
+        "en": "Theme:",
+        "vi": "Giao diện:"
+    },
+    "theme_dark": {
+        "en": "Dark",
+        "vi": "Tối"
+    },
+    "theme_light": {
+        "en": "Light",
+        "vi": "Sáng"
+    },
+    "msg_theme_restart_required": {
+        "en": "Theme will apply after restarting the app.",
+        "vi": "Thay đổi giao diện sẽ áp dụng sau khi khởi động lại ứng dụng."
     },
     "lbl_wait_page": {
         "en": "Initial Wait Per Page (seconds):",

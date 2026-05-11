@@ -8,13 +8,23 @@ Pipeline chính:
 ```
 PDF (scan/digital)
    → preprocess (rotate / deskew / orientation)
-   → OCR  (Chrome ScreenAI, offline DLL)
+   → OCR  (Chrome ScreenAI, offline DLL, Authenticode-verified)
    → text correction  (CTranslate2, distilled-protonx)
    → layout + tables  (DocLayout-YOLO + GMFT/Docling TableFormer)
    → KIE  (LayoutLMv3 fine-tune trên văn bản hành chính VN)
+   → PDF/A + ký số  (pyHanko, Windows Cert Store, TSA)
    → searchable PDF + DOCX export
-   → indexed search archive  (Tantivy + FAISS, optional reranker)
+   → indexed search archive  (Tantivy + SQLite, full-text + filters)
 ```
+
+Các màn hình UI chính:
+
+- **Chuyển scan PDF → Word** — drag-drop OCR đơn lẻ, xuất searchable PDF + DOCX
+- **Số hóa lưu trữ** — pipeline 3 bước: split PDF dài → KIE/metadata → ký số + đóng gói HSLTCQ
+- **Kho lưu trữ** — search metadata + full-text trên kho nội bộ
+- **Đo độ chính xác OCR** — so PDF OCR vs ground truth (CER/WER)
+- **Phát hiện file mật** — quét folder, OCR trang đầu, nhận dạng dấu MẬT/TỐI MẬT/TUYỆT MẬT
+- **Công cụ hỗ trợ** — utilities khác
 
 ## Cài đặt từ source
 
@@ -54,7 +64,14 @@ python ocr_app.py
 build_portable.bat
 ```
 
-Output ở `dist/Lightweight_OCR/`. Spec: [Lightweight_OCR.spec](Lightweight_OCR.spec).
+Output ở `dist/ScanIndex-<version>/` (auto-derived từ `git describe`). Spec: [Lightweight_OCR.spec](Lightweight_OCR.spec).
+
+Auto-versioning đi theo git tag SemVer (xem [scanindex/infra/version.py](scanindex/infra/version.py)):
+
+```powershell
+git tag v1.1.0          # → bundle dist\ScanIndex-1.1.0\
+# 3 commits sau v1.1.0  → dist\ScanIndex-1.1.0\ + VERSION="1.1.0+3.<hash>"
+```
 
 ## Cấu trúc
 
@@ -108,8 +125,7 @@ correction model, số worker, v.v.). `settings.ini` được gitignored.
 ## Phụ thuộc chính
 
 PySide6 · PyMuPDF · pikepdf · CTranslate2 · Transformers · ONNX Runtime ·
-DocLayout-YOLO · GMFT · img2table · Selenium · OpenCV · sentence-transformers ·
-tantivy · faiss-cpu
+DocLayout-YOLO · GMFT · OpenCV · LightGBM · tantivy · pyHanko · pywin32
 
 ## License
 

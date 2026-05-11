@@ -208,6 +208,10 @@ BORDER    = "#4a4a4a"
 FONT_UI   = "Segoe UI"
 FONT_MONO = "Cascadia Code"
 
+# Reuse the global asset resolver so QComboBox::down-arrow works in both
+# source and frozen-exe builds.
+from scanindex.ui.theme import CHEVRON_DOWN_URL as _CHEVRON_DOWN_URL
+
 # 16 colored KIE fields + 2 neutral, distributed across 360° hue wheel
 # Ontology v3: 10 train labels + 3 rule-based marks + DOC_TYPE (output-only).
 # Colors chosen from Tailwind palette (600/300 bright, 700-800/400 deep) so
@@ -380,7 +384,15 @@ QComboBox {{
     font-size: 12px; min-height: 26px; min-width: 140px;
 }}
 QComboBox:hover {{ border-color: {ACCENT}; }}
-QComboBox::drop-down {{ border: none; width: 20px; }}
+QComboBox::drop-down {{
+    subcontrol-origin: padding; subcontrol-position: top right;
+    border: none; background: {ELEVATED}; width: 22px;
+    border-top-right-radius: 4px; border-bottom-right-radius: 4px;
+}}
+QComboBox::down-arrow {{
+    image: url({_CHEVRON_DOWN_URL}); width: 10px; height: 10px;
+}}
+QComboBox::down-arrow:on {{ top: 1px; }}
 QComboBox QAbstractItemView {{
     background-color: {SURFACE}; border: 1px solid {BORDER};
     color: {TEXT}; selection-background-color: {ACCENT};

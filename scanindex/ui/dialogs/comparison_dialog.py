@@ -19,7 +19,8 @@ from PySide6.QtCore import Qt, Signal
 from scanindex.ui.theme import (
     COLOR_BG, COLOR_SURFACE, COLOR_ELEVATED, COLOR_TEXT, COLOR_TEXT_SECONDARY,
     COLOR_ACCENT, COLOR_ACCENT_HOVER, COLOR_ORANGE, COLOR_GREEN, COLOR_RED,
-    COLOR_RED_HOVER, COLOR_BORDER, FONT_UI, FONT_MONO, SP, RADIUS_MD
+    COLOR_RED_HOVER, COLOR_BORDER, FONT_UI, FONT_MONO, SP, RADIUS_MD,
+    BUTTON_PRIMARY_QSS,
 )
 from scanindex.infra import translations
 
@@ -114,6 +115,7 @@ class ComparisonDialog(QDialog):
 
         self.btn_action = QPushButton(translations.get_text("comp_reprocess"))
         self.btn_action.setProperty("cssClass", "primary")
+        self.btn_action.setStyleSheet(BUTTON_PRIMARY_QSS)
         self.btn_action.setFixedSize(90, 30)
         self.btn_action.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_action.clicked.connect(self._on_action_click)

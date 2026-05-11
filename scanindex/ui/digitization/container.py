@@ -246,6 +246,7 @@ class ArchiveContainer(QWidget):
         docs = []
         for s in segments:
             secrecy = secrecy_cache.get(int(s.start_page))
+            source_pages = list(s.page_indices())
             docs.append({
                 "pdf_path": os.path.join(seg_dir, s.name),
                 "path": os.path.join(seg_dir, s.name),
@@ -257,6 +258,7 @@ class ArchiveContainer(QWidget):
                 "status": "OCR...",
                 "_step1_segment": s,            # carry the source page range
                 "_step1_source_pdf": self.session.source_pdf,
+                "_step1_source_pages": source_pages,
                 "_secrecy": secrecy,            # None | "MẬT" | "TỐI MẬT" | …
             })
         self._step2.set_documents(docs, default_status="OCR...")

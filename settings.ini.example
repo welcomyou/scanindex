@@ -1,5 +1,7 @@
 [General]
 language = vi
+; Giao diện: dark (mặc định) hoặc light. Đổi xong khởi động lại app để áp dụng.
+theme = dark
 
 [OCR]
 waitperpage = 1

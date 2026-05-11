@@ -36,6 +36,13 @@ class ScreenContent(QWidget):
     def request_cancel(self) -> None:
         return None
 
+    def handle_back_requested(self) -> bool:
+        """Intercept the container's Back button. Return True to consume
+        (e.g. a nested screen pops its inner stack instead of leaving the
+        feature). Return False to let the container emit ``back_requested``
+        and navigate home."""
+        return False
+
 
 class ScreenContainer(QWidget):
     """Wraps a ScreenContent with header (title + back button). The global log
@@ -84,11 +91,18 @@ class ScreenContainer(QWidget):
         self.btn_back.clicked.connect(self._on_back_clicked)
         h.addWidget(self.btn_back)
 
-        lbl = QLabel(title)
-        lbl.setStyleSheet(
+        self._title_label = QLabel(title)
+        self._default_title = title
+        self._title_label.setStyleSheet(
             f"color: {COLOR_TEXT}; font: 600 16px '{FONT_UI}'; padding-left: {SP[2]}px;"
         )
-        h.addWidget(lbl)
+        h.addWidget(self._title_label)
+        # If the content widget reports its own title changes (e.g. the
+        # SupportToolsScreen swaps the displayed sub-tool), reflect that
+        # in the header automatically.
+        title_signal = getattr(self.content, "title_changed", None)
+        if title_signal is not None and hasattr(title_signal, "connect"):
+            title_signal.connect(self.set_title)
 
         self._title_widget_insert_index = h.count()
         h.addStretch(1)
@@ -120,21 +134,35 @@ class ScreenContainer(QWidget):
         self._header_layout.addWidget(btn)
         return btn
 
-    def add_header_widget(self, widget: QWidget) -> QWidget:
+    def add_header_widget(self, widget: QWidget, *, stretch: int = 0) -> QWidget:
         """Append a custom widget to the right side of the header bar."""
-        self._header_layout.addWidget(widget)
+        self._header_layout.addWidget(widget, stretch)
         return widget
 
-    def add_title_widget(self, widget: QWidget) -> QWidget:
+    def add_title_widget(self, widget: QWidget, *, stretch: int = 0) -> QWidget:
         """Place a widget immediately beside the screen title."""
         index = getattr(self, "_title_widget_insert_index", None)
         if index is None:
-            return self.add_header_widget(widget)
-        self._header_layout.insertWidget(index, widget)
+            return self.add_header_widget(widget, stretch=stretch)
+        self._header_layout.insertWidget(index, widget, stretch)
         self._title_widget_insert_index = index + 1
         return widget
 
+    def set_title(self, title: str) -> None:
+        """Update the header title (e.g. when content swaps sub-pages).
+        Falls back to the default title when ``title`` is empty."""
+        self._title_label.setText(title or self._default_title)
+
     def _on_back_clicked(self):
+        # Let the content intercept first (e.g. nested menu pops to root
+        # instead of leaving the feature).
+        handler = getattr(self.content, "handle_back_requested", None)
+        if callable(handler):
+            try:
+                if handler():
+                    return
+            except Exception:
+                pass
         if self._busy_check():
             confirm = QMessageBox(self)
             confirm.setWindowTitle("Xác nhận dừng")

@@ -49,13 +49,6 @@ REPOS = [
         "description": "LayoutLMv3 KIE (Vietnamese admin docs, ONNX int8)",
     },
     {
-        "model_id": "e5-small-vn-archive-mix50",
-        "repo_id":  "welcomyou/e5-small-vn-archive-mix50",
-        "type":     "huggingface",
-        "local_dir": "archive_models/e5-small-mix50-v2-onnx-fp32",
-        "description": "E5-small mix50 v2 ONNX fp32 (archive embedder)",
-    },
-    {
         "model_id": "distilled-protonx-vn-correction-ct2",
         "repo_id":  "welcomyou/distilled-protonx-vn-correction-ct2",
         "type":     "huggingface",

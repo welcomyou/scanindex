@@ -30,13 +30,17 @@ class StyleTokenizedPageDataset(Dataset):
         max_length: int,
         stride: int,
         subword_label_strategy: str = "same",
+        style_type_vocab_size: int = STYLE_TYPE_VOCAB_SIZE,
     ) -> None:
         self.rows = rows
         self.features: list[dict[str, Any]] = []
         self.metadata: list[dict[str, Any]] = []
         for row_index, row in enumerate(rows):
             labels = row.get("labels") or ["O"] * len(row["tokens"])
-            style_ids = row.get("layoutlmv3_style_type_id") or [0] * len(row["tokens"])
+            if style_type_vocab_size <= 64 and row.get("layoutlmv3_style_base_id"):
+                style_ids = row.get("layoutlmv3_style_base_id") or [0] * len(row["tokens"])
+            else:
+                style_ids = row.get("layoutlmv3_style_type_id") or [0] * len(row["tokens"])
             if len(style_ids) != len(row["tokens"]):
                 style_ids = [0] * len(row["tokens"])
             enc = tokenizer(
@@ -63,7 +67,7 @@ class StyleTokenizedPageDataset(Dataset):
                             aligned_labels.append(-100)
                         else:
                             aligned_labels.append(label2id[labels[wid]])
-                        token_type_ids.append(min(STYLE_TYPE_VOCAB_SIZE - 1, max(0, int(style_ids[wid]))))
+                        token_type_ids.append(min(style_type_vocab_size - 1, max(0, int(style_ids[wid]))))
                         seen_words.add(wid)
                 feature = {
                     "input_ids": enc["input_ids"][chunk_index],
@@ -151,11 +155,20 @@ def predict_pytorch(
     label_list, label2id, id2label = label_maps_from_model(model_path)
     tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
     model = AutoModelForTokenClassification.from_pretrained(model_path)
+    style_type_vocab_size = int(getattr(model.config, "type_vocab_size", STYLE_TYPE_VOCAB_SIZE) or STYLE_TYPE_VOCAB_SIZE)
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     model.eval()
 
-    dataset = StyleTokenizedPageDataset(rows, tokenizer, label2id, max_length, stride, subword_label_strategy)
+    dataset = StyleTokenizedPageDataset(
+        rows,
+        tokenizer,
+        label2id,
+        max_length,
+        stride,
+        subword_label_strategy,
+        style_type_vocab_size=style_type_vocab_size,
+    )
     collator = DataCollatorForTokenClassification(
         tokenizer=tokenizer,
         padding="max_length",
@@ -202,7 +215,17 @@ def predict_onnx(
 
     _label_list, label2id, id2label = label_maps_from_model(model_path)
     tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
-    dataset = StyleTokenizedPageDataset(rows, tokenizer, label2id, max_length, stride, subword_label_strategy)
+    config = read_json(Path(model_path) / "config.json")
+    style_type_vocab_size = int(config.get("type_vocab_size") or STYLE_TYPE_VOCAB_SIZE)
+    dataset = StyleTokenizedPageDataset(
+        rows,
+        tokenizer,
+        label2id,
+        max_length,
+        stride,
+        subword_label_strategy,
+        style_type_vocab_size=style_type_vocab_size,
+    )
     collator = DataCollatorForTokenClassification(
         tokenizer=tokenizer,
         padding="max_length",

@@ -24,6 +24,7 @@ class FileItemWidget(QWidget):
     view_raw_clicked = Signal(int)
     view_corrected_clicked = Signal(int)
     view_metadata_clicked = Signal(int)
+    open_folder_clicked = Signal(int)
     remove_clicked = Signal(int)
 
     def __init__(self, index: int, item: dict, list_type: str = "dnd",
@@ -98,6 +99,16 @@ class FileItemWidget(QWidget):
             return
 
         status = self._item.get("status", "Pending")
+        output_path = self._item.get("output_path")
+        has_output = bool(output_path and os.path.exists(str(output_path)))
+        if has_output and status in ["Done", "OCR Done", "Corrected", "Done (Export Failed)"]:
+            btn_folder = self._make_icon_btn(
+                text="\U0001f4c2",
+                color=COLOR_INFO,
+                tooltip=translations.get_text("tooltip_open_output_folder")
+            )
+            btn_folder.clicked.connect(lambda: self.open_folder_clicked.emit(self._index))
+            self.btn_container.addWidget(btn_folder)
 
         # Re-run button (Done/Failed/OCR Done/Corrected)
         if status in ["Done", "OCR Done", "Corrected", "Failed"]:
@@ -111,7 +122,6 @@ class FileItemWidget(QWidget):
             self.btn_container.addWidget(btn_rerun)
 
         # View raw (yellow eye) — needs output_path
-        output_path = self._item.get("output_path")
         is_pdf_output = (
             output_path
             and str(output_path).lower().endswith(".pdf")

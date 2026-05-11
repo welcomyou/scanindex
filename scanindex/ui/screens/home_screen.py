@@ -28,6 +28,7 @@ FUNCTION_KHO_LUU_TRU = FUNCTION_REPOSITORY
 FUNCTION_SETTINGS = "settings"
 FUNCTION_ABOUT = "about"
 FUNCTION_ACCURACY = "accuracy"
+FUNCTION_SUPPORT_TOOLS = "support_tools"
 
 
 # Width breakpoints for grid reflow
@@ -201,11 +202,11 @@ class HomeScreen(QWidget):
              "OCR cả thư mục, trích xuất metadata "
              "văn bản hành chính cho lưu trữ."),
             (FUNCTION_KHO_LUU_TRU, "🔎", "Kho lưu trữ",
-             "Tra cứu toàn văn + ngữ nghĩa kho PDF đã số hóa, "
+             "Tra cứu metadata và toàn văn kho PDF đã số hóa, "
              "lọc theo metadata HSLTCQ."),
-            (FUNCTION_ACCURACY, "🎯", "Đo độ chính xác OCR",
-             "Tải lên PDF có ground truth, "
-             "so sánh kết quả OCR (CER/WER)."),
+            (FUNCTION_SUPPORT_TOOLS, "🛠", "Công cụ",
+             "Đo độ chính xác OCR, phát hiện file mật "
+             "trong thư mục."),
             (FUNCTION_SETTINGS, "⚙", "Cấu hình",
              "Tùy chỉnh tốc độ xử lý, model, "
              "ngôn ngữ và tùy chọn nâng cao."),

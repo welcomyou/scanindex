@@ -273,17 +273,23 @@ def _get_pool():
             return _mp_pool
 
         import multiprocessing
+        from scanindex.infra.mp_safety import (
+            patch_multiprocessing_spawn_sys_path,
+            sanitized_sys_path_for_spawn,
+        )
 
         dll_path, model_dir = _find_screen_ai_paths()
         if not dll_path:
             raise FileNotFoundError("OCR library not installed")
 
-        pool = multiprocessing.Pool(
-            processes=_NUM_PAGE_WORKERS,
-            initializer=_worker_init,
-            initargs=(dll_path, model_dir),
-            maxtasksperchild=100,
-        )
+        patch_multiprocessing_spawn_sys_path()
+        with sanitized_sys_path_for_spawn():
+            pool = multiprocessing.Pool(
+                processes=_NUM_PAGE_WORKERS,
+                initializer=_worker_init,
+                initargs=(dll_path, model_dir),
+                maxtasksperchild=100,
+            )
 
         _mp_pool = pool
         logger.info(
@@ -1123,6 +1129,7 @@ def process_pdf(input_path, output_path, num_pages=None, update_callback=None,
 
 def assemble_pdf_from_page_results(input_path, output_path, all_page_results,
                                    source_document_path=None,
+                                   source_page_indices=None,
                                    preprocess_rotations=None,
                                    update_callback=None,
                                    canonical_profile=None,
@@ -1150,8 +1157,23 @@ def assemble_pdf_from_page_results(input_path, output_path, all_page_results,
         if not font_path:
             return False, "No Unicode font found (need arial.ttf or similar)"
 
-        doc_in = fitz.open(input_path)
-        total_pages = len(doc_in)
+        source_for_pages = (source_document_path or input_path) if source_page_indices else input_path
+        doc_in = fitz.open(source_for_pages)
+        if source_page_indices:
+            page_map = [int(p) for p in source_page_indices]
+            total_pages = len(page_map)
+            source_page_count = len(doc_in)
+            max_page = source_page_count - 1
+            bad_pages = [p for p in page_map if p < 0 or p > max_page]
+            if bad_pages:
+                doc_in.close()
+                return False, (
+                    f"Invalid source page index {bad_pages[0] + 1}; "
+                    f"source has {source_page_count} pages"
+                )
+        else:
+            page_map = list(range(len(doc_in)))
+            total_pages = len(page_map)
 
         _layout_analyzers = (
             _init_layout_analyzers(log)
@@ -1172,7 +1194,8 @@ def assemble_pdf_from_page_results(input_path, output_path, all_page_results,
         pending_line_overlays = []
         background_specs = []
         for page_idx in range(total_pages):
-            page = doc_in[page_idx]
+            source_page_idx = page_map[page_idx]
+            page = doc_in[source_page_idx]
             page_w = page.rect.width
             page_h = page.rect.height
 
@@ -1222,7 +1245,7 @@ def assemble_pdf_from_page_results(input_path, output_path, all_page_results,
             bake_angle = 180 if coord_flipped else 0
             pending_line_overlays.append(lines_data)
             background_specs.append({
-                "page_idx": page_idx,
+                "page_idx": source_page_idx,
                 "page_w": page_w,
                 "page_h": page_h,
                 "bake_angle": bake_angle,

@@ -125,15 +125,6 @@ function Prune-ExcludedPythonRuntime {
         }
     }
 
-    foreach ($extra in @(
-        "_internal\faiss\contrib\torch",
-        "_internal\faiss\contrib\torch_utils.py"
-    )) {
-        if (Remove-IfExists $extra) {
-            $removed += 1
-        }
-    }
-
     if ($removed -gt 0) {
         Write-Host "  [-] Pruned excluded Python runtime leftovers ($removed item(s))"
     }
@@ -188,20 +179,6 @@ function Copy-LayoutTextKie {
     }
 }
 
-function Copy-ArchiveEmbedder {
-    $root = "models\archive_models"
-    Copy-DirIfExists `
-        "$root\e5-small-mix50-v2-onnx-fp32" `
-        "$root\e5-small-mix50-v2-onnx-fp32" `
-        "Kho E5 mix50 ONNX fp32 embedding"
-    if (Test-Path -LiteralPath (Repo-Path "$root\e5-small-mix50-v2-onnx-int8\model_quantized.onnx")) {
-        Copy-DirIfExists `
-            "$root\e5-small-mix50-v2-onnx-int8" `
-            "$root\e5-small-mix50-v2-onnx-int8" `
-            "Kho E5 mix50 ONNX int8 embedding"
-    }
-}
-
 function Copy-LightgbmSplitter {
     $root = "models\lightgbm_splitter"
     if (-not (Test-Path -LiteralPath (Repo-Path $root) -PathType Container)) {
@@ -230,10 +207,9 @@ Copy-DirIfExists "models\orientation" "models\orientation" "orientation ONNX"
 Copy-DirIfExists "models\gmft_onnx" "models\gmft_onnx" "GMFT table ONNX"
 Copy-DirIfExists "models\docling_tableformer_v1_stepcache_onnx" "models\docling_tableformer_v1_stepcache_onnx" "Docling TableFormer v1 step-cache ONNX"
 Copy-DirIfExists "models\doclayout_yolo_onnx_dynamic" "models\doclayout_yolo_onnx_dynamic" "DocLayout-YOLO dynamic ONNX"
+Copy-DirIfExists "models\doclayout_yolo_doclaynet_onnx_dynamic" "models\doclayout_yolo_doclaynet_onnx_dynamic" "DocLayout-YOLO DocLayNet auxiliary ONNX"
 Copy-LightgbmSplitter
 Copy-LayoutTextKie
-Copy-ArchiveEmbedder
-
 if (Is-Enabled $IncludeCorrection) {
     Copy-DirIfExists "models\distilled_ct2" "models\distilled_ct2" "distilled Proton CT2"
 } else {

@@ -259,6 +259,28 @@ def _word_items_from_page_record(page: dict, source_layer: str) -> list[dict]:
     return items
 
 
+def _items_text(items: list[dict]) -> str:
+    return " ".join(str(item.get("text") or "") for item in items).strip()
+
+
+def _is_mojibake_char(ch: str) -> bool:
+    code = ord(ch)
+    return (
+        0x0300 <= code <= 0x036F      # combining marks from broken extraction
+        or 0x0370 <= code <= 0x052F   # Greek/Cyrillic substitutions
+        or 0x02B0 <= code <= 0x02FF   # modifier letters such as ˱/˯
+        or ch in {"ÿ", "þ", "ð"}
+    )
+
+
+def _looks_like_broken_native_text(text: str) -> bool:
+    chars = [ch for ch in (text or "") if not ch.isspace()]
+    if len(chars) < 40:
+        return False
+    suspicious = sum(1 for ch in chars if _is_mojibake_char(ch))
+    return suspicious >= max(8, int(len(chars) * 0.025))
+
+
 def merge_native_text_layer_into_canonical_json(
     canonical_json_path: str,
     source_pdf_path: str,
@@ -291,23 +313,32 @@ def merge_native_text_layer_into_canonical_json(
             )
             native_items = _word_items_from_page_record(native_record, "native")
             ocr_items = _word_items_from_page_record(pages_by_index.get(page_index, {}), "ocr")
-            native_boxes = [item["bbox"] for item in native_items]
-            ocr_only: list[dict] = []
-            for item in ocr_items:
-                box = item["bbox"]
-                if any(_bbox_coverage(box, native_box) >= 0.55 or _bbox_coverage(native_box, box) >= 0.55 for native_box in native_boxes):
-                    continue
-                ocr_only.append(item)
+            native_broken = _looks_like_broken_native_text(_items_text(native_items))
+            if native_broken and ocr_items:
+                merge_items = ocr_items
+                ocr_only: list[dict] = []
+                primary_layer = "ocr"
+            else:
+                native_boxes = [item["bbox"] for item in native_items]
+                ocr_only = []
+                for item in ocr_items:
+                    box = item["bbox"]
+                    if any(_bbox_coverage(box, native_box) >= 0.55 or _bbox_coverage(native_box, box) >= 0.55 for native_box in native_boxes):
+                        continue
+                    ocr_only.append(item)
+                merge_items = native_items + ocr_only
+                primary_layer = "native"
             merged_record = _build_page_record_from_line_groups(
                 page_index,
                 pdf_page,
                 render_width,
                 render_height,
-                _group_visual_items(native_items + ocr_only),
+                _group_visual_items(merge_items),
             )
             merged_record["coord_origin"] = "top-left"
             merged_record["text_layers"] = {
-                "primary": "native",
+                "primary": primary_layer,
+                "native_mojibake_rejected": bool(native_broken and ocr_items),
                 "merged_ocr_only_words": len(ocr_only),
             }
 
@@ -325,6 +356,7 @@ def merge_native_text_layer_into_canonical_json(
                 "page_index": page_index,
                 "native_words": len(native_items),
                 "ocr_words": len(ocr_items),
+                "native_mojibake_rejected": bool(native_broken and ocr_items),
                 "merged_ocr_only_words": len(ocr_only),
             })
     finally:

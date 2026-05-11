@@ -53,14 +53,43 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--subword-label-strategy", choices=["same", "first"], default="same")
     parser.add_argument("--loss", choices=["ce", "weighted_ce", "focal"], default="weighted_ce")
     parser.add_argument("--focal-gamma", type=float, default=2.0)
+    parser.add_argument(
+        "--o-label-weight-floor",
+        type=float,
+        default=0.0,
+        help="Optional floor for the normalized O-label class weight; useful to reduce over-predicted KIE spans.",
+    )
     parser.add_argument("--positive-token-weight", type=float, default=1.0)
     parser.add_argument("--b-token-weight", type=float, default=1.25)
     parser.add_argument("--boundary-token-weight", type=float, default=1.5)
+    parser.add_argument(
+        "--extra-field-penalty",
+        type=float,
+        default=0.0,
+        help="Soft penalty for assigning any KIE field probability to gold-O tokens.",
+    )
+    parser.add_argument(
+        "--missing-field-penalty",
+        type=float,
+        default=0.0,
+        help="Soft penalty for assigning O probability to gold-KIE tokens.",
+    )
+    parser.add_argument(
+        "--wrong-field-penalty",
+        type=float,
+        default=0.0,
+        help="Soft penalty for assigning another KIE field probability to gold-KIE tokens.",
+    )
     parser.add_argument("--hard-example-jsonl", action="append")
     parser.add_argument("--hard-example-repeat", type=int, default=1)
     parser.add_argument("--focus-fields", nargs="*", default=[])
     parser.add_argument("--focus-repeat", type=int, default=1)
     parser.add_argument("--early-stopping-patience", type=int, default=5)
+    parser.add_argument(
+        "--save-only-model",
+        action="store_true",
+        help="Save model-only checkpoints without optimizer/scheduler state to reduce disk usage.",
+    )
     parser.add_argument("--limit-train-docs", type=int)
     parser.add_argument("--limit-eval-docs", type=int)
     parser.add_argument("--dry-run", action="store_true")
@@ -93,7 +122,7 @@ def prediction_metrics_fn(eval_dataset: StyleTokenizedPageDataset, id2label: dic
     return compute
 
 
-def class_weights_from_rows(rows: list[dict[str, Any]]) -> torch.Tensor:
+def class_weights_from_rows(rows: list[dict[str, Any]], o_label_weight_floor: float = 0.0) -> torch.Tensor:
     counts = label_counts(rows)
     total = sum(counts.values())
     weights = []
@@ -105,6 +134,8 @@ def class_weights_from_rows(rows: list[dict[str, Any]]) -> torch.Tensor:
         weights.append(weight)
     arr = np.asarray(weights, dtype=np.float32)
     arr = arr / max(arr.mean(), 1e-6)
+    if o_label_weight_floor > 0:
+        arr[LABEL_LIST.index("O")] = max(float(arr[LABEL_LIST.index("O")]), float(o_label_weight_floor))
     return torch.tensor(arr, dtype=torch.float32)
 
 
@@ -138,6 +169,43 @@ def token_region_weights(labels: torch.Tensor, positive_weight: float, b_weight:
     return torch.where(valid, weights, torch.zeros_like(weights))
 
 
+def field_constraint_penalty(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    extra_penalty: float,
+    missing_penalty: float,
+    wrong_penalty: float,
+) -> torch.Tensor:
+    if extra_penalty <= 0 and missing_penalty <= 0 and wrong_penalty <= 0:
+        return logits.new_tensor(0.0)
+
+    probs = torch.softmax(logits, dim=-1)
+    valid = labels != -100
+    gold_o = valid & (labels == 0)
+    gold_kie = valid & (labels > 0)
+    loss = logits.new_tensor(0.0)
+
+    if extra_penalty > 0 and bool(gold_o.any()):
+        kie_prob = probs[..., 1:].sum(dim=-1)
+        loss = loss + float(extra_penalty) * kie_prob[gold_o].mean()
+
+    if missing_penalty > 0 and bool(gold_kie.any()):
+        loss = loss + float(missing_penalty) * probs[..., 0][gold_kie].mean()
+
+    if wrong_penalty > 0 and bool(gold_kie.any()):
+        field_ids = _field_id_tensor(labels).clamp_min(0)
+        same_b_ids = 1 + (field_ids * 2)
+        same_i_ids = same_b_ids + 1
+        same_b_prob = probs.gather(-1, same_b_ids.unsqueeze(-1)).squeeze(-1)
+        same_i_prob = probs.gather(-1, same_i_ids.unsqueeze(-1)).squeeze(-1)
+        same_field_prob = same_b_prob + same_i_prob
+        any_kie_prob = probs[..., 1:].sum(dim=-1)
+        wrong_field_prob = (any_kie_prob - same_field_prob).clamp_min(0.0)
+        loss = loss + float(wrong_penalty) * wrong_field_prob[gold_kie].mean()
+
+    return loss
+
+
 class WeightedLossTrainer(Trainer):
     def __init__(
         self,
@@ -148,6 +216,9 @@ class WeightedLossTrainer(Trainer):
         positive_token_weight: float = 1.0,
         b_token_weight: float = 1.0,
         boundary_token_weight: float = 1.0,
+        extra_field_penalty: float = 0.0,
+        missing_field_penalty: float = 0.0,
+        wrong_field_penalty: float = 0.0,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -157,6 +228,9 @@ class WeightedLossTrainer(Trainer):
         self.positive_token_weight = positive_token_weight
         self.b_token_weight = b_token_weight
         self.boundary_token_weight = boundary_token_weight
+        self.extra_field_penalty = extra_field_penalty
+        self.missing_field_penalty = missing_field_penalty
+        self.wrong_field_penalty = wrong_field_penalty
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         labels = inputs.pop("labels")
@@ -178,6 +252,13 @@ class WeightedLossTrainer(Trainer):
             flat_loss = (1 - pt) ** self.focal_gamma * flat_loss
         weighted = (flat_loss * token_weights)[valid]
         loss = weighted.sum() / token_weights[valid].sum().clamp_min(1.0)
+        loss = loss + field_constraint_penalty(
+            logits,
+            labels,
+            extra_penalty=self.extra_field_penalty,
+            missing_penalty=self.missing_field_penalty,
+            wrong_penalty=self.wrong_field_penalty,
+        )
         return (loss, outputs) if return_outputs else loss
 
 
@@ -241,12 +322,23 @@ def training_arguments(args: argparse.Namespace, output_dir: Path, fp16: bool, b
         "remove_unused_columns": False,
     }
     params = inspect.signature(TrainingArguments.__init__).parameters
+    if getattr(args, "save_only_model", False) and "save_only_model" in params:
+        kwargs["save_only_model"] = True
     kwargs["save_strategy"] = "epoch"
     if "eval_strategy" in params:
         kwargs["eval_strategy"] = "epoch"
     else:
         kwargs["evaluation_strategy"] = "epoch"
     return TrainingArguments(**kwargs)
+
+
+def trainer_tokenizer_kwargs(tokenizer: Any) -> dict[str, Any]:
+    params = inspect.signature(Trainer.__init__).parameters
+    if "processing_class" in params:
+        return {"processing_class": tokenizer}
+    if "tokenizer" in params:
+        return {"tokenizer": tokenizer}
+    return {}
 
 
 def main() -> None:
@@ -306,7 +398,11 @@ def main() -> None:
     label_freq = dict(label_counts(train_rows))
     write_json(dirs["reports"] / "train_label_frequency.json", label_freq)
 
-    class_weights = class_weights_from_rows(train_rows) if args.loss in {"weighted_ce", "focal"} else None
+    class_weights = (
+        class_weights_from_rows(train_rows, o_label_weight_floor=args.o_label_weight_floor)
+        if args.loss in {"weighted_ce", "focal"}
+        else None
+    )
     if class_weights is not None:
         write_json(
             dirs["reports"] / "class_weights.json",
@@ -323,7 +419,7 @@ def main() -> None:
         args=train_args,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
-        tokenizer=tokenizer,
+        **trainer_tokenizer_kwargs(tokenizer),
         data_collator=collator,
         compute_metrics=prediction_metrics_fn(val_dataset, id2label),
         callbacks=[EarlyStoppingCallback(early_stopping_patience=args.early_stopping_patience)],
@@ -333,6 +429,9 @@ def main() -> None:
         positive_token_weight=args.positive_token_weight,
         b_token_weight=args.b_token_weight,
         boundary_token_weight=args.boundary_token_weight,
+        extra_field_penalty=args.extra_field_penalty,
+        missing_field_penalty=args.missing_field_penalty,
+        wrong_field_penalty=args.wrong_field_penalty,
     )
 
     train_result = trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
@@ -348,9 +447,13 @@ def main() -> None:
             "stride": args.stride,
             "subword_label_strategy": args.subword_label_strategy,
             "loss": args.loss,
+            "o_label_weight_floor": args.o_label_weight_floor,
             "positive_token_weight": args.positive_token_weight,
             "b_token_weight": args.b_token_weight,
             "boundary_token_weight": args.boundary_token_weight,
+            "extra_field_penalty": args.extra_field_penalty,
+            "missing_field_penalty": args.missing_field_penalty,
+            "wrong_field_penalty": args.wrong_field_penalty,
             "style_input": "token_type_ids",
             "style_type_vocab_size": STYLE_TYPE_VOCAB_SIZE,
             "style_source_features": ["font_size", "fg_gray", "word_height"],
@@ -372,9 +475,13 @@ def main() -> None:
             "stride": args.stride,
             "subword_label_strategy": args.subword_label_strategy,
             "loss": args.loss,
+            "o_label_weight_floor": args.o_label_weight_floor,
             "positive_token_weight": args.positive_token_weight,
             "b_token_weight": args.b_token_weight,
             "boundary_token_weight": args.boundary_token_weight,
+            "extra_field_penalty": args.extra_field_penalty,
+            "missing_field_penalty": args.missing_field_penalty,
+            "wrong_field_penalty": args.wrong_field_penalty,
             "style_type_vocab_size": STYLE_TYPE_VOCAB_SIZE,
             "hard_example_jsonl": args.hard_example_jsonl,
             "hard_example_repeat": args.hard_example_repeat,

@@ -5,6 +5,14 @@ import os
 import sys
 import multiprocessing
 
+from scanindex.infra.mp_safety import (
+    patch_multiprocessing_spawn_sys_path,
+    sanitize_current_sys_path,
+)
+
+sanitize_current_sys_path()
+patch_multiprocessing_spawn_sys_path()
+
 
 def _patch_six_meta_path_importer():
     """Avoid PyInstaller/PySide6 inspect crashes on Python 3.12."""
@@ -69,8 +77,8 @@ def main():
     # Apply theme + font AFTER splash is visible so heavy QSS parse does not
     # delay first paint of the splash.
     from PySide6.QtGui import QFont
-    from scanindex.ui.theme import DARK_STYLESHEET, FONT_UI
-    app.setStyleSheet(DARK_STYLESHEET)
+    from scanindex.ui.theme import APP_STYLESHEET, FONT_UI
+    app.setStyleSheet(APP_STYLESHEET)
     app.setFont(QFont(FONT_UI, 13))
     splash.set_status("Đang khởi tạo giao diện...")
     app.processEvents()

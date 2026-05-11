@@ -42,7 +42,7 @@ COLLECTION_TITLE = "ScanIndex"
 # HF caps collection description at 150 chars
 COLLECTION_DESCRIPTION = (
     "Models loaded by https://github.com/welcomyou/scanindex — "
-    "OCR, KIE, layout, tables, embedder for Vietnamese admin docs."
+    "OCR, KIE, layout, and tables for Vietnamese admin docs."
 )
 
 
@@ -123,63 +123,6 @@ Trained on internal annotated Vietnamese admin documents (not redistributed).
 ## License
 
 Inherits LayoutLMv3 base license: **CC-BY-NC-SA-4.0** (research / non-commercial). Commercial use requires a separate agreement with Microsoft for the base model.
-""",
-)
-
-# ── 2. E5-small mix50 v2 ONNX fp32 ──────────────────────────────────
-E5_README = _readme(
-    {
-        "library_name": "sentence-transformers",
-        "pipeline_tag": "sentence-similarity",
-        "license": "mit",
-        "base_model": "intfloat/multilingual-e5-small",
-        "language": ["vi", "en"],
-        "tags": [
-            "sentence-similarity", "sentence-transformers", "e5",
-            "vietnamese", "onnx", "fp32", "retrieval", "document-search",
-        ],
-    },
-    """
-# E5-small mix50 v2 — Vietnamese archive embedder
-
-Fine-tuned [`intfloat/multilingual-e5-small`](https://huggingface.co/intfloat/multilingual-e5-small) for retrieval on Vietnamese archived administrative documents. Trained on a 50/50 mix of (a) in-domain Vietnamese corpus and (b) general retrieval pairs, exported to ONNX fp32.
-
-Used as the dense passage encoder in the [ScanIndex](https://github.com/welcomyou/scanindex) hybrid search (Tantivy BM25 + FAISS HNSW + RRF fusion).
-
-## Files
-
-- `archive_models/e5-small-mix50-v2-onnx-fp32/model.onnx` (+ `model.onnx_data`)
-- Tokenizer + sentence-transformers metadata (`config.json`, `tokenizer.json`, `sentencepiece.bpe.model`, `1_Pooling/`, `modules.json`, …)
-
-## Asymmetric input
-
-E5 requires query/passage prefixes:
-
-```python
-queries  = [f"query: {q}" for q in raw_queries]
-passages = [f"passage: {p}" for p in raw_passages]
-```
-
-## Loading (ONNX)
-
-```python
-import onnxruntime as ort
-from transformers import AutoTokenizer
-from huggingface_hub import snapshot_download
-
-local = snapshot_download("welcomyou/e5-small-vn-archive-mix50", local_dir="models")
-sub = f"{local}/archive_models/e5-small-mix50-v2-onnx-fp32"
-tok = AutoTokenizer.from_pretrained(sub)
-sess = ort.InferenceSession(f"{sub}/model.onnx")
-```
-
-## Training
-
-See [train-convert/archive-embedder/train/mix50_v2/](https://github.com/welcomyou/scanindex/tree/main/train-convert/archive-embedder/train/mix50_v2).
-
-## License
-
-MIT, inherited from `intfloat/multilingual-e5-small`.
 """,
 )
 
@@ -465,7 +408,6 @@ The actual model weights live in the standalone repos below. Download all of the
 ## Not included (fetched at runtime from upstream)
 
 - **Chrome ScreenAI OCR** — `scanindex.core.ocr.screen_ai_downloader` pulls directly from Google CDN to honor the Chrome license.
-- **`BAAI/bge-reranker-v2-m3`** — `sentence_transformers` pulls upstream on first use of the Accurate search mode.
 
 ## See also
 
@@ -479,11 +421,6 @@ STANDALONE: List[RepoSpec] = [
         repo_id=f"{USER}/layoutlmv3-vn-admin-kie",
         sources=["layoutlmv3_fontgray_norm_final_epoch25"],
         readme=LAYOUTLMV3_README,
-    ),
-    RepoSpec(
-        repo_id=f"{USER}/e5-small-vn-archive-mix50",
-        sources=["archive_models/e5-small-mix50-v2-onnx-fp32"],
-        readme=E5_README,
     ),
     RepoSpec(
         repo_id=f"{USER}/distilled-protonx-vn-correction-ct2",
@@ -516,10 +453,8 @@ BUNDLE_REPO = f"{USER}/scanindex-models"
 BUNDLE_SOURCES = ["orientation"]
 
 
-# NOTE: Upstream models (microsoft/layoutlmv3-base, intfloat/multilingual-e5-small,
-# protonx-models/distilled-protonx-legal-tc, juliozhao/DocLayout-YOLO-DocStructBench,
+# NOTE: Upstream models (microsoft/layoutlmv3-base, protonx-models/distilled-protonx-legal-tc, juliozhao/DocLayout-YOLO-DocStructBench,
 # microsoft/table-transformer-{detection,structure-recognition-v1.1-all},
-# BAAI/bge-reranker-v2-m3) are intentionally NOT pinned in the Collection.
 # Their lineage is already surfaced by HuggingFace via the `base_model:` field
 # in each child repo's frontmatter — re-pinning them in the Collection makes
 # it look like ScanIndex is republishing them, which we are not.

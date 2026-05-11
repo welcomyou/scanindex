@@ -202,6 +202,7 @@ class FileSpec:
     input_path: str
     file_id: str = ""
     source_document_path: Optional[str] = None
+    source_page_indices: Optional[list[int]] = None
     pre_ocr_cache: dict = field(default_factory=dict)  # page_idx -> page_dict
     selected_pages: Optional[list[int]] = None
     from_step1: bool = False
@@ -436,9 +437,15 @@ class ArchiveRunner:
             task.preprocess_rotations = preprocess_rotations
             task.preprocessed_pdf_path = task_input_path if task_input_path != original_input_path else ""
             task.selected_pages = list(spec.selected_pages) if spec.selected_pages else None
+            task.source_page_indices = list(spec.source_page_indices) if spec.source_page_indices else None
             task.from_step1_cache = bool(from_step1)
-            # Classify once up front; this is part of the configured pipeline.
-            task.is_digital = (classify_pdf(original_input_path) == "digital")
+            # Step 1 handoff uses the visual OCR cache and may no longer have
+            # the temporary split PDF by the time KIE assembles output, so keep
+            # it on the OCR-backed path instead of the native-text copy path.
+            task.is_digital = (
+                False if from_step1
+                else (classify_pdf(original_input_path) == "digital")
+            )
             tasks.append(task)
             with self._results_lock:
                 self.results[file_id] = ArchiveResult(file_name=file_id)
@@ -599,6 +606,7 @@ class ArchiveRunner:
                 task.input_path, task.output_pdf_path,
                 task.page_results,
                 source_document_path=task.source_document_path or task.input_path,
+                source_page_indices=getattr(task, "source_page_indices", None),
                 preprocess_rotations=getattr(task, "preprocess_rotations", None),
                 update_callback=lambda m, lvl="info": self.log(m),
                 canonical_profile="layoutlmv3_runtime",

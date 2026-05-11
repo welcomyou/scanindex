@@ -9,7 +9,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, Signal
 
 from scanindex.ui.theme import (
-    COLOR_TEXT, COLOR_TEXT_MUTED, SP
+    COLOR_TEXT, COLOR_TEXT_MUTED, SP, BUTTON_PRIMARY_QSS
 )
 from scanindex.ui.widgets.section_card import SectionCard
 from scanindex.ui.widgets.fuzzy_combobox import FuzzyComboBox
@@ -28,6 +28,7 @@ class SettingsTab(QWidget):
     def __init__(self, current_language: str = "en", parent=None):
         super().__init__(parent)
         self._current_language = current_language
+        self._current_theme = "dark"
         self._kie_mode_values = ["layoutlmv3"]
         self._catalogs: dict[str, dict] = {}
         self._current_catalog_key = ""
@@ -93,7 +94,18 @@ class SettingsTab(QWidget):
             "Tiếng Việt" if self._current_language == "vi" else "English")
         self.combo_lang.setFixedWidth(160)
         self.combo_lang.currentTextChanged.connect(self._on_lang_change)
-        form.addRow(self._row_label(translations.get_text("lbl_language")), self.combo_lang)
+        self.lbl_lang = self._row_label(translations.get_text("lbl_language"))
+        form.addRow(self.lbl_lang, self.combo_lang)
+
+        # Theme picker — Light/Dark. Change persists on Save and applies
+        # after the next app restart (most widgets capture COLOR_* tokens
+        # at module load time).
+        self.combo_theme = FuzzyComboBox(sort=False)
+        self.combo_theme.addItem(translations.get_text("theme_dark"), userData="dark")
+        self.combo_theme.addItem(translations.get_text("theme_light"), userData="light")
+        self.combo_theme.setFixedWidth(160)
+        self.lbl_theme = self._row_label(translations.get_text("lbl_theme"))
+        form.addRow(self.lbl_theme, self.combo_theme)
 
         card.content_layout().addLayout(form)
         self._layout.addWidget(card)
@@ -292,6 +304,7 @@ class SettingsTab(QWidget):
         row.addStretch()
         self.btn_save = QPushButton(translations.get_text("btn_save_settings"))
         self.btn_save.setProperty("cssClass", "primary")
+        self.btn_save.setStyleSheet(BUTTON_PRIMARY_QSS)
         self.btn_save.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_save.clicked.connect(self.save_clicked.emit)
         row.addWidget(self.btn_save)
@@ -510,7 +523,8 @@ class SettingsTab(QWidget):
                    show_log_panel: bool = True,
                    kie_mode: str = "layoutlmv3",
                    doc_types: list[str] | None = None,
-                   catalogs: dict | None = None):
+                   catalogs: dict | None = None,
+                   theme: str = "dark"):
         self._wait_page_value = wait_page
         self._compare_value = compare_int
         self.entry_concurrency.setText(concurrency)
@@ -527,6 +541,13 @@ class SettingsTab(QWidget):
         if kie_mode not in self._kie_mode_values:
             kie_mode = "layoutlmv3"
         self.combo_kie_mode.setCurrentIndex(self._kie_mode_values.index(kie_mode))
+        theme = "light" if str(theme).lower() == "light" else "dark"
+        self._current_theme = theme
+        idx = self.combo_theme.findData(theme)
+        if idx >= 0:
+            self.combo_theme.blockSignals(True)
+            self.combo_theme.setCurrentIndex(idx)
+            self.combo_theme.blockSignals(False)
         if catalogs is not None:
             self.set_catalogs(catalogs)
         elif doc_types is not None:
@@ -538,6 +559,8 @@ class SettingsTab(QWidget):
             kie_mode = self._kie_mode_values[kie_idx]
         else:
             kie_mode = "layoutlmv3"
+        theme_data = self.combo_theme.currentData()
+        theme = "light" if str(theme_data).lower() == "light" else "dark"
         return {
             "wait_page": self._wait_page_value,
             "compare_int": self._compare_value,
@@ -550,6 +573,7 @@ class SettingsTab(QWidget):
             "kie_mode": kie_mode,
             "doc_types": self._doc_type_items(),
             "catalogs": self._catalog_payload(),
+            "theme": theme,
         }
 
     def set_model_choices(self, models: list):
@@ -568,3 +592,17 @@ class SettingsTab(QWidget):
         self.chk_verbose.setText(translations.get_text("chk_verbose_log"))
         self.lbl_desc.setText(translations.get_text("lbl_settings_desc"))
         self.lbl_concurrency.setText(translations.get_text("lbl_concurrency_ocr"))
+        if hasattr(self, "lbl_lang"):
+            self.lbl_lang.setText(translations.get_text("lbl_language"))
+        if hasattr(self, "lbl_theme"):
+            self.lbl_theme.setText(translations.get_text("lbl_theme"))
+        if hasattr(self, "combo_theme"):
+            self.combo_theme.blockSignals(True)
+            cur = self.combo_theme.currentData()
+            self.combo_theme.clear()
+            self.combo_theme.addItem(translations.get_text("theme_dark"), userData="dark")
+            self.combo_theme.addItem(translations.get_text("theme_light"), userData="light")
+            idx = self.combo_theme.findData(cur if cur in ("dark", "light") else self._current_theme)
+            if idx >= 0:
+                self.combo_theme.setCurrentIndex(idx)
+            self.combo_theme.blockSignals(False)

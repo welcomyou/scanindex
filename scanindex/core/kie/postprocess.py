@@ -1824,9 +1824,70 @@ def apply_layoutlmv3_schema_postprocess(canonical: dict[str, Any], annotation: d
     out = apply_signer_fragment_constraints(canonical, out)
     out = _normalize_field_instances_reading_order(canonical, out)
     out = apply_doc_subject_text_format(out)
+    out = _ensure_doc_number_symbol(canonical, out)
     out = _ensure_doc_type(out)
     out = _ensure_rule_based_marks(canonical, out)
     out = apply_primary_page_field_policy(canonical, out)
+    return out
+
+
+def _ensure_doc_number_symbol(canonical: dict[str, Any], annotation: dict[str, Any]) -> dict[str, Any]:
+    """Add DOC_NUMBER_SYMBOL from the visual first-page line when the model
+    misses it entirely.
+
+    This is intentionally conservative: it only accepts early page-0 lines
+    whose normalized text starts with the document-number prefix ``so`` and
+    then matches the existing doc-number shape. Body text such as
+    "Hướng dẫn số 16-..." must not become the document number.
+    """
+    fields = annotation.get("field_instances") or []
+    if any(
+        inst.get("label") == "DOC_NUMBER_SYMBOL"
+        and (inst.get("text") or "").strip()
+        for inst in fields
+    ):
+        return annotation
+
+    pages = canonical.get("pages") or []
+    page = next((p for p in pages if int(p.get("page_index") or 0) == 0), None)
+    if page is None:
+        return annotation
+
+    _words, words_by_id = _page_word_maps(page)
+    candidates = []
+    for line in _ordered_page_lines(page):
+        norm = str(line.get("norm") or normalize_vn_text(line.get("text") or ""))
+        if not norm.startswith("so"):
+            continue
+        if float(line.get("top") or 0.0) > 0.35:
+            continue
+        if not _looks_like_doc_number_norm(norm):
+            continue
+        candidates.append(line)
+    if not candidates:
+        return annotation
+
+    chosen = min(candidates, key=lambda item: (float(item.get("top") or 0.0), float(item.get("x0") or 0.0)))
+    out = deepcopy(annotation)
+    inst = _instance_from_lines(
+        "DOC_NUMBER_SYMBOL",
+        [chosen],
+        words_by_id,
+        int(chosen.get("page_index") or page.get("page_index") or 0),
+        [],
+    )
+    inst["field_id"] = "doc_number_symbol_auto"
+    inst["confidence"] = 1.0
+    inst["source"] = "postprocess"
+    inst["doc_number_symbol_fallback"] = True
+    out.setdefault("field_instances", []).append(inst)
+    post = dict(out.get("postprocess") or {})
+    post["doc_number_symbol_fallback"] = {
+        "line_id": chosen.get("line_id"),
+        "text": chosen.get("text"),
+    }
+    out["postprocess"] = post
+    out["field_instances"] = _sort_field_instances(out.get("field_instances") or [])
     return out
 
 

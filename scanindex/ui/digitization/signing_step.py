@@ -20,7 +20,8 @@ from scanindex.ui.theme import (
     COLOR_ACCENT, COLOR_ACCENT_HOVER, COLOR_BG, COLOR_BORDER,
     COLOR_BORDER_DEFAULT, COLOR_ELEVATED, COLOR_GREEN, COLOR_GREEN_HOVER,
     COLOR_HOVER, COLOR_INPUT, COLOR_RED, COLOR_RED_HOVER, COLOR_SURFACE,
-    COLOR_TEXT, COLOR_TEXT_MUTED, COLOR_TEXT_SECONDARY, FONT_MONO_FALLBACK,
+    COLOR_TEXT, COLOR_TEXT_MUTED, COLOR_TEXT_SECONDARY,
+    COMBOBOX_DROPDOWN_QSS, FONT_MONO_FALLBACK,
     FONT_UI,
 )
 
@@ -684,10 +685,9 @@ class ArchiveStep3Sign(QWidget):
         """)
 
     def _style_combo(self, combo: QComboBox):
-        # Local stylesheet keeps the per-step layout dimensions (smaller
-        # font, custom padding) but no longer overrides the down-arrow
-        # subcontrol — the global theme paints a consistent chevron via
-        # `assets/chevron_down.png` (see gui/theme.py).
+        # Local QSS isolates the widget from the global theme's
+        # ::drop-down/::down-arrow rules, so re-apply them via the shared
+        # COMBOBOX_DROPDOWN_QSS so the chevron stays visible.
         combo.setStyleSheet(f"""
             QComboBox {{
                 background: {COLOR_INPUT};
@@ -708,7 +708,7 @@ class ArchiveStep3Sign(QWidget):
                 border: 1px solid {COLOR_BORDER_DEFAULT};
                 outline: none;
             }}
-        """)
+        """ + COMBOBOX_DROPDOWN_QSS)
 
     def _coord_spin(self, value: float) -> QDoubleSpinBox:
         w = _NoWheelDoubleSpinBox()

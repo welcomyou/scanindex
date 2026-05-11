@@ -70,8 +70,16 @@ class SplashScreen(QDialog):
         # App name
         lbl_name = QLabel(translations.get_text("about_app_name"))
         lbl_name.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        lbl_name.setFont(QFont(FONT_UI, 22, QFont.Weight.Bold))
-        lbl_name.setStyleSheet(f"color: {COLOR_ACCENT}; background: transparent;")
+        lbl_name.setFont(QFont(FONT_UI, 32, QFont.Weight.Bold))
+        lbl_name.setStyleSheet(
+            f"QLabel {{ "
+            f"color: {COLOR_ACCENT}; "
+            f"background: transparent; "
+            f"font-family: '{FONT_UI}'; "
+            f"font-size: 32px; "
+            f"font-weight: 800; "
+            f"}}"
+        )
         layout.addWidget(lbl_name)
 
         # Status text

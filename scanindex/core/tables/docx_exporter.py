@@ -379,20 +379,28 @@ def _mostly_uppercase_text(text: str, threshold: float = 0.65) -> bool:
 
 
 def _looks_like_numbered_heading(text: str) -> bool:
-    """Detect left-aligned section headings such as "4. ..." or "5.1. ..."."""
+    """Detect left-aligned section headings such as "II. ...", "4. ..." or "5.1. ..."."""
     stripped = _clean_extracted_text(text)
-    match = re.match(r"^\s*(\d{1,3}(?:\.\d{1,3}){0,4}\.?)\s+(.+)$", stripped)
+    roman_match = re.match(r"^\s*([IVXLCDM]{1,8}\.)\s+(.+)$", stripped)
+    match = roman_match or re.match(r"^\s*(\d{1,3}(?:\.\d{1,3}){0,4}\.?)\s+(.+)$", stripped)
     if not match:
         return False
+    marker = match.group(1).strip()
     body = match.group(2).strip()
-    if not body or len(body) > 140:
+    if not body or len(body) > 160:
         return False
     if body.endswith(":"):
         return True
     if _mostly_uppercase_text(body):
         return True
     words = [w for w in re.split(r"\s+", body) if w]
-    return len(words) <= 8 and not body.endswith((".", ";", ","))
+    if body.endswith((".", ";", ",")):
+        return False
+    if roman_match:
+        return len(words) <= 14
+    if "." in marker.rstrip("."):
+        return len(words) <= 14 and len(body) <= 120
+    return len(words) <= 14 and len(body) <= 90
 
 
 def _looks_like_list_item(text: str) -> bool:
@@ -774,28 +782,29 @@ def is_numbered_bullet(text: str) -> bool:
     - I., II., IV. (roman numerals)
     - a), b), c) or 1), 2), 3)
     """
-    if re.match(r'^\d{4}\.$', text.strip()):
+    stripped = _clean_extracted_text(text or "")
+    if re.match(r'^\d{4}\.$', stripped):
         return False
 
     # Pattern for "1.", "2.", "1.1.", "1.2.3." etc - must be followed by space or end
     # Distinguish from "18.000" by checking what follows the dot
-    if re.match(r'^\d+(?:\.\d+)*\.\s', text) or re.match(r'^\d+(?:\.\d+)*\.$', text):
+    if re.match(r'^\d+(?:\.\d+)*\.\s', stripped) or re.match(r'^\d+(?:\.\d+)*\.$', stripped):
         return True
     
     # Roman numerals: I., II., III., IV., V., VI., etc.
-    if re.match(r'^[IVX]+\.\s', text) or re.match(r'^[IVX]+\.$', text):
+    if re.match(r'^[IVX]+\.\s', stripped) or re.match(r'^[IVX]+\.$', stripped):
         return True
     
-    # a), b), c) style
-    if re.match(r'^[a-z]\)\s', text) or re.match(r'^[a-z]\)$', text):
+    # a), b), c), đ) style. [^\W\d_] is a single Unicode letter.
+    if re.match(r'^[^\W\d_]\)\s', stripped) or re.match(r'^[^\W\d_]\)$', stripped):
         return True
     
     # 1), 2), 3) style
-    if re.match(r'^\d+\)\s', text) or re.match(r'^\d+\)$', text):
+    if re.match(r'^\d+\)\s', stripped) or re.match(r'^\d+\)$', stripped):
         return True
 
     # (1), (2), (a) style used in Vietnamese administrative lists
-    if re.match(r'^\(\d+\)\s', text) or re.match(r'^\([a-z]\)\s', text):
+    if re.match(r'^\(\d+\)\s', stripped) or re.match(r'^\([^\W\d_]\)\s', stripped):
         return True
     
     return False
@@ -880,6 +889,83 @@ def _looks_like_standalone_centered_title_line(
     )
 
 
+def _line_style_compatible_for_heading_wrap(line1: TextLine, line2: TextLine) -> bool:
+    h1 = max(float(getattr(line1, "height", 0.0) or 0.0), 1.0)
+    h2 = max(float(getattr(line2, "height", 0.0) or 0.0), 1.0)
+    height_ratio = min(h1, h2) / max(h1, h2)
+    try:
+        gray1 = int(getattr(line1, "fg_gray", 128))
+        gray2 = int(getattr(line2, "fg_gray", 128))
+        gray_compatible = (
+            not (_has_known_gray(gray1) and _has_known_gray(gray2))
+            or abs(gray1 - gray2) <= 48
+        )
+    except Exception:
+        gray_compatible = True
+    return height_ratio >= 0.72 and gray_compatible
+
+
+def _looks_like_short_heading_tail(line: TextLine, next_width: float) -> bool:
+    text = _clean_extracted_text(line.text or "")
+    if not text:
+        return False
+    words = [word for word in re.split(r"\s+", text) if word]
+    return len(words) <= 3 and line.width <= next_width * 0.28
+
+
+def _looks_like_structural_heading_continuation(
+    line1: TextLine,
+    line2: TextLine,
+    prev_base: float,
+    prev_right: float,
+    next_base: float,
+    next_right: float,
+    numbered_heading_prev: bool,
+    numbered_next: bool,
+    numbered_heading_next: bool,
+    dot_bullet_next: bool,
+    dash_next: bool,
+) -> bool:
+    """Detect wrapped heading lines using OCR block/style/layout, not fixed wording."""
+    if not numbered_heading_prev:
+        return False
+    if getattr(line1, "block_id", 0) <= 0 or line1.block_id != getattr(line2, "block_id", 0):
+        return False
+    if line1.page != line2.page:
+        return False
+    text1 = (line1.text or "").rstrip()
+    text2 = (line2.text or "").strip()
+    if not text1 or not text2:
+        return False
+    if _hard_terminal_punctuation(text1):
+        return False
+    if numbered_next or numbered_heading_next or dot_bullet_next or dash_next:
+        return False
+
+    gap = line2.y - (line1.y + line1.height)
+    compact_gap = gap <= max(line1.height, line2.height) * 0.75
+    if not compact_gap:
+        return False
+
+    prev_width = _content_width(prev_base, prev_right)
+    next_width = _content_width(next_base, next_right)
+    prev_reaches_right = (line1.x + line1.width) >= prev_right - max(30.0, prev_width * 0.075)
+    next_has_heading_width = line2.width >= next_width * 0.45
+    next_in_content_band = (
+        abs(line2.x - next_base) <= max(42.0, next_width * 0.10)
+        or abs(line2.x - line1.x) <= max(42.0, next_width * 0.10)
+    )
+    if not (prev_reaches_right or next_has_heading_width):
+        return False
+    if not next_in_content_band:
+        return False
+
+    if _looks_like_short_heading_tail(line2, next_width):
+        return True
+
+    return _line_style_compatible_for_heading_wrap(line1, line2)
+
+
 def score_paragraph_edge(
     line1: TextLine,
     line2: TextLine,
@@ -940,6 +1026,19 @@ def score_paragraph_edge(
     starts_digit = text2[0].isdigit()
     prev_centered_title = _looks_like_standalone_centered_title_line(text1, line1, prev_base, prev_right)
     next_centered = _line_centered_in_content_band(line2, next_base, next_right)
+    structural_heading_wrap = _looks_like_structural_heading_continuation(
+        line1,
+        line2,
+        prev_base,
+        prev_right,
+        next_base,
+        next_right,
+        numbered_heading_prev,
+        numbered_next,
+        numbered_heading_next,
+        dot_bullet_next,
+        dash_next,
+    )
 
     features.update(
         {
@@ -960,6 +1059,7 @@ def score_paragraph_edge(
             "dot_bullet_next": dot_bullet_next,
             "prev_centered_title": prev_centered_title,
             "next_centered": next_centered,
+            "structural_heading_wrap": structural_heading_wrap,
         }
     )
 
@@ -986,10 +1086,13 @@ def score_paragraph_edge(
 
     if numbered_heading_prev:
         same_heading_wrap = (
-            near_same_left
-            and _mostly_uppercase_text(text1)
-            and _mostly_uppercase_text(text2)
-            and not _terminal_punctuation(text2)
+            structural_heading_wrap
+            or (
+                near_same_left
+                and _mostly_uppercase_text(text1)
+                and _mostly_uppercase_text(text2)
+                and not _terminal_punctuation(text2)
+            )
         )
         if same_heading_wrap:
             merge_score += 4.0
@@ -1732,12 +1835,20 @@ def _line_is_visually_bold(line: TextLine) -> bool:
     return line_gray <= float(cutoff) and _gray_z(line_gray, median, iqr) >= z_cutoff
 
 
-def _word_is_visually_bold(word: dict, line: TextLine) -> bool:
+def _word_is_visually_bold(
+    word: dict,
+    line: TextLine,
+    *,
+    allow_line_bold: bool = True,
+    allow_word_bold: bool = True,
+) -> bool:
     """Infer local bold from robustly-normalized foreground gray."""
     if not word:
         return False
-    if _line_is_visually_bold(line):
+    if allow_line_bold and _line_is_visually_bold(line):
         return True
+    if not allow_word_bold:
+        return False
     try:
         gray = int(word.get("fg_gray", 128) or 128)
     except Exception:
@@ -1767,7 +1878,7 @@ def _word_is_visually_bold(word: dict, line: TextLine) -> bool:
     page_iqr = max(float(stats.get("gray_iqr", doc_iqr)), 1.0)
     page_z = _gray_z(gray, page_median, page_iqr)
     page_cutoff = stats.get("page_bold_gray_cutoff")
-    page_supports_dark = page_cutoff is None or gray <= float(page_cutoff) or page_z >= 0.0
+    page_supports_dark = page_cutoff is None or gray <= float(page_cutoff) or page_z >= 0.75
 
     return page_supports_dark
 
@@ -1790,7 +1901,12 @@ def _word_items_for_line(line: TextLine) -> List[dict]:
     return []
 
 
-def _merged_word_tokens(first_line: TextLine) -> List[Tuple[str, bool, bool]]:
+def _merged_word_tokens(
+    first_line: TextLine,
+    *,
+    allow_line_bold: bool = True,
+    allow_word_bold: bool = True,
+) -> List[Tuple[str, bool, bool]]:
     """Return (text, has_space_before, is_bold) tokens for a merged paragraph."""
     tokens: List[Tuple[str, bool, bool]] = []
     previous_has_space_after = False
@@ -1804,7 +1920,16 @@ def _merged_word_tokens(first_line: TextLine) -> List[Tuple[str, bool, bool]]:
             if not text:
                 continue
             has_space_before = bool(tokens) and (previous_has_space_after or word_idx == 0 or line_idx > 0)
-            tokens.append((text, has_space_before, _word_is_visually_bold(word, line)))
+            tokens.append((
+                text,
+                has_space_before,
+                _word_is_visually_bold(
+                    word,
+                    line,
+                    allow_line_bold=allow_line_bold,
+                    allow_word_bold=allow_word_bold,
+                ),
+            ))
             previous_has_space_after = bool(word.get("has_space_after", True))
         previous_has_space_after = True
     return tokens
@@ -1928,7 +2053,7 @@ def _try_add_word_formatted_text(
     *,
     bold: bool,
 ) -> bool:
-    tokens = _merged_word_tokens(first_line)
+    tokens = _merged_word_tokens(first_line, allow_line_bold=bold, allow_word_bold=bold)
     if not tokens:
         return False
 
@@ -5380,8 +5505,8 @@ def create_docx_from_pdf(
                 "page_height_pt": page_h,
                 "left_margin_pt": _median(group.get("left", []), defaults["left_margin_pt"]),
                 "right_margin_pt": _median(group.get("right_gap", []), defaults["right_margin_pt"]),
-                "top_margin_pt": _median(group.get("top", []), defaults["top_margin_pt"]),
-                "bottom_margin_pt": _median(group.get("bottom_gap", []), defaults["bottom_margin_pt"]),
+                "top_margin_pt": defaults["top_margin_pt"],
+                "bottom_margin_pt": defaults["bottom_margin_pt"],
                 "body_font_pt": body_font,
                 "table_font_pt": table_font,
                 "first_line_indent_pt": _median(group.get("indent", []), defaults["first_line_indent_pt"]),

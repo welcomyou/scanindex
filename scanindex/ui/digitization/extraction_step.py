@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QComboBox,
     QLabel, QLineEdit, QTextEdit, QPushButton,
     QListWidget, QListWidgetItem, QScrollArea, QFrame,
-    QMessageBox, QSizePolicy,
+    QMessageBox, QSizePolicy, QSplitter,
 )
 from PySide6.QtCore import Qt, QTimer, Signal, QDate
 from PySide6.QtGui import QBrush, QColor, QTextOption
@@ -30,6 +30,7 @@ from scanindex.ui.theme import (
     COLOR_TEXT, COLOR_TEXT_SECONDARY, COLOR_TEXT_MUTED,
     COLOR_ACCENT, COLOR_ACCENT_HOVER,
     COLOR_GREEN, COLOR_GREEN_HOVER, COLOR_RED, COLOR_RED_HOVER,
+    COMBOBOX_DROPDOWN_QSS,
     SP, RADIUS_MD, RADIUS_SM, FONT_UI,
 )
 from scanindex.ui.widgets.kie_archive_viewer import KieArchiveViewer
@@ -407,6 +408,7 @@ class ArchiveStep2Kie(QWidget):
         self._field_widgets = {}
         self._field_labels = {}
         self._flist_visible = True
+        self._review_mode = False
         self._source_mode = "folder"   # "folder" | "step1"
         self._is_processing = False
         # Tracks whether the section-1 form has user edits the
@@ -439,32 +441,29 @@ class ArchiveStep2Kie(QWidget):
 
         self._build_toolbar(root)
 
-        body = QHBoxLayout()
-        body.setContentsMargins(0, 0, 0, 0)
-        body.setSpacing(0)
+        # Same pattern as Step 1: one horizontal splitter owns the body.
+        # Left and right panels are bounded but resizable; the PDF viewer
+        # gets the stretch space in the middle.
+        body = QSplitter(Qt.Orientation.Horizontal)
+        self._body_splitter = body
+        body.setChildrenCollapsible(False)
+        body.setHandleWidth(4)
+        body.setStyleSheet(
+            f"QSplitter::handle {{ background: {COLOR_BORDER}; }}"
+            f"QSplitter::handle:hover {{ background: {COLOR_ACCENT}; }}"
+        )
 
         self._flist_panel = QWidget()
-        self._flist_panel.setFixedWidth(_FLIST_W)
+        self._flist_panel.setMinimumWidth(140)
+        self._flist_panel.setMaximumWidth(560)
         self._flist_panel.setStyleSheet(f"background: {COLOR_SURFACE};")
         self._build_file_list_panel()
         body.addWidget(self._flist_panel)
 
-        self._btn_toggle = QPushButton("❯")
-        self._btn_toggle.setFixedWidth(14)
-        self._btn_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._btn_toggle.setStyleSheet(f"""
-            QPushButton {{
-                background: {COLOR_SURFACE};
-                border: none;
-                border-left: 1px solid {COLOR_BORDER};
-                border-right: 1px solid {COLOR_BORDER};
-                color: {COLOR_TEXT_MUTED};
-                font-size: 10px; padding: 0;
-            }}
-            QPushButton:hover {{ background: {COLOR_ELEVATED}; color: {COLOR_TEXT}; }}
-        """)
-        self._btn_toggle.clicked.connect(self._toggle_file_list)
-        body.addWidget(self._btn_toggle)
+        center = QWidget()
+        center_l = QHBoxLayout(center)
+        center_l.setContentsMargins(0, 0, 0, 0)
+        center_l.setSpacing(0)
 
         self.pdf_viewer = KieArchiveViewer()
         self.pdf_viewer.prev_file_requested.connect(self._go_prev_file)
@@ -472,15 +471,25 @@ class ArchiveStep2Kie(QWidget):
         self.pdf_viewer.dirty_changed.connect(self._on_viewer_dirty_changed)
         self.pdf_viewer.field_words_changed.connect(self._on_viewer_field_changed)
         self.pdf_viewer.field_clicked.connect(self._on_viewer_field_clicked)
-        body.addWidget(self.pdf_viewer, 1)
+        center_l.addWidget(self.pdf_viewer, 1)
+        center.setMinimumWidth(360)
+        body.addWidget(center)
 
         self._meta_panel = QWidget()
-        self._meta_panel.setFixedWidth(_META_W)
+        self._meta_panel.setMinimumWidth(220)
+        self._meta_panel.setMaximumWidth(620)
         self._meta_panel.setStyleSheet(f"QWidget {{ background: {COLOR_SURFACE}; }}")
         self._build_metadata_panel()
         body.addWidget(self._meta_panel)
 
-        root.addLayout(body, 1)
+        body.setCollapsible(0, False)
+        body.setCollapsible(1, False)
+        body.setCollapsible(2, False)
+        body.setStretchFactor(0, 0)
+        body.setStretchFactor(1, 1)
+        body.setStretchFactor(2, 0)
+        body.setSizes([_FLIST_W, 9999, _META_W])
+        root.addWidget(body, 1)
 
         self._spinner_chars = ["⠋", "⠙", "⠹", "⠸",
                                 "⠼", "⠴", "⠦", "⠧",
@@ -493,6 +502,7 @@ class ArchiveStep2Kie(QWidget):
 
     def _build_toolbar(self, parent_layout):
         bar = QFrame()
+        self._toolbar = bar
         bar.setFixedHeight(34)
         bar.setStyleSheet(
             f"QFrame {{ background: {COLOR_SURFACE}; "
@@ -937,11 +947,6 @@ class ArchiveStep2Kie(QWidget):
         """)
         return b
 
-    def _toggle_file_list(self):
-        self._flist_visible = not self._flist_visible
-        self._flist_panel.setVisible(self._flist_visible)
-        self._btn_toggle.setText("❯" if self._flist_visible else "❮")
-
     # ── source mode ─────────────────────────────────────────────────
 
     def set_source_mode(self, mode: str):
@@ -965,6 +970,24 @@ class ArchiveStep2Kie(QWidget):
                 translations.get_text("arc_step2_source_folder_hint"))
             self._btn_browse_in.setVisible(True)
             self.btn_process.setVisible(not self._is_processing)
+
+    def set_review_mode(self, enabled: bool = True, *, show_file_list: bool = False):
+        """Reuse the Step 2 editor inside another workflow.
+
+        Review mode keeps the shared PDF/KIE editor and metadata panel, but
+        hides the source toolbar and optional file list because the caller
+        already prepared the OCR/KIE result.
+        """
+        self._review_mode = bool(enabled)
+        toolbar = getattr(self, "_toolbar", None)
+        if toolbar is not None:
+            toolbar.setVisible(not self._review_mode)
+        if self._review_mode and not show_file_list:
+            self._flist_panel.setVisible(False)
+            self._flist_visible = False
+        else:
+            self._flist_panel.setVisible(True)
+            self._flist_visible = True
 
     def get_source_mode(self) -> str:
         return self._source_mode
@@ -1056,8 +1079,9 @@ class ArchiveStep2Kie(QWidget):
                 target_row = i; break
         if target_row >= 0:
             self.doc_list.setCurrentRow(target_row)
-        if not self._flist_visible and documents:
-            self._toggle_file_list()
+        if not self._review_mode and documents:
+            self._flist_panel.setVisible(True)
+            self._flist_visible = True
 
     def update_doc_status(self, idx: int, status: str):
         if not (0 <= idx < self.doc_list.count()):
@@ -1303,16 +1327,25 @@ class ArchiveStep2Kie(QWidget):
     def _field_qss(self, widget_type: str, *, invalid: bool) -> str:
         """Build the per-field stylesheet. When ``invalid`` is True, the
         border swaps to ``COLOR_RED`` even on focus so the alert is
-        visible until the user fixes the value."""
+        visible until the user fixes the value.
+
+        For QComboBox, append the shared ::drop-down/::down-arrow rules
+        so the chevron stays visible — Qt isolates a widget's QSS from
+        the global theme as soon as setStyleSheet is called.
+        """
         if invalid:
-            return (
+            qss = (
                 f"{widget_type} {{ {_TEXTAREA} border: 1px solid {COLOR_RED}; }}"
                 f"{widget_type}:focus {{ border: 1px solid {COLOR_RED}; }}"
             )
-        return (
-            f"{widget_type} {{ {_TEXTAREA} }}"
-            f"{widget_type}:focus {{ {_INPUT_FOCUS} }}"
-        )
+        else:
+            qss = (
+                f"{widget_type} {{ {_TEXTAREA} }}"
+                f"{widget_type}:focus {{ {_INPUT_FOCUS} }}"
+            )
+        if widget_type == "QComboBox":
+            qss += COMBOBOX_DROPDOWN_QSS
+        return qss
 
     def _auto_normalize_date(self, key: str) -> None:
         """On editingFinished, snap parseable text to DD/MM/YYYY in the
@@ -1557,6 +1590,8 @@ class ArchiveStep2Kie(QWidget):
             _kie_label_for_field_id(ann, field_id)
             or _kie_label_for_field_id(previous_ann, field_id)
         )
+        if not changed_label and isinstance(op, str) and op.startswith("deleted:"):
+            changed_label = op.split(":", 1)[1].strip()
         doc["annotation"] = ann
         derived = _annotation_to_metadata_form(ann)
         existing = doc.get("metadata") or {}

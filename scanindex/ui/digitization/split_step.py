@@ -653,18 +653,15 @@ class ArchiveStep1Split(QWidget):
     def _physically_split(self, segs: list[Segment]) -> list[str]:
         """Use PyMuPDF to extract each segment's pages into its own PDF in
         the session temp dir. Returns the list of output paths."""
-        import fitz as _f
+        from scanindex.core.pdf.splitter import split_pdf_segments_preserving_appearances
+
         sub = self.session.step1_split_dir()
-        out_paths: list[str] = []
-        with _f.open(self.session.source_pdf) as src:
-            for s in segs:
-                dst_path = os.path.join(sub, s.name)
-                dst = _f.open()
-                dst.insert_pdf(src, from_page=s.start_page, to_page=s.end_page)
-                dst.save(dst_path, deflate=True, garbage=4)
-                dst.close()
-                out_paths.append(dst_path)
-        return out_paths
+        return split_pdf_segments_preserving_appearances(
+            self.session.source_pdf,
+            sub,
+            segs,
+            log_cb=self.log_message.emit,
+        )
 
     # OCR overlay ------------------------------------------------------------
 

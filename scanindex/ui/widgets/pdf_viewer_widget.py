@@ -20,6 +20,7 @@ from scanindex.ui.theme import (
     COLOR_BG, COLOR_SURFACE, COLOR_ELEVATED, COLOR_HOVER,
     COLOR_BORDER, COLOR_BORDER_DEFAULT,
     COLOR_TEXT, COLOR_TEXT_SECONDARY, COLOR_TEXT_MUTED, COLOR_ACCENT,
+    COLOR_RED,
     SP, RADIUS_MD, FONT_UI
 )
 from scanindex.infra import translations
@@ -285,23 +286,30 @@ class _ContinuousPageWidget(QWidget):
                              Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
                              badge)
 
-        # Search result highlight. Exact/fuzzy lexical matches use a thin
-        # underline; semantic/body chunk matches keep the broader box.
+        # Search result highlight. Exact/fuzzy lexical matches use a
+        # highlighter-style fill; semantic/body chunk matches keep the
+        # broader box.
         if self._search_highlight:
             pi, rects, style = self._search_highlight
             if 0 <= pi < len(self._page_y_offsets):
                 y_off = self._page_y_offsets[pi]
                 pm = self._page_pixmaps[pi]
                 x_off = (widget_w - pm.width()) // 2
-                color = QColor(COLOR_ACCENT)
+                color = QColor("#f59e0b" if style == "highlight" else COLOR_RED)
                 for zx, zy, zw, zh in rects:
                     rx, ry = int(x_off + zx), int(y_off + zy)
                     rw, rh = int(zw), int(zh)
                     if style == "underline":
-                        pen = QPen(color, 2)
+                        pen = QPen(color, 3)
                         painter.setPen(pen)
                         y = int(ry + rh * 0.88)
                         painter.drawLine(rx, y, rx + rw, y)
+                    elif style == "highlight":
+                        fill = QColor("#facc15")
+                        fill.setAlpha(90)
+                        painter.fillRect(QRect(rx, ry, rw, rh), fill)
+                        painter.setPen(QPen(color, 2))
+                        painter.drawRect(QRect(rx, ry, rw, rh))
                     else:
                         fill = QColor(color)
                         fill.setAlpha(35)
@@ -408,6 +416,7 @@ class PdfViewerWidget(QWidget):
         self._file_label_text = ""
         self._render_gen = 0
         self._current_search_highlight = None
+        self._pending_view_scroll = None
         self._pages_rendered.connect(self._on_pages_rendered)
         self._hires_timer = QTimer(self)
         self._hires_timer.setSingleShot(True)
@@ -556,6 +565,7 @@ class PdfViewerWidget(QWidget):
         self._raw_pixmaps = []
         self._pages_widget.clear_pages()
         self._current_search_highlight = None
+        self._pending_view_scroll = None
         self._pages_widget.clear_search_highlight()
         try:
             import fitz
@@ -594,7 +604,7 @@ class PdfViewerWidget(QWidget):
 
     def show_pdf(self, pdf_path, page=1, bbox=None, bboxes=None, highlight_style="box"):
         """Repository-compatible API: load a PDF, jump to page, and draw
-        exact lexical underlines or broader semantic/chunk boxes."""
+        exact lexical highlights or broader semantic/chunk boxes."""
         path = str(pdf_path)
         if path != self._pdf_path:
             self.load_pdf(path)
@@ -604,9 +614,16 @@ class PdfViewerWidget(QWidget):
         page_idx = max(0, int(page or 1) - 1)
         if boxes:
             self.highlight_regions(page_idx, boxes, highlight_style)
-            self.scroll_to_bbox(page_idx, boxes[0])
         else:
             self.clear_highlight()
+        focus_bbox = boxes[0] if boxes else None
+        if not self._raw_pixmaps or self._pages_widget.page_count() == 0:
+            self._pending_view_scroll = (page_idx, focus_bbox)
+            return
+        self._pending_view_scroll = None
+        if focus_bbox:
+            self.scroll_to_bbox(page_idx, focus_bbox)
+        else:
             self.scroll_to_page(page_idx)
 
     def highlight_zone(self, page_idx, bbox_pdf):
@@ -631,6 +648,21 @@ class PdfViewerWidget(QWidget):
         boxes = [list(bb[:4]) for bb in (bboxes_pdf or []) if bb and len(bb) >= 4]
         self._current_search_highlight = (int(page_idx), boxes, style or "box")
         self._reapply_search_highlight()
+
+    def _apply_pending_view_scroll(self):
+        pending = self._pending_view_scroll
+        if not pending or not self._raw_pixmaps:
+            return
+        self._pending_view_scroll = None
+        page_idx, focus_bbox = pending
+
+        def _scroll():
+            if focus_bbox:
+                self.scroll_to_bbox(page_idx, focus_bbox)
+            else:
+                self.scroll_to_page(page_idx)
+
+        QTimer.singleShot(0, _scroll)
 
     def _reapply_search_highlight(self):
         if not self._current_search_highlight or not self._raw_pixmaps:
@@ -901,6 +933,7 @@ class PdfViewerWidget(QWidget):
         if is_base:
             self._raw_pixmaps = pixmaps
             self._rebuild_scaled_pages()
+            self._apply_pending_view_scroll()
         else:
             # Hi-res: pixmaps already at correct display size
             self._pages_widget.set_pages(pixmaps)
@@ -909,6 +942,7 @@ class PdfViewerWidget(QWidget):
             self._reapply_search_highlight()
             if getattr(self, "_current_fuzzy_matches", None):
                 self._reapply_fuzzy_matches()
+            self._apply_pending_view_scroll()
 
     def _start_hires_render(self):
         if not self._pdf_path or self._zoom <= 1.05:

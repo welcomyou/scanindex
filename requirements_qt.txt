@@ -2,10 +2,9 @@ PySide6>=6.6.0
 pypdf>=6.6.0
 selenium>=4.39.0
 webdriver-manager>=4.0.2
-huggingface_hub>=0.24.0
+huggingface_hub>=0.34.0,<1.0
 ctranslate2>=4.6.0
-transformers>=4.40.0
-torch --index-url https://download.pytorch.org/whl/cpu
+transformers>=4.40.0,<5
 sentencepiece
 configparser
 
@@ -28,10 +27,7 @@ tzlocal>=5.0
 opencv-contrib-python>=4.9.0
 numpy>=1.26.0,<2.4
 onnxruntime>=1.20.0
-optimum[onnxruntime]>=1.20.0
-doclayout-yolo>=0.0.4
 
-# Kho lưu trữ (archive search) — Tantivy lexical/fuzzy + FAISS HNSW + dense embed
+# Kho luu tru: Tantivy lexical/fuzzy search
 tantivy>=0.22
-faiss-cpu>=1.8
 underthesea>=6.0

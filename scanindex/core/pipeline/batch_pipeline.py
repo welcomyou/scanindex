@@ -69,6 +69,7 @@ class FileTask:
     kie_annotation: Optional[dict] = None
     error: Optional[str] = None
     selected_pages: Optional[list[int]] = None
+    source_page_indices: Optional[list[int]] = None
     page_selection: dict = field(default_factory=dict)
     signature_page: Optional[int] = None
     from_step1_cache: bool = False
@@ -234,15 +235,18 @@ class BatchPipeline:
 
             # Discover page count if not yet known
             if task.num_pages <= 0:
-                try:
-                    import fitz
-                    with fitz.open(task.input_path) as doc:
-                        task.num_pages = len(doc)
-                except Exception as e:
-                    task.error = f"open failed: {e}"
-                    self._on_event(EVENT_FILE_FAILED, task, str(e))
-                    next_idx += 1
-                    continue
+                if task.source_page_indices:
+                    task.num_pages = len(task.source_page_indices)
+                else:
+                    try:
+                        import fitz
+                        with fitz.open(task.input_path) as doc:
+                            task.num_pages = len(doc)
+                    except Exception as e:
+                        task.error = f"open failed: {e}"
+                        self._on_event(EVENT_FILE_FAILED, task, str(e))
+                        next_idx += 1
+                        continue
 
             task.pages_remaining = task.num_pages
 

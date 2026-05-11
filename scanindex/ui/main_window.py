@@ -24,7 +24,7 @@ from PySide6.QtGui import QFont
 from scanindex.ui.theme import (
     COLOR_BG, COLOR_SURFACE, COLOR_BORDER, COLOR_TEXT_SECONDARY, FONT_UI, SP,
     LOG_INFO, LOG_ERROR, LOG_DEBUG, LOG_SUCCESS,
-    STATUS_KEY_MAP, STATUS_COLOR_MAP
+    STATUS_KEY_MAP, STATUS_COLOR_MAP, ACTIVE_THEME
 )
 from scanindex.ui.signals import AppSignals
 from scanindex.ui.icons import load_all_icons
@@ -37,10 +37,10 @@ from scanindex.ui.tabs.about_tab import AboutTab
 from scanindex.ui.dialogs.comparison_dialog import ComparisonDialog
 from scanindex.ui.dialogs.text_preview_dialog import TextPreviewDialog
 from scanindex.ui.screens import (
-    HomeScreen, AccuracyScreen, RepositoryScreen, ScreenContainer,
+    HomeScreen, SupportToolsScreen, RepositoryScreen, ScreenContainer,
     FUNCTION_HOME, FUNCTION_PDF_TO_WORD, FUNCTION_DIGITIZATION,
     FUNCTION_REPOSITORY,
-    FUNCTION_SETTINGS, FUNCTION_ABOUT, FUNCTION_ACCURACY,
+    FUNCTION_SETTINGS, FUNCTION_ABOUT, FUNCTION_SUPPORT_TOOLS,
 )
 from scanindex.ui.model_manager import (
     ModelManager,
@@ -170,10 +170,7 @@ def _docx_output_for_ocr_pdf(pdf_path):
 
 
 class _KhoImportWorker(QThread):
-    """Background thread for `Importer.import_dossier`. The model load
-    (Embedder ~540 MB ONNX, Reranker if used later) and per-doc embedding
-    must NOT run on the Qt main thread — otherwise the progress dialog
-    (and the rest of the GUI) freezes for the whole import."""
+    """Background thread for Importer.import_dossier."""
     progress = Signal(object)        # ImportProgress
     finished_ok = Signal(object)     # ImportProgress
     failed = Signal(str)
@@ -192,7 +189,6 @@ class _KhoImportWorker(QThread):
         try:
             from scanindex.core.repository.store import ArchiveStore
             from scanindex.core.repository.indexer import HybridIndex
-            from scanindex.core.repository.embedder import Embedder
             from scanindex.core.repository.importer import Importer
 
             res = None
@@ -201,13 +197,11 @@ class _KhoImportWorker(QThread):
                 idx = HybridIndex(self._archive_path)
                 idx.open()
                 try:
-                    embedder = Embedder()
-                    importer = Importer(store, idx, embedder)
+                    importer = Importer(store, idx)
                     res = importer.import_dossier(
                         self._codes, self._docs,
                         progress_cb=lambda p: self.progress.emit(p),
                         cancel_check=lambda: self._cancel,
-                        build_semantic=False,
                     )
                 finally:
                     idx.close()
@@ -324,13 +318,10 @@ class MainWindow(QMainWindow):
         self.archive_tab.step1_segments_ready.connect(self._arc_start_from_step1)
         self.settings_tab = SettingsTab(current_language=self.current_language)
         self.about_tab = AboutTab()
-        self.accuracy_screen = AccuracyScreen()
+        self.support_tools_screen = SupportToolsScreen()
         self.repository_screen = RepositoryScreen()
         self.repository_screen.log_message.connect(
             lambda m, lvl: self.log(m, lvl)
-        )
-        self.repository_screen.semantic_progress_changed.connect(
-            self._on_kho_semantic_progress
         )
 
         # Wrap each in a ScreenContainer (header + back button)
@@ -339,7 +330,7 @@ class MainWindow(QMainWindow):
             (FUNCTION_PDF_TO_WORD, "Chuyển scan PDF → Word", self.dnd_tab),
             (FUNCTION_DIGITIZATION, "Số hóa lưu trữ", self.archive_tab),
             (FUNCTION_REPOSITORY, "Kho lưu trữ", self.repository_screen),
-            (FUNCTION_ACCURACY, "Đo độ chính xác OCR", self.accuracy_screen),
+            (FUNCTION_SUPPORT_TOOLS, "Công cụ", self.support_tools_screen),
             (FUNCTION_SETTINGS, "Cấu hình", self.settings_tab),
             (FUNCTION_ABOUT, "Giới thiệu", self.about_tab),
         ]
@@ -368,16 +359,9 @@ class MainWindow(QMainWindow):
         self.screen_containers[FUNCTION_DIGITIZATION].add_title_widget(
             self._digitization_header_status
         )
-        self._kho_header_status = QLabel("")
-        self._kho_header_status.setVisible(False)
-        self._kho_header_status.setStyleSheet(
-            f"color: {COLOR_TEXT_SECONDARY}; font: 600 12px '{FONT_UI}';"
-        )
-        self.screen_containers[FUNCTION_REPOSITORY].add_header_widget(
-            self._kho_header_status
-        )
-        self._on_kho_semantic_progress(
-            self.repository_screen.current_semantic_progress()
+        self.screen_containers[FUNCTION_REPOSITORY].add_title_widget(
+            self.repository_screen.header_info_widget(),
+            stretch=100,
         )
         self._background_model_loading: set[str] = set()
         self._background_model_status: dict[str, str] = {}
@@ -392,8 +376,8 @@ class MainWindow(QMainWindow):
             FUNCTION_HOME: [],  # idle on home
             FUNCTION_PDF_TO_WORD: [],  # loaded in background; the screen opens immediately
             FUNCTION_DIGITIZATION: [GROUP_CORE_OCR, GROUP_CORRECTION],
-            FUNCTION_REPOSITORY: [],  # manages its own embedder/reranker
-            FUNCTION_ACCURACY: [GROUP_CORE_OCR],
+            FUNCTION_REPOSITORY: [],
+            FUNCTION_SUPPORT_TOOLS: [GROUP_CORE_OCR],
             FUNCTION_SETTINGS: [],
             FUNCTION_ABOUT: [],
         }
@@ -415,8 +399,8 @@ class MainWindow(QMainWindow):
         self.splitter.setStretchFactor(1, 0)
         self.splitter.setSizes([800, 300])
 
-        # Wire AccuracyScreen's log to the global log panel
-        self.accuracy_screen.log_message.connect(
+        # Wire SupportToolsScreen's log to the global log panel
+        self.support_tools_screen.log_message.connect(
             lambda msg, lvl: self.log(msg, lvl)
         )
 
@@ -448,7 +432,6 @@ class MainWindow(QMainWindow):
         self.dnd_tab.stop_clicked.connect(self.stop_ocr)
         self.dnd_tab.clear_clicked.connect(self.clear_list)
         self.dnd_tab.file_list.files_dropped.connect(self.drop_files)
-        self.dnd_tab.chk_export.toggled.connect(self._on_pdf_word_export_toggled)
 
         # Archive tab
         self.archive_tab.browse_input_clicked.connect(self._arc_browse_input)
@@ -472,10 +455,6 @@ class MainWindow(QMainWindow):
         effective = list(groups or [])
         if GROUP_CORRECTION in effective and not bool(self._saved.get("correct", True)):
             effective.remove(GROUP_CORRECTION)
-        if (function_id == FUNCTION_PDF_TO_WORD
-                and GROUP_TABLE_EXTRACTION in effective
-                and not self.dnd_tab.chk_export.isChecked()):
-            effective.remove(GROUP_TABLE_EXTRACTION)
         return effective
 
     def _navigate_to(self, function_id: str):
@@ -540,7 +519,7 @@ class MainWindow(QMainWindow):
             FUNCTION_PDF_TO_WORD: "Đang chuẩn bị: Chuyển scan PDF → Word",
             FUNCTION_DIGITIZATION: "Đang chuẩn bị: Số hóa lưu trữ",
             FUNCTION_REPOSITORY: "Đang mở Kho lưu trữ",
-            FUNCTION_ACCURACY: "Đang chuẩn bị: Đo độ chính xác OCR",
+            FUNCTION_SUPPORT_TOOLS: "Đang chuẩn bị: Công cụ",
             FUNCTION_SETTINGS: "Đang chuẩn bị: Cấu hình",
             FUNCTION_ABOUT: "Đang chuẩn bị: Giới thiệu",
         }
@@ -681,10 +660,6 @@ class MainWindow(QMainWindow):
                 daemon=True,
             ).start()
 
-    def _on_pdf_word_export_toggled(self, checked: bool):
-        if checked and getattr(self, "_current_function", None) == FUNCTION_PDF_TO_WORD:
-            self._start_background_model_loads(FUNCTION_PDF_TO_WORD)
-
     def _pdf_to_word_run_groups(self) -> list[str]:
         return self._effective_model_groups(
             FUNCTION_PDF_TO_WORD,
@@ -821,24 +796,6 @@ class MainWindow(QMainWindow):
                 return False
         return True
 
-    def _on_kho_semantic_progress(self, progress):
-        text = ""
-        try:
-            if progress and progress.total_chunks > 0 and not progress.done:
-                text = (
-                    f"Đang lập chỉ mục ngữ nghĩa: còn "
-                    f"{progress.pending_docs} file ({progress.percent}%)"
-                )
-        except Exception:
-            text = ""
-        if hasattr(self, "_kho_header_status"):
-            self._kho_header_status.setText(text)
-            self._kho_header_status.setVisible(bool(text))
-        try:
-            self.home_screen.set_function_status(FUNCTION_REPOSITORY, text)
-        except Exception:
-            pass
-
     def _cancel_running_task(self):
         """User confirmed cancel from the back-button dialog. Stops pipeline
         and cleans up obvious temp files (pre_*.pdf in known dirs)."""
@@ -919,6 +876,7 @@ class MainWindow(QMainWindow):
             "kie_mode": None,
             "doc_types": doc_type_defaults,
             "catalogs": catalog_defaults,
+            "theme": ACTIVE_THEME,
         }
 
         if os.path.exists(settings_path):
@@ -926,6 +884,8 @@ class MainWindow(QMainWindow):
                 if "General" in self.config:
                     self.current_language = self.config["General"].get("Language", "en")
                     translations.set_lang(self.current_language)
+                    theme_val = str(self.config["General"].get("Theme", ACTIVE_THEME)).strip().lower()
+                    self._saved["theme"] = "light" if theme_val == "light" else "dark"
 
                 if "OCR" in self.config:
                     self._saved["w_page"] = self.config["OCR"].get("WaitPerPage", "1.0")
@@ -943,7 +903,9 @@ class MainWindow(QMainWindow):
                     self.max_parallel_ocr_files = conc  # legacy attribute name kept
 
                     self._saved["correct"] = self.config["OCR"].getboolean("CorrectEnabled", True)
-                    self._saved["export"] = self.config["OCR"].getboolean("ExportEnabled", True)
+                    # PDF-to-Word now always exports DOCX; keep the old
+                    # setting ignored so stale settings.ini cannot disable it.
+                    self._saved["export"] = True
                     self._saved["verbose"] = self.config["OCR"].getboolean("VerboseLog", True)
                     self._saved["show_log_panel"] = self.config["OCR"].getboolean("ShowLogPanel", True)
 
@@ -1018,9 +980,9 @@ class MainWindow(QMainWindow):
             kie_mode=self._normalize_kie_mode_setting(s.get("kie_mode")),
             doc_types=s.get("doc_types", []),
             catalogs=s.get("catalogs"),
+            theme=s.get("theme", ACTIVE_THEME),
         )
 
-        self.dnd_tab.chk_export.setChecked(s["export"])
         self.log_panel.set_verbose(s["verbose"])
         self._toggle_log_panel(s["show_log_panel"])
 
@@ -1042,13 +1004,19 @@ class MainWindow(QMainWindow):
         val_exp = 1
         self.max_export_workers = val_exp
 
-        self.config["General"] = {"Language": self.current_language}
+        new_theme = "light" if str(vals.get("theme", "dark")).lower() == "light" else "dark"
+        self.config["General"] = {
+            "Language": self.current_language,
+            "Theme": new_theme,
+        }
+        theme_changed = new_theme != ACTIVE_THEME
+        self._saved["theme"] = new_theme
         self.config["OCR"] = {
             "WaitPerPage": vals["wait_page"],
             "ComparisonInterval": vals["compare_int"],
             "MaxConcurrentOCR": str(val_ocr),
             "CorrectEnabled": str(bool(vals.get("correct", True))),
-            "ExportEnabled": str(self.dnd_tab.chk_export.isChecked()),
+            "ExportEnabled": "True",
             "VerboseLog": str(vals["verbose"]),
             "ShowLogPanel": str(vals["show_log_panel"]),
         }
@@ -1099,6 +1067,13 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self.log(f"Failed to save settings: {e}", LOG_ERROR)
 
+        if theme_changed:
+            QMessageBox.information(
+                self,
+                get_text("lbl_theme"),
+                get_text("msg_theme_restart_required"),
+            )
+
     # ================================================================
     # LOG PANEL TOGGLE
     # ================================================================
@@ -1123,7 +1098,7 @@ class MainWindow(QMainWindow):
             "Thao tác này sẽ xóa toàn bộ dữ liệu trong Kho lưu trữ nội bộ:\n"
             "- Hồ sơ và metadata\n"
             "- PDF đã chuyển vào kho\n"
-            "- Chỉ mục tìm kiếm nhanh và ngữ nghĩa\n\n"
+            "- Chỉ mục tìm kiếm nhanh\n\n"
             f"Kho hiện tại: {archive_path}\n\n"
             "Không thể hoàn tác.",
             QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Ok,
@@ -1155,10 +1130,6 @@ class MainWindow(QMainWindow):
                 f"Không reset được dữ liệu kho:\n{e}",
             )
             return
-
-        self._on_kho_semantic_progress(
-            self.repository_screen.current_semantic_progress()
-        )
         self.log(f"Đã reset dữ liệu kho: {reset_path}", LOG_SUCCESS)
         QMessageBox.information(
             self,
@@ -1392,7 +1363,24 @@ class MainWindow(QMainWindow):
                     lambda idx: self.show_corrected_content(idx, "dnd"))
                 w.view_metadata_clicked.connect(
                     lambda idx: self.show_metadata_dialog(idx, "dnd"))
+                w.open_folder_clicked.connect(self.open_output_folder)
                 w.remove_clicked.connect(self.remove_file)
+
+    def open_output_folder(self, idx):
+        if not (0 <= idx < len(self.dnd_files)):
+            return
+        output_path = self.dnd_files[idx].get("output_path") or ""
+        if not output_path:
+            return
+        output_path = os.path.abspath(output_path)
+        folder = os.path.dirname(output_path)
+        if not os.path.isdir(folder):
+            QMessageBox.warning(self, "Lỗi", f"Không tìm thấy thư mục:\n{folder}")
+            return
+        try:
+            os.startfile(folder)
+        except Exception as exc:
+            QMessageBox.warning(self, "Lỗi", f"Không mở được thư mục:\n{folder}\n{exc}")
 
     # ================================================================
     # STATUS UPDATES (from worker threads via signals)
@@ -1606,9 +1594,7 @@ class MainWindow(QMainWindow):
                 cached_orig = self.dnd_files[idx].get("original_text", "")
                 dialog.refresh_state(cached_orig, corrected_text)
 
-                # Export if enabled
-                if self.dnd_tab.chk_export.isChecked():
-                    self._export_from_comparison(idx, output_path)
+                self._export_from_comparison(idx, output_path)
             else:
                 QMessageBox.critical(self, get_text("msg_error"), msg)
                 self.log(f"Failed to save: {msg}", LOG_ERROR)
@@ -1736,6 +1722,20 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         self.archive_tab.set_input_folder(d)
+
+        confirm = QMessageBox(self)
+        confirm.setWindowTitle("Bước 2 - Trích xuất KIE")
+        confirm.setIcon(QMessageBox.Icon.Question)
+        confirm.setText("Đã chọn xong thư mục PDF.")
+        confirm.setInformativeText(
+            "Bạn muốn xử lý ngay hay chỉ lưu đường dẫn để xử lý sau?"
+        )
+        btn_process = confirm.addButton("Xử lý", QMessageBox.ButtonRole.AcceptRole)
+        btn_skip = confirm.addButton("Bỏ qua", QMessageBox.ButtonRole.RejectRole)
+        confirm.setDefaultButton(btn_process)
+        confirm.exec()
+        if confirm.clickedButton() is btn_process:
+            self._arc_start_process()
 
     def _arc_start_process(self):
         """Start the new 3-stage archive pipeline (page-level OCR + correction
@@ -1943,10 +1943,13 @@ class MainWindow(QMainWindow):
         specs = []
         for doc in documents:
             seg = doc.get("_step1_segment")
-            if seg is None:
+            source_pages = doc.get("_step1_source_pages")
+            if not source_pages and seg is not None:
+                source_pages = list(seg.page_indices())
+            if not source_pages:
                 continue
             page_cache = {}
-            for local_idx, src_idx in enumerate(seg.page_indices()):
+            for local_idx, src_idx in enumerate(source_pages):
                 cached = session.get_cached_page(src_idx)
                 if cached is not None:
                     page_cache[local_idx] = cached
@@ -1954,6 +1957,7 @@ class MainWindow(QMainWindow):
                 input_path=doc["pdf_path"],
                 file_id=os.path.basename(doc["pdf_path"]),
                 source_document_path=doc.get("_step1_source_pdf"),
+                source_page_indices=list(source_pages),
                 pre_ocr_cache=page_cache,
                 from_step1=True,
             ))
@@ -2223,32 +2227,16 @@ class MainWindow(QMainWindow):
         if ask.exec() == QMessageBox.StandardButton.Yes:
             self._arc_import_to_kho()
 
-    @staticmethod
-    def _kho_embedder_cached() -> bool:
-        """True if the embedding model is already on disk. Acceptable
-        forms:
-          1. E5 mix50 ONNX fp32 at `models/archive_models/e5-small-mix50-v2-onnx-fp32/`
-          2. E5 mix50 ONNX int8 at `models/archive_models/e5-small-mix50-v2-onnx-int8/`
-        Either avoids an on-demand Hugging Face download surprise."""
-        try:
-            from scanindex.infra.paths import get_base_dir
-            base = os.path.join(get_base_dir(), "models", "archive_models")
-            # Form 0: E5 mix50 ONNX fp32 (quality-first preferred backend)
-            if os.path.isfile(os.path.join(base, "e5-small-mix50-v2-onnx-fp32", "model.onnx")):
-                return True
-            # Form 1: E5 mix50 ONNX int8
-            if os.path.isfile(os.path.join(base, "e5-small-mix50-v2-onnx-int8", "model_quantized.onnx")):
-                return True
-        except Exception:
-            return False
-        return False
-
     def _arc_import_to_kho(self):
         """Step 3 button "Chuyển vào Kho" — push the current dossier into
         the internal Kho lưu trữ. Standalone: user can call this without
         first exporting externally."""
         if not self.archive_tab.confirm_unsaved_before_leave():
             return
+        try:
+            self.archive_tab._step2._save_current_fields()
+        except Exception:
+            pass
         documents = self.archive_tab.get_documents()
         if not documents:
             QMessageBox.information(self, "Chuyển vào Kho",
@@ -2291,6 +2279,7 @@ class MainWindow(QMainWindow):
                 "pdf_path": final_pdf,
                 "canonical_json_path": json_path,
                 "target_file_name": target_name,
+                "metadata": dict(doc.get("metadata") or {}),
             })
         if not docs_to_import:
             QMessageBox.warning(self, "Chuyển vào Kho",
@@ -2332,7 +2321,7 @@ class MainWindow(QMainWindow):
 
         worker = _KhoImportWorker(archive_path, codes, docs_to_import)
 
-        # The Kho screen opens its own HybridIndex (Tantivy + FAISS) at
+        # The Kho screen opens its own HybridIndex (Tantivy) at
         # app startup for fast browse/search. On Windows, Tantivy's
         # writer can't create the new .pos / .term files while another
         # Index instance has them mmap-mapped — we get ACCESS_DENIED.
@@ -2365,7 +2354,7 @@ class MainWindow(QMainWindow):
             msg = (f"Đã chuyển: {result.imported}\n"
                    f"Bỏ qua (đã có trong Kho): {result.skipped}\n"
                    f"Lỗi: {result.failed}\n\n"
-                   "Có thể tìm nhanh ngay. Chỉ mục ngữ nghĩa sẽ chạy nền.")
+                   "Có thể tìm kiếm ngay.")
             QMessageBox.information(self, "Chuyển vào Kho hoàn tất", msg)
             self.log(
                 f"Archive: imported to Kho — {result.imported}/{result.total}",
@@ -2463,7 +2452,7 @@ class MainWindow(QMainWindow):
             "max_workers": max_w,
             "do_correct": bool(self._saved.get("correct", True)),
             "do_metadata": False,
-            "do_export": self.dnd_tab.chk_export.isChecked(),
+            "do_export": True,
             "force_rerun": False,
         }
 
@@ -2540,7 +2529,7 @@ class MainWindow(QMainWindow):
             return
         f = self.dnd_files[idx]
         do_correct = bool(self._saved.get("correct", True))
-        do_export = self.dnd_tab.chk_export.isChecked()
+        do_export = True
 
         vals = self.settings_tab.get_values()
         try:

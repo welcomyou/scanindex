@@ -19,11 +19,6 @@ Trust anchors NOT covered here (separate channels):
   - Chrome ScreenAI: fetched from Google CDN by
     scanindex.core.ocr.screen_ai_downloader. Trusted via Google's
     signed Chrome extension (CRX) channel, not SHA256.
-  - BAAI/bge-reranker-v2-m3: fetched lazily by sentence_transformers
-    if the user enables Accurate search mode. Trusted via HF's own
-    LFS hash + the upstream BAAI account. Not currently wired up in
-    UI (UI passes None for the reranker arg).
-
 Failure modes are loud: any hash mismatch, missing file, or HF error
 halts the script with a non-zero exit. Better to fail than to leave the
 app loading a tampered model.
@@ -65,23 +60,6 @@ MODELS_CONFIG = [
             'layoutlmv3_fontgray_norm_final_epoch25/tokenizer_config.json': 'f726bf300393378f5db81dcd7db1562712a4fc694e6119a18f74523eead55a02',
             'layoutlmv3_fontgray_norm_final_epoch25/training_summary.json': '7ef16a831f1f8d02275c6d0a4dae76947bd9c10915de6e7e076b9210336309b7',
             'layoutlmv3_fontgray_norm_final_epoch25/vocab.json': 'ed19656ea1707df69134c4af35c8ceda2cc9860bf2c3495026153a133670ab5e',
-        },
-    },
-    {
-        "model_id":    'e5-small-vn-archive-mix50',
-        "repo_id":     'welcomyou/e5-small-vn-archive-mix50',
-        "type":        'huggingface',
-        "sources":     ['archive_models/e5-small-mix50-v2-onnx-fp32'],
-        "revision":    'e700c6f6a57818df1843256c9668433850f33f3b',
-        "description": 'E5-small mix50 v2 ONNX fp32 (archive embedder)',
-        "integrity_files": {
-            'archive_models/e5-small-mix50-v2-onnx-fp32/config.json': '51d8afcd56f9cdaf391c71abe73f1179fb52e71baa944234d27d070992917a9d',
-            'archive_models/e5-small-mix50-v2-onnx-fp32/model.onnx': '4f203af8192028636d9eba2c6e60b6a224d64196492735dfb4d77f1ba7b172be',
-            'archive_models/e5-small-mix50-v2-onnx-fp32/onnx_metadata.json': 'f53a7647df4ae429de9b6736d793f4158b004ef5e3e6c9c98889b525d0cade0f',
-            'archive_models/e5-small-mix50-v2-onnx-fp32/sentencepiece.bpe.model': 'cfc8146abe2a0488e9e2a0c56de7952f7c11ab059eca145a0a727afce0db2865',
-            'archive_models/e5-small-mix50-v2-onnx-fp32/special_tokens_map.json': '38d989b0fdad0fec0c67c14b1f3c8b68184022cf6d4adc5444526ced8653f738',
-            'archive_models/e5-small-mix50-v2-onnx-fp32/tokenizer.json': '9a1e21e6d1e5cd51e1c5784f27451f04a2e44211197912a384531e818f0ec6ed',
-            'archive_models/e5-small-mix50-v2-onnx-fp32/tokenizer_config.json': '65f5e8cbd6d2eb4cec9e437e58b96f0a21202dd94f0b84b702f979995ad6a770',
         },
     },
     {
@@ -374,3 +352,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

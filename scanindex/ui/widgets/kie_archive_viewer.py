@@ -69,6 +69,29 @@ FIELD_NUMBER_MAP = {
     "SIGNER_NAME":        9,
 }
 
+FIELD_DISPLAY_NAMES = {
+    "REGIME_HEADER":      "Tiêu ngữ",
+    "ISSUE_ORG_SUPERIOR": "Cơ quan cấp trên",
+    "ISSUE_ORG_NAME":     "Cơ quan ban hành",
+    "DOC_NUMBER_SYMBOL":  "Số, ký hiệu văn bản",
+    "PLACE_DATE":         "Địa danh, ngày tháng",
+    "DOC_SUBJECT":        "Trích yếu",
+    "ADDRESSEE":          "Kính gửi",
+    "RECIPIENTS":         "Nơi nhận",
+    "SIGNER_ROLE":        "Chức vụ người ký",
+    "SIGNER_NAME":        "Người ký",
+}
+
+
+def _field_display_name(label: str) -> str:
+    return FIELD_DISPLAY_NAMES.get(label, label)
+
+
+def _field_menu_text(label: str) -> str:
+    name = _field_display_name(label)
+    return f"{name} ({label})" if name != label else label
+
+
 _LINE_NUM_RE = re.compile(r"(?:^|[_\-.])(?:l|line)[_\-.]?(\d+)(?=$|[_\-.])", re.IGNORECASE)
 
 
@@ -200,11 +223,14 @@ class _PdfPageWidget(QLabel):
     def __init__(self, page_index: int, parent: QWidget | None = None):
         super().__init__(parent)
         self.page_index = page_index
-        # `_source_pixmap`: pristine fitz render — never scaled, used as the
-        # source for fast zoom rescales so we don't accumulate blur.
+        # `_source_pixmap`: pristine high-resolution fitz render. Step 2 is
+        # opened at 50%, but zooming must scale from this high-res source
+        # instead of from the 50% display pixmap; otherwise the page gets soft
+        # as soon as users zoom in.
         # `base_pixmap`: pixmap at the current display scale — what overlays
         # are painted onto by `_repaint`.
         self._source_pixmap: Optional[QPixmap] = None
+        self._source_render_scale = 1.0
         self.base_pixmap: Optional[QPixmap] = None
         self.pdf_width = 0.0
         self.pdf_height = 0.0
@@ -217,7 +243,6 @@ class _PdfPageWidget(QLabel):
         self.fuzzy_overlays: list[dict] = []          # [{bbox, text, score, rank}]
         self.word_to_line: dict[str, str] = {}       # word_id → line_id
         self.line_to_words: dict[str, list[str]] = {}
-        self.line_mode = False                        # single click selects entire line
         # Coord-system metadata copied from canonical JSON. Both flags here
         # are READ in _bbox_to_rect (and therefore also affect hit testing,
         # since hit testing reuses the same projection).
@@ -239,17 +264,45 @@ class _PdfPageWidget(QLabel):
 
     # ---- public ----------------------------------------------------
 
-    def set_page(self, pixmap: QPixmap, pdf_w: float, pdf_h: float, scale: float):
-        # Store the fitz output as the unscaled source so subsequent zoom
-        # ticks can rescale from it without cumulative blur.
+    def set_page(
+        self,
+        pixmap: QPixmap,
+        pdf_w: float,
+        pdf_h: float,
+        scale: float,
+        source_scale: float | None = None,
+    ):
+        # Store the fitz output as the unscaled high-res source so subsequent
+        # zoom ticks can rescale from it without cumulative blur.
         self._source_pixmap = pixmap
-        self.base_pixmap = pixmap
+        self._source_render_scale = float(source_scale or scale or 1.0)
         self.pdf_width = pdf_w
         self.pdf_height = pdf_h
         self.render_scale = scale
         self._overlaid_pixmap = None
-        self.setPixmap(pixmap)
-        self.setFixedSize(pixmap.size())
+        self.rescale_from_source(scale)
+
+    def rescale_from_source(self, display_scale: float):
+        """Update the visible pixmap from the high-res source render."""
+        self.render_scale = display_scale
+        target_w = max(1, int(round(self.pdf_width * display_scale)))
+        target_h = max(1, int(round(self.pdf_height * display_scale)))
+        src = self._source_pixmap
+        if src is None or src.isNull():
+            self.setFixedSize(target_w, target_h)
+            return
+        if src.width() == target_w and src.height() == target_h:
+            display_pm = src
+        else:
+            display_pm = src.scaled(
+                target_w, target_h,
+                Qt.AspectRatioMode.IgnoreAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        self.base_pixmap = display_pm
+        self._overlaid_pixmap = None
+        self.setPixmap(display_pm)
+        self.setFixedSize(display_pm.size())
 
     def set_word_rects(self, words: list[tuple[str, list[float]]]):
         self.word_rects = list(words)
@@ -530,7 +583,7 @@ class _PdfPageWidget(QLabel):
             return
         off = self._pixmap_offset()
         pos = event.position() - off
-        modifiers = self._drag_modifiers
+        modifiers = self._drag_modifiers | event.modifiers()
         was_dragging = self._is_dragging
 
         if was_dragging:
@@ -566,12 +619,7 @@ class _PdfPageWidget(QLabel):
                         self.bbox_clicked_non_edit.emit(self.page_index, wid)
                         return
                     op = self._op_from_modifiers(modifiers, default="toggle")
-                    if self.line_mode:
-                        line_id = self.word_to_line.get(wid)
-                        siblings = list(self.line_to_words.get(line_id, []) or [wid])
-                        self.word_selection_changed.emit(self.page_index, siblings, op)
-                    else:
-                        self.word_selection_changed.emit(self.page_index, [wid], op)
+                    self.word_selection_changed.emit(self.page_index, [wid], op)
                     return
             # Empty-area click in edit mode exits edit mode only; the parent
             # keeps pending bbox edits dirty until an explicit save/leave.
@@ -645,12 +693,16 @@ class KieArchiveViewer(QWidget):
 
     prev_file_requested = Signal()
     next_file_requested = Signal()
-    field_words_changed = Signal(str, str)   # field_id, op  (op = set|add|remove|toggle)
+    field_words_changed = Signal(str, str)   # field_id, op  (set/add/remove/toggle/deleted:<label>)
     field_clicked = Signal(str)              # field_id (when user clicks a word in non-edit mode)
     fuzzy_match_picked = Signal(str, list)    # text, bbox_pdf
     dirty_changed = Signal(bool)
 
     RENDER_DPI = 150
+    # Match Step 1's strategy: keep a high-quality base raster and scale the
+    # visible pixmap from it. At 150 DPI this is roughly 2.08x PDF points, so
+    # the default 50% view can zoom to 100% without reusing a low-res image.
+    SOURCE_RENDER_SCALE = RENDER_DPI / 72.0
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -664,11 +716,10 @@ class KieArchiveViewer(QWidget):
         # zoom controls.
         self._zoom = 0.5
         self._edit_mode = False
-        self._line_mode = False
         self._dirty = False
         self._last_dirty_resolution: Optional[str] = None
         self._active_field_id: Optional[str] = None
-        # Pixmap cache keyed by (pdf_path, zoom, page_idx) — switching back
+        # Pixmap cache keyed by (pdf_path, source_scale, page_idx) — switching back
         # to a file we've already opened reuses cached pixmaps so the file
         # appears instantly instead of blocking on fitz re-render.
         self._pixmap_cache: dict[tuple, QPixmap] = {}
@@ -754,16 +805,6 @@ class KieArchiveViewer(QWidget):
         self._btn_edit.setStyleSheet(self._toggle_style())
         self._btn_edit.toggled.connect(self._on_edit_toggled)
         h.addWidget(self._btn_edit)
-
-        # Line-mode toggle: clicking any word in a line picks the whole line
-        self._btn_line = QPushButton("☰ Line")
-        self._btn_line.setCheckable(True)
-        self._btn_line.setToolTip(
-            "Chế độ chọn theo dòng: click 1 từ sẽ chọn cả dòng chứa từ đó"
-        )
-        self._btn_line.setStyleSheet(self._toggle_style())
-        self._btn_line.toggled.connect(self._on_line_mode_toggled)
-        h.addWidget(self._btn_line)
 
         # Save button
         self._btn_save = QPushButton("💾 Lưu")
@@ -1065,14 +1106,15 @@ class KieArchiveViewer(QWidget):
         if pw.base_pixmap is not None:
             return  # already rendered
         page = self._doc[page_idx]
-        scale = self.RENDER_DPI / 72.0 * self._zoom
+        display_scale = self.RENDER_DPI / 72.0 * self._zoom
+        source_scale = max(self.SOURCE_RENDER_SCALE, display_scale)
         rotation = self._get_page_rotation(page_idx)
         # Cache key includes rotation so a manually-rotated page does not
         # collide with the un-rotated render.
-        cache_key = (self._pdf_path, self._zoom, page_idx, rotation)
+        cache_key = (self._pdf_path, round(source_scale, 4), page_idx, rotation)
         pm = self._pixmap_cache.get(cache_key)
         if pm is None:
-            mat = fitz.Matrix(scale, scale)
+            mat = fitz.Matrix(source_scale, source_scale)
             pix = page.get_pixmap(matrix=mat, annots=True)
             img = QImage(pix.samples, pix.width, pix.height, pix.stride,
                           QImage.Format.Format_RGB888)
@@ -1088,7 +1130,7 @@ class KieArchiveViewer(QWidget):
         w_pts, h_pts = page.rect.width, page.rect.height
         if rotation in (90, 270):
             w_pts, h_pts = h_pts, w_pts
-        pw.set_page(pm, w_pts, h_pts, scale)
+        pw.set_page(pm, w_pts, h_pts, display_scale, source_scale=source_scale)
         # set_page wipes word_rects/ownership; re-apply this page's data
         self._apply_word_data_to_single_page(page_idx)
         # Re-apply highlights now that the pixmap is in place
@@ -1141,8 +1183,6 @@ class KieArchiveViewer(QWidget):
         pw.set_word_ownership(ownership)
         pw.word_to_line = word_to_line
         pw.line_to_words = line_to_words
-        pw.line_mode = self._line_mode
-
     def _on_scroll(self, _value: int):
         """Coalesce rapid scroll events; queue any newly-visible pages."""
         if self._scroll_debounce_pending:
@@ -1210,7 +1250,7 @@ class KieArchiveViewer(QWidget):
         if self._canonical and self._active_field_id:
             for f in (self._canonical.get("annotations") or {}).get("field_instances") or []:
                 if f.get("field_id") == self._active_field_id:
-                    label_txt = f"Đang sửa: {f.get('label','?')}"
+                    label_txt = f"Đang sửa: {_field_menu_text(f.get('label', '?'))}"
                     break
         if self._edit_mode and not label_txt:
             label_txt = "Chọn field bên metadata để sửa bbox"
@@ -1430,46 +1470,20 @@ class KieArchiveViewer(QWidget):
             self._apply_zoom_in_place()
 
     def _apply_zoom_in_place(self):
-        """Resize page widgets and Qt-scale their cached pixmaps without
-        destroying widgets and without calling PyMuPDF. Eliminates the
-        flicker users saw when every zoom step rebuilt the page list and
-        re-rendered through fitz.
-
-        Trade-off: pages already rendered at the previous zoom stay slightly
-        soft when zoomed far out/in, since we never re-rasterise. Pages that
-        are still placeholders will render at the correct (new) zoom on the
-        next viewport tick because the cache key in `_render_one_page`
-        includes `self._zoom`."""
+        """Resize page widgets and scale from the high-resolution source
+        pixmap, mirroring Step 1's zoom path. This keeps zoom responsive
+        while avoiding the old 50%-source blur."""
         if not self._doc:
             return
         new_scale = self.RENDER_DPI / 72.0 * self._zoom
         for pw in self._page_widgets:
-            new_w = int(round(pw.pdf_width * new_scale))
-            new_h = int(round(pw.pdf_height * new_scale))
-            pw.setFixedSize(new_w, new_h)
-            pw.render_scale = new_scale
-            # Always rescale from the pristine fitz output so repeated zoom
-            # ticks don't compound blur. Update `base_pixmap` to the new size
-            # so `_repaint` (which copies base_pixmap) draws overlays on a
-            # correctly-sized canvas — otherwise QLabel.AlignCenter would
-            # show only the centered crop of an over-sized pixmap.
-            src = pw._source_pixmap
-            if src is not None and not src.isNull():
-                scaled = src.scaled(
-                    new_w, new_h,
-                    Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation,
-                )
-                pw.base_pixmap = scaled
-                pw._overlaid_pixmap = None
-                pw.setPixmap(scaled)
+            pw.rescale_from_source(new_scale)
             try:
                 pw._repaint()
             except Exception:
                 pw.update()
         # Pixmaps not yet loaded (placeholders) need to be re-queued so they
-        # render at the *new* zoom — the cache key includes zoom so we don't
-        # accidentally pull a stale rasterisation.
+        # render at the current display scale from the high-res source cache.
         self._render_queue.clear()
         self._render_queued = {
             pw.page_index for pw in self._page_widgets
@@ -1518,11 +1532,6 @@ class KieArchiveViewer(QWidget):
         for pw in self._page_widgets:
             pw.set_edit_mode(self._edit_mode)
         self._update_active_label()
-
-    def _on_line_mode_toggled(self, checked: bool):
-        self._line_mode = bool(checked)
-        for pw in self._page_widgets:
-            pw.line_mode = self._line_mode
 
     # ---- unsaved-changes guard -------------------------------------
 
@@ -1651,7 +1660,10 @@ class KieArchiveViewer(QWidget):
         # The set of labels users can create — same as kie_viewer's V3 set
         labels = list(FIELD_NUMBER_MAP.keys())
         for label in labels:
-            act = QAction(f"{FIELD_NUMBER_MAP.get(label, '?')} • {label}", menu)
+            act = QAction(
+                f"{FIELD_NUMBER_MAP.get(label, '?')} • {_field_menu_text(label)}",
+                menu,
+            )
             act.triggered.connect(
                 lambda _checked=False, lbl=label, pi=page_idx:
                     self._create_empty_field(lbl, pi)
@@ -1712,7 +1724,7 @@ class KieArchiveViewer(QWidget):
             text_preview = text_preview[:40] + "..."
 
         # Header (non-clickable info row)
-        info = QAction(f"{label} • {text_preview}", menu)
+        info = QAction(f"{_field_menu_text(label)} • {text_preview}", menu)
         info.setEnabled(False)
         menu.addAction(info)
         menu.addSeparator()
@@ -1731,10 +1743,15 @@ class KieArchiveViewer(QWidget):
 
         menu.exec(global_pos)
 
-    def _delete_field(self, field_id: str):
-        """Remove the field from the canonical annotation and refresh the UI."""
+    def _remove_field_instance(self, field_id: str, *, confirm: bool) -> bool:
+        """Remove a field instance and any relations pointing to it.
+
+        `confirm=False` is used when the user explicitly removes the last bbox
+        of the active field. In that flow an empty selection means delete the
+        KIE field entirely, not leave an unclickable placeholder behind.
+        """
         if not field_id or not self._canonical:
-            return
+            return False
         ann = self._canonical.get("annotations") or {}
         fields = ann.get("field_instances") or []
         target = None
@@ -1743,17 +1760,19 @@ class KieArchiveViewer(QWidget):
                 target = f
                 break
         if target is None:
-            return
+            return False
 
-        confirm = QMessageBox.question(
-            self, "Xác nhận xóa",
-            f"Xóa field '{target.get('label','?')}'?\n"
-            f"Nội dung: {(target.get('text') or '').strip()[:80]}",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if confirm != QMessageBox.StandardButton.Yes:
-            return
+        label = str(target.get("label") or "")
+        if confirm:
+            answer = QMessageBox.question(
+                self, "Xác nhận xóa",
+                f"Xóa field '{target.get('label','?')}'?\n"
+                f"Nội dung: {(target.get('text') or '').strip()[:80]}",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return False
 
         new_fields = [f for f in fields if f.get("field_id") != field_id]
         # Also drop any relations that point to this field
@@ -1771,9 +1790,14 @@ class KieArchiveViewer(QWidget):
             self._active_field_id = None
         self._mark_dirty()
         # Surface the change to the archive screen so the metadata form refreshes
-        self.field_words_changed.emit(field_id, "deleted")
-        self._refresh_active_field_highlight()
+        self.field_words_changed.emit(field_id, f"deleted:{label}" if label else "deleted")
+        self._apply_word_data_to_pages()
         self._update_active_label()
+        return True
+
+    def _delete_field(self, field_id: str):
+        """Remove the field from the canonical annotation and refresh the UI."""
+        self._remove_field_instance(field_id, confirm=True)
 
     def _on_word_selection_changed(self, page_idx: int, word_ids: list[str], op: str):
         if not self._canonical:
@@ -1816,6 +1840,10 @@ class KieArchiveViewer(QWidget):
                     new_set.remove(wid); current.discard(wid)
                 else:
                     new_set.append(wid); current.add(wid)
+
+        if not new_set:
+            self._remove_field_instance(self._active_field_id, confirm=False)
+            return
 
         target["word_ids"] = new_set
         if new_set:
