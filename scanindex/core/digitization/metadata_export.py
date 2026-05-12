@@ -238,7 +238,7 @@ def write_enriched_canonical_json(canonical_json_path: str, annotation: dict,
     """Inject `annotation` into the canonical JSON's `annotations` block and
     write back. Returns the path written."""
     from scanindex.core.canonical_io import (
-        finalize_and_save_canonical,
+        save_canonical,
         load_canonical,
     )
 
@@ -256,7 +256,7 @@ def write_enriched_canonical_json(canonical_json_path: str, annotation: dict,
     out = output_path or canonical_json_path
     # profile=None → resolved from doc's pipeline.ocr.canonical_profile,
     # preserving slim status if the source was slim.
-    written = finalize_and_save_canonical(out, doc)
+    written = save_canonical(out, doc)
     return str(written)
 
 

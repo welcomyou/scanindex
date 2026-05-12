@@ -376,11 +376,11 @@ def _finalize_canonical(canonical: dict, json_path: str | None = None) -> dict:
     """
     from scanindex.core.canonical_io import (
         LAYOUTLMV3_RUNTIME_PROFILE,
-        finalize_and_save_canonical,
+        save_canonical,
     )
 
     if json_path:
-        finalize_and_save_canonical(json_path, canonical, profile=LAYOUTLMV3_RUNTIME_PROFILE)
+        save_canonical(json_path, canonical, profile=LAYOUTLMV3_RUNTIME_PROFILE)
     return canonical
 
 

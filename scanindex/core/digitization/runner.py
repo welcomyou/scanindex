@@ -133,13 +133,13 @@ def write_aggregated_excel(tasks_or_docs, excel_path: str,
         the row in Step 2. Files whose row was never opened still have a
         valid annotation — read it from disk so the export covers every
         finished doc, not just the inspected ones."""
-        from scanindex.core.canonical_io import load_canonical, resolve_existing_companion
+        from scanindex.core.canonical_io import load_canonical, resolve_companion
         json_path = entry.get("json_path") or ""
         if not json_path:
             output_path = entry.get("output_path") or ""
             if output_path:
                 json_path = output_path + ".json"
-        resolved = resolve_existing_companion(json_path) if json_path else None
+        resolved = resolve_companion(json_path) if json_path else None
         if resolved is None:
             return {}
         try:

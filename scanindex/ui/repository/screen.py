@@ -337,9 +337,9 @@ class _PrepareAddFileWorker(QThread):
             for task in tasks:
                 if getattr(task, "error", None):
                     raise RuntimeError(f"{task.file_id}: {task.error}")
-                from scanindex.core.canonical_io import load_canonical, resolve_existing_companion
+                from scanindex.core.canonical_io import load_canonical, resolve_companion
                 output_pdf = Path(getattr(task, "output_pdf_path", "") or "")
-                output_json = resolve_existing_companion(getattr(task, "output_json_path", "") or "")
+                output_json = resolve_companion(getattr(task, "output_json_path", "") or "")
                 if not output_pdf.exists() or output_json is None:
                     raise RuntimeError(
                         f"{task.file_id}: Thiếu PDF OCR hoặc JSON KIE sau khi xử lý"

@@ -2992,8 +2992,8 @@ class ProcessingPipeline:
             return
 
         # Find JSON companion: try _ocr.pdf.json or _ocr.pdf.json.zst
-        from scanindex.core.canonical_io import resolve_existing_companion
-        json_path = resolve_existing_companion(output_path)
+        from scanindex.core.canonical_io import resolve_companion
+        json_path = resolve_companion(output_path)
         if json_path is None:
             return
         json_path = str(json_path)

@@ -696,8 +696,8 @@ def extract_metadata(json_path, log_callback=None):
         "loai_van_ban": None,
     }
 
-    from scanindex.core.canonical_io import load_canonical, resolve_existing_companion
-    resolved = resolve_existing_companion(json_path) if json_path else None
+    from scanindex.core.canonical_io import load_canonical, resolve_companion
+    resolved = resolve_companion(json_path) if json_path else None
     if resolved is None:
         _log(f"Metadata: JSON not found: {json_path}", "err")
         return result
@@ -823,8 +823,8 @@ def extract_metadata(json_path, log_callback=None):
         "loai_van_ban": None,
     }
 
-    from scanindex.core.canonical_io import load_canonical, resolve_existing_companion
-    resolved = resolve_existing_companion(json_path) if json_path else None
+    from scanindex.core.canonical_io import load_canonical, resolve_companion
+    resolved = resolve_companion(json_path) if json_path else None
     if resolved is None:
         _log(f"Metadata: JSON not found: {json_path}", "err")
         return result

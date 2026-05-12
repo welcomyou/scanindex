@@ -2,40 +2,30 @@
 
 A canonical companion is the JSON sidecar that lives next to `_ocr.pdf`. It
 holds OCR pages/lines/words, KIE annotations, and document metadata. Every
-producer in the app — Tab "Chuyển scan PDF → Word", Số hóa lưu trữ Bước 1,
-Số hóa lưu trữ Bước 2 (per-segment + signer re-OCR + digital merge + KIE
-augment), Quét file mật, OCR accuracy benchmark — writes the **same** schema
-(`ocr_kie_document_v3` in `kie/json_utils.py`). The only producer-side
-variance is the canonical profile (full vs `layoutlmv3_runtime` slim) and
-the engine label.
+producer (Tab "Chuyển scan PDF → Word", Số hóa lưu trữ Bước 1+2, Quét file
+mật, OCR accuracy benchmark) writes the same schema `ocr_kie_document_v3`
+(see `kie/json_utils.py`). Producer-side variance is limited to the canonical
+profile (full vs `layoutlmv3_runtime` slim) and the engine label.
 
-Two write entrypoints:
+Public API:
 
-  * `save_canonical(path, data, compress=, level=)` — low-level: atomic
-    write, optional zstd. Caller controls every byte.
+    load_canonical(path)              transparent for .json and .json.zst
+    save_canonical(path, data, *,     upgrade + conditional slim + atomic
+                   profile=None,      write — compressed by default
+                   compress=True)
 
-  * `finalize_and_save_canonical(path, data, profile=, compress=, level=)`
-    — high-level: runs the shared finishing pipeline before write —
+    resolve_companion(any_path)       existing companion or None
+    companion_for_pdf(pdf_path)       default companion path (may not exist)
+    companion_to_pdf(companion)       strip suffix back to PDF path
 
-        upgrade_ocr_data_in_place(data)
-        if profile resolves to a slim profile:
-            slim_canonical_for_layoutlmv3_runtime_in_place(data)
-        save_canonical(...)
+Profile resolution inside save_canonical: explicit `profile=` arg > value on
+`data.pipeline.ocr.canonical_profile` > none. This lets augment-and-rewrite
+callers stay slim if the source was slim.
 
-    Profile resolution: explicit `profile=` arg, else
-    `data["pipeline"]["ocr"]["canonical_profile"]` already on the document.
-    This matches `replace_canonical_page_with_page_result`'s detection so
-    augment-and-rewrite callers stay slim if the source was slim.
-
-Two read helpers:
-
-  * `load_canonical(path)` — auto-detects `.json` vs `.json.zst` by suffix or
-    zstd magic bytes. Dual-read works while a directory has both variants.
-  * `resolve_existing_companion(any_related_path)` — find the on-disk
-    companion given the PDF path or either companion suffix.
-
-Compression is OFF by default; switching it on is a per-callsite or
-per-config flag flip — disk format only changes when a caller opts in.
+Compression: on by default at zstd level 3. Real-world OCR JSON shrinks to
+~13% of plain size (87% saved); decompress+parse is ≈ raw json.load. Opt out
+at a specific callsite with `compress=False` — e.g. for end-user output
+files that should stay human-inspectable.
 """
 from __future__ import annotations
 
@@ -49,27 +39,24 @@ PathLike = Union[str, os.PathLike]
 JSON_SUFFIX = ".json"
 ZST_SUFFIX = ".json.zst"
 
-# Zstandard frame magic — first 4 bytes of every zstd stream. Lets
-# `load_canonical` accept either suffix without trusting the filename.
+# First 4 bytes of every zstd stream — lets `load_canonical` accept either
+# suffix without trusting the filename.
 _ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 
-# Canonical profile names that mean "this is the LayoutLMv3 runtime slim
-# variant". `slim_canonical_for_layoutlmv3_runtime_in_place` writes the `_v1`
-# suffix into pipeline.ocr.canonical_profile on the document, but callers
-# still pass the un-suffixed name as the profile argument. Both are accepted.
+# Canonical profile name for the LayoutLMv3 runtime slim variant.
+# `slim_canonical_for_layoutlmv3_runtime_in_place` stamps the `_v1` form into
+# `pipeline.ocr.canonical_profile` after slimming; callers pass the
+# un-suffixed name. Both are accepted by save_canonical's profile resolver.
 LAYOUTLMV3_RUNTIME_PROFILE = "layoutlmv3_runtime"
-LAYOUTLMV3_RUNTIME_PROFILES = frozenset({
-    "layoutlmv3_runtime",
-    "layoutlmv3_runtime_v1",
-})
+_SLIM_PROFILES = frozenset({"layoutlmv3_runtime", "layoutlmv3_runtime_v1"})
 
 
 def companion_for_pdf(pdf_path: PathLike) -> Path:
-    """Resolve the canonical companion for a PDF path.
+    """Default companion path for a PDF.
 
     Returns the existing `.json` if present, else the existing `.json.zst`,
-    else the default `.json` path (which may not exist yet — useful as a
-    destination for a fresh write). Never raises for missing files.
+    else the default `.json` path (may not exist yet — useful as a destination
+    for a fresh write). Never raises for missing files.
     """
     pdf = Path(pdf_path)
     plain = pdf.with_name(pdf.name + JSON_SUFFIX)
@@ -81,12 +68,8 @@ def companion_for_pdf(pdf_path: PathLike) -> Path:
     return plain
 
 
-def resolve_existing_companion(path: PathLike) -> Optional[Path]:
-    """Locate an existing companion given any related path.
-
-    Accepts the PDF path, a `.json` path, or a `.json.zst` path. Returns the
-    actually-on-disk file, or None if neither variant exists.
-    """
+def resolve_companion(path: PathLike) -> Optional[Path]:
+    """Locate an existing companion. Accepts PDF path or either suffix."""
     p = Path(path)
     s = str(p)
     if s.endswith(ZST_SUFFIX) or s.endswith(JSON_SUFFIX):
@@ -107,16 +90,15 @@ def companion_to_pdf(companion_path: PathLike) -> Path:
 
 
 def load_canonical(path: PathLike) -> dict:
-    """Read a canonical companion. Transparent for `.json` and `.json.zst`.
+    """Read a canonical companion. Auto-detects `.json` vs `.json.zst`.
 
-    Detection order: filename suffix first (fast path), then zstd magic
-    bytes (handles files saved with an unexpected name).
+    Detection: filename suffix first (fast path), then zstd magic bytes
+    (covers files saved with an unexpected name).
     """
-    p = Path(path)
-    raw = p.read_bytes()
-    looks_zst = str(p).endswith(ZST_SUFFIX) or raw[:4] == _ZSTD_MAGIC
-    if looks_zst:
-        import zstandard as zstd  # lazy: keeps zstandard optional at import time
+    raw = Path(path).read_bytes()
+    is_zst = str(path).endswith(ZST_SUFFIX) or raw[:4] == _ZSTD_MAGIC
+    if is_zst:
+        import zstandard as zstd
         raw = zstd.ZstdDecompressor().decompress(raw)
     return json.loads(raw)
 
@@ -125,63 +107,18 @@ def save_canonical(
     path: PathLike,
     data: dict,
     *,
-    compress: bool = False,
-    level: int = 3,
-) -> Path:
-    """Atomic write of canonical JSON. Low-level: no upgrade/slim.
-
-    When `compress=True`, a caller-supplied `.json` path is auto-rewritten to
-    `.json.zst`. Level 3 is the benchmarked sweet spot (~13% ratio, ~4ms per
-    file on representative OCR JSON). Otherwise behavior mirrors the pre-
-    existing write pattern: `<dest>.tmp` then `os.replace`.
-    """
-    p = Path(path)
-    s = str(p)
-    if compress:
-        if s.endswith(JSON_SUFFIX) and not s.endswith(ZST_SUFFIX):
-            p = Path(s + ".zst")
-        elif not s.endswith(ZST_SUFFIX):
-            p = Path(s + ZST_SUFFIX)
-    payload = json.dumps(data, ensure_ascii=False).encode("utf-8")
-    if compress:
-        import zstandard as zstd
-        payload = zstd.ZstdCompressor(level=level).compress(payload)
-    tmp = Path(str(p) + ".tmp")
-    tmp.write_bytes(payload)
-    os.replace(tmp, p)
-    return p
-
-
-def _resolve_profile(data: dict, profile: Optional[str]) -> Optional[str]:
-    """Resolve canonical profile: explicit arg > value already on the doc."""
-    if profile:
-        return profile
-    try:
-        return data.get("pipeline", {}).get("ocr", {}).get("canonical_profile")
-    except AttributeError:
-        return None
-
-
-def finalize_and_save_canonical(
-    path: PathLike,
-    data: dict,
-    *,
     profile: Optional[str] = None,
-    compress: bool = False,
+    compress: bool = True,
     level: int = 3,
 ) -> Path:
-    """Run the shared finishing pipeline, then atomic-save.
+    """Run the canonical finishing pipeline and atomic-write.
 
-    Steps:
-      1. `upgrade_ocr_data_in_place(data)` — fill defaults, normalize older
-         schema variants.
-      2. If the resolved profile names the LayoutLMv3 runtime slim variant
-         (`layoutlmv3_runtime` / `_v1`), strip runtime-unused fields.
-      3. Atomic write via `save_canonical(compress=…)`.
+    1. `upgrade_ocr_data_in_place(data)` — fill defaults, normalize. Idempotent.
+    2. If profile resolves to a slim variant, strip runtime-unused fields.
+    3. Atomic write — `.json.zst` by default, `.json` if `compress=False`.
+       The caller's path suffix is auto-corrected to match.
 
-    `upgrade_ocr_data_in_place` and `slim_canonical_for_layoutlmv3_runtime_in_place`
-    are imported lazily so this module stays light at import time and free of
-    cycles with `scanindex.core.kie.json_utils`.
+    Returns the actual path written.
     """
     from scanindex.core.kie.json_utils import (
         slim_canonical_for_layoutlmv3_runtime_in_place,
@@ -189,7 +126,30 @@ def finalize_and_save_canonical(
     )
 
     upgrade_ocr_data_in_place(data)
-    resolved = _resolve_profile(data, profile)
-    if resolved in LAYOUTLMV3_RUNTIME_PROFILES:
+    resolved = profile or data.get("pipeline", {}).get("ocr", {}).get("canonical_profile")
+    if resolved in _SLIM_PROFILES:
         slim_canonical_for_layoutlmv3_runtime_in_place(data)
-    return save_canonical(path, data, compress=compress, level=level)
+
+    s = str(path)
+    if compress:
+        if s.endswith(JSON_SUFFIX):
+            dest = Path(s + ".zst")
+        elif s.endswith(ZST_SUFFIX):
+            dest = Path(s)
+        else:
+            dest = Path(s + ZST_SUFFIX)
+    else:
+        if s.endswith(ZST_SUFFIX):
+            dest = Path(s[: -len(".zst")])
+        else:
+            dest = Path(s)
+
+    payload = json.dumps(data, ensure_ascii=False).encode("utf-8")
+    if compress:
+        import zstandard as zstd
+        payload = zstd.ZstdCompressor(level=level).compress(payload)
+
+    tmp = Path(str(dest) + ".tmp")
+    tmp.write_bytes(payload)
+    os.replace(tmp, dest)
+    return dest

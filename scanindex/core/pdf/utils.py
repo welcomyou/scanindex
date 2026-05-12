@@ -222,8 +222,8 @@ def _sync_companion_json(original_pdf_path: str, output_path: str,
                          replacements: dict[str, str], log,
                          correction_engine="proton_ct2_opt",
                          correction_mode="v8_final"):
-    from scanindex.core.canonical_io import resolve_existing_companion
-    source_json = resolve_existing_companion(original_pdf_path)
+    from scanindex.core.canonical_io import resolve_companion
+    source_json = resolve_companion(original_pdf_path)
     if source_json is None:
         return
     target_json = output_path + ".json"
@@ -356,8 +356,8 @@ def _try_rebuild_fallback(original_pdf_path: str, output_path: str,
     Fallback: rebuild PDF using stored OCR positions from companion JSON.
     Used when byte-level content stream replacement fails (CID font encoding).
     """
-    from scanindex.core.canonical_io import load_canonical, resolve_existing_companion
-    json_path = resolve_existing_companion(original_pdf_path)
+    from scanindex.core.canonical_io import load_canonical, resolve_companion
+    json_path = resolve_companion(original_pdf_path)
     if json_path is None:
         # No companion JSON - just copy original (best effort)
         log("No OCR positions JSON found, copying original.", "debug")

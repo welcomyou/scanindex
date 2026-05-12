@@ -169,8 +169,8 @@ from scanindex.core.kie.text_normalize import (  # noqa: E402
 
 
 def _load_annotation(json_path):
-    from scanindex.core.canonical_io import load_canonical, resolve_existing_companion
-    resolved = resolve_existing_companion(json_path) if json_path else None
+    from scanindex.core.canonical_io import load_canonical, resolve_companion
+    resolved = resolve_companion(json_path) if json_path else None
     if resolved is None:
         return None
     try:
@@ -1262,7 +1262,7 @@ class ArchiveStep2Kie(QWidget):
             return
         doc = self._documents[idx]
         saved_meta = doc.pop("_metadata_before_viewer_dirty", None)
-        from scanindex.core.canonical_io import load_canonical, resolve_existing_companion
+        from scanindex.core.canonical_io import load_canonical, resolve_companion
         json_path = doc.get("json_path")
         if not json_path:
             out_pdf = doc.get("output_path") or ""
@@ -1270,7 +1270,7 @@ class ArchiveStep2Kie(QWidget):
                 json_path = out_pdf + ".json"
 
         canonical = None
-        resolved_json = resolve_existing_companion(json_path) if json_path else None
+        resolved_json = resolve_companion(json_path) if json_path else None
         if resolved_json is not None:
             canonical = load_canonical(resolved_json)
         ann = (canonical or {}).get("annotations") or {}
@@ -1778,9 +1778,9 @@ class ArchiveStep2Kie(QWidget):
             return
         canonical = doc.get("_canonical_cache")
         if canonical is None:
-            from scanindex.core.canonical_io import load_canonical, resolve_existing_companion
+            from scanindex.core.canonical_io import load_canonical, resolve_companion
             json_path = doc.get("json_path")
-            resolved = resolve_existing_companion(json_path) if json_path else None
+            resolved = resolve_companion(json_path) if json_path else None
             if resolved is not None:
                 try:
                     canonical = load_canonical(resolved)

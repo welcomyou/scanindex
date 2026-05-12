@@ -19,7 +19,7 @@ import atexit
 import unicodedata
 
 from scanindex.core.canonical_io import (
-    finalize_and_save_canonical,
+    save_canonical,
     load_canonical,
 )
 from scanindex.core.ocr.screen_ai import ScreenAIOCR
@@ -482,7 +482,7 @@ def replace_canonical_page_with_page_result(
         "word_count": len(words_data),
     }
 
-    finalize_and_save_canonical(canonical_json_path, ocr_data, profile=canonical_profile)
+    save_canonical(canonical_json_path, ocr_data, profile=canonical_profile)
 
     return {
         "page_index": int(page_idx),
@@ -1103,7 +1103,7 @@ def process_pdf(input_path, output_path, num_pages=None, update_callback=None,
         doc_in.close()
 
         json_path = output_path + ".json"
-        finalize_and_save_canonical(json_path, ocr_data, profile=canonical_profile)
+        save_canonical(json_path, ocr_data, profile=canonical_profile)
 
         log(f"OCR completed: {output_path}", "success")
         return True, None
@@ -1250,7 +1250,7 @@ def assemble_pdf_from_page_results(input_path, output_path, all_page_results,
         doc_in.close()
 
         json_path = output_path + ".json"
-        finalize_and_save_canonical(json_path, ocr_data, profile=canonical_profile)
+        save_canonical(json_path, ocr_data, profile=canonical_profile)
 
         log(f"Assembled (cached OCR): {output_path}", "success")
         return True, None

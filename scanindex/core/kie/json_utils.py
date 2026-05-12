@@ -730,11 +730,11 @@ def write_corrected_companion_json(source_json_path, target_json_path, replaceme
                                    correction_mode="v8_final"):
     from scanindex.core.canonical_io import (
         load_canonical,
-        resolve_existing_companion,
+        resolve_companion,
         save_canonical,
     )
 
-    resolved_source = resolve_existing_companion(source_json_path) if source_json_path else None
+    resolved_source = resolve_companion(source_json_path) if source_json_path else None
     if resolved_source is None:
         return False
 

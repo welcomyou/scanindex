@@ -140,8 +140,8 @@ def _ocr_groundtruth_pdf(
     if not res:
         raise RuntimeError(f"OCR thất bại trên file mẫu: {msg}")
 
-    from scanindex.core.canonical_io import load_canonical, resolve_existing_companion
-    json_path = resolve_existing_companion(out_pdf)
+    from scanindex.core.canonical_io import load_canonical, resolve_companion
+    json_path = resolve_companion(out_pdf)
     if json_path is None:
         raise RuntimeError("OCR không sinh ra JSON")
     data = load_canonical(json_path)

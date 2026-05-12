@@ -227,8 +227,8 @@ def _json_line_xywh(line: dict) -> Tuple[float, float, float, float]:
 
 def load_lines_from_companion_json(json_path: str, logger: Logger) -> Optional[List[TextLine]]:
     """Load OCR text/positions directly from the canonical JSON when present."""
-    from scanindex.core.canonical_io import load_canonical, resolve_existing_companion
-    resolved = resolve_existing_companion(json_path) if json_path else None
+    from scanindex.core.canonical_io import load_canonical, resolve_companion
+    resolved = resolve_companion(json_path) if json_path else None
     if resolved is None:
         return None
 

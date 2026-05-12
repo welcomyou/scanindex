@@ -7,9 +7,9 @@ import shutil
 import fitz
 
 from scanindex.core.canonical_io import (
-    finalize_and_save_canonical,
+    save_canonical,
     load_canonical,
-    resolve_existing_companion,
+    resolve_companion,
 )
 from scanindex.core.kie.json_utils import (
     make_document_stub,
@@ -35,7 +35,7 @@ def is_digital_ocr_output(ocr_pdf_path: str) -> bool:
     Resolve canonical companion (`.json` hoặc `.json.zst`), check `document.engine`.
     Trả True nếu engine = DIGITAL_TEXT_ENGINE → caller nên skip correction.
     """
-    companion = resolve_existing_companion(ocr_pdf_path)
+    companion = resolve_companion(ocr_pdf_path)
     if companion is None:
         return False
     try:
@@ -364,7 +364,7 @@ def merge_native_text_layer_into_canonical_json(
         doc.close()
 
     data.setdefault("pipeline", {}).setdefault("ocr", {})["digital_layer_merge"] = details
-    finalize_and_save_canonical(canonical_json_path, data, profile=canonical_profile)
+    save_canonical(canonical_json_path, data, profile=canonical_profile)
     return {"pages": details}
 
 
@@ -419,7 +419,7 @@ def extract_digital_pdf_as_ocr(
 
         doc.close()
         json_path = output_path + ".json"
-        finalize_and_save_canonical(json_path, ocr_data, profile=canonical_profile)
+        save_canonical(json_path, ocr_data, profile=canonical_profile)
 
         log(f"Digital extraction completed: {output_path}", "success")
         return True, None

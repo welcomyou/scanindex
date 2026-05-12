@@ -1082,8 +1082,8 @@ class KieViewer(QMainWindow):
         # This keeps page geometry aligned with OCR boxes and avoids depending
         # on the original PDF tree layout.
         if source_canonical_json:
-            from scanindex.core.canonical_io import companion_to_pdf, resolve_existing_companion
-            canonical_path = resolve_existing_companion(source_canonical_json)
+            from scanindex.core.canonical_io import companion_to_pdf, resolve_companion
+            canonical_path = resolve_companion(source_canonical_json)
             if canonical_path is not None:
                 ocr_pdf_path = companion_to_pdf(canonical_path)
                 if ocr_pdf_path.exists():
@@ -2159,9 +2159,9 @@ class KieViewer(QMainWindow):
         from scanindex.core.canonical_io import (
             companion_for_pdf,
             load_canonical as _load_companion,
-            resolve_existing_companion,
+            resolve_companion,
         )
-        path = resolve_existing_companion(self.input_json.get("source_canonical_json") or "")
+        path = resolve_companion(self.input_json.get("source_canonical_json") or "")
         if path is not None:
             try:
                 return _load_companion(path)
