@@ -28,10 +28,17 @@ def _new_session_id() -> str:
     return f"{ts}_{secrets.token_hex(2)}"
 
 
+_STALE_TEMP_PREFIXES = ("archive_", "secret_scan_")
+
+
 def cleanup_stale_temp_dirs() -> int:
-    """Remove every `./temp/archive_*` left behind by previous app runs.
-    Best-effort: directories still locked by another process are skipped.
-    Returns the number of dirs successfully removed."""
+    """Remove stale session temp dirs left behind by previous app runs.
+
+    Targets every `./temp/<prefix>*` for prefixes in `_STALE_TEMP_PREFIXES` —
+    currently archive sessions (Số hóa lưu trữ) and secret-file-scan runs.
+    Best-effort: directories still locked by another process are retried with
+    ignore_errors. Returns the number of dirs successfully removed.
+    """
     base = os.path.join(os.getcwd(), "temp")
     if not os.path.isdir(base):
         return 0
@@ -41,7 +48,7 @@ def cleanup_stale_temp_dirs() -> int:
     except OSError:
         return 0
     for name in entries:
-        if not name.startswith("archive_"):
+        if not any(name.startswith(p) for p in _STALE_TEMP_PREFIXES):
             continue
         path = os.path.join(base, name)
         if not os.path.isdir(path):

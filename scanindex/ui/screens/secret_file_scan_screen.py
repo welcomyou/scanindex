@@ -1340,6 +1340,16 @@ class SecretFileScanScreen(ScreenContent):
             "success" if not cancelled else "info",
         )
 
+        # Wipe per-run workdir — UI keeps results in memory; nothing on disk
+        # in temp/secret_scan_<ts>/ is needed after the scan completes. Match
+        # behavior of cleanup_stale_temp_dirs() at startup.
+        work_root = payload.get("work_root") if isinstance(payload, dict) else None
+        if work_root and os.path.isdir(work_root):
+            try:
+                shutil.rmtree(work_root, ignore_errors=True)
+            except Exception:
+                pass
+
     def _open_result_file(self, item: QTableWidgetItem) -> None:
         source_path = item.data(Qt.ItemDataRole.UserRole)
         if source_path and os.path.exists(source_path):
