@@ -7,9 +7,9 @@ import shutil
 import fitz
 
 from scanindex.core.canonical_io import (
+    finalize_and_save_canonical,
     load_canonical,
     resolve_existing_companion,
-    save_canonical,
 )
 from scanindex.core.kie.json_utils import (
     make_document_stub,
@@ -17,8 +17,6 @@ from scanindex.core.kie.json_utils import (
     make_page_record,
     make_word_record,
     merge_bboxes,
-    slim_canonical_for_layoutlmv3_runtime_in_place,
-    upgrade_ocr_data_in_place,
 )
 from scanindex.core.ocr.text_normalizer import OCR_TEXT_NORMALIZATION, sanitize_ocr_surface_text
 
@@ -366,10 +364,7 @@ def merge_native_text_layer_into_canonical_json(
         doc.close()
 
     data.setdefault("pipeline", {}).setdefault("ocr", {})["digital_layer_merge"] = details
-    upgrade_ocr_data_in_place(data)
-    if canonical_profile in {"layoutlmv3_runtime", "layoutlmv3_runtime_v1"}:
-        slim_canonical_for_layoutlmv3_runtime_in_place(data)
-    save_canonical(canonical_json_path, data)
+    finalize_and_save_canonical(canonical_json_path, data, profile=canonical_profile)
     return {"pages": details}
 
 
@@ -423,11 +418,8 @@ def extract_digital_pdf_as_ocr(
             ocr_data["pages"].append(page_record)
 
         doc.close()
-        upgrade_ocr_data_in_place(ocr_data)
-        if canonical_profile == "layoutlmv3_runtime":
-            slim_canonical_for_layoutlmv3_runtime_in_place(ocr_data)
         json_path = output_path + ".json"
-        save_canonical(json_path, ocr_data)
+        finalize_and_save_canonical(json_path, ocr_data, profile=canonical_profile)
 
         log(f"Digital extraction completed: {output_path}", "success")
         return True, None

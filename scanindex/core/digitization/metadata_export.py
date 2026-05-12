@@ -237,8 +237,12 @@ def write_enriched_canonical_json(canonical_json_path: str, annotation: dict,
                                     output_path: str | None = None) -> str:
     """Inject `annotation` into the canonical JSON's `annotations` block and
     write back. Returns the path written."""
-    with open(canonical_json_path, "r", encoding="utf-8") as f:
-        doc = json.load(f)
+    from scanindex.core.canonical_io import (
+        finalize_and_save_canonical,
+        load_canonical,
+    )
+
+    doc = load_canonical(canonical_json_path)
     doc["annotations"] = {
         "schema": annotation.get("schema", "kie_vi_official_v3"),
         "source": annotation.get("source", "unknown"),
@@ -250,11 +254,10 @@ def write_enriched_canonical_json(canonical_json_path: str, annotation: dict,
     if annotation.get("postprocess"):
         doc["annotations"]["postprocess"] = annotation.get("postprocess")
     out = output_path or canonical_json_path
-    tmp = out + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(doc, f, ensure_ascii=False)
-    os.replace(tmp, out)
-    return out
+    # profile=None → resolved from doc's pipeline.ocr.canonical_profile,
+    # preserving slim status if the source was slim.
+    written = finalize_and_save_canonical(out, doc)
+    return str(written)
 
 
 def _parse_ddmmyyyy(s: str | None) -> tuple[int, int, int] | None:

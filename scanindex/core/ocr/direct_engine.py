@@ -18,7 +18,10 @@ import logging
 import atexit
 import unicodedata
 
-from scanindex.core.canonical_io import save_canonical
+from scanindex.core.canonical_io import (
+    finalize_and_save_canonical,
+    load_canonical,
+)
 from scanindex.core.ocr.screen_ai import ScreenAIOCR
 from scanindex.core.kie.json_utils import (
     decorate_layout_regions,
@@ -26,8 +29,6 @@ from scanindex.core.kie.json_utils import (
     make_line_record,
     make_page_record,
     make_word_record,
-    slim_canonical_for_layoutlmv3_runtime_in_place,
-    upgrade_ocr_data_in_place,
 )
 from scanindex.core.ocr.text_normalizer import (
     OCR_TEXT_NORMALIZATION,
@@ -404,8 +405,7 @@ def replace_canonical_page_with_page_result(
     """
     import fitz  # PyMuPDF - lazy import
 
-    with open(canonical_json_path, "r", encoding="utf-8") as f:
-        ocr_data = json.load(f)
+    ocr_data = load_canonical(canonical_json_path)
 
     doc = fitz.open(source_pdf_path)
     try:
@@ -482,15 +482,7 @@ def replace_canonical_page_with_page_result(
         "word_count": len(words_data),
     }
 
-    upgrade_ocr_data_in_place(ocr_data)
-    profile = canonical_profile or ocr_data.get("pipeline", {}).get("ocr", {}).get("canonical_profile")
-    if profile in {"layoutlmv3_runtime", "layoutlmv3_runtime_v1"}:
-        slim_canonical_for_layoutlmv3_runtime_in_place(ocr_data)
-
-    tmp_path = canonical_json_path + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(ocr_data, f, ensure_ascii=False)
-    os.replace(tmp_path, canonical_json_path)
+    finalize_and_save_canonical(canonical_json_path, ocr_data, profile=canonical_profile)
 
     return {
         "page_index": int(page_idx),
@@ -1111,10 +1103,7 @@ def process_pdf(input_path, output_path, num_pages=None, update_callback=None,
         doc_in.close()
 
         json_path = output_path + ".json"
-        upgrade_ocr_data_in_place(ocr_data)
-        if canonical_profile == "layoutlmv3_runtime":
-            slim_canonical_for_layoutlmv3_runtime_in_place(ocr_data)
-        save_canonical(json_path, ocr_data)
+        finalize_and_save_canonical(json_path, ocr_data, profile=canonical_profile)
 
         log(f"OCR completed: {output_path}", "success")
         return True, None
@@ -1261,10 +1250,7 @@ def assemble_pdf_from_page_results(input_path, output_path, all_page_results,
         doc_in.close()
 
         json_path = output_path + ".json"
-        upgrade_ocr_data_in_place(ocr_data)
-        if canonical_profile == "layoutlmv3_runtime":
-            slim_canonical_for_layoutlmv3_runtime_in_place(ocr_data)
-        save_canonical(json_path, ocr_data)
+        finalize_and_save_canonical(json_path, ocr_data, profile=canonical_profile)
 
         log(f"Assembled (cached OCR): {output_path}", "success")
         return True, None

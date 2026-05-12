@@ -368,24 +368,19 @@ def _source_to_pdf(
     raise RuntimeError(f"Không hỗ trợ định dạng: {ext}")
 
 
-def _write_canonical_json(canonical: dict, json_path: str | None) -> None:
-    if not json_path:
-        return
-    tmp_path = json_path + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(canonical, f, ensure_ascii=False)
-    os.replace(tmp_path, json_path)
-
-
 def _finalize_canonical(canonical: dict, json_path: str | None = None) -> dict:
-    from scanindex.core.kie.json_utils import (
-        slim_canonical_for_layoutlmv3_runtime_in_place,
-        upgrade_ocr_data_in_place,
+    """Run upgrade + slim + atomic write via the shared canonical_io helper.
+
+    Always emits the LayoutLMv3 runtime slim variant — secret-file-scan output
+    is consumed by the same downstream tools as Số hóa lưu trữ Step 2.
+    """
+    from scanindex.core.canonical_io import (
+        LAYOUTLMV3_RUNTIME_PROFILE,
+        finalize_and_save_canonical,
     )
 
-    upgrade_ocr_data_in_place(canonical)
-    slim_canonical_for_layoutlmv3_runtime_in_place(canonical)
-    _write_canonical_json(canonical, json_path)
+    if json_path:
+        finalize_and_save_canonical(json_path, canonical, profile=LAYOUTLMV3_RUNTIME_PROFILE)
     return canonical
 
 
