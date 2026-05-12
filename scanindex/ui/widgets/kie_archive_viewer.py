@@ -2058,10 +2058,13 @@ class KieArchiveViewer(QWidget):
         ann["field_instances"] = kept_fields
         ann["relations"] = relations
         try:
-            tmp = self._canonical_path + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(self._canonical, f, ensure_ascii=False)
-            os.replace(tmp, self._canonical_path)
+            from scanindex.core.canonical_io import save_canonical
+            written = save_canonical(self._canonical_path, self._canonical)
+            # save_canonical may auto-correct the suffix (e.g. add .zst when
+            # compressing). Mirror that back onto self._canonical_path so the
+            # post-save validator and any subsequent reads target the actual
+            # on-disk file.
+            self._canonical_path = str(written)
         except Exception as e:
             QMessageBox.warning(self, "Lỗi lưu", f"Không thể ghi file:\n{e}")
             return False
@@ -2122,8 +2125,8 @@ class KieArchiveViewer(QWidget):
         except Exception:
             return
         try:
-            with open(saved_path, "r", encoding="utf-8") as f:
-                on_disk = json.load(f)
+            from scanindex.core.canonical_io import load_canonical
+            on_disk = load_canonical(saved_path)
         except Exception as e:
             QMessageBox.warning(self, "Post-save load lỗi", str(e))
             return
