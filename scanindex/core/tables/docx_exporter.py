@@ -227,13 +227,13 @@ def _json_line_xywh(line: dict) -> Tuple[float, float, float, float]:
 
 def load_lines_from_companion_json(json_path: str, logger: Logger) -> Optional[List[TextLine]]:
     """Load OCR text/positions directly from the canonical JSON when present."""
-    if not os.path.exists(json_path):
+    from scanindex.core.canonical_io import load_canonical, resolve_existing_companion
+    resolved = resolve_existing_companion(json_path) if json_path else None
+    if resolved is None:
         return None
 
     try:
-        import json
-        with open(json_path, "r", encoding="utf-8") as f:
-            ocr_data = json.load(f)
+        ocr_data = load_canonical(resolved)
     except Exception as e:
         logger.log(f"Could not load OCR JSON as text source: {e}")
         return None

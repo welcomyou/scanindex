@@ -621,9 +621,8 @@ class ArchiveStep1Split(QWidget):
         except Exception:
             return
         try:
-            import json as _json
-            with open(canonical_json_path, "r", encoding="utf-8") as f:
-                canonical = _json.load(f)
+            from scanindex.core.canonical_io import load_canonical
+            canonical = load_canonical(canonical_json_path)
         except Exception:
             return
         pages = canonical.get("pages") or []

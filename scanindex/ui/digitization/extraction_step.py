@@ -169,12 +169,12 @@ from scanindex.core.kie.text_normalize import (  # noqa: E402
 
 
 def _load_annotation(json_path):
-    if not json_path or not os.path.exists(json_path):
+    from scanindex.core.canonical_io import load_canonical, resolve_existing_companion
+    resolved = resolve_existing_companion(json_path) if json_path else None
+    if resolved is None:
         return None
     try:
-        import json
-        with open(json_path, "r", encoding="utf-8") as f:
-            doc = json.load(f)
+        doc = load_canonical(resolved)
         ann = doc.get("annotations") or None
         if ann and "field_instances" in ann:
             try:
@@ -1262,6 +1262,7 @@ class ArchiveStep2Kie(QWidget):
             return
         doc = self._documents[idx]
         saved_meta = doc.pop("_metadata_before_viewer_dirty", None)
+        from scanindex.core.canonical_io import load_canonical, resolve_existing_companion
         json_path = doc.get("json_path")
         if not json_path:
             out_pdf = doc.get("output_path") or ""
@@ -1269,9 +1270,9 @@ class ArchiveStep2Kie(QWidget):
                 json_path = out_pdf + ".json"
 
         canonical = None
-        if json_path and os.path.exists(json_path):
-            with open(json_path, "r", encoding="utf-8") as f:
-                canonical = json.load(f)
+        resolved_json = resolve_existing_companion(json_path) if json_path else None
+        if resolved_json is not None:
+            canonical = load_canonical(resolved_json)
         ann = (canonical or {}).get("annotations") or {}
         doc["annotation"] = ann
         doc["metadata"] = dict(saved_meta) if isinstance(saved_meta, dict) else _annotation_to_metadata_form(ann)
@@ -1777,12 +1778,12 @@ class ArchiveStep2Kie(QWidget):
             return
         canonical = doc.get("_canonical_cache")
         if canonical is None:
+            from scanindex.core.canonical_io import load_canonical, resolve_existing_companion
             json_path = doc.get("json_path")
-            if json_path and os.path.exists(json_path):
+            resolved = resolve_existing_companion(json_path) if json_path else None
+            if resolved is not None:
                 try:
-                    import json as _json
-                    with open(json_path, "r", encoding="utf-8") as f:
-                        canonical = _json.load(f)
+                    canonical = load_canonical(resolved)
                     doc["_canonical_cache"] = canonical
                 except Exception:
                     return

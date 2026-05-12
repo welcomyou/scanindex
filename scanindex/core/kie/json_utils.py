@@ -728,11 +728,17 @@ def write_corrected_companion_json(source_json_path, target_json_path, replaceme
                                    output_pdf_path=None,
                                    correction_engine="proton_ct2_opt",
                                    correction_mode="v8_final"):
-    if not source_json_path or not os.path.exists(source_json_path):
+    from scanindex.core.canonical_io import (
+        load_canonical,
+        resolve_existing_companion,
+        save_canonical,
+    )
+
+    resolved_source = resolve_existing_companion(source_json_path) if source_json_path else None
+    if resolved_source is None:
         return False
 
-    with open(source_json_path, "r", encoding="utf-8") as f:
-        ocr_data = json.load(f)
+    ocr_data = load_canonical(resolved_source)
 
     apply_replacements_to_ocr_data(
         ocr_data,
@@ -742,12 +748,9 @@ def write_corrected_companion_json(source_json_path, target_json_path, replaceme
         correction_mode=correction_mode,
     )
 
-    target_json_path = target_json_path or source_json_path
+    target_json_path = target_json_path or str(resolved_source)
     target_dir = os.path.dirname(target_json_path)
     if target_dir:
         os.makedirs(target_dir, exist_ok=True)
-    temp_json_path = target_json_path + ".tmp"
-    with open(temp_json_path, "w", encoding="utf-8") as f:
-        json.dump(ocr_data, f, ensure_ascii=False)
-    os.replace(temp_json_path, target_json_path)
+    save_canonical(target_json_path, ocr_data)
     return True

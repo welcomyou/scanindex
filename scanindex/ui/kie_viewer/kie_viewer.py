@@ -1082,9 +1082,10 @@ class KieViewer(QMainWindow):
         # This keeps page geometry aligned with OCR boxes and avoids depending
         # on the original PDF tree layout.
         if source_canonical_json:
-            canonical_path = Path(source_canonical_json)
-            if canonical_path.exists():
-                ocr_pdf_path = canonical_path.with_suffix("")
+            from scanindex.core.canonical_io import companion_to_pdf, resolve_existing_companion
+            canonical_path = resolve_existing_companion(source_canonical_json)
+            if canonical_path is not None:
+                ocr_pdf_path = companion_to_pdf(canonical_path)
                 if ocr_pdf_path.exists():
                     return str(ocr_pdf_path.resolve())
 
@@ -1518,9 +1519,10 @@ class KieViewer(QMainWindow):
                         return os.path.abspath(hint)
             except Exception:
                 pass
-        guessed = os.path.join(DEFAULT_OCR_DIR, f"{stem}_ocr.pdf.json")
-        if os.path.isfile(guessed):
-            return guessed
+        from scanindex.core.canonical_io import companion_for_pdf
+        guessed = companion_for_pdf(os.path.join(DEFAULT_OCR_DIR, f"{stem}_ocr.pdf"))
+        if guessed.exists():
+            return str(guessed)
         return None
 
     def _detect_secret(self, stem: str):
@@ -1683,16 +1685,17 @@ class KieViewer(QMainWindow):
         canonical_hint = None
         if isinstance(raw, dict):
             canonical_hint = raw.get("source_canonical_json")
+        from scanindex.core.canonical_io import companion_for_pdf, companion_to_pdf
         if canonical_hint and os.path.isfile(canonical_hint):
             paths.append(os.path.abspath(canonical_hint))
-            ocr_pdf = Path(canonical_hint).with_suffix("")
+            ocr_pdf = companion_to_pdf(canonical_hint)
             if ocr_pdf.is_file():
                 paths.append(str(ocr_pdf.resolve()))
         else:
             guessed_pdf = Path(DEFAULT_OCR_DIR) / f"{stem}_ocr.pdf"
             if guessed_pdf.is_file():
                 paths.append(str(guessed_pdf.resolve()))
-            guessed_json = Path(DEFAULT_OCR_DIR) / f"{stem}_ocr.pdf.json"
+            guessed_json = companion_for_pdf(guessed_pdf)
             if guessed_json.is_file():
                 paths.append(str(guessed_json.resolve()))
         return paths
@@ -2153,15 +2156,26 @@ class KieViewer(QMainWindow):
         Fallback: derive path from pdf filename in default ocr/ directory."""
         if not self.input_json:
             return None
-        path = self.input_json.get("source_canonical_json")
-        if path and os.path.isfile(path):
-            return self._read_json(path)
-        # Fallback: try DEFAULT_OCR_DIR/{stem}_ocr.pdf.json
+        from scanindex.core.canonical_io import (
+            companion_for_pdf,
+            load_canonical as _load_companion,
+            resolve_existing_companion,
+        )
+        path = resolve_existing_companion(self.input_json.get("source_canonical_json") or "")
+        if path is not None:
+            try:
+                return _load_companion(path)
+            except Exception:
+                return None
+        # Fallback: try DEFAULT_OCR_DIR/{stem}_ocr.pdf{.json,.json.zst}
         stem = self.current_stem
         if stem:
-            guessed = os.path.join(DEFAULT_OCR_DIR, f"{stem}_ocr.pdf.json")
-            if os.path.isfile(guessed):
-                return self._read_json(guessed)
+            guessed = companion_for_pdf(os.path.join(DEFAULT_OCR_DIR, f"{stem}_ocr.pdf"))
+            if guessed.exists():
+                try:
+                    return _load_companion(guessed)
+                except Exception:
+                    return None
         return None
 
     def _find_page_data(self, page_index):

@@ -2493,6 +2493,7 @@ class MainWindow(QMainWindow):
                 cleanup_paths = {
                     out_path,
                     out_path + ".json",
+                    out_path + ".json.zst",
                 }
                 base, ext = os.path.splitext(out_path)
                 cleanup_paths.add(base + "_final.docx")
@@ -2504,6 +2505,7 @@ class MainWindow(QMainWindow):
                 cleanup_paths.update({
                     src_base + "_ocr.pdf",
                     src_base + "_ocr.pdf.json",
+                    src_base + "_ocr.pdf.json.zst",
                     src_base + "_final.docx",
                 })
             for p in cleanup_paths:
@@ -2989,17 +2991,12 @@ class ProcessingPipeline:
         if not output_path:
             return
 
-        # Find JSON companion: try _ocr.pdf.json (always created by OCR)
-        json_path = None
-        for candidate in [
-            output_path + ".json",
-        ]:
-            if os.path.exists(candidate):
-                json_path = candidate
-                break
-
-        if not json_path:
+        # Find JSON companion: try _ocr.pdf.json or _ocr.pdf.json.zst
+        from scanindex.core.canonical_io import resolve_existing_companion
+        json_path = resolve_existing_companion(output_path)
+        if json_path is None:
             return
+        json_path = str(json_path)
 
         try:
             from scanindex.core.digitization import metadata_extractor as document_metadata_extractor

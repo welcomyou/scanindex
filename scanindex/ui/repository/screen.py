@@ -337,15 +337,15 @@ class _PrepareAddFileWorker(QThread):
             for task in tasks:
                 if getattr(task, "error", None):
                     raise RuntimeError(f"{task.file_id}: {task.error}")
+                from scanindex.core.canonical_io import load_canonical, resolve_existing_companion
                 output_pdf = Path(getattr(task, "output_pdf_path", "") or "")
-                output_json = Path(getattr(task, "output_json_path", "") or "")
-                if not output_pdf.exists() or not output_json.exists():
+                output_json = resolve_existing_companion(getattr(task, "output_json_path", "") or "")
+                if not output_pdf.exists() or output_json is None:
                     raise RuntimeError(
                         f"{task.file_id}: Thiếu PDF OCR hoặc JSON KIE sau khi xử lý"
                     )
 
-                with open(output_json, "r", encoding="utf-8") as f:
-                    canonical = json.load(f)
+                canonical = load_canonical(output_json)
                 kie_fields = _extract_raw_kie_fields(canonical)
                 ann_block = canonical.get("annotations") or {}
                 results.append({
@@ -4219,9 +4219,9 @@ class RepositoryScreen(ScreenContent):
                     return
 
                 try:
+                    from scanindex.core.canonical_io import load_canonical
                     from scanindex.core.repository.importer import _extract_raw_kie_fields
-                    with open(output_json, "r", encoding="utf-8") as f:
-                        canonical = json.load(f)
+                    canonical = load_canonical(output_json)
                     kie_fields = _extract_raw_kie_fields(canonical)
                     kie_fields = self._apply_step2_metadata_to_kie_fields(
                         kie_fields,
@@ -4363,8 +4363,8 @@ class RepositoryScreen(ScreenContent):
             return []
         if canonical_json_path:
             try:
-                with open(canonical_json_path, "r", encoding="utf-8") as f:
-                    canonical = json.load(f)
+                from scanindex.core.canonical_io import load_canonical
+                canonical = load_canonical(canonical_json_path)
                 blocks = extract_blocks_from_canonical(canonical)
                 if blocks:
                     return chunk_blocks(blocks)

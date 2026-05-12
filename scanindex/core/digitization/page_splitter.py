@@ -849,8 +849,8 @@ def predict_doc_starts(canonical_json_path: str, threshold: float = DEFAULT_THRE
     if model is None:
         raise FileNotFoundError("doc_start LightGBM model not found")
 
-    with open(canonical_json_path, "r", encoding="utf-8") as f:
-        payload = json.load(f)
+    from scanindex.core.canonical_io import load_canonical
+    payload = load_canonical(canonical_json_path)
     pages = payload.get("pages") or []
     rows = []
     feature_rows = []
@@ -902,8 +902,8 @@ def predict_signer_page(
     if model is None:
         raise FileNotFoundError("signer_page LightGBM model not found")
 
-    with open(canonical_json_path, "r", encoding="utf-8") as f:
-        payload = json.load(f)
+    from scanindex.core.canonical_io import load_canonical
+    payload = load_canonical(canonical_json_path)
     pages = payload.get("pages") or []
     rows = []
     for ordinal, page in enumerate(pages):

@@ -912,13 +912,14 @@ class KieArchiveViewer(QWidget):
     def load_canonical(self, canonical_json_path: str):
         """Load the canonical OCR JSON so word bboxes + ownership become
         available. Call AFTER load_pdf for the same file."""
-        self._canonical_path = canonical_json_path
+        from scanindex.core.canonical_io import load_canonical as _load_companion, resolve_existing_companion
+        resolved = resolve_existing_companion(canonical_json_path) if canonical_json_path else None
+        self._canonical_path = str(resolved) if resolved is not None else canonical_json_path
         self._canonical = None
         self._last_dirty_resolution = None
-        if canonical_json_path and os.path.exists(canonical_json_path):
+        if resolved is not None:
             try:
-                with open(canonical_json_path, "r", encoding="utf-8") as f:
-                    self._canonical = json.load(f)
+                self._canonical = _load_companion(resolved)
                 ann = (self._canonical or {}).get("annotations") or None
                 if ann and ann.get("field_instances"):
                     try:

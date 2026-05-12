@@ -473,8 +473,8 @@ def _run_layoutlmv3(canonical_json_path: str,
     if not _llmv3.loaded:
         raise RuntimeError("LayoutLMv3 text-only model is not loaded.")
 
-    with open(canonical_json_path, "r", encoding="utf-8") as f:
-        canonical = json.load(f)
+    from scanindex.core.canonical_io import load_canonical
+    canonical = load_canonical(canonical_json_path)
 
     pages = canonical.get("pages", [])
     page_filter = _resolve_selected_pages(canonical, selected_pages)
@@ -784,6 +784,7 @@ def _visual_page_image_from_payload(raw_page: dict[str, Any]) -> Path | None:
 
 
 def _visual_source_pdf_candidates(canonical_json: str | Path, canonical_payload: dict[str, Any]) -> list[Path]:
+    from scanindex.core.canonical_io import JSON_SUFFIX, ZST_SUFFIX, companion_to_pdf
     path = Path(canonical_json)
     candidates: list[Path] = []
     for raw in (
@@ -793,8 +794,9 @@ def _visual_source_pdf_candidates(canonical_json: str | Path, canonical_payload:
     ):
         if raw:
             candidates.append(Path(raw))
-    if path.name.endswith(".pdf.json"):
-        candidates.append(Path(str(path)[:-5]))
+    s = str(path)
+    if s.endswith(JSON_SUFFIX) or s.endswith(ZST_SUFFIX):
+        candidates.append(companion_to_pdf(path))
     candidates.extend([
         path.with_suffix(""),
         path.with_name(path.stem + ".pdf"),
@@ -1183,8 +1185,8 @@ def _run_layoutlmv3_visual(canonical_json_path: str,
 
     import numpy as np
 
-    with open(canonical_json_path, "r", encoding="utf-8") as f:
-        canonical = json.load(f)
+    from scanindex.core.canonical_io import load_canonical
+    canonical = load_canonical(canonical_json_path)
 
     page_filter = _resolve_selected_pages(canonical, selected_pages)
     stem = os.path.splitext(os.path.basename(canonical_json_path))[0]

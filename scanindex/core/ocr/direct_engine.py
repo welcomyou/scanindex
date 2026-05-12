@@ -1371,8 +1371,7 @@ def rebuild_pdf_with_text(original_input_path, output_path, ocr_json_path,
                 pass
 
     try:
-        with open(ocr_json_path, "r", encoding="utf-8") as f:
-            ocr_data = json.load(f)
+        ocr_data = load_canonical(ocr_json_path)
 
         font_path = _find_unicode_font()
         if not font_path:
