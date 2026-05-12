@@ -2392,6 +2392,76 @@ def merge_lines_to_paragraphs(lines: List[TextLine], page_info: dict, logger: Lo
     return final_paragraphs
 
 
+def _is_list_item_line(text: str) -> bool:
+    text = (text or "").lstrip()
+    return bool(re.match(r'^(\d+\.|[a-zA-Z]\)|[-+\u2022\u2023\u2043\u25e6\u2219])', text))
+
+
+def _is_standalone_score_line(text: str) -> bool:
+    normalized = _unaccent_upper(_clean_extracted_text(text)).strip(" .")
+    normalized = re.sub(r"\s+", " ", normalized)
+    return bool(re.fullmatch(r"\d+(?:[,.]\d+)?\s*(?:DIEM|D)", normalized))
+
+
+def _looks_like_rubric_heading_after_score(text: str) -> bool:
+    text = _clean_extracted_text(text)
+    if not text or _is_list_item_line(text) or _is_standalone_score_line(text):
+        return False
+    if len(text.split()) < 2 or len(text) > 120 or ":" not in text:
+        return False
+    first_alpha = next((ch for ch in text if ch.isalpha()), "")
+    return bool(first_alpha and first_alpha.isupper())
+
+
+def _split_embedded_score_heading_line(line: str) -> List[str]:
+    line = _clean_extracted_text(line)
+    words = line.split()
+    if len(words) < 3:
+        return [line]
+    max_score_tokens = min(4, len(words) - 1)
+    for cut in range(1, max_score_tokens + 1):
+        score = " ".join(words[:cut])
+        tail = " ".join(words[cut:])
+        if _is_standalone_score_line(score) and _looks_like_rubric_heading_after_score(tail):
+            return [score, "- " + tail]
+    return [line]
+
+
+def _restore_missing_rubric_bullets(lines: List[str]) -> List[str]:
+    has_list_context = any(_is_list_item_line(line) for line in lines)
+    if not has_list_context:
+        return lines
+
+    expanded: List[str] = []
+    for line in lines:
+        if _is_list_item_line(line):
+            expanded.append(line)
+        else:
+            expanded.extend(_split_embedded_score_heading_line(line))
+
+    restored: List[str] = []
+    for line in expanded:
+        if (
+            restored
+            and _is_standalone_score_line(restored[-1])
+            and _looks_like_rubric_heading_after_score(line)
+        ):
+            line = "- " + line
+        restored.append(line)
+    return restored
+
+
+def _restore_inline_list_breaks(text: str) -> str:
+    fixed_lines = []
+    for line in (text or "").split("\n"):
+        stripped = line.lstrip()
+        if stripped.startswith("-") and " - " in stripped:
+            indent = line[:len(line) - len(stripped)]
+            line = indent + re.sub(r"\s+-\s+(?=\S)", "\n- ", stripped)
+        fixed_lines.append(line)
+    return "\n".join(fixed_lines)
+
+
 def clean_ocr_cell_text(text: str) -> str:
     """
     Clean OCR text:
@@ -2421,23 +2491,29 @@ def clean_ocr_cell_text(text: str) -> str:
         
     if not lines:
         return ""
-        
+
+    lines = _restore_missing_rubric_bullets(lines)
+
     # Smart merge
     merged = [lines[0]]
-    import re
     
     for line in lines[1:]:
         prev = merged[-1]
         should_merge = False
         
+        # Standalone score lines are complete rubric atoms; they should not
+        # swallow the next criterion when OCR misses a bullet marker.
+        if _is_standalone_score_line(prev):
+            should_merge = False
+
         # Rule 1: Starts with lowercase -> Merge
-        if line and line[0].islower():
+        elif line and line[0].islower():
             should_merge = True
         
         # Rule 2: Prev line indicates continuation (no punctuation)
         # AND line doesn't look like a list item
         elif prev and prev[-1] not in '.!?;:':
-            is_list_item = re.match(r'^(\d+\.|[a-zA-Z]\)|[-+•➢])', line)
+            is_list_item = _is_list_item_line(line)
             if not is_list_item:
                 should_merge = True
         
@@ -2447,6 +2523,7 @@ def clean_ocr_cell_text(text: str) -> str:
             merged.append(line)
     
     text = "\n".join(merged)
+    text = _restore_inline_list_breaks(text)
         
     return text
 
@@ -3625,10 +3702,19 @@ def repair_continued_tables(table_regions: List[TableRegion],
                             page_info: dict,
                             logger: Logger) -> List[TableRegion]:
     """
-    Merge multi-page ruled tables before DOCX rendering. GMFT/TATR often
-    detects continuation pages with fewer columns or misses a continuation
-    segment; layout table regions plus the first page's column grid give a
-    more stable representation.
+    Keep table render units page-local.
+
+    Earlier versions synthesized one DOCX table across physical PDF pages
+    when a table appeared to continue on the next page. That preserves logical
+    continuity only when every page has the same grid, but it is fragile for
+    scanned administrative documents: continuation pages often have different
+    detected schemas, merged cells, missing narrow columns, or partial rows.
+    For visual fidelity, the source page boundary is a hard rendering boundary.
+
+    We still use layout table regions as a recovery signal: if layout detected
+    a table region but the structure recognizer missed it entirely, build a
+    page-local fallback table from the most recent page schema. Detected tables
+    are never marked ``skip_render`` here.
     """
     if not table_regions:
         return table_regions
@@ -3671,112 +3757,943 @@ def repair_continued_tables(table_regions: List[TableRegion],
     if not layout_items:
         return table_regions
 
-    groups = []
-    current = None
+    repaired: List[TableRegion] = list(table_regions)
+    fallback_count = 0
+    last_col_intervals: List[Tuple[float, float]] = []
+
     for item in layout_items:
         table = item.get("detected")
-        header_like = _table_has_header(table) if table is not None else False
-        if not header_like:
-            lines_in_region = [l for l in pdf_lines if l.page == item["page"] and _line_in_bbox(l, item["bbox"])]
-            header_like = _looks_like_table_header_text(" ".join(l.text for l in lines_in_region[:20]))
-
-        starts_near_top = item["bbox"][1] < page_info.get(item["page"], {}).get("height", 842) * 0.18
-        prev_item = current["items"][-1] if current is not None and current["items"] else None
-        continues_next_page = prev_item is not None and item["page"] == prev_item["page"] + 1
-        should_continue = current is not None and continues_next_page and starts_near_top and not header_like
-        if header_like or current is None or not should_continue:
-            current = {"items": [], "col_intervals": None, "first": item}
-            groups.append(current)
-        current["items"].append(item)
-        if current["col_intervals"] is None and table is not None:
+        if table is not None:
+            table.y_top = item["bbox"][1]
+            table.y_bottom = item["bbox"][3]
             intervals = _table_column_intervals(table)
             if len(intervals) >= 2:
-                current["col_intervals"] = intervals
-
-    repaired: List[TableRegion] = list(table_regions)
-    synthetic_count = 0
-
-    for group in groups:
-        if len(group["items"]) <= 1:
+                last_col_intervals = intervals
             continue
-        col_intervals = group.get("col_intervals") or []
-        if len(col_intervals) < 2:
+
+        if len(last_col_intervals) < 2:
             continue
-        col_count = len(col_intervals)
+        rows, boxes = _build_table_rows_from_bbox(
+            item["page"], item["bbox"], last_col_intervals, pdf_lines, logger
+        )
+        if not rows:
+            continue
+        fallback = TableRegion(
+            page=item["page"],
+            y_top=item["bbox"][1],
+            y_bottom=item["bbox"][3],
+            cells=rows,
+            row_count=len(rows),
+            col_count=len(last_col_intervals),
+            cell_bboxes=boxes,
+        )
+        repaired.append(fallback)
+        fallback_count += 1
+
+    if fallback_count:
+        logger.log(f"Added {fallback_count} page-local fallback table segment(s)")
+    return repaired
+
+
+def _horizontal_overlap_ratio(a: Tuple[float, float, float, float],
+                              b: Tuple[float, float, float, float]) -> float:
+    aw = max(a[2] - a[0], 1e-6)
+    bw = max(b[2] - b[0], 1e-6)
+    overlap = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
+    return overlap / max(min(aw, bw), 1e-6)
+
+
+def _table_is_full_page_segment(table: TableRegion, page_info: dict) -> bool:
+    page_height = float(page_info.get(table.page, {}).get("height", 842) or 842)
+    height = max(0.0, float(table.y_bottom) - float(table.y_top))
+    return height >= page_height * 0.35
+
+
+def _regrid_table_columns(table: TableRegion,
+                          col_intervals: List[Tuple[float, float]],
+                          logger: Logger) -> bool:
+    if len(col_intervals) <= int(getattr(table, "col_count", 0) or 0):
+        return False
+
+    row_bands: List[Tuple[float, float]] = []
+    for row_boxes in getattr(table, "cell_bboxes", []) or []:
+        y0, y1 = _row_y_bounds(row_boxes)
+        if y1 > y0 and y1 - y0 >= 4:
+            row_bands.append((float(y0), float(y1)))
+
+    if not row_bands:
+        return False
+
+    old_shape = (int(getattr(table, "row_count", 0) or 0), int(getattr(table, "col_count", 0) or 0))
+    new_cols = len(col_intervals)
+    table.row_count = len(row_bands)
+    table.col_count = new_cols
+    table.cells = [[""] * new_cols for _ in row_bands]
+    table.cell_bboxes = [
+        [(float(x0), y0, float(x1), y1) for x0, x1 in col_intervals]
+        for y0, y1 in row_bands
+    ]
+    setattr(table, "disable_vertical_merge", True)
+    logger.log(
+        f"Regridded page-local table on page {table.page}: "
+        f"{old_shape[0]}x{old_shape[1]} -> {table.row_count}x{table.col_count}"
+    )
+    return True
+
+
+def stabilize_page_local_table_grids(table_regions: List[TableRegion],
+                                     layout_regions_by_page: Dict[int, List[dict]],
+                                     page_info: dict,
+                                     logger: Logger) -> List[TableRegion]:
+    """
+    Normalize collapsed continuation-page grids without merging pages.
+
+    A table may span several PDF pages visually while each page still needs its
+    own DOCX table. Structure engines sometimes collapse a narrow serial-number
+    or score column on one page even though adjacent pages with the same ruled
+    border expose the full grid. Use nearby page-local tables as schema
+    references, but only when the horizontal border is strongly consistent.
+    """
+    ordered = [
+        table for table in sorted(table_regions, key=lambda t: (t.page, t.y_top))
+        if not getattr(table, "skip_render", False)
+    ]
+    fixed = 0
+
+    for table in ordered:
+        cols = int(getattr(table, "col_count", 0) or 0)
+        if cols <= 0 or cols >= 4:
+            continue
+        if not _table_is_full_page_segment(table, page_info):
+            continue
+
+        table_bbox = _matching_layout_bbox_for_table(table, layout_regions_by_page) or _table_bbox(table)
+        best = None
+        best_score = float("inf")
+
+        for candidate in ordered:
+            if candidate is table or not _table_is_full_page_segment(candidate, page_info):
+                continue
+            cand_cols = int(getattr(candidate, "col_count", 0) or 0)
+            if cand_cols <= cols or cand_cols > 8:
+                continue
+            page_delta = abs(int(candidate.page) - int(table.page))
+            if page_delta <= 0 or page_delta > 3:
+                continue
+
+            cand_intervals = _table_column_intervals(candidate)
+            if len(cand_intervals) != cand_cols:
+                continue
+            cand_bbox = _matching_layout_bbox_for_table(candidate, layout_regions_by_page) or _table_bbox(candidate)
+            if _horizontal_overlap_ratio(table_bbox, cand_bbox) < 0.82:
+                continue
+
+            edge_delta = abs(table_bbox[0] - cand_bbox[0]) + abs(table_bbox[2] - cand_bbox[2])
+            if edge_delta > max(48.0, (table_bbox[2] - table_bbox[0]) * 0.14):
+                continue
+            score = edge_delta + page_delta * 4.0
+            if score < best_score:
+                best_score = score
+                best = cand_intervals
+
+        if best and _regrid_table_columns(table, best, logger):
+            fixed += 1
+
+    if fixed:
+        logger.log(f"Stabilized {fixed} page-local table grid(s) from adjacent page schemas")
+    return table_regions
+
+
+def _line_column_index(line: TextLine, col_intervals: List[Tuple[float, float]]) -> Optional[int]:
+    if not col_intervals:
+        return None
+    lx0, _, lx1, _ = _line_bbox_for_assignment(line)
+    line_w = max(lx1 - lx0, 1e-6)
+    center_x = (lx0 + lx1) / 2.0
+    best_idx = None
+    best_score = 0.0
+    for idx, (x0, x1) in enumerate(col_intervals):
+        overlap = max(0.0, min(lx1, x1) - max(lx0, x0))
+        score = overlap / line_w
+        if score > best_score:
+            best_score = score
+            best_idx = idx
+        if x0 <= center_x <= x1 and best_score < 0.15:
+            best_idx = idx
+            best_score = 0.15
+    return best_idx if best_score >= 0.10 else None
+
+
+def _table_lines_in_y_band(table: TableRegion,
+                           pdf_lines: List[TextLine],
+                           y0: float,
+                           y1: float,
+                           col_intervals: List[Tuple[float, float]]) -> List[TextLine]:
+    if y1 <= y0 or not col_intervals:
+        return []
+    x0 = min(x for x, _ in col_intervals)
+    x1 = max(x for _, x in col_intervals)
+    out = []
+    for line in pdf_lines:
+        if int(line.page) != int(table.page):
+            continue
+        lx0, ly0, lx1, ly1 = _line_bbox_for_assignment(line)
+        cy = (ly0 + ly1) / 2.0
+        if cy < y0 or cy > y1:
+            continue
+        if lx1 < x0 - 4.0 or lx0 > x1 + 4.0:
+            continue
+        if not _clean_extracted_text(line.text):
+            continue
+        out.append(line)
+    return out
+
+
+def _row_is_right_only_fragment(row: List[str]) -> bool:
+    if len(row) < 3:
+        return False
+    first = _clean_extracted_text(str(row[0]))
+    second = _clean_extracted_text(str(row[1]))
+    last = _clean_extracted_text(str(row[-1]))
+    middle = [_clean_extracted_text(str(cell)) for cell in row[2:-1]]
+    return not first and not second and not last and any(middle)
+
+
+def _gap_has_row_anchor(lines: List[TextLine], col_intervals: List[Tuple[float, float]]) -> bool:
+    if len(lines) < 2:
+        return False
+    has_leading_marker = False
+    has_left_text = False
+    has_score = False
+    has_body_text = False
+    last_col = len(col_intervals) - 1
+    for line in lines:
+        text = _clean_extracted_text(line.text)
+        if not text:
+            continue
+        col_idx = _line_column_index(line, col_intervals)
+        if col_idx is None:
+            continue
+        if col_idx == 0 and _looks_like_table_index_marker(text):
+            has_leading_marker = True
+        elif col_idx == 1 and len(text.split()) >= 3:
+            has_left_text = True
+        elif col_idx == last_col and is_numeric_cell(text):
+            has_score = True
+        elif 1 < col_idx < last_col and len(text.split()) >= 2:
+            has_body_text = True
+    return (has_leading_marker or has_left_text) and (has_score or has_body_text)
+
+
+def _row_boxes_from_band(col_intervals: List[Tuple[float, float]],
+                         y0: float,
+                         y1: float) -> List[Tuple[float, float, float, float]]:
+    return [(float(x0), float(y0), float(x1), float(y1)) for x0, x1 in col_intervals]
+
+
+def repair_table_row_gaps_from_ocr(table_regions: List[TableRegion],
+                                   pdf_lines: List[TextLine],
+                                   logger: Logger) -> List[TableRegion]:
+    """
+    Repair row bands when the structure recognizer leaves a ruled-row gap.
+
+    The detector can miss the middle of a tall row in scanned tables. If OCR
+    lines inside that vertical gap contain row anchors (index/left descriptor or
+    score), use the text geometry to restore the row band before cell assignment.
+    """
+    repaired = 0
+    inserted = 0
+    for table in table_regions:
+        if getattr(table, "skip_render", False) or int(getattr(table, "col_count", 0) or 0) < 3:
+            continue
+        col_intervals = _table_column_intervals(table)
+        rows = [list(row) for row in (getattr(table, "cells", []) or [])]
+        boxes = [list(row) for row in (getattr(table, "cell_bboxes", []) or [])]
+        if len(col_intervals) < int(getattr(table, "col_count", 0) or 0) or not rows or len(rows) != len(boxes):
+            continue
+
+        out_rows: List[List[str]] = []
+        out_boxes: List[List[Tuple[float, float, float, float]]] = []
+        r = 0
+        changed = False
+        while r < len(rows):
+            row = rows[r]
+            row_boxes = boxes[r]
+            y0, y1 = _row_y_bounds(row_boxes)
+            if r + 1 >= len(rows) or y1 <= y0:
+                out_rows.append(row)
+                out_boxes.append(row_boxes)
+                r += 1
+                continue
+
+            next_y0, next_y1 = _row_y_bounds(boxes[r + 1])
+            gap = next_y0 - y1
+            gap_lines = _table_lines_in_y_band(table, pdf_lines, y1, next_y0, col_intervals) if gap >= 18.0 else []
+            if gap_lines and _gap_has_row_anchor(gap_lines, col_intervals):
+                current_fragment = _row_is_right_only_fragment(row)
+                next_fragment = _row_is_right_only_fragment(rows[r + 1])
+                if current_fragment:
+                    new_bottom = next_y1 if next_fragment and next_y1 > next_y0 else next_y0
+                    out_rows.append(row)
+                    out_boxes.append(_row_boxes_from_band(col_intervals, y0, new_bottom))
+                    r += 2 if next_fragment else 1
+                    repaired += 1
+                    changed = True
+                    continue
+                if next_fragment:
+                    out_rows.append(row)
+                    out_boxes.append(row_boxes)
+                    out_rows.append([""] * int(getattr(table, "col_count", 0) or 0))
+                    out_boxes.append(_row_boxes_from_band(col_intervals, y1, next_y1))
+                    r += 2
+                    inserted += 1
+                    changed = True
+                    continue
+
+                out_rows.append(row)
+                out_boxes.append(row_boxes)
+                out_rows.append([""] * int(getattr(table, "col_count", 0) or 0))
+                out_boxes.append(_row_boxes_from_band(col_intervals, y1, next_y0))
+                r += 1
+                inserted += 1
+                changed = True
+                continue
+
+            out_rows.append(row)
+            out_boxes.append(row_boxes)
+            r += 1
+
+        if changed:
+            table.cells = out_rows
+            table.cell_bboxes = out_boxes
+            table.row_count = len(out_rows)
+
+    if repaired:
+        logger.log(f"Repaired {repaired} OCR-anchored table row gap(s)")
+    if inserted:
+        logger.log(f"Inserted {inserted} OCR-anchored missing table row(s)")
+    return table_regions
+
+
+def _looks_like_table_index_marker(text: str) -> bool:
+    cleaned = _clean_extracted_text(text)
+    if not cleaned:
+        return False
+    key = _norm_table_key(cleaned)
+    return bool(re.fullmatch(r"\d{1,3}|[IVXLCDM]{1,6}", key or ""))
+
+
+def repair_shifted_leading_table_cells(table_regions: List[TableRegion], logger: Logger) -> List[TableRegion]:
+    """
+    Move long prose out of the narrow leading index column.
+
+    OCR/table engines occasionally swap the first two columns on continuation
+    rows with vertical spans: the prose goes into "Số TT" and the serial number
+    goes into the content column. Detect this by content shape, not document
+    text, so the fix stays generic.
+    """
+    fixes = 0
+    for table in table_regions:
+        if getattr(table, "skip_render", False) or int(getattr(table, "col_count", 0) or 0) < 4:
+            continue
+        rows = getattr(table, "cells", []) or []
+        cols = int(getattr(table, "col_count", 0) or 0)
+        for r_idx, row in enumerate(rows):
+            normalized = list(row[:cols]) + [""] * max(0, cols - len(row))
+            first = _clean_extracted_text(str(normalized[0]))
+            second = _clean_extracted_text(str(normalized[1]))
+            if not first or len(first) < 16 or _looks_like_table_index_marker(first):
+                continue
+            first_words = [w for w in re.split(r"\s+", first) if w]
+            if len(first_words) < 3:
+                continue
+            if _looks_like_table_index_marker(second):
+                normalized[0], normalized[1] = normalized[1], normalized[0]
+                rows[r_idx] = normalized
+                fixes += 1
+            elif not second:
+                normalized[1] = normalized[0]
+                normalized[0] = ""
+                rows[r_idx] = normalized
+                fixes += 1
+
+    if fixes:
+        logger.log(f"Repaired {fixes} shifted leading table cell(s)")
+    return table_regions
+
+
+def _merge_cell_bbox(a: Tuple[float, float, float, float],
+                     b: Tuple[float, float, float, float]) -> Tuple[float, float, float, float]:
+    if not any(a):
+        return tuple(float(v) for v in b)
+    if not any(b):
+        return tuple(float(v) for v in a)
+    return (
+        min(float(a[0]), float(b[0])),
+        min(float(a[1]), float(b[1])),
+        max(float(a[2]), float(b[2])),
+        max(float(a[3]), float(b[3])),
+    )
+
+
+def _append_continuation_text(dst: str, src: str) -> str:
+    dst = _clean_extracted_text(dst or "")
+    src = _clean_extracted_text(src or "")
+    if not src:
+        return dst
+    if not dst:
+        return src
+    if src in dst:
+        return dst
+    return dst + "\n" + src
+
+
+def fuse_page_local_continuation_rows(table_regions: List[TableRegion], logger: Logger) -> List[TableRegion]:
+    """
+    Merge detector-created continuation rows back into the logical row.
+
+    This handles scanned rows that are cut by a physical page/long-cell band:
+    the continuation row has no index/score, but carries more text for the
+    middle descriptive columns. It keeps table segments page-local and changes
+    only row structure inside each detected segment.
+    """
+    fused = 0
+    suppressed = 0
+
+    for table in table_regions:
+        if getattr(table, "skip_render", False) or int(getattr(table, "col_count", 0) or 0) < 4:
+            continue
+        cols = int(getattr(table, "col_count", 0) or 0)
+        rows = [list(row[:cols]) + [""] * max(0, cols - len(row)) for row in (getattr(table, "cells", []) or [])]
+        boxes = [
+            list(row[:cols]) + [(0.0, 0.0, 0.0, 0.0)] * max(0, cols - len(row))
+            for row in (getattr(table, "cell_bboxes", []) or [])
+        ]
+        if not rows or len(boxes) != len(rows):
+            continue
+
+        out_rows: List[List[str]] = []
+        out_boxes: List[List[Tuple[float, float, float, float]]] = []
+        for row, row_boxes in zip(rows, boxes):
+            first = _clean_extracted_text(str(row[0]))
+            score = _clean_extracted_text(str(row[-1]))
+            middle_has_text = any(_clean_extracted_text(str(cell)) for cell in row[1:-1])
+            previous_anchor = None
+            for previous in reversed(out_rows):
+                prev_first = _clean_extracted_text(str(previous[0]))
+                prev_second = _clean_extracted_text(str(previous[1]))
+                if prev_first or prev_second:
+                    previous_anchor = previous
+                    break
+            is_continuation = (
+                not first
+                and not score
+                and middle_has_text
+                and bool(out_rows)
+                and _looks_like_table_index_marker(_clean_extracted_text(str(out_rows[-1][0])))
+            )
+            if is_continuation:
+                target = out_rows[-1]
+                target_boxes = out_boxes[-1]
+                for c in range(1, cols - 1):
+                    target[c] = _append_continuation_text(str(target[c]), str(row[c]))
+                    target_boxes[c] = _merge_cell_bbox(tuple(target_boxes[c]), tuple(row_boxes[c]))
+                fused += 1
+                continue
+
+            if previous_anchor is not None:
+                if (
+                    _clean_extracted_text(str(row[0]))
+                    and _clean_extracted_text(str(row[0])) == _clean_extracted_text(str(previous_anchor[0]))
+                    and _clean_extracted_text(str(row[1]))
+                    and _clean_extracted_text(str(row[1])) == _clean_extracted_text(str(previous_anchor[1]))
+                ):
+                    row[0] = ""
+                    row[1] = ""
+                    suppressed += 1
+
+            out_rows.append(row)
+            out_boxes.append([tuple(float(v) for v in bx[:4]) for bx in row_boxes])
+
+        if len(out_rows) != len(rows) or suppressed:
+            table.cells = out_rows
+            table.cell_bboxes = out_boxes
+            table.row_count = len(out_rows)
+
+    if fused:
+        logger.log(f"Fused {fused} page-local continuation table row(s)")
+    if suppressed:
+        logger.log(f"Suppressed {suppressed} repeated leading table cell pair(s)")
+    return table_regions
+
+
+_ROMAN_DIGITS = [
+    (1000, "M"),
+    (900, "CM"),
+    (500, "D"),
+    (400, "CD"),
+    (100, "C"),
+    (90, "XC"),
+    (50, "L"),
+    (40, "XL"),
+    (10, "X"),
+    (9, "IX"),
+    (5, "V"),
+    (4, "IV"),
+    (1, "I"),
+]
+
+
+def _roman_to_int(text: str) -> Optional[int]:
+    key = _norm_table_key(text)
+    if not key or not re.fullmatch(r"[IVXLCDM]{1,8}", key):
+        return None
+    total = 0
+    prev = 0
+    values = {"I": 1, "V": 5, "X": 10, "L": 50, "C": 100, "D": 500, "M": 1000}
+    for ch in reversed(key):
+        value = values.get(ch, 0)
+        total += -value if value < prev else value
+        prev = max(prev, value)
+    return total if 0 < total < 100 else None
+
+
+def _int_to_roman(value: int) -> str:
+    if value <= 0:
+        return ""
+    out = []
+    remaining = value
+    for number, roman in _ROMAN_DIGITS:
+        while remaining >= number:
+            out.append(roman)
+            remaining -= number
+    return "".join(out)
+
+
+def _uppercase_letter_ratio(text: str) -> float:
+    letters = [ch for ch in text if ch.isalpha()]
+    if not letters:
+        return 0.0
+    return sum(1 for ch in letters if ch.isupper()) / len(letters)
+
+
+def _looks_like_section_heading_text(text: str) -> bool:
+    text = _clean_extracted_text(text)
+    if not text or _is_list_item_line(text):
+        return False
+    if len(text.split()) < 3 or len(text) > 170:
+        return False
+    if re.search(r"[.;:]", text):
+        return False
+    key = _norm_table_key(text)
+    return key.startswith("CONGTAC") or key.startswith("TONG") or _uppercase_letter_ratio(text) >= 0.78
+
+
+def _section_heading_middle_text(row: List[str], cols: int) -> str:
+    if cols < 3:
+        return ""
+    score = _clean_extracted_text(str(row[-1])) if row else ""
+    if not is_numeric_cell(score):
+        return ""
+    middle_values = [
+        _clean_extracted_text(str(row[c]))
+        for c in range(1, cols - 1)
+        if c < len(row) and _clean_extracted_text(str(row[c]))
+    ]
+    if not middle_values:
+        return ""
+    deduped = []
+    for value in middle_values:
+        if deduped and _norm_table_key(deduped[-1]) == _norm_table_key(value):
+            continue
+        deduped.append(value)
+    combined = _clean_extracted_text(" ".join(deduped))
+    return combined if _looks_like_section_heading_text(combined) else ""
+
+
+def repair_section_heading_rows(table_regions: List[TableRegion], logger: Logger) -> List[TableRegion]:
+    """
+    Normalize all-caps section rows that span the middle columns.
+
+    These rows are visual section headers, not data rows with independent middle
+    cells. OCR/table structure often splits one centered title across adjacent
+    columns. Store that as explicit render-span metadata instead of duplicating
+    the title into every covered cell.
+    """
+    refs = []
+    normalized = 0
+    for table in sorted(table_regions, key=lambda t: (int(t.page), float(t.y_top))):
+        if getattr(table, "skip_render", False):
+            continue
+        cols = int(getattr(table, "col_count", 0) or 0)
+        if cols < 3:
+            continue
+        rows = [list(row[:cols]) + [""] * max(0, cols - len(row)) for row in (getattr(table, "cells", []) or [])]
+        heading_spans = dict(getattr(table, "horizontal_text_spans", {}) or {})
+        changed = False
+        for r_idx, row in enumerate(rows):
+            combined = _section_heading_middle_text(row, cols)
+            if not combined:
+                continue
+            row[1] = combined
+            for c in range(2, cols - 1):
+                row[c] = ""
+            rows[r_idx] = row
+            heading_spans[r_idx] = (1, cols - 2, combined)
+            normalized += 1
+            changed = True
+            refs.append({
+                "table": table,
+                "row": r_idx,
+                "marker": _clean_extracted_text(str(row[0])),
+            })
+        if changed:
+            table.cells = rows
+            setattr(table, "horizontal_text_spans", heading_spans)
+
+    inferred = 0
+    i = 0
+    while i < len(refs):
+        marker_value = _roman_to_int(refs[i]["marker"])
+        if marker_value is not None:
+            i += 1
+            continue
+        run_start = i
+        while i < len(refs) and _roman_to_int(refs[i]["marker"]) is None:
+            i += 1
+        run_end = i
+        blanks = refs[run_start:run_end]
+        prev_value = None
+        next_value = None
+        for j in range(run_start - 1, -1, -1):
+            prev_value = _roman_to_int(refs[j]["marker"])
+            if prev_value is not None:
+                break
+        for j in range(run_end, len(refs)):
+            next_value = _roman_to_int(refs[j]["marker"])
+            if next_value is not None:
+                break
+
+        start_value = prev_value or 0
+        can_infer = False
+        if next_value is not None and next_value - start_value == len(blanks) + 1:
+            can_infer = True
+        elif prev_value is None and next_value is not None and next_value > len(blanks):
+            start_value = next_value - len(blanks) - 1
+            can_infer = True
+
+        if not can_infer:
+            continue
+        for offset, ref in enumerate(blanks, start=1):
+            value = start_value + offset
+            marker = _int_to_roman(value)
+            if not marker:
+                continue
+            table = ref["table"]
+            rows = getattr(table, "cells", []) or []
+            if ref["row"] < len(rows) and rows[ref["row"]]:
+                rows[ref["row"]][0] = marker
+                ref["marker"] = marker
+                inferred += 1
+
+    if normalized:
+        logger.log(f"Normalized {normalized} section heading row span(s)")
+    if inferred:
+        logger.log(f"Inferred {inferred} missing section marker(s)")
+    return table_regions
+
+
+def _table_starts_near_page_top(table: TableRegion, page_info: dict) -> bool:
+    page_height = float(page_info.get(table.page, {}).get("height", 842) or 842)
+    return float(table.y_top) <= page_height * 0.16
+
+
+def _table_ends_near_page_bottom(table: TableRegion, page_info: dict) -> bool:
+    page_height = float(page_info.get(table.page, {}).get("height", 842) or 842)
+    return float(table.y_bottom) >= page_height * 0.84
+
+
+def _table_header_signal(table: TableRegion, pdf_lines: List[TextLine]) -> bool:
+    if _table_has_header(table):
+        return True
+    bbox = _table_bbox(table)
+    lines_in_region = [
+        line for line in pdf_lines
+        if line.page == table.page and _line_in_bbox(line, bbox)
+    ]
+    return _looks_like_table_header_text(" ".join(line.text for line in lines_in_region[:20]))
+
+
+def _continued_table_reference_intervals(
+    tables: List[TableRegion],
+    col_count: int,
+) -> List[Tuple[float, float]]:
+    candidates: List[List[Tuple[float, float]]] = []
+    for table in tables:
+        intervals = _table_column_intervals(table)
+        if len(intervals) == col_count:
+            candidates.append(intervals)
+    if not candidates:
+        return []
+    return max(candidates, key=lambda intervals: intervals[-1][1] - intervals[0][0])
+
+
+def _table_column_widths_from_intervals(
+    table: TableRegion,
+    intervals: List[Tuple[float, float]],
+    layout_regions_by_page: Optional[Dict[int, List[dict]]] = None,
+) -> List[float]:
+    col_count = len(intervals)
+    if col_count <= 0:
+        return []
+    table_bbox = (
+        _matching_layout_bbox_for_table(table, layout_regions_by_page or {})
+        or _table_bbox(table)
+    )
+    boundaries = [float(table_bbox[0])]
+    for col_idx in range(col_count - 1):
+        boundaries.append((float(intervals[col_idx][1]) + float(intervals[col_idx + 1][0])) / 2.0)
+    boundaries.append(float(table_bbox[2]))
+    widths = [max(0.0, boundaries[i + 1] - boundaries[i]) for i in range(col_count)]
+    if any(width <= 1.0 for width in widths):
+        return []
+    return widths
+
+
+def _canonical_column_ratios(
+    tables: List[TableRegion],
+    layout_regions_by_page: Dict[int, List[dict]],
+) -> List[float]:
+    if not tables:
+        return []
+    col_count = int(getattr(tables[0], "col_count", 0) or 0)
+    ratio_sets: List[List[float]] = []
+    for table in tables:
+        if int(getattr(table, "col_count", 0) or 0) != col_count:
+            continue
+        intervals = _table_column_intervals(table)
+        if len(intervals) != col_count:
+            continue
+        widths = _table_column_widths_from_intervals(table, intervals, layout_regions_by_page)
+        total = sum(widths)
+        if total <= 1.0:
+            continue
+        ratio_sets.append([width / total for width in widths])
+    if not ratio_sets:
+        return []
+    ratios = [_median([ratio_set[c] for ratio_set in ratio_sets]) for c in range(col_count)]
+    total = sum(ratios)
+    if total <= 0:
+        return []
+    return [ratio / total for ratio in ratios]
+
+
+def _intervals_from_ratios(
+    table: TableRegion,
+    ratios: List[float],
+    layout_regions_by_page: Dict[int, List[dict]],
+) -> List[Tuple[float, float]]:
+    table_bbox = _matching_layout_bbox_for_table(table, layout_regions_by_page) or _table_bbox(table)
+    x = float(table_bbox[0])
+    right = float(table_bbox[2])
+    total_width = max(right - x, 1.0)
+    intervals: List[Tuple[float, float]] = []
+    for idx, ratio in enumerate(ratios):
+        if idx == len(ratios) - 1:
+            next_x = right
+        else:
+            next_x = x + total_width * max(float(ratio), 0.0)
+        intervals.append((x, max(next_x, x + 1.0)))
+        x = next_x
+    return intervals
+
+
+def _normalize_table_rows_to_intervals(
+    table: TableRegion,
+    col_intervals: List[Tuple[float, float]],
+) -> Tuple[List[List[str]], List[List[Tuple[float, float, float, float]]]]:
+    col_count = len(col_intervals)
+    rows = [
+        list(row[:col_count]) + [""] * max(0, col_count - len(row))
+        for row in (getattr(table, "cells", []) or [])
+    ]
+    out_boxes: List[List[Tuple[float, float, float, float]]] = []
+    for r_idx, row in enumerate(rows):
+        source_boxes = (
+            table.cell_bboxes[r_idx]
+            if r_idx < len(getattr(table, "cell_bboxes", []) or [])
+            else []
+        )
+        y0, y1 = _row_y_bounds(source_boxes)
+        if y1 <= y0:
+            row_height = max((float(table.y_bottom) - float(table.y_top)) / max(len(rows), 1), 12.0)
+            y0 = float(table.y_top) + r_idx * row_height
+            y1 = y0 + row_height
+        out_boxes.append([(x0, y0, x1, y1) for x0, x1 in col_intervals])
+    return rows, out_boxes
+
+
+def _continued_table_groups(table_regions: List[TableRegion],
+                            layout_regions_by_page: Dict[int, List[dict]],
+                            page_info: dict,
+                            pdf_lines: List[TextLine]) -> List[List[TableRegion]]:
+    ordered = sorted(
+        [table for table in table_regions if not getattr(table, "skip_render", False)],
+        key=lambda table: (table.page, table.y_top),
+    )
+    groups: List[List[TableRegion]] = []
+    current: List[TableRegion] = []
+    for table in ordered:
+        if (
+            current
+            and _continued_tables_are_compatible(
+                current[-1], table, layout_regions_by_page, page_info, pdf_lines
+            )
+        ):
+            current.append(table)
+            continue
+        if current:
+            groups.append(current)
+        current = [table]
+    if current:
+        groups.append(current)
+    return groups
+
+
+def _continued_tables_are_compatible(prev: TableRegion,
+                                     nxt: TableRegion,
+                                     layout_regions_by_page: Dict[int, List[dict]],
+                                     page_info: dict,
+                                     pdf_lines: List[TextLine]) -> bool:
+    if getattr(prev, "skip_render", False) or getattr(nxt, "skip_render", False):
+        return False
+    if int(nxt.page) != int(prev.page) + 1:
+        return False
+    if int(getattr(prev, "col_count", 0) or 0) != int(getattr(nxt, "col_count", 0) or 0):
+        return False
+    if int(getattr(prev, "col_count", 0) or 0) < 3:
+        return False
+    if not _table_starts_near_page_top(nxt, page_info):
+        return False
+    if not _table_ends_near_page_bottom(prev, page_info):
+        return False
+
+    prev_bbox = _matching_layout_bbox_for_table(prev, layout_regions_by_page) or _table_bbox(prev)
+    next_bbox = _matching_layout_bbox_for_table(nxt, layout_regions_by_page) or _table_bbox(nxt)
+    if _horizontal_overlap_ratio(prev_bbox, next_bbox) < 0.86:
+        return False
+    edge_delta = abs(prev_bbox[0] - next_bbox[0]) + abs(prev_bbox[2] - next_bbox[2])
+    if edge_delta > max(36.0, (prev_bbox[2] - prev_bbox[0]) * 0.10):
+        return False
+
+    # A repeated header is a strong signal that the next page should stay as a
+    # separate table. Continuation pages in scanned forms usually start with a
+    # body row or a blank-leading row inside an existing rowspan.
+    if _table_header_signal(nxt, pdf_lines):
+        return False
+    return True
+
+
+def stabilize_continued_table_column_schemas(table_regions: List[TableRegion],
+                                             layout_regions_by_page: Dict[int, List[dict]],
+                                             page_info: dict,
+                                             pdf_lines: List[TextLine],
+                                             logger: Logger) -> List[TableRegion]:
+    """
+    Keep page-local continuation segments on the same DOCX column schema.
+
+    Structure recognizers may choose slightly different x boundaries on each
+    physical page. Rendering each segment with its own tblGrid makes vertical
+    borders appear to jump even when the PDF ruled table is continuous. Use the
+    median column-width ratio across compatible continuation pages, then map it
+    back to each page's own layout bbox so OCR geometry still stays local.
+    """
+    fixed = 0
+    for group in _continued_table_groups(table_regions, layout_regions_by_page, page_info, pdf_lines):
+        if len(group) <= 1:
+            continue
+        ratios = _canonical_column_ratios(group, layout_regions_by_page)
+        if len(ratios) != int(getattr(group[0], "col_count", 0) or 0):
+            continue
+        for table in group:
+            intervals = _intervals_from_ratios(table, ratios, layout_regions_by_page)
+            rows, boxes = _normalize_table_rows_to_intervals(table, intervals)
+            if not rows or not boxes:
+                continue
+            table.cells = rows
+            table.cell_bboxes = boxes
+            table.row_count = len(rows)
+            table.col_count = len(intervals)
+            table_bbox = _matching_layout_bbox_for_table(table, layout_regions_by_page) or _table_bbox(table)
+            setattr(table, "x_left", float(table_bbox[0]))
+            setattr(table, "x_right", float(table_bbox[2]))
+            fixed += 1
+    if fixed:
+        logger.log(f"Stabilized {fixed} continued table segment column schema(s)")
+    return table_regions
+
+
+def compose_continued_tables_for_word_flow(table_regions: List[TableRegion],
+                                           layout_regions_by_page: Dict[int, List[dict]],
+                                           page_info: dict,
+                                           pdf_lines: List[TextLine],
+                                           logger: Logger) -> List[TableRegion]:
+    """
+    Build one DOCX table for physical pages that are clearly one ruled table.
+
+    The repair is intentionally after page-local structure/OCR cleanup. We do
+    not rebuild later pages from the first page's grid; each page keeps its
+    detected rows, then a compatible column schema is applied so Word can flow
+    the same logical table across pages and vertical rowspans can continue.
+    """
+    synthetic_tables: List[TableRegion] = []
+    merged_groups = 0
+    for group in _continued_table_groups(table_regions, layout_regions_by_page, page_info, pdf_lines):
+        if len(group) <= 1:
+            continue
+        col_count = int(getattr(group[0], "col_count", 0) or 0)
+        col_intervals = _continued_table_reference_intervals(group, col_count)
+        if len(col_intervals) != col_count:
+            continue
 
         combined_rows: List[List[str]] = []
-        first_render_item = group["first"]
-        source_segments = []
+        combined_boxes: List[List[Tuple[float, float, float, float]]] = []
+        row_source_pages: List[int] = []
+        for source in group:
+            rows, boxes = _normalize_table_rows_to_intervals(source, col_intervals)
+            combined_rows.extend(rows)
+            combined_boxes.extend(boxes)
+            row_source_pages.extend([int(source.page)] * len(rows))
 
-        for idx, item in enumerate(group["items"]):
-            table = item.get("detected")
-            use_detected_rows = (
-                idx == 0
-                and table is not None
-                and table.col_count == col_count
-            )
-            if use_detected_rows:
-                assign_ocr_lines_to_table_cells_by_geometry(
-                    [table],
-                    pdf_lines,
-                    logger,
-                    preserve_header_rows=True,
-                )
-                rows = [list(row) for row in table.cells]
-                boxes = table.cell_bboxes
-            else:
-                rows, boxes = _build_table_rows_from_bbox(
-                    item["page"], item["bbox"], col_intervals, pdf_lines, logger
-                )
-                if table is None and rows:
-                    fallback = TableRegion(
-                        page=item["page"],
-                        y_top=item["bbox"][1],
-                        y_bottom=item["bbox"][3],
-                        cells=rows,
-                        row_count=len(rows),
-                        col_count=col_count,
-                        cell_bboxes=boxes,
-                    )
-                    repaired.append(fallback)
-                    table = fallback
-                    item["detected"] = table
-
-            if rows:
-                combined_rows = _merge_table_rows(combined_rows, rows, col_count)
-            if table is not None:
-                table.y_top = item["bbox"][1]
-                table.y_bottom = item["bbox"][3]
-                source_segments.append(table)
-
-        if not combined_rows or first_render_item is None:
+        if not combined_rows:
             continue
 
-        combined_rows = _repair_continued_table_headers(combined_rows, col_count)
-        first_table = first_render_item.get("detected")
-        first_bbox = first_render_item["bbox"]
+        first = group[0]
+        layout_bbox = _matching_layout_bbox_for_table(first, layout_regions_by_page) or _table_bbox(first)
         synthetic = TableRegion(
-            page=first_render_item["page"],
-            y_top=first_bbox[1],
-            y_bottom=first_bbox[3],
+            page=first.page,
+            y_top=first.y_top,
+            y_bottom=first.y_bottom,
             cells=combined_rows,
             row_count=len(combined_rows),
             col_count=col_count,
-            cell_bboxes=_dummy_table_bboxes(len(combined_rows), col_intervals, first_bbox[1]),
+            cell_bboxes=combined_boxes,
         )
+        setattr(synthetic, "x_left", float(layout_bbox[0]))
+        setattr(synthetic, "x_right", float(layout_bbox[2]))
+        setattr(synthetic, "source_segments", list(group))
+        setattr(synthetic, "source_pages", [int(table.page) for table in group])
+        setattr(synthetic, "row_source_pages", row_source_pages)
+        setattr(synthetic, "enable_blank_continuation_vmerge", True)
         setattr(synthetic, "disable_vertical_merge", True)
-        setattr(synthetic, "source_segments", source_segments)
-        if first_table is not None:
-            setattr(synthetic, "x_left", getattr(first_table, "x_left", first_bbox[0]))
-            setattr(synthetic, "x_right", getattr(first_table, "x_right", first_bbox[2]))
-        for source in source_segments:
+        for source in group:
             setattr(source, "skip_render", True)
-        synthetic_count += 1
-        repaired.append(synthetic)
+        synthetic_tables.append(synthetic)
+        merged_groups += 1
 
-    if synthetic_count:
-        logger.log(f"Repaired {synthetic_count} continued multi-page table(s)")
-    return repaired
+    if merged_groups:
+        logger.log(f"Composed {merged_groups} continued table group(s) for Word flow")
+    return table_regions + synthetic_tables
 
 
 def filter_false_positive_tables(table_regions: List[TableRegion],
@@ -4674,7 +5591,7 @@ def _choose_docling_first_candidates(
         gmft_usable
         and gmft_matches == docling_matches
         and gmft_cells >= docling_cells + max(4, int(docling_cells * 0.12))
-        and gmft_ocr >= docling_ocr - 0.35
+        and gmft_ocr >= docling_ocr - 0.50
         and gmft_score >= docling_score - 1.00
     ):
         use_gmft = True
@@ -4938,6 +5855,164 @@ def _cell_text_should_be_bold(
     return bold_count / max(len(known), 1) >= 0.45
 
 
+def _row_has_continuation_body(row: List[str], cols: int) -> bool:
+    if cols <= 2:
+        return False
+    body_end = max(2, cols - 1)
+    return any(_clean_extracted_text(str(row[c])) for c in range(2, body_end))
+
+
+def _blank_leading_continuation_row(row: List[str], cols: int) -> bool:
+    if cols < 3:
+        return False
+    first = _clean_extracted_text(str(row[0])) if len(row) > 0 else ""
+    second = _clean_extracted_text(str(row[1])) if len(row) > 1 else ""
+    return not first and not second and _row_has_continuation_body(row, cols)
+
+
+def _blank_continuation_vmerge_spans(table_region: TableRegion) -> List[Tuple[int, int, int]]:
+    """
+    Vertical-merge leading descriptor columns over blank continuation rows.
+
+    This restores rowspans such as an item number/title spanning several
+    scoring criteria, including when that span crosses a physical PDF page.
+    The signal is structural: an indexed row anchors the span, and following
+    rows must have blank leading cells while retaining body text.
+    """
+    cols = int(getattr(table_region, "col_count", 0) or 0)
+    rows = [
+        list(row[:cols]) + [""] * max(0, cols - len(row))
+        for row in (getattr(table_region, "cells", []) or [])
+    ]
+    if cols < 4 or len(rows) < 2:
+        return []
+
+    spans: List[Tuple[int, int, int]] = []
+    for c in (0, 1):
+        r = 0
+        while r < len(rows) - 1:
+            anchor_first = _clean_extracted_text(str(rows[r][0]))
+            anchor_text = _clean_extracted_text(str(rows[r][c]))
+            if not anchor_text or not _looks_like_table_index_marker(anchor_first):
+                r += 1
+                continue
+
+            end = r
+            j = r + 1
+            while j < len(rows) and _blank_leading_continuation_row(rows[j], cols):
+                if _clean_extracted_text(str(rows[j][c])):
+                    break
+                end = j
+                j += 1
+
+            if end > r:
+                spans.append((r, end, c))
+                r = end + 1
+            else:
+                r += 1
+
+    def _overlaps_existing(start: int, end: int, col: int) -> bool:
+        return any(col == sc and start <= se and end >= ss for ss, se, sc in spans)
+
+    # A continuation page can begin in the middle of a vertical span, so there
+    # is no anchor text on that physical page. Merge the blank leading run
+    # itself to avoid redrawing horizontal rules through the continued cell.
+    for c in (0, 1):
+        r = 0
+        while r < len(rows):
+            if not _blank_leading_continuation_row(rows[r], cols):
+                r += 1
+                continue
+            start = r
+            while r + 1 < len(rows) and _blank_leading_continuation_row(rows[r + 1], cols):
+                r += 1
+            end = r
+            if end > start and not _overlaps_existing(start, end, c):
+                spans.append((start, end, c))
+            r += 1
+    return spans
+
+
+def _set_tc_border_nil(tc, edge: str) -> None:
+    tc_pr = tc.get_or_add_tcPr()
+    borders = tc_pr.find(qn('w:tcBorders'))
+    if borders is None:
+        borders = OxmlElement('w:tcBorders')
+        tc_pr.append(borders)
+    edge_el = borders.find(qn(f'w:{edge}'))
+    if edge_el is None:
+        edge_el = OxmlElement(f'w:{edge}')
+        borders.append(edge_el)
+    # Some DOCX renderers keep table-style insideH lines even when a cell
+    # border is set to nil. A white explicit edge reliably suppresses the
+    # visual rule while preserving the table grid and cell addressing.
+    edge_el.set(qn('w:val'), 'single')
+    edge_el.set(qn('w:sz'), '4')
+    edge_el.set(qn('w:space'), '0')
+    edge_el.set(qn('w:color'), 'FFFFFF')
+
+
+def _set_tc_border_black(tc, edge: str) -> None:
+    tc_pr = tc.get_or_add_tcPr()
+    borders = tc_pr.find(qn('w:tcBorders'))
+    if borders is None:
+        borders = OxmlElement('w:tcBorders')
+        tc_pr.append(borders)
+    edge_el = borders.find(qn(f'w:{edge}'))
+    if edge_el is None:
+        edge_el = OxmlElement(f'w:{edge}')
+        borders.append(edge_el)
+    edge_el.set(qn('w:val'), 'single')
+    edge_el.set(qn('w:sz'), '4')
+    edge_el.set(qn('w:space'), '0')
+    edge_el.set(qn('w:color'), '000000')
+
+
+def _apply_explicit_cell_grid_borders(table) -> None:
+    for row in table._tbl.tr_lst:
+        for tc in row.tc_lst:
+            for edge in ("top", "bottom", "left", "right"):
+                _set_tc_border_black(tc, edge)
+
+
+def _suppress_ooxml_internal_span_borders(table,
+                                          spans: List[Tuple[int, int, int]],
+                                          logger: Logger) -> int:
+    applied = 0
+    for start, end, col in spans:
+        try:
+            rows = table._tbl.tr_lst
+            if start >= len(rows) or end >= len(rows):
+                continue
+            ok = True
+            for row_idx in range(start, end):
+                if col >= len(rows[row_idx].tc_lst) or col >= len(rows[row_idx + 1].tc_lst):
+                    ok = False
+                    break
+                _set_tc_border_nil(rows[row_idx].tc_lst[col], 'bottom')
+                _set_tc_border_nil(rows[row_idx + 1].tc_lst[col], 'top')
+            if ok:
+                applied += 1
+        except Exception as exc:
+            logger.log(f"  Leading border suppression failed at r{start}-{end}c{col}: {exc}")
+    return applied
+
+
+def _set_cell_no_wrap(cell) -> None:
+    tc_pr = cell._tc.get_or_add_tcPr()
+    if tc_pr.find(qn('w:noWrap')) is None:
+        tc_pr.append(OxmlElement('w:noWrap'))
+
+
+def _compact_wrapped_marker_text(text: str) -> str:
+    cleaned = _clean_extracted_text(text)
+    if re.fullmatch(r"[IVXLCDM](?:\s+[IVXLCDM])+", cleaned, flags=re.IGNORECASE):
+        return _norm_table_key(cleaned)
+    if re.fullmatch(r"\d(?:\s+\d)+", cleaned):
+        return _norm_table_key(cleaned)
+    return text
+
+
 
 def add_table_to_doc(doc: Document, table_region: TableRegion, pdf_lines_page: List[TextLine], logger: Logger, page_info: dict = None):
     """Add a table to the document with PDF-verified horizontal merging."""
@@ -4950,29 +6025,56 @@ def add_table_to_doc(doc: Document, table_region: TableRegion, pdf_lines_page: L
     table.style = 'Table Grid'
     table.alignment = WD_TABLE_ALIGNMENT.CENTER
 
-    # Set proportional column widths from cell bboxes
-    # Find a row with distinct (non-merged) column bboxes for width reference
+    # Set proportional column widths from cell bboxes. Pick the row whose
+    # neighboring boxes have the smallest horizontal gaps; header text boxes are
+    # often much narrower than the ruled cells and make poor width references.
     col_widths_pt = [0.0] * cols
+    best_width_score = float("inf")
+    table_bbox = _table_bbox(table_region)
     for ref_row in range(rows):
-        widths = []
+        row_bboxes = []
         for c in range(cols):
             if ref_row < len(table_region.cell_bboxes) and c < len(table_region.cell_bboxes[ref_row]):
                 bx = table_region.cell_bboxes[ref_row][c]
-                widths.append(bx[2] - bx[0] if any(bx) else 0)
+                row_bboxes.append(tuple(float(v) for v in bx[:4]))
             else:
-                widths.append(0)
+                row_bboxes.append((0.0, 0.0, 0.0, 0.0))
         # Good reference row: all widths > 0 AND no adjacent cells share same bbox (not merged)
-        all_positive = all(w > 0 for w in widths)
+        all_positive = all(bx[2] > bx[0] for bx in row_bboxes)
         no_merges = True
-        if all_positive and ref_row < len(table_region.cell_bboxes):
-            row_bboxes = table_region.cell_bboxes[ref_row]
+        if all_positive:
             for c in range(len(row_bboxes) - 1):
                 if row_bboxes[c] == row_bboxes[c + 1]:
                     no_merges = False
                     break
-        if all_positive and no_merges:
+        if not (all_positive and no_merges):
+            continue
+
+        boundaries = [float(table_bbox[0])]
+        gap_sum = 0.0
+        overlap_sum = 0.0
+        valid_boundaries = True
+        for c in range(cols - 1):
+            left = row_bboxes[c]
+            right = row_bboxes[c + 1]
+            gap_sum += max(0.0, right[0] - left[2])
+            overlap_sum += max(0.0, left[2] - right[0])
+            boundary = (left[2] + right[0]) / 2.0
+            if boundary <= boundaries[-1] + 1.0:
+                valid_boundaries = False
+                break
+            boundaries.append(boundary)
+        boundaries.append(float(table_bbox[2]))
+        if not valid_boundaries:
+            continue
+
+        widths = [boundaries[i + 1] - boundaries[i] for i in range(cols)]
+        if not widths or any(w <= 1.0 for w in widths):
+            continue
+        width_score = gap_sum + overlap_sum * 2.0
+        if width_score < best_width_score:
+            best_width_score = width_score
             col_widths_pt = widths
-            break
 
     total_w = sum(col_widths_pt)
     if total_w > 0:
@@ -5005,6 +6107,27 @@ def add_table_to_doc(doc: Document, table_region: TableRegion, pdf_lines_page: L
         right_margin_pt = float(pg_info.get("docx_right_margin_pt", pg_w * 0.07))
         content_pt = max(pg_w - left_margin_pt - right_margin_pt, pg_w * 0.45)
         content_cm = content_pt / 72.0 * 2.54
+        content_twips = int(round(content_pt * 20.0))
+        col_twips = [
+            max(80, int(round(content_twips * (col_widths_pt[c] / total_w))))
+            for c in range(cols)
+        ]
+        twip_delta = content_twips - sum(col_twips)
+        if col_twips:
+            col_twips[-1] = max(80, col_twips[-1] + twip_delta)
+
+        autofit.set(qn('w:w'), str(content_twips))
+        autofit.set(qn('w:type'), 'dxa')
+
+        existing_grid = tbl_xml.find(qn('w:tblGrid'))
+        if existing_grid is not None:
+            tbl_xml.remove(existing_grid)
+        tbl_grid = OxmlElement('w:tblGrid')
+        for col_twip in col_twips:
+            grid_col = OxmlElement('w:gridCol')
+            grid_col.set(qn('w:w'), str(col_twip))
+            tbl_grid.append(grid_col)
+        tbl_xml.insert(1, tbl_grid)
 
         for c in range(cols):
             col_ratio = col_widths_pt[c] / total_w
@@ -5012,9 +6135,20 @@ def add_table_to_doc(doc: Document, table_region: TableRegion, pdf_lines_page: L
             col_width = Cm(col_cm)
             for row_obj in table.rows:
                 row_obj.cells[c].width = col_width
+                tc_pr = row_obj.cells[c]._tc.get_or_add_tcPr()
+                tc_w = tc_pr.find(qn('w:tcW'))
+                if tc_w is None:
+                    tc_w = OxmlElement('w:tcW')
+                    tc_pr.append(tc_w)
+                tc_w.set(qn('w:w'), str(col_twips[c]))
+                tc_w.set(qn('w:type'), 'dxa')
 
     # Pre-calculate row y-ranges and PDF text for verification
     row_pdf_texts = {}
+    row_source_pages = list(getattr(table_region, "row_source_pages", []) or [])
+    lines_by_page_for_table: Dict[int, List[TextLine]] = {}
+    for line in pdf_lines_page:
+        lines_by_page_for_table.setdefault(int(line.page), []).append(line)
     for r in range(rows):
         # Find min y and max y for this row based on cell bboxes
         min_y = 10000
@@ -5031,12 +6165,18 @@ def add_table_to_doc(doc: Document, table_region: TableRegion, pdf_lines_page: L
             # Extract text lines from PDF that fall within this row's Y range
             # Add some tolerance
             tolerance = 2.0
-            row_lines = [l.text for l in pdf_lines_page if min_y - tolerance <= l.y + l.height/2 <= max_y + tolerance]
+            row_page = row_source_pages[r] if r < len(row_source_pages) else table_region.page
+            candidate_lines = lines_by_page_for_table.get(int(row_page), pdf_lines_page)
+            row_lines = [
+                l.text for l in candidate_lines
+                if min_y - tolerance <= l.y + l.height/2 <= max_y + tolerance
+            ]
             row_pdf_texts[r] = " ".join(row_lines)
         else:
             row_pdf_texts[r] = ""
 
     visited = set()
+    horizontal_text_spans = getattr(table_region, "horizontal_text_spans", {}) or {}
     
     for row_idx in range(rows):
         # Calculate table occurrences for this row 
@@ -5062,6 +6202,12 @@ def add_table_to_doc(doc: Document, table_region: TableRegion, pdf_lines_page: L
             colspan = 1
             rowspan = 1 # Always 1 as requested (No vertical merging)
             row_vals = table_region.cells[row_idx] if row_idx < len(table_region.cells) else []
+            span_spec = horizontal_text_spans.get(row_idx)
+            if span_spec:
+                span_start, span_end, span_text = span_spec
+                if col_idx == span_start:
+                    current_text = str(span_text)
+                    colspan = max(1, int(span_end) - int(span_start) + 1)
 
             # Header cells from TATR sometimes land in the visual center of a
             # multi-column span with empty neighbor cells. Start the merge from
@@ -5159,11 +6305,24 @@ def add_table_to_doc(doc: Document, table_region: TableRegion, pdf_lines_page: L
                     logger.log(f"  Merge failed at r{row_idx}c{col_idx}: {e}")
             
             # Set Text
+            current_text = _compact_wrapped_marker_text(current_text)
             cell.text = current_text
+            if _looks_like_table_index_marker(current_text) or is_numeric_cell(current_text):
+                _set_cell_no_wrap(cell)
             cell_bbox = (0.0, 0.0, 0.0, 0.0)
             if row_idx < len(table_region.cell_bboxes) and col_idx < len(table_region.cell_bboxes[row_idx]):
                 cell_bbox = tuple(table_region.cell_bboxes[row_idx][col_idx])
-            cell_bold = _cell_text_should_be_bold(cell_bbox, pdf_lines_page) if any(cell_bbox) else False
+            row_page = row_source_pages[row_idx] if row_idx < len(row_source_pages) else table_region.page
+            cell_page_lines = lines_by_page_for_table.get(int(row_page), pdf_lines_page)
+            cell_bold = _cell_text_should_be_bold(cell_bbox, cell_page_lines) if any(cell_bbox) else False
+            cell_font_size = table_font_size
+            marker_for_fit = _clean_extracted_text(current_text)
+            if (
+                col_idx in (0, cols - 1)
+                and len(marker_for_fit) > 1
+                and (_looks_like_table_index_marker(marker_for_fit) or is_numeric_cell(marker_for_fit))
+            ):
+                cell_font_size = max(9, table_font_size - 3)
             
             # Formatting
             for para in cell.paragraphs:
@@ -5174,18 +6333,29 @@ def add_table_to_doc(doc: Document, table_region: TableRegion, pdf_lines_page: L
                     para.alignment = WD_PARAGRAPH_ALIGNMENT.LEFT
                     
                 if para.runs:
-                    set_paragraph_font(para, font_size=table_font_size, bold=cell_bold if cell_bold else None)
+                    set_paragraph_font(para, font_size=cell_font_size, bold=cell_bold if cell_bold else None)
                 else:
                     run = para.add_run()
                     run.font.name = "Times New Roman"
-                    run.font.size = Pt(table_font_size)
+                    run.font.size = Pt(cell_font_size)
                     if cell_bold:
                         run.font.bold = True
+
+    if getattr(table_region, "enable_blank_continuation_vmerge", False):
+        spans = _blank_continuation_vmerge_spans(table_region)
+        _apply_explicit_cell_grid_borders(table)
+        applied = _suppress_ooxml_internal_span_borders(table, spans, logger)
+        if applied:
+            logger.log(f"  Suppressed {applied} leading continuation border span(s)")
     
-    # Vertical merge detection: merge cells in same column with identical text
-    # where cell bboxes are vertically aligned (same x0, x1)
-    if not getattr(table_region, "disable_vertical_merge", False):
-      for c in range(cols):
+    # Vertical merges are opt-in. python-docx cell addressing can shift after
+    # rowspan merges in dense scanned tables, which is worse than keeping
+    # repeated/blank page-local cells readable.
+    if (
+        os.environ.get("OCRTOOL_ENABLE_VERTICAL_TABLE_MERGE") == "1"
+        and not getattr(table_region, "disable_vertical_merge", False)
+    ):
+      for c in reversed(range(cols)):
         r = 0
         while r < rows - 1:
             text_r = table_region.cells[r][c].strip() if r < len(table_region.cells) and c < len(table_region.cells[r]) else ""
@@ -5592,7 +6762,11 @@ def create_docx_from_pdf(
         )
         table_regions = split_stacked_tables(table_regions, logger)
         table_regions = postprocess_table_layout_grids(table_regions, layout_regions_by_page, logger)
+        table_regions = stabilize_page_local_table_grids(
+            table_regions, layout_regions_by_page, page_info, logger
+        )
         table_regions = filter_false_positive_tables(table_regions, layout_regions_by_page, logger)
+        table_regions = repair_table_row_gaps_from_ocr(table_regions, pdf_lines, logger)
         table_assigned_ids = assign_ocr_lines_to_table_cells_by_geometry(
             table_regions,
             pdf_lines,
@@ -5604,6 +6778,19 @@ def create_docx_from_pdf(
             postprocess_tables_v2(table_regions, pdf_lines, logger)
         except Exception as exc:
             logger.log(f"V2 table postprocess failed, keeping V1 cells: {exc}")
+        table_regions = repair_shifted_leading_table_cells(table_regions, logger)
+        table_regions = fuse_page_local_continuation_rows(table_regions, logger)
+        table_regions = stabilize_continued_table_column_schemas(
+            table_regions, layout_regions_by_page, page_info, pdf_lines, logger
+        )
+        if os.environ.get("OCRTOOL_ENABLE_CONTINUED_TABLE_FLOW") == "1":
+            table_regions = compose_continued_tables_for_word_flow(
+                table_regions, layout_regions_by_page, page_info, pdf_lines, logger
+            )
+        table_regions = repair_section_heading_rows(table_regions, logger)
+        for table in table_regions:
+            if not getattr(table, "skip_render", False):
+                setattr(table, "enable_blank_continuation_vmerge", True)
 
         # --- NEW: Refine Structure ---
         # User requested to disable custom geometric refinement.
@@ -5933,6 +7120,19 @@ def create_docx_from_pdf(
         for section in doc.sections:
             _apply_standard_section_layout(section, current_orientation)
         last_rendered_page = None
+        table_render_pages = {
+            int(table.page)
+            for table in table_regions
+            if not getattr(table, "skip_render", False)
+        }
+        table_bottom_pages = {
+            int(table.page)
+            for table in table_regions
+            if (
+                not getattr(table, "skip_render", False)
+                and float(table.y_bottom) >= float(page_info.get(table.page, {}).get("height", 842)) * 0.86
+            )
+        }
 
         for elem_index, elem in enumerate(doc_elements):
             elem_page = elem["page"]
@@ -5940,10 +7140,21 @@ def create_docx_from_pdf(
 
             page_changed = last_rendered_page is not None and elem_page != last_rendered_page
             orientation_changed = needed_orient != current_orientation
+            table_boundary = (
+                page_changed
+                and (
+                    int(elem_page) in table_render_pages
+                    or int(last_rendered_page) in table_render_pages
+                )
+            )
+            page_break_likely_implicit = page_changed and int(last_rendered_page) in table_bottom_pages
             if (
                 page_changed
                 and not orientation_changed
-                and os.environ.get("OCRTOOL_PRESERVE_SOURCE_PAGE_BREAKS") == "1"
+                and (
+                    os.environ.get("OCRTOOL_PRESERVE_SOURCE_PAGE_BREAKS") == "1"
+                    or (table_boundary and not page_break_likely_implicit)
+                )
             ):
                 doc.add_page_break()
                 logger.log(f"Inserted page break before source page {elem_page}")
@@ -6120,10 +7331,14 @@ def create_docx_from_pdf(
 
             elif elem["type"] == "table":
                 table = elem["data"]
-                page_lines = [l for l in pdf_lines if l.page == table.page]
+                source_pages = set(getattr(table, "source_pages", []) or [table.page])
+                page_lines = [l for l in pdf_lines if l.page in source_pages]
                 add_table_to_doc(doc, table, page_lines, logger, page_info)
                 tables_added_count += 1
-                if elem_index < len(doc_elements) - 1:
+                if (
+                    elem_index < len(doc_elements) - 1
+                    and doc_elements[elem_index + 1]["page"] == elem_page
+                ):
                     doc.add_paragraph()  # Space after table when more content follows
         
         # Cleanup
