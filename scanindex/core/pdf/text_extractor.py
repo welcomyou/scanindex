@@ -6,6 +6,11 @@ import shutil
 
 import fitz
 
+from scanindex.core.canonical_io import (
+    load_canonical,
+    resolve_existing_companion,
+    save_canonical,
+)
 from scanindex.core.kie.json_utils import (
     make_document_stub,
     make_line_record,
@@ -29,15 +34,14 @@ OCR_DPI = 200
 def is_digital_ocr_output(ocr_pdf_path: str) -> bool:
     """Kiểm tra _ocr.pdf là output của digital text extraction (không phải ScreenAI).
 
-    Đọc canonical JSON `<ocr_pdf_path>.json`, check `document.engine`.
+    Resolve canonical companion (`.json` hoặc `.json.zst`), check `document.engine`.
     Trả True nếu engine = DIGITAL_TEXT_ENGINE → caller nên skip correction.
     """
-    json_path = ocr_pdf_path + ".json"
-    if not os.path.exists(json_path):
+    companion = resolve_existing_companion(ocr_pdf_path)
+    if companion is None:
         return False
     try:
-        with open(json_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        data = load_canonical(companion)
         return data.get("document", {}).get("engine") == DIGITAL_TEXT_ENGINE
     except Exception:
         return False
@@ -288,8 +292,7 @@ def merge_native_text_layer_into_canonical_json(
     merge_pages: list[int] | None = None,
     canonical_profile: str | None = None,
 ) -> dict:
-    with open(canonical_json_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    data = load_canonical(canonical_json_path)
 
     doc = fitz.open(source_pdf_path)
     try:
@@ -366,10 +369,7 @@ def merge_native_text_layer_into_canonical_json(
     upgrade_ocr_data_in_place(data)
     if canonical_profile in {"layoutlmv3_runtime", "layoutlmv3_runtime_v1"}:
         slim_canonical_for_layoutlmv3_runtime_in_place(data)
-    tmp_path = canonical_json_path + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False)
-    os.replace(tmp_path, canonical_json_path)
+    save_canonical(canonical_json_path, data)
     return {"pages": details}
 
 
@@ -427,10 +427,7 @@ def extract_digital_pdf_as_ocr(
         if canonical_profile == "layoutlmv3_runtime":
             slim_canonical_for_layoutlmv3_runtime_in_place(ocr_data)
         json_path = output_path + ".json"
-        json_tmp_path = json_path + ".tmp"
-        with open(json_tmp_path, "w", encoding="utf-8") as f:
-            json.dump(ocr_data, f, ensure_ascii=False)
-        os.replace(json_tmp_path, json_path)
+        save_canonical(json_path, ocr_data)
 
         log(f"Digital extraction completed: {output_path}", "success")
         return True, None

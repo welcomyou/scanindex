@@ -755,8 +755,8 @@ class Importer:
 
     @staticmethod
     def _load_canonical(path: Path) -> dict:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+        from scanindex.core.canonical_io import load_canonical
+        return load_canonical(path)
 
     def _import_one_pdf(self,
                         pdf: Path,

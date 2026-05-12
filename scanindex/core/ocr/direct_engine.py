@@ -18,6 +18,7 @@ import logging
 import atexit
 import unicodedata
 
+from scanindex.core.canonical_io import save_canonical
 from scanindex.core.ocr.screen_ai import ScreenAIOCR
 from scanindex.core.kie.json_utils import (
     decorate_layout_regions,
@@ -1113,10 +1114,7 @@ def process_pdf(input_path, output_path, num_pages=None, update_callback=None,
         upgrade_ocr_data_in_place(ocr_data)
         if canonical_profile == "layoutlmv3_runtime":
             slim_canonical_for_layoutlmv3_runtime_in_place(ocr_data)
-        json_tmp_path = json_path + ".tmp"
-        with open(json_tmp_path, "w", encoding="utf-8") as f:
-            json.dump(ocr_data, f, ensure_ascii=False)
-        os.replace(json_tmp_path, json_path)
+        save_canonical(json_path, ocr_data)
 
         log(f"OCR completed: {output_path}", "success")
         return True, None
@@ -1266,10 +1264,7 @@ def assemble_pdf_from_page_results(input_path, output_path, all_page_results,
         upgrade_ocr_data_in_place(ocr_data)
         if canonical_profile == "layoutlmv3_runtime":
             slim_canonical_for_layoutlmv3_runtime_in_place(ocr_data)
-        json_tmp_path = json_path + ".tmp"
-        with open(json_tmp_path, "w", encoding="utf-8") as f:
-            json.dump(ocr_data, f, ensure_ascii=False)
-        os.replace(json_tmp_path, json_path)
+        save_canonical(json_path, ocr_data)
 
         log(f"Assembled (cached OCR): {output_path}", "success")
         return True, None
