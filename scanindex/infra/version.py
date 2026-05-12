@@ -39,19 +39,30 @@ def _project_root() -> Path:
 
 
 def get_version() -> str:
-    """Trả về version string. Cache sau lần gọi đầu."""
+    """Trả về version string. Cache sau lần gọi đầu.
+
+    Tier order:
+      1. git describe — when running inside a working .git tree, the tag
+         is the source of truth. A stale VERSION file left at project
+         root from a previous build_portable run must NOT shadow the
+         current tag (was the cause of v1.0.1 build producing
+         dist\\ScanIndex-1.0.0\\).
+      2. VERSION file — only used when git is unavailable (portable
+         frozen bundle has no .git).
+      3. Hard-coded fallback.
+    """
     global _cached_version
     if _cached_version is not None:
         return _cached_version
 
-    # 1. Thử đọc từ VERSION file (portable build)
-    version = _read_version_file()
+    # 1. Thử đọc từ git (dev tree)
+    version = _read_git_version()
     if version:
         _cached_version = version
         return version
 
-    # 2. Thử đọc từ git
-    version = _read_git_version()
+    # 2. Thử đọc từ VERSION file (portable bundle without .git)
+    version = _read_version_file()
     if version:
         _cached_version = version
         return version
