@@ -65,7 +65,7 @@ if "%MODE%"=="1" (
     echo [FULL] Installing dependencies...
     python -m pip install --upgrade pip
     if errorlevel 1 goto :fail
-    pip install -r requirements_qt.txt
+    pip install -r requirements.txt
     if errorlevel 1 goto :fail
     pip install pyinstaller
     if errorlevel 1 goto :fail
@@ -79,6 +79,7 @@ if "%MODE%"=="1" (
     call :check_dir "models\lightgbm_splitter" "Archive page splitter"
     call :check_dir "models\layoutlmv3_fontgray_norm_final_epoch25" "LayoutLMv3 text KIE"
     if "%INCLUDE_CORRECTION%"=="1" call :check_dir "models\distilled_ct2" "Distilled Proton CT2"
+    call :check_dir "models\translate" "***REMOVED*** EN<->VI"
 )
 
 echo.

@@ -1132,7 +1132,7 @@ class ArchiveStep3Sign(QWidget):
         self.lbl_cert_detail.setText(_IMPORT_ERR)
         self.btn_sign.setEnabled(False)
         self.lbl_status.setText(
-            "Không tải được module ký số. Cài dependencies trong requirements_qt.txt rồi khởi động lại."
+            "Không tải được module ký số. Cài dependencies trong requirements.txt rồi khởi động lại."
         )
 
     def _reload_certs(self):

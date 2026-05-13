@@ -163,6 +163,13 @@ class SettingsTab(QWidget):
         self.chk_correct_enabled.setChecked(True)
         card.content_layout().addWidget(self.chk_correct_enabled)
 
+        # EN→VI translation toggle. When on, _export_single writes an extra
+        # *_vi.docx alongside the regular Word output using the bundled
+        # ***REMOVED*** shim. Default off — translation adds 2-30s per file.
+        self.chk_translate_vi = QCheckBox(translations.get_text("chk_translate_vi"))
+        self.chk_translate_vi.setChecked(False)
+        card.content_layout().addWidget(self.chk_translate_vi)
+
         form = QFormLayout()
         form.setSpacing(SP[1])
         form.setContentsMargins(0, 0, 0, 0)
@@ -524,7 +531,8 @@ class SettingsTab(QWidget):
                    kie_mode: str = "layoutlmv3",
                    doc_types: list[str] | None = None,
                    catalogs: dict | None = None,
-                   theme: str = "dark"):
+                   theme: str = "dark",
+                   translate_vi: bool = False):
         self._wait_page_value = wait_page
         self._compare_value = compare_int
         self.entry_concurrency.setText(concurrency)
@@ -535,6 +543,7 @@ class SettingsTab(QWidget):
             self.combo_model.setCurrentText(model)
         self.combo_model.blockSignals(False)
         self.chk_correct_enabled.setChecked(bool(correct))
+        self.chk_translate_vi.setChecked(bool(translate_vi))
         self.chk_verbose.setChecked(verbose)
         self.chk_show_log_panel.setChecked(show_log_panel)
         # Map config key → display index
@@ -568,6 +577,7 @@ class SettingsTab(QWidget):
             "export_workers": "1",
             "model": self.combo_model.currentText(),
             "correct": self.chk_correct_enabled.isChecked(),
+            "translate_vi": self.chk_translate_vi.isChecked(),
             "verbose": self.chk_verbose.isChecked(),
             "show_log_panel": self.chk_show_log_panel.isChecked(),
             "kie_mode": kie_mode,
@@ -588,6 +598,7 @@ class SettingsTab(QWidget):
     def update_texts(self):
         self.btn_save.setText(translations.get_text("btn_save_settings"))
         self.chk_correct_enabled.setText(translations.get_text("chk_correct_enabled"))
+        self.chk_translate_vi.setText(translations.get_text("chk_translate_vi"))
         self.chk_show_log_panel.setText(translations.get_text("chk_show_log_panel"))
         self.chk_verbose.setText(translations.get_text("chk_verbose_log"))
         self.lbl_desc.setText(translations.get_text("lbl_settings_desc"))

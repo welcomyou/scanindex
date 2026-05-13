@@ -416,7 +416,7 @@ class ArchiveStep2Kie(QWidget):
         # rows while dirty triggers a Save / Discard / Cancel prompt.
         self._form_dirty = False
         # Output folder is no longer surfaced in the toolbar; the pipeline
-        # always writes intermediate _ocr.pdf / _ocr.pdf.json into
+        # always writes intermediate _ocr.pdf / _ocr.pdf.json.zst into
         # <session_temp>/_step2_kie/ and only Step 3's "Xuất hồ sơ nén"
         # button picks the real destination. We keep the value here so
         # existing set_output_folder/get_output_folder callers still work.
@@ -1262,12 +1262,12 @@ class ArchiveStep2Kie(QWidget):
             return
         doc = self._documents[idx]
         saved_meta = doc.pop("_metadata_before_viewer_dirty", None)
-        from scanindex.core.canonical_io import load_canonical, resolve_companion
+        from scanindex.core.canonical_io import companion_for_pdf, load_canonical, resolve_companion
         json_path = doc.get("json_path")
         if not json_path:
             out_pdf = doc.get("output_path") or ""
             if out_pdf:
-                json_path = out_pdf + ".json"
+                json_path = str(companion_for_pdf(out_pdf))
 
         canonical = None
         resolved_json = resolve_companion(json_path) if json_path else None
@@ -1279,7 +1279,7 @@ class ArchiveStep2Kie(QWidget):
         doc["zones"] = _annotation_to_zone_map(ann)
         if canonical is not None:
             doc["_canonical_cache"] = canonical
-            self.pdf_viewer.load_canonical(json_path)
+            self.pdf_viewer.load_canonical(str(resolved_json or json_path))
         self._refresh_raw_kie_panel(ann)
         for key, _, _ in _FIELDS:
             self._set_field_value(key, doc["metadata"].get(key, "") or "", block_signals=True)
@@ -1501,14 +1501,18 @@ class ArchiveStep2Kie(QWidget):
         if not json_path:
             out_pdf = doc.get("output_path") or ""
             if out_pdf:
-                json_path = out_pdf + ".json"
+                from scanindex.core.canonical_io import companion_for_pdf
+
+                json_path = str(companion_for_pdf(out_pdf))
+        from scanindex.core.canonical_io import resolve_companion
+        resolved_json = resolve_companion(json_path) if json_path else None
         self._debug_log(
             f"row={row} status={doc.get('status')!r} "
             f"output_path={doc.get('output_path')!r} "
             f"json_path={json_path!r} "
-            f"json_exists={bool(json_path) and os.path.exists(json_path)}"
+            f"json_exists={resolved_json is not None}"
         )
-        annotation = _load_annotation(json_path) if json_path else None
+        annotation = _load_annotation(str(resolved_json or json_path)) if json_path else None
         if annotation:
             doc["annotation"] = annotation
             # Derive form metadata from the annotation only when the

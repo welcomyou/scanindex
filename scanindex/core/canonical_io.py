@@ -1,4 +1,4 @@
-"""Canonical OCR JSON I/O — single point for reading/writing `_ocr.pdf.json`.
+"""Canonical OCR JSON I/O — single point for reading/writing `_ocr.pdf.json.zst`.
 
 A canonical companion is the JSON sidecar that lives next to `_ocr.pdf`. It
 holds OCR pages/lines/words, KIE annotations, and document metadata. Every
@@ -9,13 +9,13 @@ profile (full vs `layoutlmv3_runtime` slim) and the engine label.
 
 Public API:
 
-    load_canonical(path)              transparent for .json and .json.zst
+    load_canonical(path)              read canonical data; `.json.zst` is canonical
     save_canonical(path, data, *,     upgrade + conditional slim + atomic
                    profile=None,      write — compressed by default
                    compress=True)
 
-    resolve_companion(any_path)       existing companion or None
-    companion_for_pdf(pdf_path)       default companion path (may not exist)
+    resolve_companion(any_path)       existing `.json.zst` companion or None
+    companion_for_pdf(pdf_path)       default `.json.zst` companion path
     companion_to_pdf(companion)       strip suffix back to PDF path
 
 Profile resolution inside save_canonical: explicit `profile=` arg > value on
@@ -23,9 +23,7 @@ Profile resolution inside save_canonical: explicit `profile=` arg > value on
 callers stay slim if the source was slim.
 
 Compression: on by default at zstd level 3. Real-world OCR JSON shrinks to
-~13% of plain size (87% saved); decompress+parse is ≈ raw json.load. Opt out
-at a specific callsite with `compress=False` — e.g. for end-user output
-files that should stay human-inspectable.
+~13% of plain size (87% saved); decompress+parse is ≈ raw json.load.
 """
 from __future__ import annotations
 
@@ -39,41 +37,114 @@ PathLike = Union[str, os.PathLike]
 JSON_SUFFIX = ".json"
 ZST_SUFFIX = ".json.zst"
 
-# First 4 bytes of every zstd stream — lets `load_canonical` accept either
-# suffix without trusting the filename.
+# First 4 bytes of every zstd stream.
 _ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 
-# Canonical profile name for the LayoutLMv3 runtime slim variant.
-# `slim_canonical_for_layoutlmv3_runtime_in_place` stamps the `_v1` form into
-# `pipeline.ocr.canonical_profile` after slimming; callers pass the
-# un-suffixed name. Both are accepted by save_canonical's profile resolver.
+# Public profile aliases. The stored value is always the versioned form.
 LAYOUTLMV3_RUNTIME_PROFILE = "layoutlmv3_runtime"
-_SLIM_PROFILES = frozenset({"layoutlmv3_runtime", "layoutlmv3_runtime_v1"})
+LAYOUTLMV3_RUNTIME_PROFILE_V1 = "layoutlmv3_runtime_v1"
+LAYOUTLMV3_TRAINING_PROFILE = "layoutlmv3_training"
+LAYOUTLMV3_TRAINING_PROFILE_V1 = "layoutlmv3_training_v1"
+DOCX_EXPORT_PROFILE = "docx_export"
+DOCX_EXPORT_PROFILE_V1 = "docx_export_v1"
+
+_PROFILE_ALIASES = {
+    LAYOUTLMV3_RUNTIME_PROFILE: LAYOUTLMV3_RUNTIME_PROFILE_V1,
+    LAYOUTLMV3_RUNTIME_PROFILE_V1: LAYOUTLMV3_RUNTIME_PROFILE_V1,
+    LAYOUTLMV3_TRAINING_PROFILE: LAYOUTLMV3_TRAINING_PROFILE_V1,
+    LAYOUTLMV3_TRAINING_PROFILE_V1: LAYOUTLMV3_TRAINING_PROFILE_V1,
+    DOCX_EXPORT_PROFILE: DOCX_EXPORT_PROFILE_V1,
+    DOCX_EXPORT_PROFILE_V1: DOCX_EXPORT_PROFILE_V1,
+    # Historical internal name from earlier PDF-to-Word cache experiments.
+    "docx_export_full": DOCX_EXPORT_PROFILE_V1,
+}
+
+KNOWN_CANONICAL_PROFILES = frozenset(_PROFILE_ALIASES.values())
+
+
+def resolve_profile(profile: Optional[str]) -> Optional[str]:
+    """Resolve a public profile alias to the stored versioned profile name."""
+    if profile is None:
+        return None
+    value = str(profile).strip()
+    if not value:
+        return None
+    return _PROFILE_ALIASES.get(value, value)
+
+
+def _infer_source_mode(data: dict) -> str:
+    """Best-effort source-mode metadata for old callers/files."""
+    ocr = data.get("pipeline", {}).get("ocr", {}) if isinstance(data, dict) else {}
+    engine = (
+        ocr.get("engine")
+        or data.get("document", {}).get("engine")
+        or data.get("engine")
+        or ""
+    )
+    if ocr.get("digital_layer_merge"):
+        return "mixed"
+    if str(engine).lower() == "digital_pdf_text":
+        return "digital"
+    return "scan"
+
+
+def _stamp_profile_metadata(data: dict, profile: Optional[str]) -> None:
+    pipeline = data.setdefault("pipeline", {})
+    ocr = pipeline.setdefault("ocr", {})
+    if profile:
+        ocr["canonical_profile"] = profile
+    source_mode = str(ocr.get("source_mode") or "").strip().lower()
+    if source_mode not in {"scan", "digital", "mixed"}:
+        ocr["source_mode"] = _infer_source_mode(data)
+
+
+def validate_canonical_profile(data: dict, profile: Optional[str]) -> list[str]:
+    """Lightweight profile contract checks used by tests and diagnostics."""
+    resolved = resolve_profile(profile)
+    warnings: list[str] = []
+    pages = data.get("pages") or [] if isinstance(data, dict) else []
+    if resolved == LAYOUTLMV3_RUNTIME_PROFILE_V1:
+        if any(page.get("kie_tokens") for page in pages if isinstance(page, dict)):
+            warnings.append("layoutlmv3_runtime_v1 must not contain page.kie_tokens")
+        if any(page.get("layout_regions") for page in pages if isinstance(page, dict)):
+            warnings.append("layoutlmv3_runtime_v1 must not contain page.layout_regions")
+        if any(page.get("table_structures") for page in pages if isinstance(page, dict)):
+            warnings.append("layoutlmv3_runtime_v1 must not contain page.table_structures")
+    elif resolved == LAYOUTLMV3_TRAINING_PROFILE_V1:
+        if any("kie_tokens" not in page for page in pages if isinstance(page, dict)):
+            warnings.append("layoutlmv3_training_v1 should contain page.kie_tokens")
+        if any(page.get("table_structures") for page in pages if isinstance(page, dict)):
+            warnings.append("layoutlmv3_training_v1 must not contain page.table_structures")
+    elif resolved == DOCX_EXPORT_PROFILE_V1:
+        if any(page.get("kie_tokens") for page in pages if isinstance(page, dict)):
+            warnings.append("docx_export_v1 must not contain page.kie_tokens")
+    return warnings
 
 
 def companion_for_pdf(pdf_path: PathLike) -> Path:
     """Default companion path for a PDF.
 
-    Returns the existing `.json` if present, else the existing `.json.zst`,
-    else the default `.json` path (may not exist yet — useful as a destination
-    for a fresh write). Never raises for missing files.
+    `.json.zst` is the only canonical companion suffix from this point on.
+    The path may not exist yet, which is useful as a destination for fresh
+    writes. Never raises for missing files.
     """
     pdf = Path(pdf_path)
-    plain = pdf.with_name(pdf.name + JSON_SUFFIX)
-    if plain.exists():
-        return plain
-    zst = pdf.with_name(pdf.name + ZST_SUFFIX)
-    if zst.exists():
-        return zst
-    return plain
+    return pdf.with_name(pdf.name + ZST_SUFFIX)
 
 
 def resolve_companion(path: PathLike) -> Optional[Path]:
-    """Locate an existing companion. Accepts PDF path or either suffix."""
+    """Locate an existing canonical `.json.zst` companion.
+
+    A legacy `.json` argument is treated as an alias for `.json.zst`; plain
+    `.json` files are not resolved implicitly.
+    """
     p = Path(path)
     s = str(p)
-    if s.endswith(ZST_SUFFIX) or s.endswith(JSON_SUFFIX):
+    if s.endswith(ZST_SUFFIX):
         return p if p.exists() else None
+    if s.endswith(JSON_SUFFIX):
+        zst = Path(s + ".zst")
+        return zst if zst.exists() else None
     found = companion_for_pdf(p)
     return found if found.exists() else None
 
@@ -90,10 +161,11 @@ def companion_to_pdf(companion_path: PathLike) -> Path:
 
 
 def load_canonical(path: PathLike) -> dict:
-    """Read a canonical companion. Auto-detects `.json` vs `.json.zst`.
+    """Read a canonical companion.
 
-    Detection: filename suffix first (fast path), then zstd magic bytes
-    (covers files saved with an unexpected name).
+    `.json.zst` is the production format. Plain JSON is still parseable when
+    explicitly passed for developer migration/debugging, but `resolve_companion`
+    never selects it implicitly.
     """
     raw = Path(path).read_bytes()
     is_zst = str(path).endswith(ZST_SUFFIX) or raw[:4] == _ZSTD_MAGIC
@@ -121,14 +193,28 @@ def save_canonical(
     Returns the actual path written.
     """
     from scanindex.core.kie.json_utils import (
+        build_kie_tokens_in_place,
+        prune_canonical_for_docx_export_in_place,
+        prune_canonical_for_layoutlmv3_training_in_place,
         slim_canonical_for_layoutlmv3_runtime_in_place,
         upgrade_ocr_data_in_place,
     )
 
     upgrade_ocr_data_in_place(data)
-    resolved = profile or data.get("pipeline", {}).get("ocr", {}).get("canonical_profile")
-    if resolved in _SLIM_PROFILES:
+    resolved = resolve_profile(
+        profile or data.get("pipeline", {}).get("ocr", {}).get("canonical_profile")
+    )
+    _stamp_profile_metadata(data, resolved)
+
+    if resolved == LAYOUTLMV3_RUNTIME_PROFILE_V1:
         slim_canonical_for_layoutlmv3_runtime_in_place(data)
+    elif resolved == LAYOUTLMV3_TRAINING_PROFILE_V1:
+        build_kie_tokens_in_place(data)
+        prune_canonical_for_layoutlmv3_training_in_place(data)
+    elif resolved == DOCX_EXPORT_PROFILE_V1:
+        prune_canonical_for_docx_export_in_place(data)
+
+    _stamp_profile_metadata(data, resolved)
 
     s = str(path)
     if compress:

@@ -1,0 +1,71 @@
+{
+  "root": "D:\\App\\ocrtool",
+  "out": "D:\\App\\ocrtool\\graphify\\graphify-out",
+  "mode": "ast_only",
+  "detected_counts": {
+    "code": 274,
+    "document": 56,
+    "paper": 0,
+    "image": 0,
+    "video": 0
+  },
+  "total_words": 1229780,
+  "warning": "Large corpus: 330 files · ~1,229,780 words. Semantic extraction will be expensive (many Claude tokens). Consider running on a subfolder, or use --no-semantic to run AST-only.",
+  "nodes": 3662,
+  "edges": 9362,
+  "communities": 163,
+  "god_nodes_top10": [
+    {
+      "id": "ocrtool_ocr_app_main",
+      "label": "main()",
+      "degree": 300
+    },
+    {
+      "id": "kie_viewer_kie_viewer_kieviewer",
+      "label": "KieViewer",
+      "degree": 107
+    },
+    {
+      "id": "repository_screen_repositoryscreen",
+      "label": "RepositoryScreen",
+      "degree": 90
+    },
+    {
+      "id": "digitization_extraction_step_archivestep2kie",
+      "label": "ArchiveStep2Kie",
+      "degree": 88
+    },
+    {
+      "id": "pdf_splitter_log",
+      "label": "_log()",
+      "degree": 73
+    },
+    {
+      "id": "digitization_signing_step_archivestep3sign",
+      "label": "ArchiveStep3Sign",
+      "degree": 72
+    },
+    {
+      "id": "repository_importer_importer",
+      "label": "Importer",
+      "degree": 69
+    },
+    {
+      "id": "repository_search_engine_searchengine",
+      "label": "SearchEngine",
+      "degree": 55
+    },
+    {
+      "id": "ocr_screen_ai_downloader_build_url",
+      "label": "_build_url()",
+      "degree": 53
+    },
+    {
+      "id": "dialogs_archive_session_dialog_dossierinfodialog",
+      "label": "DossierInfoDialog",
+      "degree": 52
+    }
+  ],
+  "html_status": "written",
+  "built_at_commit": "acab4b891004fc42e2a678a4857592a500258c51"
+}

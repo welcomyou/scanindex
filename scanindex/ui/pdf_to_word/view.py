@@ -2,7 +2,7 @@
 DnD Tab — Drag & Drop file processing tab.
 """
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QPushButton
+    QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QCheckBox
 )
 from PySide6.QtCore import Qt, Signal
 
@@ -56,6 +56,15 @@ class DnDTab(QWidget):
 
         toolbar.addStretch()
 
+        # Optional EN→VI translation toggle — when on, _export_single writes
+        # an extra {name}_vi.docx alongside the Word output. Source of truth
+        # for the feature; settings.ini value is loaded into this on startup.
+        self.chk_translate_vi = QCheckBox(translations.get_text("chk_translate_vi"))
+        self.chk_translate_vi.setChecked(False)
+        self.chk_translate_vi.setToolTip(translations.get_text("tooltip_translate_vi"))
+        self.chk_translate_vi.setCursor(Qt.CursorShape.PointingHandCursor)
+        toolbar.addWidget(self.chk_translate_vi)
+
         self.btn_clear = QPushButton(translations.get_text("btn_clear"))
         self.btn_clear.setProperty("cssClass", "ghost")
         self.btn_clear.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -78,3 +87,5 @@ class DnDTab(QWidget):
         self.btn_process.setText(translations.get_text("btn_process_all"))
         self.btn_stop.setText(translations.get_text("btn_stop"))
         self.btn_clear.setText(translations.get_text("btn_clear"))
+        self.chk_translate_vi.setText(translations.get_text("chk_translate_vi"))
+        self.chk_translate_vi.setToolTip(translations.get_text("tooltip_translate_vi"))

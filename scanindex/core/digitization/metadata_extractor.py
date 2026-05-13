@@ -662,7 +662,7 @@ def extract_metadata(json_path, log_callback=None):
     Reads FIRST page data only.
 
     Args:
-        json_path: Path to _ocr.pdf.json companion file
+        json_path: Path to _ocr.pdf.json.zst companion file
         log_callback: Optional callback(msg, level) for logging
 
     Returns:
@@ -789,7 +789,7 @@ def extract_metadata(json_path, log_callback=None):
     for signer detection.
 
     Args:
-        json_path: Path to _ocr.pdf.json companion file
+        json_path: Path to _ocr.pdf.json.zst companion file
         log_callback: Optional callback(msg, level) for logging
 
     Returns:

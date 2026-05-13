@@ -128,7 +128,7 @@ def write_aggregated_excel(tasks_or_docs, excel_path: str,
             row[col] = v
 
     def _hydrate_annotation_from_json(entry: dict) -> dict:
-        """KIE pipeline writes the annotation to disk (`<stem>_ocr.pdf.json`)
+        """KIE pipeline writes the annotation to disk (`<stem>_ocr.pdf.json.zst`)
         but only caches it on `doc["annotation"]` when the user clicks
         the row in Step 2. Files whose row was never opened still have a
         valid annotation — read it from disk so the export covers every
@@ -138,7 +138,7 @@ def write_aggregated_excel(tasks_or_docs, excel_path: str,
         if not json_path:
             output_path = entry.get("output_path") or ""
             if output_path:
-                json_path = output_path + ".json"
+                json_path = output_path + ".json.zst"
         resolved = resolve_companion(json_path) if json_path else None
         if resolved is None:
             return {}
@@ -217,11 +217,11 @@ def _unique_output_pdf_path(output_dir: str, stem: str) -> str:
     file. Use a run-local suffix when the canonical target already exists.
     """
     base = os.path.join(output_dir, f"{stem}_ocr.pdf")
-    if not os.path.exists(base) and not os.path.exists(base + ".json"):
+    if not os.path.exists(base) and not os.path.exists(base + ".json.zst"):
         return base
     for index in range(2, 10000):
         candidate = os.path.join(output_dir, f"{stem}_ocr_r{index}.pdf")
-        if not os.path.exists(candidate) and not os.path.exists(candidate + ".json"):
+        if not os.path.exists(candidate) and not os.path.exists(candidate + ".json.zst"):
             return candidate
     raise RuntimeError(f"cannot allocate output path for {stem!r} in {output_dir}")
 
@@ -397,7 +397,7 @@ class ArchiveRunner:
             from_step1 = step1_handoff_by_file.get(file_id, False)
             stem = os.path.splitext(file_id)[0]
             out_pdf = _unique_output_pdf_path(self.output_dir, stem)
-            out_json = out_pdf + ".json"
+            out_json = out_pdf + ".json.zst"
             original_input_path = spec.input_path
             task_input_path = original_input_path
             preprocess_rotations = None

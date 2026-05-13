@@ -81,7 +81,8 @@ def line_text_from_words(words):
 def make_document_stub(input_path, engine, ocr_dpi,
                        source_path=None,
                        text_normalization=None,
-                       raw_text_preserved=False):
+                       raw_text_preserved=False,
+                       source_mode=None):
     abs_input = os.path.abspath(input_path)
     abs_source = os.path.abspath(source_path or input_path)
     return {
@@ -101,6 +102,7 @@ def make_document_stub(input_path, engine, ocr_dpi,
                 "text_normalization": text_normalization,
                 "raw_text_preserved": bool(raw_text_preserved),
                 "completed_at": _utc_now_iso(),
+                "source_mode": source_mode,
             },
             "correction": {
                 "applied": False,
@@ -140,7 +142,6 @@ def make_page_record(page_index, width, height, render_width, render_height,
         "render_height": int(render_height),
         "lines": [],
         "words": [],
-        "kie_tokens": [],
         "layout_regions": [],
     }
     try:
@@ -503,8 +504,6 @@ def upgrade_ocr_data_in_place(ocr_data):
             if "bbox" in region and "bbox_px" not in region:
                 region["bbox_px"] = list(region["bbox"])
 
-        page["kie_tokens"] = _build_page_kie_tokens(page)
-
     line_lookup = {}
     word_lookup = {}
     for page in ocr_data.get("pages", []):
@@ -525,6 +524,16 @@ def upgrade_ocr_data_in_place(ocr_data):
         if isinstance(relation, dict)
     ]
 
+    return ocr_data
+
+
+def build_kie_tokens_in_place(ocr_data):
+    """Build training/export KIE surface tokens from normalized page words."""
+    upgrade_ocr_data_in_place(ocr_data)
+    for page in ocr_data.get("pages", []) or []:
+        if not isinstance(page, dict):
+            continue
+        page["kie_tokens"] = _build_page_kie_tokens(page)
     return ocr_data
 
 
@@ -590,7 +599,7 @@ def slim_canonical_for_layoutlmv3_runtime_in_place(ocr_data):
       - annotations and document/pipeline metadata
 
     Removed data:
-      - page.kie_tokens and layout_regions
+      - page.kie_tokens, layout_regions, and table_structures
       - OCR raw duplicates, confidence/content_type, x/y/w/h/page_id fields
       - line.word_ids because word.line_id is the canonical ownership link
     """
@@ -600,6 +609,7 @@ def slim_canonical_for_layoutlmv3_runtime_in_place(ocr_data):
     pipeline = ocr_data.setdefault("pipeline", {})
     ocr_pipeline = pipeline.setdefault("ocr", {})
     ocr_pipeline["canonical_profile"] = "layoutlmv3_runtime_v1"
+    pipeline.pop("table_extraction", None)
 
     page_keep = (
         "id",
@@ -636,6 +646,35 @@ def slim_canonical_for_layoutlmv3_runtime_in_place(ocr_data):
         ]
         page.clear()
         page.update(slim_page)
+    return ocr_data
+
+
+def prune_canonical_for_layoutlmv3_training_in_place(ocr_data):
+    """Keep training fields and remove DOCX/table-only payload."""
+    if not isinstance(ocr_data, dict):
+        return ocr_data
+    pipeline = ocr_data.setdefault("pipeline", {})
+    ocr_pipeline = pipeline.setdefault("ocr", {})
+    ocr_pipeline["canonical_profile"] = "layoutlmv3_training_v1"
+    pipeline.pop("table_extraction", None)
+    for page in ocr_data.get("pages", []) or []:
+        if not isinstance(page, dict):
+            continue
+        page.pop("table_structures", None)
+    return ocr_data
+
+
+def prune_canonical_for_docx_export_in_place(ocr_data):
+    """Keep OCR/layout/table cache fields and remove training-only tokens."""
+    if not isinstance(ocr_data, dict):
+        return ocr_data
+    pipeline = ocr_data.setdefault("pipeline", {})
+    ocr_pipeline = pipeline.setdefault("ocr", {})
+    ocr_pipeline["canonical_profile"] = "docx_export_v1"
+    for page in ocr_data.get("pages", []) or []:
+        if not isinstance(page, dict):
+            continue
+        page.pop("kie_tokens", None)
     return ocr_data
 
 

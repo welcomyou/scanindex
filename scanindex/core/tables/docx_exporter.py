@@ -16,14 +16,17 @@ import os
 # FORCE CPU ONLY
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
+import hashlib
+import json
 import re
 import fitz  # PyMuPDF
 import unicodedata
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import List, Tuple, Optional, Dict, Set
 from docx import Document
 from docx.shared import Pt, Inches, Twips, Cm, Mm
-from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_PARAGRAPH_ALIGNMENT
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_PARAGRAPH_ALIGNMENT, WD_TAB_ALIGNMENT
 from docx.enum.table import WD_TABLE_ALIGNMENT, WD_CELL_VERTICAL_ALIGNMENT
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
@@ -225,17 +228,26 @@ def _json_line_xywh(line: dict) -> Tuple[float, float, float, float]:
     return (x0, y0, max(0.0, x1 - x0), max(0.0, y1 - y0))
 
 
+def _load_canonical_companion_data(path: str, logger: Logger, purpose: str) -> Tuple[Optional[dict], Optional[Path]]:
+    """Load the canonical `.json.zst` sidecar for a PDF or sidecar-like path."""
+    if not path:
+        return None, None
+    try:
+        from scanindex.core.canonical_io import load_canonical, resolve_companion
+
+        resolved = resolve_companion(path)
+        if resolved is None:
+            return None, None
+        return load_canonical(resolved), resolved
+    except Exception as e:
+        logger.log(f"Could not load OCR JSON for {purpose}: {e}")
+        return None, None
+
+
 def load_lines_from_companion_json(json_path: str, logger: Logger) -> Optional[List[TextLine]]:
     """Load OCR text/positions directly from the canonical JSON when present."""
-    from scanindex.core.canonical_io import load_canonical, resolve_companion
-    resolved = resolve_companion(json_path) if json_path else None
-    if resolved is None:
-        return None
-
-    try:
-        ocr_data = load_canonical(resolved)
-    except Exception as e:
-        logger.log(f"Could not load OCR JSON as text source: {e}")
+    ocr_data, _resolved = _load_canonical_companion_data(json_path, logger, "text source")
+    if not ocr_data:
         return None
 
     all_lines: List[TextLine] = []
@@ -259,6 +271,7 @@ def load_lines_from_companion_json(json_path: str, logger: Logger) -> Optional[L
                 "has_space_after": bool(word.get("has_space_after", True)),
                 "fg_gray": int(word.get("fg_gray", 128) or 128),
                 "confidence": float(word.get("confidence", 0.0) or 0.0),
+                "source_layer": str(word.get("source_layer") or ""),
             })
 
         for line in page.get("lines", []):
@@ -288,6 +301,7 @@ def load_lines_from_companion_json(json_path: str, logger: Logger) -> Optional[L
                 source_line_id=source_line_id,
                 kie_labels=set(kie_labels_by_line.get(source_line_id, set())),
             )
+            setattr(text_line, "source_layer", str(line.get("source_layer") or page.get("text_source") or ""))
             line_words = words_by_line.get(str(line.get("id") or ""), [])
             if line_words:
                 line_words.sort(key=lambda item: item["order"])
@@ -522,7 +536,65 @@ def _line_overlaps_layout_type(line: TextLine,
 def filter_figure_ocr_noise(lines: List[TextLine],
                             layout_regions_by_page: Dict[int, List[dict]],
                             logger: Logger) -> List[TextLine]:
-    return lines
+    if not lines or not layout_regions_by_page:
+        return lines
+
+    lines_by_page: Dict[int, List[TextLine]] = {}
+    for line in lines:
+        lines_by_page.setdefault(line.page, []).append(line)
+
+    figure_bboxes_by_page: Dict[int, List[Tuple[float, float, float, float]]] = {}
+    for page, regions in (layout_regions_by_page or {}).items():
+        page_lines = lines_by_page.get(page, [])
+        max_right = max((line.x + line.width for line in page_lines), default=0.0)
+        noi_nhan_anchors = [
+            line for line in page_lines
+            if _unaccent_upper(line.text).startswith("NOI NHAN")
+        ]
+        for region in regions or []:
+            if _layout_region_kind(region) != "figure":
+                continue
+            bbox = _layout_region_bbox_pdf(region)
+            if not bbox:
+                continue
+            fig_center_x = (bbox[0] + bbox[2]) / 2.0
+            looks_like_signature = False
+            if noi_nhan_anchors:
+                anchor_y = max(line.y for line in noi_nhan_anchors)
+                looks_like_signature = fig_center_x >= max_right * 0.45 and bbox[1] >= anchor_y - 30.0
+            if looks_like_signature:
+                continue
+            figure_bboxes_by_page.setdefault(page, []).append(bbox)
+
+    if not figure_bboxes_by_page:
+        return lines
+
+    kept: List[TextLine] = []
+    removed = 0
+    for line in lines:
+        sem = (line.semantic_type or "").strip().lower()
+        text = _clean_extracted_text(line.text)
+        is_caption = (
+            sem in {"figure_caption", "figure caption", "table_caption", "table caption"}
+            or bool(re.match(r"^(figure|fig\.?|table)\s*\d+\s*[:.\-]", text, re.IGNORECASE))
+        )
+        if is_caption:
+            kept.append(line)
+            continue
+        line_bbox = _line_bbox(line)
+        inside_figure = False
+        for fig_bbox in figure_bboxes_by_page.get(line.page, []):
+            if _bbox_overlap_ratio(line_bbox, fig_bbox) >= 0.35 or _layout_center_inside(line_bbox, fig_bbox, pad=3.0):
+                inside_figure = True
+                break
+        if inside_figure:
+            removed += 1
+            continue
+        kept.append(line)
+
+    if removed:
+        logger.log(f"Removed {removed} OCR line(s) inside rendered figure regions")
+    return kept
 
 
 def enrich_lines_from_json(lines: List[TextLine], json_path: str, logger: Logger):
@@ -531,15 +603,8 @@ def enrich_lines_from_json(lines: List[TextLine], json_path: str, logger: Logger
     Matches lines by bbox overlap/proximity and assigns:
     block_id, paragraph_id, content_type, confidence, fg_gray.
     """
-    if not os.path.exists(json_path):
-        return
-
-    try:
-        import json
-        with open(json_path, "r", encoding="utf-8") as f:
-            ocr_data = json.load(f)
-    except Exception as e:
-        logger.log(f"Could not load OCR JSON for enrichment: {e}")
+    ocr_data, _resolved = _load_canonical_companion_data(json_path, logger, "enrichment")
+    if not ocr_data:
         return
 
     pages = ocr_data.get("pages", [])
@@ -625,7 +690,7 @@ def extract_pdf_lines(pdf_path: str, logger: Logger) -> Tuple[List[TextLine], di
             "height": page.rect.height
         }
 
-    json_lines = load_lines_from_companion_json(pdf_path + ".json", logger)
+    json_lines = load_lines_from_companion_json(pdf_path, logger)
     if json_lines is not None:
         doc.close()
         logger.log(f"PDF: {len(page_info)} pages, {len(json_lines)} OCR JSON text lines loaded")
@@ -661,7 +726,11 @@ def extract_pdf_lines(pdf_path: str, logger: Logger) -> Tuple[List[TextLine], di
                         text_spans.append(TextSpan(
                             text=text,
                             font_size=span_size,
-                            y=span_y
+                            y=span_y,
+                            x=float(bbox[0]),
+                            width=max(0.0, float(bbox[2]) - float(bbox[0])),
+                            fg_gray=128,
+                            has_space_after=text.endswith(" "),
                         ))
                 
                 avg_font_size = sum(font_sizes) / len(font_sizes) if font_sizes else 12
@@ -991,6 +1060,60 @@ def score_paragraph_edge(
 
     if not text1 or not text2:
         return ParagraphEdgeDecision(True, 100.0, 0.0, ["empty_text"], features)
+
+    sem2 = (getattr(line2, "semantic_type", "") or "").strip().lower()
+    layout_type2 = (getattr(line2, "_layout_region_type", "") or "").strip().lower()
+    if (
+        sem2 in {"figure_caption", "figure caption", "table_caption", "table caption"}
+        or layout_type2 in {"figure_caption", "figure caption", "table_caption", "table caption"}
+        or bool(re.match(r"^(figure|fig\.?|table)\s*\d+\s*[:.\-]", text2, re.IGNORECASE))
+    ):
+        return ParagraphEdgeDecision(
+            True,
+            100.0,
+            0.0,
+            ["caption_boundary"],
+            {"semantic_type2": sem2, "layout_type2": layout_type2},
+        )
+
+    multi_col1 = getattr(line1, "_multi_column_role", None) or getattr(line1, "_digital_column", None)
+    multi_col2 = getattr(line2, "_multi_column_role", None) or getattr(line2, "_digital_column", None)
+    if (
+        line1.page == line2.page
+        and (getattr(line1, "_multi_column_page", False) or getattr(line1, "_digital_two_column_page", False))
+        and (getattr(line2, "_multi_column_page", False) or getattr(line2, "_digital_two_column_page", False))
+        and multi_col1
+        and multi_col2
+        and multi_col1 != multi_col2
+    ):
+        return ParagraphEdgeDecision(
+            True,
+            100.0,
+            0.0,
+            ["multi_column_boundary"],
+            {"multi_col1": multi_col1, "multi_col2": multi_col2},
+        )
+
+    layout_region1 = getattr(line1, "_layout_region_order", None)
+    layout_region2 = getattr(line2, "_layout_region_order", None)
+    if (
+        line1.page == line2.page
+        and layout_region1 is not None
+        and layout_region2 is not None
+        and layout_region1 != layout_region2
+    ):
+        return ParagraphEdgeDecision(
+            True,
+            100.0,
+            0.0,
+            ["layout_region_boundary"],
+            {
+                "layout_region1": layout_region1,
+                "layout_region2": layout_region2,
+                "layout_type1": getattr(line1, "_layout_region_type", ""),
+                "layout_type2": getattr(line2, "_layout_region_type", ""),
+            },
+        )
 
     prev_base, prev_right = (margin_map or {}).get(line1.page, (base_x, right_margin))
     next_base, next_right = (margin_map or {}).get(line2.page, (base_x, right_margin))
@@ -1586,20 +1709,30 @@ def add_dual_header_table(doc: Document, left_lines: List[TextLine], right_lines
                           page_width_pt: float, logger: Logger):
     """Render dual-column header as a borderless 1x2 table."""
     table = doc.add_table(rows=1, cols=2)
+    table.alignment = WD_TABLE_ALIGNMENT.CENTER
+    table.autofit = False
     _borderless_table_xml(table)
 
-    # Column widths: derive from actual text extents of left and right groups
-    left_max_x = max(l.x + l.width for l in left_lines) if left_lines else page_width_pt / 2
-    right_min_x = min(l.x for l in right_lines) if right_lines else page_width_pt / 2
-    # Gap between columns = right_start - left_end
-    gap = max(right_min_x - left_max_x, 0)
-    left_w = left_max_x + gap / 2  # each side takes half the gap
-    right_w = page_width_pt - right_min_x + gap / 2
+    # Column widths are based on text extents, scaled to the DOCX content width.
+    # Using raw PDF x positions here can make the DOCX table wider than the
+    # writable area and causes Word/layout renderers to reflow it unpredictably.
+    content_width = max(float(page_width_pt or 0.0), 120.0)
+    left_w = max((float(l.width) for l in left_lines), default=content_width / 2.0)
+    right_w = max((float(l.width) for l in right_lines), default=content_width / 2.0)
     total = left_w + right_w
     if total > 0:
+        left_pt = content_width * left_w / total
+        right_pt = content_width - left_pt
+        tbl_pr = table._tbl.tblPr
+        tbl_w = tbl_pr.find(qn("w:tblW"))
+        if tbl_w is None:
+            tbl_w = OxmlElement("w:tblW")
+            tbl_pr.append(tbl_w)
+        tbl_w.set(qn("w:type"), "dxa")
+        tbl_w.set(qn("w:w"), str(int(content_width * 20)))
         for row in table.rows:
-            row.cells[0].width = Pt(left_w / total * page_width_pt)
-            row.cells[1].width = Pt(right_w / total * page_width_pt)
+            row.cells[0].width = Pt(left_pt)
+            row.cells[1].width = Pt(right_pt)
 
     right_emphasis_indices = [
         idx for idx, line in enumerate(right_lines)
@@ -1632,6 +1765,73 @@ def add_dual_header_table(doc: Document, left_lines: List[TextLine], right_lines
             run.font.bold = True
         if i == right_underline_idx:
             run.font.underline = True
+
+
+def _coalesce_admin_header_fragments(lines: List[TextLine]) -> List[Tuple[str, TextLine]]:
+    rows: List[Tuple[str, TextLine]] = []
+    for line in sorted(lines, key=lambda item: (item.y, item.x)):
+        text = _clean_extracted_text(line.text)
+        if not text:
+            continue
+        if rows and re.fullmatch(r"\d{1,2}", text):
+            prev_text, prev_line = rows[-1]
+            if re.search(r"\bngày\s+tháng\b", prev_text, re.IGNORECASE):
+                rows[-1] = (
+                    re.sub(r"\bngày\s+tháng\b", f"ngày {text} tháng", prev_text, count=1, flags=re.IGNORECASE),
+                    prev_line,
+                )
+                continue
+            if re.match(r"^Số\s*-", prev_text, re.IGNORECASE):
+                rows[-1] = (
+                    re.sub(r"^Số\s*", f"Số {text} ", prev_text, count=1, flags=re.IGNORECASE),
+                    prev_line,
+                )
+                continue
+        rows.append((text, line))
+    return rows
+
+
+def add_dual_header_paragraphs(doc: Document, left_lines: List[TextLine], right_lines: List[TextLine],
+                               content_width_pt: float, logger: Logger):
+    """Render an administrative two-sided header as editable tabbed paragraphs."""
+    left_sorted = _coalesce_admin_header_fragments(left_lines)
+    right_sorted = _coalesce_admin_header_fragments(right_lines)
+    row_count = max(len(left_sorted), len(right_sorted))
+    right_emphasis_indices = {
+        idx for idx, (_text, line) in enumerate(right_sorted)
+        if _looks_like_header_emphasis_line(line.text)
+    }
+    for idx in range(row_count):
+        left_line = left_sorted[idx] if idx < len(left_sorted) else None
+        right_line = right_sorted[idx] if idx < len(right_sorted) else None
+        para = doc.add_paragraph()
+        fmt = para.paragraph_format
+        fmt.first_line_indent = Pt(0)
+        fmt.left_indent = Pt(0)
+        fmt.right_indent = Pt(0)
+        fmt.space_before = Pt(0)
+        fmt.space_after = Pt(0)
+        fmt.line_spacing = 1.0
+        fmt.tab_stops.add_tab_stop(Pt(max(float(content_width_pt), 120.0)), WD_TAB_ALIGNMENT.RIGHT)
+        para.alignment = WD_PARAGRAPH_ALIGNMENT.LEFT
+
+        if left_line is not None:
+            left_text, left_source = left_line
+            run = para.add_run(left_text)
+            run.font.name = "Times New Roman"
+            run.font.size = Pt(12.5)
+            if _looks_like_header_emphasis_line(left_source.text):
+                run.font.bold = True
+        if right_line is not None:
+            right_text, right_source = right_line
+            para.add_run("\t")
+            run = para.add_run(right_text)
+            run.font.name = "Times New Roman"
+            run.font.size = Pt(12.5)
+            if _looks_like_header_emphasis_line(right_source.text):
+                run.font.bold = True
+            if idx in right_emphasis_indices:
+                run.font.underline = True
 
 
 def detect_footnotes(lines: List[TextLine], page_info: dict, logger: Logger) -> List[TextLine]:
@@ -2174,6 +2374,17 @@ def add_text_with_superscripts(para, text: str, first_line: TextLine, is_footnot
                 _apply_run_format(run)
             i = next_pos if next_pos > i else i + 1
 
+
+def _repair_drop_cap_join(text: str, first_line: TextLine) -> str:
+    first_text = _clean_extracted_text(getattr(first_line, "text", ""))
+    if len(first_text) != 1 or not first_text.isalpha() or not first_text.isupper():
+        return text
+    match = re.match(r"^([A-Z])\s+([a-z]{1,4})(\b.*)$", text or "", re.DOTALL)
+    if not match:
+        return text
+    return match.group(1) + match.group(2) + match.group(3)
+
+
 def merge_raw_paragraphs(
     lines: List[TextLine],
     margin_map: Dict[int, Tuple[float, float]],
@@ -2586,6 +2797,1489 @@ def sort_lines_reading_order(lines: List[TextLine]) -> List[TextLine]:
     return final_lines
 
 
+def _quantile(values: List[float], q: float, default: float = 0.0) -> float:
+    if not values:
+        return default
+    ordered = sorted(float(v) for v in values)
+    if len(ordered) == 1:
+        return ordered[0]
+    q = max(0.0, min(1.0, q))
+    pos = (len(ordered) - 1) * q
+    lo = int(pos)
+    hi = min(lo + 1, len(ordered) - 1)
+    frac = pos - lo
+    return ordered[lo] * (1.0 - frac) + ordered[hi] * frac
+
+
+def _cluster_objects_by_x(objects: List[object], k: int, x_getter) -> List[List[object]]:
+    if k <= 1 or len(objects) < k:
+        return []
+
+    xs = [float(x_getter(obj)) for obj in objects]
+    centers = [_quantile(xs, (idx + 0.5) / k, xs[0]) for idx in range(k)]
+    clusters: List[List[object]] = [[] for _ in range(k)]
+    for _ in range(18):
+        clusters = [[] for _ in range(k)]
+        for obj in objects:
+            x = float(x_getter(obj))
+            best = min(range(k), key=lambda idx: abs(x - centers[idx]))
+            clusters[best].append(obj)
+        if any(not cluster for cluster in clusters):
+            return []
+        new_centers = [_median([float(x_getter(obj)) for obj in cluster], centers[idx]) for idx, cluster in enumerate(clusters)]
+        if max(abs(new_centers[idx] - centers[idx]) for idx in range(k)) < 0.5:
+            centers = new_centers
+            break
+        centers = new_centers
+
+    return [cluster for _center, cluster in sorted(zip(centers, clusters), key=lambda pair: pair[0])]
+
+
+def _multi_column_candidate(line: TextLine, page_w: float, page_h: float) -> bool:
+    text = _clean_extracted_text(line.text)
+    if len(text) < 3:
+        return False
+    if line.y < page_h * 0.07 or line.y > page_h * 0.94:
+        return False
+    if line.width <= 0 or line.height <= 0:
+        return False
+    if line.width > page_w * 0.52:
+        return False
+    if line.height > page_h * 0.10:
+        return False
+    semantic_type = (getattr(line, "semantic_type", "") or "").strip().lower().replace("-", " ")
+    layout_type = (getattr(line, "_layout_region_type", "") or "").strip().lower().replace("-", " ")
+    if semantic_type in {"table", "figure", "isolate formula", "formula"}:
+        return False
+    if layout_type in {"table", "figure", "isolate formula", "formula"}:
+        return False
+    return True
+
+
+def _build_multi_column_profile(candidates: List[TextLine], page_w: float, page_h: float, column_count: int) -> Optional[dict]:
+    min_total = 18 if column_count == 3 else 12
+    if len(candidates) < min_total:
+        return None
+
+    clusters = _cluster_objects_by_x(candidates, column_count, lambda line: line.x)
+    if len(clusters) != column_count:
+        return None
+
+    min_cluster = max(4 if column_count == 3 else 5, int(len(candidates) * (0.12 if column_count == 3 else 0.16)))
+    if min(len(cluster) for cluster in clusters) < min_cluster:
+        return None
+
+    starts = [_median([line.x for line in cluster], 0.0) for cluster in clusters]
+    gaps = [starts[idx + 1] - starts[idx] for idx in range(column_count - 1)]
+    min_gap = page_w * (0.13 if column_count == 3 else 0.22)
+    if min(gaps) < min_gap:
+        return None
+    min_span = page_w * (0.42 if column_count == 3 else 0.24)
+    if starts[-1] - starts[0] < min_span:
+        return None
+
+    start_tolerance = page_w * (0.058 if column_count == 3 else 0.08)
+    core_ratio = 0.45 if column_count == 3 else 0.55
+    cores: List[List[TextLine]] = []
+    for idx, cluster in enumerate(clusters):
+        core = [line for line in cluster if abs(line.x - starts[idx]) <= start_tolerance]
+        if len(core) < max(3, int(len(cluster) * core_ratio)):
+            return None
+        cores.append(core)
+
+    ends = [_median([line.x + line.width for line in cluster], starts[idx]) for idx, cluster in enumerate(clusters)]
+    gutters: List[float] = []
+    for idx in range(column_count - 1):
+        visual_gap = starts[idx + 1] - ends[idx]
+        if visual_gap < max(8.0, page_w * 0.018):
+            return None
+        gutter = (ends[idx] + starts[idx + 1]) / 2.0
+        if not (starts[idx] + page_w * 0.06 <= gutter <= starts[idx + 1] - page_w * 0.015):
+            return None
+        gutters.append(gutter)
+    if column_count == 2 and not (page_w * 0.34 <= gutters[0] <= page_w * 0.66):
+        return None
+
+    min_ys = [min(line.y for line in core) for core in cores]
+    max_ys = [max(line.y for line in core) for core in cores]
+    balance = min(len(cluster) for cluster in clusters) / max(1, max(len(cluster) for cluster in clusters))
+    columns = [
+        {
+            "index": idx,
+            "start": starts[idx],
+            "end": ends[idx],
+            "count": len(clusters[idx]),
+            "core_count": len(cores[idx]),
+        }
+        for idx in range(column_count)
+    ]
+    return {
+        "column_count": column_count,
+        "columns": columns,
+        "gutters": gutters,
+        "start_y": min(min_ys),
+        "balanced_start_y": max(min_ys),
+        "end_y": max(max_ys),
+        "start_tolerance": start_tolerance,
+        "balance": balance,
+        "score": column_count * 100.0 + balance * 20.0 + (min(gaps) / max(page_w, 1.0)) * 100.0,
+    }
+
+
+def _detect_multi_column_profile(page_lines: List[TextLine], page_w: float, page_h: float) -> Optional[dict]:
+    candidates = [line for line in page_lines if _multi_column_candidate(line, page_w, page_h)]
+    if len(candidates) < 12:
+        return None
+
+    profiles = [
+        profile
+        for profile in (
+            _build_multi_column_profile(candidates, page_w, page_h, 3),
+            _build_multi_column_profile(candidates, page_w, page_h, 2),
+        )
+        if profile is not None
+    ]
+    if not profiles:
+        return None
+    return sorted(profiles, key=lambda profile: profile["score"], reverse=True)[0]
+
+
+def _detect_two_column_profile(page_lines: List[TextLine], page_w: float, page_h: float) -> Optional[dict]:
+    profile = _build_multi_column_profile(
+        [line for line in page_lines if _multi_column_candidate(line, page_w, page_h)],
+        page_w,
+        page_h,
+        2,
+    )
+    if not profile:
+        return None
+    return {
+        **profile,
+        "gutter": profile["gutters"][0],
+        "left_start": profile["columns"][0]["start"],
+        "right_start": profile["columns"][1]["start"],
+        "left_count": profile["columns"][0]["count"],
+        "right_count": profile["columns"][1]["count"],
+    }
+
+
+def _column_index_for_x(center_x: float, gutters: List[float]) -> int:
+    for idx, gutter in enumerate(gutters):
+        if center_x < gutter:
+            return idx
+    return len(gutters)
+
+
+def _multi_column_role_for_index(idx: int, column_count: int) -> str:
+    if column_count == 2:
+        return "left" if idx == 0 else "right"
+    return f"col{idx + 1}"
+
+
+def apply_multi_column_reading_order(
+    lines: List[TextLine],
+    page_info: dict,
+    logger: Logger,
+) -> List[TextLine]:
+    """
+    Reorder scientific/newsletter pages column-major when independent text
+    columns are clearly present. This is intentionally branch-agnostic: digital
+    text extraction and scan OCR both emit positioned TextLine objects, so the
+    same geometric reading-order rule applies to both.
+    """
+    if not lines:
+        return lines
+
+    lines_by_page: Dict[int, List[TextLine]] = {}
+    for line in lines:
+        lines_by_page.setdefault(int(line.page), []).append(line)
+
+    profiles_by_page: Dict[int, dict] = {}
+    repeated_edge_keys: Dict[str, int] = {}
+    for page, page_lines in lines_by_page.items():
+        info = page_info.get(page, {}) if page_info else {}
+        page_w = float(info.get("width", 595.0) or 595.0)
+        page_h = float(info.get("height", 842.0) or 842.0)
+        profile = _detect_multi_column_profile(page_lines, page_w, page_h)
+        if not profile:
+            continue
+        profiles_by_page[page] = profile
+        for line in page_lines:
+            if line.y > page_h * 0.09 and line.y + line.height < page_h * 0.93:
+                continue
+            key = _norm_table_key(re.sub(r"\d", "#", _clean_extracted_text(line.text)))
+            if 3 <= len(key) <= 120:
+                repeated_edge_keys[key] = repeated_edge_keys.get(key, 0) + 1
+
+    def is_running_edge_line(line: TextLine, page_w: float, page_h: float) -> bool:
+        if line.y > page_h * 0.09 and line.y + line.height < page_h * 0.93:
+            return False
+        text = _clean_extracted_text(line.text)
+        key = _norm_table_key(re.sub(r"\d", "#", text))
+        if repeated_edge_keys.get(key, 0) >= 2:
+            return True
+        compact = _norm_table_key(text)
+        return (
+            ("QXP" in compact and "PAGE" in compact)
+            or ("CANCERCONTROL" in compact and bool(re.search(r"\b20\d{2}\b", text)))
+            or bool(re.search(r"\bPAGE\s+\d+\b", text, re.IGNORECASE))
+        )
+
+    reordered_pages = []
+    removed_running = 0
+    result: List[TextLine] = []
+    for page in sorted(lines_by_page):
+        page_lines = lines_by_page[page]
+        info = page_info.get(page, {}) if page_info else {}
+        page_w = float(info.get("width", 595.0) or 595.0)
+        page_h = float(info.get("height", 842.0) or 842.0)
+        profile = profiles_by_page.get(page)
+        if not profile:
+            result.extend(sorted(page_lines, key=lambda line: (line.order, line.y, line.x)))
+            continue
+
+        column_count = int(profile.get("column_count", 2) or 2)
+        columns = list(profile.get("columns") or [])
+        gutters = [float(gutter) for gutter in (profile.get("gutters") or [])]
+        start_y = float(profile["start_y"])
+        balanced_start_y = float(profile["balanced_start_y"])
+        end_y = float(profile["end_y"])
+        start_tolerance = float(profile["start_tolerance"])
+        y_tol = max(_median([line.height for line in page_lines if line.height > 0], 10.0), 6.0)
+        full_width_threshold = page_w * (0.58 if column_count == 2 else 0.46)
+
+        top: List[TextLine] = []
+        column_lines: List[List[TextLine]] = [[] for _ in range(column_count)]
+        bottom: List[TextLine] = []
+        other_body: List[TextLine] = []
+
+        for line in page_lines:
+            if is_running_edge_line(line, page_w, page_h):
+                removed_running += 1
+                continue
+            setattr(line, "_multi_column_page", True)
+            setattr(line, "_multi_column_count", column_count)
+            if column_count == 2:
+                setattr(line, "_digital_two_column_page", True)
+            center_x = line.x + line.width / 2.0
+            col_idx = _column_index_for_x(center_x, gutters)
+            col_idx = min(max(col_idx, 0), max(0, column_count - 1))
+            column = columns[col_idx] if col_idx < len(columns) else {"start": line.x}
+            is_full_width = (
+                line.width > full_width_threshold
+                or (
+                    columns
+                    and line.x <= float(columns[0]["start"]) + start_tolerance
+                    and line.x + line.width >= float(columns[-1]["start"]) - start_tolerance
+                )
+            )
+            near_column_start = abs(line.x - float(column.get("start", line.x))) <= start_tolerance
+            before_balanced_columns = line.y < balanced_start_y - y_tol
+            if line.y < start_y - y_tol or (is_full_width and line.y < balanced_start_y - y_tol):
+                setattr(line, "_multi_column_role", "top")
+                setattr(line, "_multi_column_index", -1)
+                if column_count == 2:
+                    setattr(line, "_digital_column", "top")
+                top.append(line)
+            elif line.y > max(end_y + y_tol, page_h * 0.94):
+                setattr(line, "_multi_column_role", "bottom")
+                setattr(line, "_multi_column_index", -1)
+                if column_count == 2:
+                    setattr(line, "_digital_column", "bottom")
+                bottom.append(line)
+            elif before_balanced_columns and line.width > page_w * (0.45 if column_count == 2 else 0.36):
+                setattr(line, "_multi_column_role", "top")
+                setattr(line, "_multi_column_index", -1)
+                if column_count == 2:
+                    setattr(line, "_digital_column", "top")
+                top.append(line)
+            elif (
+                before_balanced_columns
+                and columns
+                and line.x > float(columns[0]["start"]) + page_w * 0.04
+                and line.width < page_w * (0.24 if column_count == 2 else 0.19)
+            ):
+                setattr(line, "_multi_column_role", "top")
+                setattr(line, "_multi_column_index", -1)
+                if column_count == 2:
+                    setattr(line, "_digital_column", "top")
+                top.append(line)
+            elif not is_full_width and (near_column_start or line.y >= balanced_start_y - y_tol):
+                role = _multi_column_role_for_index(col_idx, column_count)
+                setattr(line, "_multi_column_role", role)
+                setattr(line, "_multi_column_index", col_idx)
+                if column_count == 2:
+                    setattr(line, "_digital_column", role)
+                column_lines[col_idx].append(line)
+            elif line.y < balanced_start_y - y_tol:
+                setattr(line, "_multi_column_role", "top")
+                setattr(line, "_multi_column_index", -1)
+                if column_count == 2:
+                    setattr(line, "_digital_column", "top")
+                top.append(line)
+            else:
+                setattr(line, "_multi_column_role", "body")
+                setattr(line, "_multi_column_index", -1)
+                if column_count == 2:
+                    setattr(line, "_digital_column", "body")
+                other_body.append(line)
+
+        ordered = sorted(top, key=lambda line: (line.y, line.x))
+        for group in column_lines:
+            ordered.extend(sorted(group, key=lambda line: (line.y, line.x)))
+        ordered.extend(sorted(other_body, key=lambda line: (line.y, line.x)))
+        ordered.extend(sorted(bottom, key=lambda line: (line.y, line.x)))
+        base_order = page * 100000
+        for offset, line in enumerate(ordered):
+            line.order = base_order + offset
+        result.extend(ordered)
+        counts = ",".join(f"C{idx + 1}={int(col.get('count', 0))}" for idx, col in enumerate(columns))
+        gutter_text = "/".join(f"{gutter:.1f}" for gutter in gutters)
+        reordered_pages.append(f"{page}({column_count}col,{counts},gutter={gutter_text})")
+
+    if reordered_pages:
+        logger.log("Applied multi-column reading order on page(s): " + ", ".join(reordered_pages))
+    if removed_running:
+        logger.log(f"Removed {removed_running} repeated article running header/footer line(s)")
+    return sorted(result, key=lambda line: (line.page, line.order, line.y, line.x))
+
+
+def apply_digital_two_column_reading_order(
+    lines: List[TextLine],
+    page_info: dict,
+    logger: Logger,
+) -> List[TextLine]:
+    return apply_multi_column_reading_order(lines, page_info, logger)
+
+
+def _word_inline_sort_key(word: dict) -> Tuple[float, float]:
+    x0, y0, _x1, _y1 = _word_bbox_for_assignment(word)
+    return (x0, y0)
+
+
+def split_lines_crossing_multi_column_gutters(
+    lines: List[TextLine],
+    page_info: dict,
+    logger: Logger,
+) -> List[TextLine]:
+    """
+    Split OCR lines that accidentally join adjacent columns.
+
+    Scientific/newsletter scans often have multiple text baselines at the same
+    y. OCR can merge them into one long line. Reading-order sorting cannot
+    repair that unless the line is first split at detected column gutters.
+    """
+    if not lines:
+        return lines
+
+    lines_by_page: Dict[int, List[TextLine]] = {}
+    for line in lines:
+        lines_by_page.setdefault(int(line.page), []).append(line)
+
+    split_count = 0
+    result: List[TextLine] = []
+    for page in sorted(lines_by_page):
+        page_lines = lines_by_page[page]
+        info = page_info.get(page, {}) if page_info else {}
+        page_w = float(info.get("width", 595.0) or 595.0)
+        page_h = float(info.get("height", 842.0) or 842.0)
+        profile = _detect_multi_column_profile(page_lines, page_w, page_h)
+        if not profile:
+            result.extend(page_lines)
+            continue
+
+        column_count = int(profile.get("column_count", 2) or 2)
+        gutters = [float(gutter) for gutter in (profile.get("gutters") or [])]
+        min_line_width = page_w * (0.46 if column_count == 2 else 0.33)
+        for line in page_lines:
+            words = [
+                word for word in (getattr(line, "word_items", []) or [])
+                if _clean_extracted_text(str(word.get("text") or ""))
+            ]
+            if (
+                len(words) < 4
+                or line.width < min_line_width
+                or not any(line.x < gutter < line.x + line.width for gutter in gutters)
+            ):
+                result.append(line)
+                continue
+
+            grouped_words: List[List[dict]] = [[] for _ in range(column_count)]
+            crossing_word = False
+            for word in words:
+                wx0, wy0, wx1, wy1 = _word_bbox_for_assignment(word)
+                if any(wx0 < gutter < wx1 for gutter in gutters):
+                    crossing_word = True
+                    break
+                idx = _column_index_for_x((wx0 + wx1) / 2.0, gutters)
+                idx = min(max(idx, 0), max(0, column_count - 1))
+                grouped_words[idx].append(word)
+
+            nonempty = [(idx, group) for idx, group in enumerate(grouped_words) if group]
+            if crossing_word or len(nonempty) < 2:
+                result.append(line)
+                continue
+
+            min_gap = max(3.0, line.height * 0.20)
+            has_clear_gap = True
+            for (_left_idx, left_group), (_right_idx, right_group) in zip(nonempty, nonempty[1:]):
+                left_end = max(_word_bbox_for_assignment(word)[2] for word in left_group)
+                right_start = min(_word_bbox_for_assignment(word)[0] for word in right_group)
+                if right_start - left_end < min_gap:
+                    has_clear_gap = False
+                    break
+            if not has_clear_gap:
+                result.append(line)
+                continue
+
+            fragments: List[TextLine] = []
+            for col_idx, group in nonempty:
+                fragment = _line_fragment_from_words(line, sorted(group, key=_word_inline_sort_key))
+                if fragment is None:
+                    fragments = []
+                    break
+                setattr(fragment, "_column_split_fragment", True)
+                setattr(fragment, "_multi_column_page", True)
+                setattr(fragment, "_multi_column_count", column_count)
+                setattr(fragment, "_multi_column_index", col_idx)
+                role = _multi_column_role_for_index(col_idx, column_count)
+                setattr(fragment, "_multi_column_role", role)
+                if column_count == 2:
+                    setattr(fragment, "_digital_two_column_page", True)
+                    setattr(fragment, "_digital_column", role)
+                fragments.append(fragment)
+            if not fragments:
+                result.append(line)
+                continue
+
+            result.extend(fragments)
+            split_count += 1
+
+    if split_count:
+        logger.log(f"Split {split_count} OCR line(s) crossing detected multi-column gutters")
+    return result
+
+
+def split_lines_crossing_two_column_gutters(
+    lines: List[TextLine],
+    page_info: dict,
+    logger: Logger,
+) -> List[TextLine]:
+    return split_lines_crossing_multi_column_gutters(lines, page_info, logger)
+
+
+def split_digital_dual_header_spans(lines: List[TextLine], page_info: dict, logger: Logger) -> List[TextLine]:
+    """
+    Split digital-PDF header lines that PyMuPDF emits as one visual line even
+    though the underlying spans belong to left/right administrative headers.
+    """
+    if not lines:
+        return lines
+
+    split_count = 0
+    result: List[TextLine] = []
+    for line in lines:
+        info = (page_info or {}).get(int(line.page), {})
+        page_w = float(info.get("width", 595.0) or 595.0)
+        page_h = float(info.get("height", 842.0) or 842.0)
+        if line.y > page_h * 0.18 or line.width < page_w * 0.48:
+            result.append(line)
+            continue
+        spans = [
+            span for span in (line.spans or [])
+            if _clean_extracted_text(span.text) and float(getattr(span, "width", 0.0) or 0.0) > 0
+        ]
+        if len(spans) < 2:
+            result.append(line)
+            continue
+
+        page_center = page_w / 2.0
+        left_spans: List[TextSpan] = []
+        right_spans: List[TextSpan] = []
+        for span in spans:
+            center_x = float(span.x) + float(span.width) / 2.0
+            if center_x < page_center:
+                left_spans.append(span)
+            else:
+                right_spans.append(span)
+        if not left_spans or not right_spans:
+            result.append(line)
+            continue
+
+        left_end = max(float(span.x) + float(span.width) for span in left_spans)
+        right_start = min(float(span.x) for span in right_spans)
+        left_text = _clean_extracted_text("".join(span.text for span in left_spans))
+        right_text = _clean_extracted_text("".join(span.text for span in right_spans))
+        header_pair = _looks_like_header_emphasis_line(left_text) and _looks_like_header_emphasis_line(right_text)
+        if right_start - left_end < max(18.0, page_w * 0.045) and not header_pair:
+            result.append(line)
+            continue
+
+        left_fragment = _line_fragment_from_spans(line, left_spans)
+        right_fragment = _line_fragment_from_spans(line, right_spans)
+        if left_fragment is None or right_fragment is None:
+            result.append(line)
+            continue
+        setattr(left_fragment, "_span_split_fragment", True)
+        setattr(right_fragment, "_span_split_fragment", True)
+        result.extend([left_fragment, right_fragment])
+        split_count += 1
+
+    if split_count:
+        logger.log(f"Split {split_count} digital dual-header line(s) by span geometry")
+    return result
+
+
+def filter_publication_running_edge_lines(lines: List[TextLine], page_info: dict, logger: Logger) -> List[TextLine]:
+    """
+    Remove journal/newsletter running headers and footers from the body flow.
+
+    The signal is deliberately geometric plus publication-specific: text must
+    sit at the page edge and the document must expose cues such as QXP source
+    strings, "Page N", date/time stamps, or repeated digit-masked journal
+    mastheads. Administrative letterheads are not removed by repetition alone.
+    """
+    if not lines:
+        return lines
+
+    def is_edge(line: TextLine) -> bool:
+        info = (page_info or {}).get(int(line.page), {})
+        page_h = float(info.get("height", 842.0) or 842.0)
+        return line.y <= page_h * 0.095 or line.y + line.height >= page_h * 0.925
+
+    edge_lines = [line for line in lines if is_edge(line)]
+    if not edge_lines:
+        return lines
+
+    masked_counts: Dict[str, int] = {}
+    cue_count = 0
+    for line in edge_lines:
+        text = _clean_extracted_text(line.text)
+        compact = _norm_table_key(text)
+        masked = _norm_table_key(re.sub(r"\d", "#", text))
+        if 3 <= len(masked) <= 140:
+            masked_counts[masked] = masked_counts.get(masked, 0) + 1
+        if (
+            "QXP" in compact
+            or bool(re.search(r"\bPAGE\s+\d+\b", text, re.IGNORECASE))
+            or bool(re.search(r"\b\d{1,2}/\d{1,2}/20\d{2}\b", text))
+        ):
+            cue_count += 1
+
+    if cue_count < 2:
+        return lines
+
+    def looks_like_repeated_publication_label(text: str, masked: str) -> bool:
+        if masked_counts.get(masked, 0) < 2:
+            return False
+        stripped = _clean_extracted_text(text)
+        if not stripped or len(stripped) > 70 or re.search(r"[.:;]", stripped):
+            return False
+        words = re.findall(r"[A-Za-zÀ-ỹ]+", stripped)
+        if not (1 <= len(words) <= 6):
+            return False
+        letters = [ch for ch in stripped if ch.isalpha()]
+        if len(letters) < 6:
+            return False
+        upper = sum(1 for ch in letters if ch.upper() == ch)
+        return upper / max(1, len(letters)) >= 0.82
+
+    def is_publication_noise(line: TextLine) -> bool:
+        if not is_edge(line):
+            return False
+        text = _clean_extracted_text(line.text)
+        compact = _norm_table_key(text)
+        masked = _norm_table_key(re.sub(r"\d", "#", text))
+        if bool(re.fullmatch(r"page\s+\d+", text.strip(), re.IGNORECASE)):
+            return True
+        if "QXP" in compact:
+            return True
+        if "CANCERCONTROL" in compact and bool(re.search(r"\b20\d{2}\b", text)):
+            return True
+        if masked_counts.get(masked, 0) >= 2 and bool(re.search(r"\b20\d{2}\b", text)):
+            return True
+        if looks_like_repeated_publication_label(text, masked):
+            return True
+        return False
+
+    kept: List[TextLine] = []
+    removed = 0
+    for line in lines:
+        if is_publication_noise(line):
+            removed += 1
+            continue
+        kept.append(line)
+    if removed:
+        logger.log(f"Removed {removed} publication running header/footer line(s)")
+    return kept
+
+
+_LAYOUT_TEXT_TYPES = {
+    "plain text",
+    "text",
+    "title",
+    "figure_caption",
+    "figure caption",
+    "table_caption",
+    "table caption",
+    "table_footnote",
+    "table footnote",
+    "formula_caption",
+    "formula caption",
+    "footnote",
+    "page-header",
+    "page header",
+    "page-footer",
+    "page footer",
+    "abandon",
+}
+_LAYOUT_OBJECT_TYPES = {"table", "figure", "isolate_formula", "formula"}
+
+
+def _layout_region_kind(region: dict) -> str:
+    return str(region.get("type") or "").strip().lower().replace("-", " ")
+
+
+def _layout_region_bbox_pdf(region: dict) -> Optional[Tuple[float, float, float, float]]:
+    bbox = region.get("bbox_pdf")
+    if not bbox or len(bbox) < 4:
+        return None
+    try:
+        x0, y0, x1, y1 = (float(v) for v in bbox[:4])
+    except (TypeError, ValueError):
+        return None
+    if x1 <= x0 or y1 <= y0:
+        return None
+    return (x0, y0, x1, y1)
+
+
+def _layout_region_items(regions: List[dict]) -> List[dict]:
+    items = []
+    for idx, region in enumerate(regions or []):
+        bbox = _layout_region_bbox_pdf(region)
+        if not bbox:
+            continue
+        kind = _layout_region_kind(region)
+        x0, y0, x1, y1 = bbox
+        items.append({
+            "idx": idx,
+            "region": region,
+            "kind": kind,
+            "bbox": bbox,
+            "x0": x0,
+            "y0": y0,
+            "x1": x1,
+            "y1": y1,
+            "width": x1 - x0,
+            "height": y1 - y0,
+            "cx": (x0 + x1) / 2.0,
+            "cy": (y0 + y1) / 2.0,
+        })
+    return items
+
+
+def _layout_center_inside(bbox: Tuple[float, float, float, float],
+                          region_bbox: Tuple[float, float, float, float],
+                          pad: float = 2.0) -> bool:
+    x0, y0, x1, y1 = bbox
+    rx0, ry0, rx1, ry1 = region_bbox
+    cx = (x0 + x1) / 2.0
+    cy = (y0 + y1) / 2.0
+    return rx0 - pad <= cx <= rx1 + pad and ry0 - pad <= cy <= ry1 + pad
+
+
+def _layout_multi_column_profile_from_items(items: List[dict], page_w: float, page_h: float) -> Optional[dict]:
+    candidates = [
+        item for item in items
+        if item["kind"] not in {"page header", "page footer"}
+        and page_h * 0.04 <= item["y0"] <= page_h * 0.96
+        and page_w * 0.08 <= item["width"] <= page_w * 0.58
+        and item["height"] >= max(18.0, page_h * 0.018)
+    ]
+    if len(candidates) < 4:
+        return None
+
+    profiles = []
+    for column_count in (3, 2):
+        if len(candidates) < column_count * 2:
+            continue
+        clusters = _cluster_objects_by_x(candidates, column_count, lambda item: item["x0"])
+        if len(clusters) != column_count:
+            continue
+        if min(len(cluster) for cluster in clusters) < 2:
+            continue
+        starts = [_median([item["x0"] for item in cluster], 0.0) for cluster in clusters]
+        gaps = [starts[idx + 1] - starts[idx] for idx in range(column_count - 1)]
+        if min(gaps) < page_w * (0.12 if column_count == 3 else 0.20):
+            continue
+        if starts[-1] - starts[0] < page_w * (0.38 if column_count == 3 else 0.22):
+            continue
+        ends = [_median([item["x1"] for item in cluster], starts[idx]) for idx, cluster in enumerate(clusters)]
+        gutters = []
+        valid = True
+        for idx in range(column_count - 1):
+            if starts[idx + 1] - ends[idx] < max(8.0, page_w * 0.016):
+                valid = False
+                break
+            gutter = (ends[idx] + starts[idx + 1]) / 2.0
+            if not (starts[idx] + page_w * 0.05 <= gutter <= starts[idx + 1] - page_w * 0.015):
+                valid = False
+                break
+            gutters.append(gutter)
+        if not valid:
+            continue
+        if column_count == 2 and not (page_w * 0.34 <= gutters[0] <= page_w * 0.66):
+            continue
+        balance = min(len(cluster) for cluster in clusters) / max(1, max(len(cluster) for cluster in clusters))
+        profiles.append({
+            "column_count": column_count,
+            "columns": [
+                {
+                    "index": idx,
+                    "start": starts[idx],
+                    "end": ends[idx],
+                    "count": len(clusters[idx]),
+                }
+                for idx in range(column_count)
+            ],
+            "gutters": gutters,
+            "start_y": min(min(item["y0"] for item in cluster) for cluster in clusters),
+            "balanced_start_y": max(min(item["y0"] for item in cluster) for cluster in clusters),
+            "end_y": max(max(item["y1"] for item in cluster) for cluster in clusters),
+            "balance": balance,
+            "score": column_count * 100.0 + balance * 20.0 + (min(gaps) / max(page_w, 1.0)) * 100.0,
+        })
+
+    if not profiles:
+        return None
+    return sorted(profiles, key=lambda profile: profile["score"], reverse=True)[0]
+
+
+def _layout_two_column_profile_from_items(items: List[dict], page_w: float, page_h: float) -> Optional[dict]:
+    profile = _layout_multi_column_profile_from_items(items, page_w, page_h)
+    if not profile or int(profile.get("column_count", 0) or 0) != 2:
+        return None
+    return {
+        **profile,
+        "gutter": profile["gutters"][0],
+        "left_count": profile["columns"][0]["count"],
+        "right_count": profile["columns"][1]["count"],
+    }
+
+
+def _column_major_items_inside_layout_row(row: List[dict], page_w: float) -> List[dict]:
+    """Order a row of layout regions without reversing stacked regions inside a column.
+
+    Layout detectors often emit large text boxes for newspaper/scientific
+    columns. A tall left-column box can overlap several right-column boxes, so
+    naive row-major sorting by (x, y) treats all boxes as one row and lets tiny
+    x jitter reverse the right-column stack. Split the row into geometric
+    x-clusters first, then sort top-to-bottom inside each cluster.
+    """
+    if len(row) < 3:
+        return sorted(row, key=lambda i: (i["x0"], i["y0"]))
+
+    ordered = sorted(row, key=lambda i: (i["x0"], i["y0"]))
+    gaps = [
+        (
+            max(0.0, float(ordered[idx]["x0"]) - float(ordered[idx - 1]["x0"])),
+            idx,
+        )
+        for idx in range(1, len(ordered))
+    ]
+    split_threshold = max(32.0, page_w * 0.075)
+    split_indices = [idx for gap, idx in gaps if gap >= split_threshold]
+    if not split_indices:
+        return ordered
+
+    clusters: List[List[dict]] = []
+    start = 0
+    for idx in split_indices:
+        clusters.append(ordered[start:idx])
+        start = idx
+    clusters.append(ordered[start:])
+
+    if len(clusters) > 4 or any(not cluster for cluster in clusters):
+        return ordered
+
+    result: List[dict] = []
+    for cluster in clusters:
+        result.extend(sorted(cluster, key=lambda i: (i["y0"], i["x0"])))
+    return result
+
+
+def _row_major_layout_items(items: List[dict], page_w: float, page_h: float) -> List[dict]:
+    if not items:
+        return []
+    y_tol = max(page_h * 0.018, 12.0)
+    rows: List[List[dict]] = []
+    for item in sorted(items, key=lambda i: (i["y0"], i["x0"])):
+        placed = False
+        for row in rows:
+            row_y0 = min(r["y0"] for r in row)
+            row_y1 = max(r["y1"] for r in row)
+            overlap = max(0.0, min(row_y1, item["y1"]) - max(row_y0, item["y0"]))
+            min_h = max(min(item["height"], row_y1 - row_y0), 1.0)
+            if overlap / min_h >= 0.25 or abs(item["y0"] - row_y0) <= y_tol:
+                row.append(item)
+                placed = True
+                break
+        if not placed:
+            rows.append([item])
+    ordered: List[dict] = []
+    for row in sorted(rows, key=lambda r: min(i["y0"] for i in r)):
+        ordered.extend(_column_major_items_inside_layout_row(row, page_w))
+    return ordered
+
+
+def _sort_layout_items_for_reading_order(items: List[dict], page_w: float, page_h: float) -> List[dict]:
+    profile = _layout_multi_column_profile_from_items(items, page_w, page_h)
+    if not profile:
+        return _row_major_layout_items(items, page_w, page_h)
+
+    column_count = int(profile.get("column_count", 2) or 2)
+    gutters = [float(gutter) for gutter in (profile.get("gutters") or [])]
+    start_y = float(profile["start_y"])
+    balanced_start_y = float(profile["balanced_start_y"])
+    end_y = float(profile["end_y"])
+    y_tol = max(page_h * 0.015, 10.0)
+
+    top: List[dict] = []
+    column_items: List[List[dict]] = [[] for _ in range(column_count)]
+    bottom: List[dict] = []
+    other: List[dict] = []
+    for item in items:
+        full_width = item["width"] > page_w * (0.60 if column_count == 2 else 0.48)
+        if item["y1"] < start_y - y_tol or (full_width and item["y0"] < balanced_start_y - y_tol):
+            top.append(item)
+        elif item["y0"] > end_y + y_tol and full_width:
+            bottom.append(item)
+        elif not full_width:
+            col_idx = _column_index_for_x(float(item["cx"]), gutters)
+            col_idx = min(max(col_idx, 0), max(0, column_count - 1))
+            column_items[col_idx].append(item)
+        else:
+            other.append(item)
+
+    ordered = sorted(top, key=lambda i: (i["y0"], i["x0"]))
+    for group in column_items:
+        ordered.extend(sorted(group, key=lambda i: (i["y0"], i["x0"])))
+    ordered.extend(sorted(other, key=lambda i: (i["y0"], i["x0"])))
+    ordered.extend(sorted(bottom, key=lambda i: (i["y0"], i["x0"])))
+    return ordered
+
+
+def prepare_layout_region_reading_orders(
+    layout_regions_by_page: Dict[int, List[dict]],
+    page_info: dict,
+    logger: Optional[Logger] = None,
+) -> Dict[int, List[dict]]:
+    ordered_by_page: Dict[int, List[dict]] = {}
+    applied_pages = []
+    for page, regions in (layout_regions_by_page or {}).items():
+        info = (page_info or {}).get(page, {})
+        page_w = float(info.get("width", 595.0) or 595.0)
+        page_h = float(info.get("height", 842.0) or 842.0)
+        items = _layout_region_items(regions)
+        if not items:
+            continue
+        ordered = _sort_layout_items_for_reading_order(items, page_w, page_h)
+        for rank, item in enumerate(ordered):
+            order_key = rank * 10000
+            item["region"]["_layout_order_rank"] = rank
+            item["region"]["_layout_order_key"] = order_key
+        ordered_by_page[page] = ordered
+        applied_pages.append(page)
+    if logger and applied_pages:
+        logger.log(
+            "Prepared layout-region reading order for page(s): "
+            + ", ".join(str(p) for p in sorted(applied_pages))
+        )
+    return ordered_by_page
+
+
+def _layout_item_for_bbox(page: int,
+                          bbox: Tuple[float, float, float, float],
+                          layout_regions_by_page: Dict[int, List[dict]]) -> Optional[dict]:
+    best_item = None
+    best_score = 0.0
+    for item in _layout_region_items((layout_regions_by_page or {}).get(page, [])):
+        region_order = item["region"].get("_layout_order_key")
+        if region_order is None:
+            continue
+        overlap = _bbox_overlap_ratio(bbox, item["bbox"])
+        center = _layout_center_inside(bbox, item["bbox"], pad=3.0)
+        score = overlap + (0.35 if center else 0.0)
+        if score > best_score:
+            best_score = score
+            best_item = item
+    return best_item if best_score >= 0.20 else None
+
+
+def _layout_order_for_bbox(page: int,
+                           bbox: Tuple[float, float, float, float],
+                           layout_regions_by_page: Dict[int, List[dict]],
+                           default_order: int) -> int:
+    item = _layout_item_for_bbox(page, bbox, layout_regions_by_page)
+    if item is None:
+        return int(default_order)
+    return int(item["region"].get("_layout_order_key", default_order))
+
+
+def apply_layout_region_reading_order(
+    lines: List[TextLine],
+    layout_regions_by_page: Dict[int, List[dict]],
+    page_info: dict,
+    logger: Logger,
+) -> List[TextLine]:
+    """
+    Use detected layout blocks as the primary reading-order units.
+
+    This follows the common OCR pipeline principle used by Docstrum/XY-cut and
+    modern layout detectors: first segment the page into regions, then order
+    text inside each region. It prevents global Y-sorting from interleaving
+    two-column articles, captions, figures, and table-adjacent text.
+    """
+    if not lines or not layout_regions_by_page:
+        return lines
+
+    ordered_items_by_page = prepare_layout_region_reading_orders(layout_regions_by_page, page_info)
+    if not ordered_items_by_page:
+        return lines
+
+    lines_by_page: Dict[int, List[TextLine]] = {}
+    for line in lines:
+        lines_by_page.setdefault(int(line.page), []).append(line)
+
+    applied_pages = []
+    result: List[TextLine] = []
+    for page in sorted(lines_by_page):
+        page_lines = lines_by_page[page]
+        ordered_items = ordered_items_by_page.get(page)
+        if not ordered_items:
+            result.extend(sorted(page_lines, key=lambda line: (line.order, line.y, line.x)))
+            continue
+
+        assigned: Dict[int, List[TextLine]] = {int(item["region"]["_layout_order_rank"]): [] for item in ordered_items}
+        unassigned: List[TextLine] = []
+        for line in page_lines:
+            bbox = _line_bbox(line)
+            best_item = None
+            best_score = 0.0
+            for item in ordered_items:
+                overlap = _bbox_overlap_ratio(bbox, item["bbox"])
+                center = _layout_center_inside(bbox, item["bbox"], pad=max(2.0, line.height * 0.25))
+                score = overlap + (0.35 if center else 0.0)
+                if score > best_score:
+                    best_score = score
+                    best_item = item
+            if best_item is not None and best_score >= 0.20:
+                rank = int(best_item["region"]["_layout_order_rank"])
+                setattr(line, "_layout_region_order", rank)
+                setattr(line, "_layout_region_type", best_item["kind"])
+                assigned.setdefault(rank, []).append(line)
+            else:
+                unassigned.append(line)
+
+        assigned_count = sum(len(v) for v in assigned.values())
+        if assigned_count < max(4, int(len(page_lines) * 0.25)):
+            result.extend(sorted(page_lines, key=lambda line: (line.order, line.y, line.x)))
+            continue
+
+        page_result: List[TextLine] = []
+        for item in ordered_items:
+            rank = int(item["region"]["_layout_order_rank"])
+            group = assigned.get(rank, [])
+            if not group:
+                continue
+            base_order = int(item["region"].get("_layout_order_key", rank * 10000))
+            # Preserve the geometry/column reading order computed before this
+            # step. Layout detectors sometimes merge a two-column article into
+            # one semantic region; sorting that region by (y, x) would
+            # re-interleave the columns and undo the column detector.
+            group_sorted = sorted(group, key=lambda line: (line.order, line.y, line.x))
+            for offset, line in enumerate(group_sorted):
+                line.order = base_order + offset
+            page_result.extend(group_sorted)
+
+        if unassigned:
+            y_tol = max(float(page_info.get(page, {}).get("height", 842.0) or 842.0) * 0.01, 8.0)
+            positioned_items = sorted(
+                ordered_items,
+                key=lambda item: int(item["region"].get("_layout_order_rank", item["idx"]))
+            )
+
+            def fallback_unassigned_order(line: TextLine, offset: int) -> int:
+                if not positioned_items:
+                    return int(line.order)
+                candidate_rank = -1
+                for item in positioned_items:
+                    rank = int(item["region"].get("_layout_order_rank", item["idx"]))
+                    if line.y >= float(item["y0"]) - y_tol:
+                        candidate_rank = rank
+                    else:
+                        break
+                if candidate_rank < 0:
+                    return -10000 + offset
+                return candidate_rank * 10000 + 9000 + offset
+
+            for offset, line in enumerate(sorted(unassigned, key=lambda line: (line.order, line.y, line.x))):
+                line.order = fallback_unassigned_order(line, offset)
+            page_result.extend(sorted(unassigned, key=lambda line: (line.order, line.y, line.x)))
+
+        result.extend(page_result)
+        applied_pages.append(f"{page}({assigned_count}/{len(page_lines)} lines)")
+
+    if applied_pages:
+        logger.log("Applied layout-region reading order on page(s): " + ", ".join(applied_pages))
+    return sorted(result, key=lambda line: (line.page, line.order, line.y, line.x))
+
+
+def _source_pdf_for_layout(pdf_path: str) -> str:
+    return pdf_path
+
+
+def analyze_layout_regions_for_pdf(pdf_path: str, page_info: dict, logger: Logger) -> Dict[int, List[dict]]:
+    """Run DocLayout ONNX on demand when the canonical sidecar lacks regions."""
+    source_pdf = _source_pdf_for_layout(pdf_path)
+    if not source_pdf or not os.path.exists(source_pdf):
+        return {}
+    try:
+        from PIL import Image
+        from scanindex.core.kie.json_utils import decorate_layout_regions
+        from scanindex.core.tables import layout_analyzer as la
+    except Exception as e:
+        logger.log(f"DocLayout on-demand analysis unavailable: {e}")
+        return {}
+
+    try:
+        primary = la.get_analyzer() if la.is_available() else None
+        auxiliary = (
+            la.get_doclaynet_analyzer()
+            if os.environ.get("OCRTOOL_DISABLE_DOCLAYNET_LAYOUT") != "1"
+            and hasattr(la, "is_doclaynet_available")
+            and la.is_doclaynet_available()
+            else None
+        )
+    except Exception as e:
+        logger.log(f"DocLayout on-demand init failed: {e}")
+        return {}
+
+    if not primary and not auxiliary:
+        logger.log("DocLayout on-demand analysis skipped: ONNX model/runtime unavailable")
+        return {}
+
+    regions_by_page: Dict[int, List[dict]] = {}
+    try:
+        doc = fitz.open(source_pdf)
+        dpi = 240
+        mat = fitz.Matrix(dpi / 72.0, dpi / 72.0)
+        for page_idx, page in enumerate(doc):
+            page_num = page_idx + 1
+            pix = page.get_pixmap(matrix=mat, annots=True)
+            image = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            page_w = float(page.rect.width)
+            page_h = float(page.rect.height)
+            scale_x = page_w / max(float(pix.width), 1.0)
+            scale_y = page_h / max(float(pix.height), 1.0)
+
+            primary_regions = []
+            auxiliary_regions = []
+            if primary:
+                primary_regions = decorate_layout_regions(
+                    primary.analyze_page(image),
+                    page_index=page_idx,
+                    scale_x=scale_x,
+                    scale_y=scale_y,
+                )
+            if auxiliary:
+                auxiliary_regions = decorate_layout_regions(
+                    auxiliary.analyze_page(image),
+                    page_index=page_idx,
+                    scale_x=scale_x,
+                    scale_y=scale_y,
+                )
+            if hasattr(la, "merge_auxiliary_layout_regions"):
+                regions = la.merge_auxiliary_layout_regions(primary_regions, auxiliary_regions)
+            else:
+                regions = list(primary_regions or [])
+            if regions:
+                regions_by_page[page_num] = regions
+        doc.close()
+    except Exception as e:
+        logger.log(f"DocLayout on-demand analysis failed: {e}")
+        return {}
+
+    if regions_by_page:
+        total = sum(len(v) for v in regions_by_page.values())
+        logger.log(f"DocLayout on-demand analysis found {total} regions on {len(regions_by_page)} pages")
+    return regions_by_page
+
+
+def save_layout_regions_to_companion(
+    companion_path: Optional[Path],
+    ocr_data: Optional[dict],
+    layout_regions_by_page: Dict[int, List[dict]],
+    logger: Logger,
+) -> None:
+    if not companion_path or not ocr_data or not layout_regions_by_page:
+        return
+    pages = ocr_data.get("pages") or []
+    changed = 0
+    for page_idx, page in enumerate(pages, 1):
+        if page.get("layout_regions"):
+            continue
+        regions = layout_regions_by_page.get(page_idx)
+        if not regions:
+            continue
+        page["layout_regions"] = regions
+        changed += 1
+    if not changed:
+        return
+    try:
+        from scanindex.core.canonical_io import save_canonical
+
+        saved_path = save_canonical(companion_path, ocr_data, profile="docx_export")
+        logger.log(f"Updated canonical OCR sidecar with layout regions: {saved_path}")
+    except Exception as e:
+        logger.log(f"Could not update canonical OCR sidecar with layout regions: {e}")
+
+
+def _sha256_file(path: str) -> Optional[str]:
+    if not path or not os.path.exists(path):
+        return None
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _ocr_lines_hash(pdf_lines: List[TextLine]) -> str:
+    h = hashlib.sha256()
+    for line in sorted(pdf_lines or [], key=lambda l: (l.page, l.order, l.y, l.x, l.text)):
+        payload = [
+            int(line.page),
+            round(float(line.x), 2),
+            round(float(line.y), 2),
+            round(float(line.width), 2),
+            round(float(line.height), 2),
+            line.source_line_id or "",
+            line.text or "",
+        ]
+        h.update(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        h.update(b"\n")
+    return h.hexdigest()
+
+
+def _ocr_lines_hash_by_page(pdf_lines: List[TextLine]) -> Dict[str, str]:
+    by_page: Dict[int, List[TextLine]] = {}
+    for line in pdf_lines or []:
+        by_page.setdefault(int(line.page), []).append(line)
+    return {
+        str(page): _ocr_lines_hash(lines)
+        for page, lines in sorted(by_page.items())
+    }
+
+
+def _page_visual_hashes_from_companion(companion_data: Optional[dict]) -> Dict[str, str]:
+    result: Dict[str, str] = {}
+    for idx, page in enumerate((companion_data or {}).get("pages") or [], 1):
+        if not isinstance(page, dict):
+            continue
+        visual = page.get("visual_source") if isinstance(page.get("visual_source"), dict) else {}
+        sha = str(visual.get("sha256") or "").strip()
+        if sha:
+            result[str(idx)] = sha
+    return result
+
+
+def _continued_table_flow_enabled() -> bool:
+    return os.environ.get("OCRTOOL_ENABLE_CONTINUED_TABLE_FLOW", "1").strip() != "0"
+
+
+def _table_options_hash(layout_regions_by_page: Dict[int, List[dict]]) -> str:
+    payload = {
+        "cache_schema": "docx_table_cache_v7",
+        "continued_table_flow": _continued_table_flow_enabled(),
+        "layout_region_pages": sorted(int(page) for page in (layout_regions_by_page or {}).keys()),
+        "engines": ["doclayout", "gmft_onnx", "docling_tableformer"],
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _current_table_cache_meta(
+    pdf_path: str,
+    pdf_lines: List[TextLine],
+    layout_regions_by_page: Dict[int, List[dict]],
+    companion_data: Optional[dict],
+) -> dict:
+    ocr_pipeline = ((companion_data or {}).get("pipeline") or {}).get("ocr") or {}
+    source_mode = ocr_pipeline.get("source_mode")
+    if source_mode not in {"scan", "digital", "mixed"}:
+        source_mode = "digital" if ocr_pipeline.get("engine") == "digital_pdf_text" else "scan"
+    page_hashes = _page_visual_hashes_from_companion(companion_data)
+    file_hash = _sha256_file(pdf_path)
+    return {
+        "status": "complete",
+        "completed_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "source_mode": source_mode,
+        "visual_source_sha256": file_hash,
+        "page_visual_sha256": page_hashes or {"__file__": file_hash},
+        "ocr_lines_hash": _ocr_lines_hash(pdf_lines),
+        "page_ocr_lines_hash": _ocr_lines_hash_by_page(pdf_lines),
+        "options_hash": _table_options_hash(layout_regions_by_page),
+        "engines": ["doclayout", "gmft_onnx", "docling_tableformer"],
+        "cache_layers": {
+            "raw_page": "docx_raw_tables_v1",
+            "composed_groups": "docx_continued_table_groups_v1",
+            "render_structures": "docx_table_structures_v1",
+        },
+    }
+
+
+def _table_cache_valid(companion_data: Optional[dict], expected: dict, logger: Logger) -> bool:
+    if not companion_data:
+        return False
+    meta = (companion_data.get("pipeline") or {}).get("table_extraction") or {}
+    if not meta:
+        logger.log("Table cache missing; regenerating")
+        return False
+
+    page_hash_expected = expected.get("page_visual_sha256") or {}
+    page_hash_actual = meta.get("page_visual_sha256") or {}
+    if page_hash_expected and page_hash_actual != page_hash_expected:
+        logger.log("Table cache invalid (page visual fingerprint mismatch); regenerating")
+        return False
+
+    page_text_expected = expected.get("page_ocr_lines_hash") or {}
+    page_text_actual = meta.get("page_ocr_lines_hash") or {}
+    if page_text_expected and page_text_actual != page_text_expected:
+        logger.log("Table cache invalid (page OCR text hash mismatch); regenerating")
+        return False
+
+    for key in ("visual_source_sha256", "ocr_lines_hash", "options_hash"):
+        if meta.get(key) != expected.get(key):
+            logger.log(f"Table cache invalid ({key} mismatch); regenerating")
+            return False
+    if meta.get("status") != "complete":
+        logger.log("Table cache invalid (status is not complete); regenerating")
+        return False
+    return True
+
+
+def _bbox_record_to_tuple(value) -> Tuple[float, float, float, float]:
+    try:
+        vals = [float(v) for v in list(value or [])[:4]]
+    except Exception:
+        vals = []
+    if len(vals) != 4:
+        return (0.0, 0.0, 0.0, 0.0)
+    return (vals[0], vals[1], vals[2], vals[3])
+
+
+def _normalise_cell_grid(cells, row_count: int, col_count: int) -> List[List[str]]:
+    rows = []
+    raw_rows = cells if isinstance(cells, list) else []
+    for r in range(row_count):
+        raw = raw_rows[r] if r < len(raw_rows) and isinstance(raw_rows[r], list) else []
+        row = [str(raw[c]) if c < len(raw) and raw[c] is not None else "" for c in range(col_count)]
+        rows.append(row)
+    return rows
+
+
+def _normalise_bbox_grid(cell_bboxes, row_count: int, col_count: int) -> List[List[Tuple[float, float, float, float]]]:
+    rows = []
+    raw_rows = cell_bboxes if isinstance(cell_bboxes, list) else []
+    for r in range(row_count):
+        raw = raw_rows[r] if r < len(raw_rows) and isinstance(raw_rows[r], list) else []
+        row = [_bbox_record_to_tuple(raw[c] if c < len(raw) else None) for c in range(col_count)]
+        rows.append(row)
+    return rows
+
+
+def _table_region_to_cache(table: TableRegion, index: int) -> dict:
+    row_count = int(getattr(table, "row_count", 0) or len(getattr(table, "cells", []) or []))
+    col_count = int(getattr(table, "col_count", 0) or max((len(row) for row in (getattr(table, "cells", []) or [])), default=0))
+    x0, y0, x1, y1 = _table_bbox(table)
+    render_options = {
+        "continued_table_flow": bool(getattr(table, "enable_blank_continuation_vmerge", False)),
+    }
+    if getattr(table, "disable_vertical_merge", False):
+        render_options["disable_vertical_merge"] = True
+    record = {
+        "id": getattr(table, "id", None) or f"tbl_p{int(getattr(table, 'page', 1)) - 1}_{index}",
+        "page_index": max(0, int(getattr(table, "page", 1)) - 1),
+        "source_engine": getattr(table, "source", None) or ("pymupdf_native" if getattr(table, "native_table", False) else "unknown"),
+        "bbox": [round(float(x0), 2), round(float(y0), 2), round(float(x1), 2), round(float(y1), 2)],
+        "row_count": row_count,
+        "col_count": col_count,
+        "cells": _normalise_cell_grid(getattr(table, "cells", []), row_count, col_count),
+        "cell_bboxes": _normalise_bbox_grid(getattr(table, "cell_bboxes", []), row_count, col_count),
+        "source_pages": [int(p) for p in (getattr(table, "source_pages", None) or [getattr(table, "page", 1)])],
+        "row_source_pages": [int(p) for p in (getattr(table, "row_source_pages", None) or [])],
+        "skip_render": bool(getattr(table, "skip_render", False)),
+        "render_options": render_options,
+    }
+    if getattr(table, "native_table", False):
+        record["native_table"] = True
+    if hasattr(table, "horizontal_text_spans"):
+        record["horizontal_text_spans"] = getattr(table, "horizontal_text_spans")
+    return record
+
+
+def _table_region_from_cache(record: dict, logger: Logger) -> Optional[TableRegion]:
+    if not isinstance(record, dict):
+        return None
+    try:
+        row_count = int(record.get("row_count") or 0)
+        col_count = int(record.get("col_count") or 0)
+        page = int(record.get("page_index", 0)) + 1
+        bbox = _bbox_record_to_tuple(record.get("bbox"))
+    except Exception:
+        return None
+    if row_count <= 0 or col_count <= 0 or page <= 0:
+        return None
+    cells = _normalise_cell_grid(record.get("cells"), row_count, col_count)
+    cell_bboxes = _normalise_bbox_grid(record.get("cell_bboxes"), row_count, col_count)
+    if not any(any(any(bx) for bx in row) for row in cell_bboxes):
+        logger.log(f"Table cache entry {record.get('id') or '?'} has no usable cell bboxes; regenerating")
+        return None
+    table = TableRegion(
+        page=page,
+        y_top=float(bbox[1]),
+        y_bottom=float(bbox[3]),
+        cells=cells,
+        row_count=row_count,
+        col_count=col_count,
+        cell_bboxes=cell_bboxes,
+    )
+    setattr(table, "id", record.get("id") or "")
+    setattr(table, "source", record.get("source_engine") or "cached")
+    setattr(table, "x_left", float(bbox[0]))
+    setattr(table, "x_right", float(bbox[2]))
+    setattr(table, "source_pages", [int(p) for p in (record.get("source_pages") or [page])])
+    setattr(table, "row_source_pages", [int(p) for p in (record.get("row_source_pages") or [])])
+    setattr(table, "skip_render", bool(record.get("skip_render", False)))
+    if record.get("native_table"):
+        setattr(table, "native_table", True)
+    render_options = record.get("render_options") if isinstance(record.get("render_options"), dict) else {}
+    if render_options.get("continued_table_flow"):
+        setattr(table, "enable_blank_continuation_vmerge", True)
+    if render_options.get("disable_vertical_merge"):
+        setattr(table, "disable_vertical_merge", True)
+    if isinstance(record.get("horizontal_text_spans"), dict):
+        spans = {}
+        for key, value in record.get("horizontal_text_spans", {}).items():
+            try:
+                spans[int(key)] = value
+            except Exception:
+                continue
+        setattr(table, "horizontal_text_spans", spans)
+    return table
+
+
+def load_table_structures_from_companion(
+    companion_data: Optional[dict],
+    expected_meta: dict,
+    logger: Logger,
+) -> Optional[List[TableRegion]]:
+    if not _table_cache_valid(companion_data, expected_meta, logger):
+        return None
+    tables: List[TableRegion] = []
+    saw_table_field = False
+    for page in (companion_data or {}).get("pages") or []:
+        if "table_structures" in page or "table_raw_cache" in page:
+            saw_table_field = True
+        records = page.get("table_structures")
+        if records is None and "table_raw_cache" in page:
+            records = page.get("table_raw_cache")
+        for record in records or []:
+            table = _table_region_from_cache(record, logger)
+            if table is None:
+                return None
+            tables.append(table)
+    if not tables:
+        if saw_table_field:
+            logger.log("Loaded empty table structure cache from canonical sidecar")
+            return []
+        logger.log("Table cache missing table_structures; regenerating")
+        return None
+    logger.log(f"Loaded {len(tables)} table structures from canonical cache")
+    return sorted(tables, key=lambda t: (t.page, t.y_top, t.y_bottom))
+
+
+def _continued_table_group_cache_records(table_regions: List[TableRegion], table_meta: dict) -> List[dict]:
+    page_hashes = table_meta.get("page_visual_sha256") or {}
+    text_hashes = table_meta.get("page_ocr_lines_hash") or {}
+    records = []
+    seen = set()
+    for idx, table in enumerate(table_regions or []):
+        source_pages = [int(p) for p in (getattr(table, "source_pages", None) or [getattr(table, "page", 1)])]
+        source_pages = sorted({p for p in source_pages if p > 0})
+        if len(source_pages) <= 1 and not getattr(table, "skip_render", False):
+            continue
+        key = tuple(source_pages) or (int(getattr(table, "page", 1)),)
+        table_id = getattr(table, "id", None) or f"tbl_p{int(getattr(table, 'page', 1)) - 1}_{idx}"
+        record_key = (key, table_id)
+        if record_key in seen:
+            continue
+        seen.add(record_key)
+        records.append({
+            "id": f"group_{len(records)}",
+            "table_id": table_id,
+            "source_pages": list(key),
+            "page_visual_sha256": {str(p): page_hashes.get(str(p)) for p in key if page_hashes.get(str(p))},
+            "page_ocr_lines_hash": {str(p): text_hashes.get(str(p)) for p in key if text_hashes.get(str(p))},
+            "compose_options_hash": table_meta.get("options_hash"),
+            "status": "complete",
+        })
+    return records
+
+
+def save_table_structures_to_companion(
+    companion_path: Optional[Path],
+    companion_data: Optional[dict],
+    table_regions: List[TableRegion],
+    table_meta: dict,
+    logger: Logger,
+) -> None:
+    if not companion_path or not companion_data:
+        return
+    pages = companion_data.get("pages") or []
+    by_page: Dict[int, List[dict]] = {}
+    for idx, table in enumerate(table_regions or []):
+        page_index = max(0, int(getattr(table, "page", 1)) - 1)
+        by_page.setdefault(page_index, []).append(_table_region_to_cache(table, idx))
+    for page_idx, page in enumerate(pages):
+        if not isinstance(page, dict):
+            continue
+        records = by_page.get(page_idx, [])
+        page["table_raw_cache"] = records
+        page["table_structures"] = records
+        page["table_extraction"] = {
+            "status": "complete",
+            "page_index": page_idx,
+            "visual_source_sha256": (table_meta.get("page_visual_sha256") or {}).get(str(page_idx + 1)),
+            "ocr_lines_hash": (table_meta.get("page_ocr_lines_hash") or {}).get(str(page_idx + 1)),
+            "options_hash": table_meta.get("options_hash"),
+        }
+    pipeline = companion_data.setdefault("pipeline", {})
+    pipeline["table_extraction"] = dict(table_meta)
+    pipeline.setdefault("docx_export", {})["continued_table_groups"] = _continued_table_group_cache_records(
+        table_regions,
+        table_meta,
+    )
+    try:
+        from scanindex.core.canonical_io import save_canonical
+
+        saved_path = save_canonical(companion_path, companion_data, profile="docx_export")
+        logger.log(f"Updated canonical OCR sidecar with table structures: {saved_path}")
+    except Exception as e:
+        logger.log(f"Could not update canonical OCR sidecar with table structures: {e}")
+
+
 def get_lines_in_rect(rect: Tuple[float, float, float, float], lines: List[TextLine]) -> List[TextLine]:
     """
     Find all lines that fall within the rect (visual coords).
@@ -2728,6 +4422,26 @@ def _line_in_bbox(line: TextLine, bbox: Tuple[float, float, float, float]) -> bo
     x_ok = x0 <= cx <= x1 or overlap_x / line_w >= 0.15 or min(abs(lx1 - x0), abs(lx0 - x1)) <= pad
     y_ok = y0 <= cy <= y1 or overlap_y / line_h >= 0.35
     return x_ok and y_ok
+
+
+def _line_overlaps_table_area(line: TextLine, table: TableRegion) -> bool:
+    """2D table membership check used when suppressing separately rendered table OCR."""
+    x0, y0, x1, y1 = _table_bbox(table)
+    lx0, ly0, lx1, ly1 = _line_bbox_for_assignment(line)
+    line_w = max(lx1 - lx0, 1e-6)
+    line_h = max(ly1 - ly0, 1e-6)
+    cx = (lx0 + lx1) / 2.0
+    cy = (ly0 + ly1) / 2.0
+    pad_x = max(2.0, line_h * 0.35)
+    pad_y = max(2.0, line_h * 0.45)
+
+    if not (y0 - pad_y <= cy <= y1 + pad_y):
+        return False
+    overlap_x = _axis_overlap_for_assignment(lx0, lx1, x0 - pad_x, x1 + pad_x)
+    overlap_y = _axis_overlap_for_assignment(ly0, ly1, y0 - pad_y, y1 + pad_y)
+    if x0 - pad_x <= cx <= x1 + pad_x and overlap_y / line_h >= 0.35:
+        return True
+    return overlap_x / line_w >= 0.25 and overlap_y / line_h >= 0.45
 
 
 def _cluster_y_positions(values: List[float], threshold: float = 42.0) -> List[float]:
@@ -2959,7 +4673,199 @@ def _line_fragment_from_words(parent: TextLine, words: List[dict]) -> Optional[T
         source_line_id=parent.source_line_id,
         kie_labels=set(getattr(parent, "kie_labels", set())),
     )
+    setattr(fragment, "word_items", list(words))
     return fragment
+
+
+def _first_alpha_char(text: str) -> str:
+    for ch in _clean_extracted_text(text or ""):
+        if ch.isalpha():
+            return ch
+    return ""
+
+
+def _starts_like_continuation_tail(text: str) -> bool:
+    """
+    Detect a text fragment that is more likely the tail of the row above than
+    the beginning of a new table row. This is intentionally content-shape
+    based: lowercase starts and closing punctuation are continuation signals;
+    list markers, headings, and row numbers are not.
+    """
+    cleaned = _clean_extracted_text(text or "")
+    if not cleaned:
+        return False
+    if _looks_like_table_index_marker(cleaned) or _looks_like_list_item(cleaned):
+        return False
+    if re.match(r"^(?:\d+(?:\.\d+)*|[IVXLCDM]{1,6})[.)]?\s+", cleaned, flags=re.IGNORECASE):
+        return False
+    first = _first_alpha_char(cleaned)
+    if first and first.islower():
+        return True
+    return bool(re.match(r"^[,.;:)\]}]", cleaned))
+
+
+def _ends_like_open_continuation(text: str) -> bool:
+    cleaned = _clean_extracted_text(text or "")
+    if not cleaned:
+        return False
+    if _hard_terminal_punctuation(cleaned):
+        return False
+    return not bool(re.search(r"[.?!;:]\s*$", cleaned))
+
+
+def _lines_joined_text(lines: List[TextLine]) -> str:
+    return _clean_extracted_text(" ".join(_clean_extracted_text(line.text) for line in lines if line.text))
+
+
+def _repair_boundary_continuation_cell_lines(
+    cell_lines: Dict[Tuple[int, int, int], List[TextLine]],
+    table_regions: List[TableRegion],
+    logger: Logger,
+) -> int:
+    """
+    Move tiny top-of-cell continuation fragments back to the row above.
+
+    Scanned ruled tables often have OCR bboxes that straddle a horizontal rule.
+    If the detector places the next row's top boundary a few pixels too high,
+    a tail such as "giấy theo quy..." can be mapped to the row below. The
+    heuristic uses geometry plus lexical continuation shape, never a fixed
+    phrase.
+    """
+    moved = 0
+    for t_idx, table in enumerate(table_regions):
+        if getattr(table, "skip_render", False):
+            continue
+        rows = int(getattr(table, "row_count", 0) or 0)
+        cols = int(getattr(table, "col_count", 0) or 0)
+        if rows < 2 or cols <= 0:
+            continue
+        for r in range(1, rows):
+            for c in range(cols):
+                key = (t_idx, r, c)
+                current_lines = sort_lines_reading_order(cell_lines.get(key, []))
+                if not current_lines:
+                    continue
+                if r >= len(table.cell_bboxes) or c >= len(table.cell_bboxes[r]):
+                    continue
+                if r - 1 >= len(table.cell_bboxes) or c >= len(table.cell_bboxes[r - 1]):
+                    continue
+                current_bbox = tuple(float(v) for v in table.cell_bboxes[r][c][:4])
+                previous_bbox = tuple(float(v) for v in table.cell_bboxes[r - 1][c][:4])
+                if not any(current_bbox) or not any(previous_bbox):
+                    continue
+                top = current_bbox[1]
+                candidate = current_lines[0]
+                candidate_text = _clean_extracted_text(candidate.text)
+                if not _starts_like_continuation_tail(candidate_text):
+                    continue
+                line_top = float(candidate.y)
+                line_bottom = float(candidate.y + candidate.height)
+                line_h = max(float(candidate.height), 1.0)
+                near_top_boundary = line_top <= top + max(line_h * 1.6, 14.0)
+                straddles_or_hugs = line_top <= top + max(line_h * 0.55, 5.0) or line_bottom <= top + max(line_h * 2.2, 22.0)
+                if not (near_top_boundary and straddles_or_hugs):
+                    continue
+                x_overlap = _axis_overlap_for_assignment(
+                    float(candidate.x),
+                    float(candidate.x + candidate.width),
+                    previous_bbox[0],
+                    previous_bbox[2],
+                )
+                if x_overlap / max(float(candidate.width), 1.0) < 0.45:
+                    continue
+                previous_text = _lines_joined_text(cell_lines.get((t_idx, r - 1, c), []))
+                if previous_text and not _ends_like_open_continuation(previous_text):
+                    continue
+                cell_lines[key] = [line for line in cell_lines.get(key, []) if id(line) != id(candidate)]
+                cell_lines.setdefault((t_idx, r - 1, c), []).append(candidate)
+                moved += 1
+    if moved:
+        logger.log(f"Repaired {moved} table-boundary continuation fragment(s)")
+    return moved
+
+
+def _line_fragment_from_spans(parent: TextLine, spans: List[TextSpan]) -> Optional[TextLine]:
+    spans = [span for span in spans if _clean_extracted_text(span.text)]
+    if not spans:
+        return None
+    text = _clean_extracted_text("".join(span.text for span in spans))
+    if not text:
+        return None
+    x0 = min(float(span.x) for span in spans)
+    x1 = max(float(span.x) + float(span.width) for span in spans)
+    y0 = min(float(span.y) for span in spans)
+    font_size = _median([float(span.font_size) for span in spans if span.font_size], parent.font_size)
+    height = max(parent.height, font_size * 1.15)
+    copied_spans = [
+        TextSpan(
+            text=span.text,
+            font_size=span.font_size,
+            y=span.y,
+            is_superscript=span.is_superscript,
+            x=span.x,
+            width=span.width,
+            fg_gray=span.fg_gray,
+            has_space_after=span.has_space_after,
+        )
+        for span in spans
+    ]
+    fragment = TextLine(
+        text=text,
+        x=x0,
+        y=y0,
+        width=max(0.0, x1 - x0),
+        height=max(0.0, height),
+        page=parent.page,
+        font_size=font_size,
+        spans=copied_spans,
+        block_id=parent.block_id,
+        paragraph_id=parent.paragraph_id,
+        content_type=parent.content_type,
+        fg_gray=parent.fg_gray,
+        confidence=parent.confidence,
+        semantic_type=parent.semantic_type,
+        order=parent.order,
+        source_line_id=parent.source_line_id,
+        kie_labels=set(getattr(parent, "kie_labels", set())),
+    )
+    return fragment
+
+
+def _word_sort_key_for_assignment(item) -> Tuple[int, float, float]:
+    idx, word = item
+    try:
+        order = int(word.get("order", idx) or idx)
+    except (TypeError, ValueError):
+        order = idx
+    return (
+        order,
+        float(word.get("y", 0.0) or 0.0),
+        float(word.get("x", 0.0) or 0.0),
+    )
+
+
+def _residual_fragments_from_unassigned_words(parent: TextLine,
+                                              words: List[dict],
+                                              assigned_word_ids: Set[int]) -> List[TextLine]:
+    """Keep non-table words when one OCR line straddles a table and body text."""
+    residuals: List[TextLine] = []
+    current: List[dict] = []
+    for _idx, word in sorted(enumerate(words), key=_word_sort_key_for_assignment):
+        if id(word) in assigned_word_ids:
+            if current:
+                fragment = _line_fragment_from_words(parent, current)
+                if fragment is not None:
+                    setattr(fragment, "_table_residual_fragment", True)
+                    residuals.append(fragment)
+                current = []
+            continue
+        current.append(word)
+    if current:
+        fragment = _line_fragment_from_words(parent, current)
+        if fragment is not None:
+            setattr(fragment, "_table_residual_fragment", True)
+            residuals.append(fragment)
+    return residuals
 
 
 def assign_ocr_lines_to_table_cells_by_geometry(
@@ -2991,6 +4897,7 @@ def assign_ocr_lines_to_table_cells_by_geometry(
 
     cell_lines: Dict[Tuple[int, int, int], List[TextLine]] = {}
     assigned_source_ids = set()
+    residual_fragment_count = 0
 
     def add_to_cell(key: Tuple[int, int, int], line: TextLine):
         t_idx, r, c = key
@@ -3003,13 +4910,16 @@ def assign_ocr_lines_to_table_cells_by_geometry(
         words = [word for word in getattr(line, "word_items", []) or [] if _clean_extracted_text(str(word.get("text") or ""))]
         if words:
             grouped_words: Dict[Tuple[int, int, int], List[dict]] = {}
+            assigned_word_ids: Set[int] = set()
             for word in words:
                 key = _best_cell_for_text_bbox(_word_bbox_for_assignment(word), line.page, table_regions, table_bboxes)
                 if key is not None:
                     grouped_words.setdefault(key, []).append(word)
+                    assigned_word_ids.add(id(word))
             if grouped_words:
                 assigned_source_ids.add(id(line))
-                if len(grouped_words) == 1:
+                all_words_assigned = len(assigned_word_ids) == len(words)
+                if len(grouped_words) == 1 and all_words_assigned:
                     add_to_cell(next(iter(grouped_words.keys())), line)
                 else:
                     for key, group in grouped_words.items():
@@ -3017,12 +4927,20 @@ def assign_ocr_lines_to_table_cells_by_geometry(
                         fragment = _line_fragment_from_words(line, group)
                         if fragment is not None:
                             add_to_cell(key, fragment)
+                    if not all_words_assigned:
+                        residuals = _residual_fragments_from_unassigned_words(line, words, assigned_word_ids)
+                        if residuals:
+                            setattr(line, "_table_residual_fragments", residuals)
+                            residual_fragment_count += len(residuals)
                 continue
 
         key = _best_cell_for_text_bbox(_line_bbox_for_assignment(line), line.page, table_regions, table_bboxes)
         if key is not None:
             assigned_source_ids.add(id(line))
             add_to_cell(key, line)
+
+    if cell_lines:
+        _repair_boundary_continuation_cell_lines(cell_lines, table_regions, logger)
 
     if rebuild_cells:
         for t_idx, table in enumerate(table_regions):
@@ -3058,6 +4976,8 @@ def assign_ocr_lines_to_table_cells_by_geometry(
 
     if assigned_source_ids:
         logger.log(f"Assigned {len(assigned_source_ids)} OCR table lines by geometry cell mapping")
+    if residual_fragment_count:
+        logger.log(f"Preserved {residual_fragment_count} non-table fragment(s) from OCR lines crossing table boundaries")
     return assigned_source_ids
 
 
@@ -3600,6 +5520,91 @@ def _normalize_grouped_header_rows(table: TableRegion) -> bool:
     return True
 
 
+def repair_split_table_header_fragments(table_regions: List[TableRegion], logger: Logger) -> List[TableRegion]:
+    """
+    Normalize multi-row table headers whose fixed columns are OCR-split across
+    rows and whose group label lands in only one covered grid cell.
+
+    The signal is structural: a numeric column-index row below two header rows.
+    We combine short vertical header fragments and record an explicit
+    horizontal span for a group label whose adjacent top cell is blank but both
+    lower cells have subheaders.
+    """
+    repaired_tables = 0
+    for table in table_regions or []:
+        if getattr(table, "skip_render", False):
+            continue
+        cols = int(getattr(table, "col_count", 0) or 0)
+        if cols < 4 or int(getattr(table, "row_count", 0) or 0) < 3 or len(table.cells) < 3:
+            continue
+
+        numeric_idx = None
+        for idx, row in enumerate(table.cells[:4]):
+            normalized_row = list(row[:cols]) + [""] * max(0, cols - len(row))
+            if _is_numeric_header_row(normalized_row):
+                numeric_idx = idx
+                break
+        if numeric_idx is None or numeric_idx < 2:
+            continue
+
+        rows = [
+            list(row[:cols]) + [""] * max(0, cols - len(row))
+            for row in table.cells
+        ]
+        top = rows[0]
+        lower = rows[1]
+        numeric = rows[numeric_idx]
+        changed = False
+
+        for c in range(cols):
+            top_text = _clean_extracted_text(str(top[c]))
+            lower_text = _clean_extracted_text(str(lower[c]))
+            numeric_text = _clean_extracted_text(str(numeric[c])) if c < len(numeric) else ""
+            if not top_text or not lower_text or not re.fullmatch(r"\d{1,3}", numeric_text or ""):
+                continue
+            top_key = _norm_table_key(top_text)
+            lower_key = _norm_table_key(lower_text)
+            if lower_key and lower_key in top_key:
+                combined = top_text
+            elif top_key and top_key in lower_key:
+                combined = lower_text
+            else:
+                combined = _collapse_spaced_acronym(f"{top_text} {lower_text}")
+            words = [word for word in re.split(r"\s+", combined) if word]
+            if len(words) > 5 or len(combined) > 45:
+                continue
+            top[c] = combined
+            lower[c] = ""
+            changed = True
+
+        spans = dict(getattr(table, "horizontal_text_spans", {}) or {})
+        for c in range(1, cols):
+            group_text = _clean_extracted_text(str(top[c]))
+            if not group_text or _clean_extracted_text(str(top[c - 1])):
+                continue
+            left_lower = _clean_extracted_text(str(lower[c - 1]))
+            this_lower = _clean_extracted_text(str(lower[c]))
+            if not left_lower or not this_lower:
+                continue
+            if len(group_text) < 4 or len(group_text) > 80:
+                continue
+            if c + 1 < cols and _clean_extracted_text(str(top[c + 1])) == group_text:
+                continue
+            spans.setdefault(0, (c - 1, c, group_text))
+            changed = True
+            break
+
+        if changed:
+            table.cells = rows
+            if spans:
+                setattr(table, "horizontal_text_spans", spans)
+            repaired_tables += 1
+
+    if repaired_tables:
+        logger.log(f"Repaired split header fragments in {repaired_tables} table(s)")
+    return table_regions
+
+
 def _has_sparse_group_header(table: TableRegion) -> bool:
     if table.row_count < 2 or table.col_count < 5:
         return False
@@ -3681,6 +5686,65 @@ def postprocess_table_layout_grids(table_regions: List[TableRegion],
         logger.log(f"Added {added_grid_cols} grouped-header grid column(s)")
     if normalized_headers:
         logger.log(f"Normalized {normalized_headers} grouped table header row(s)")
+    return table_regions
+
+
+def repair_wrapped_group_header_tokens(table_regions: List[TableRegion], logger: Logger) -> List[TableRegion]:
+    """
+    Repair multi-row group headers when the OCR/model drops a continuation
+    token into the lower subheader row.
+
+    Example pattern by geometry, not by document text:
+      top:   [Group A,] [Group A,]
+      lower: [Cases]   [II %]
+    becomes:
+      top:   [Group A, II] [Group A, II]
+      lower: [Cases]       [%]
+    """
+    repaired = 0
+    for table in table_regions or []:
+        if getattr(table, "skip_render", False):
+            continue
+        if table.row_count < 2 or table.col_count < 3:
+            continue
+        if len(table.cells) < 2:
+            continue
+
+        first = list(table.cells[0][:table.col_count]) + [""] * max(0, table.col_count - len(table.cells[0]))
+        second = list(table.cells[1][:table.col_count]) + [""] * max(0, table.col_count - len(table.cells[1]))
+        changed = False
+
+        for c in range(0, table.col_count - 1):
+            top = _clean_extracted_text(first[c])
+            top_next = _clean_extracted_text(first[c + 1])
+            lower_next = _clean_extracted_text(second[c + 1])
+            if not top or _norm_table_key(top) != _norm_table_key(top_next):
+                continue
+            match = re.match(r"^([IVXLCDM]{1,8})\s+(.+)$", lower_next, re.IGNORECASE)
+            if not match:
+                continue
+            suffix = match.group(1).upper()
+            remainder = _clean_extracted_text(match.group(2))
+            if not remainder or len(remainder) > 12:
+                continue
+            if not (top.endswith((",", "/", "-", "&")) or re.search(r"\b[IVXLCDM]+\s*[,/\\-]\s*$", top, re.IGNORECASE)):
+                continue
+            combined = _clean_extracted_text(f"{top} {suffix}")
+            first[c] = combined
+            first[c + 1] = combined
+            second[c + 1] = remainder
+            changed = True
+
+        if changed:
+            for c in range(table.col_count):
+                if _norm_table_key(first[c]) == _norm_table_key(second[c]) and _clean_extracted_text(first[c]):
+                    second[c] = ""
+            table.cells[0] = first
+            table.cells[1] = second
+            repaired += 1
+
+    if repaired:
+        logger.log(f"Repaired wrapped continuation token(s) in {repaired} grouped table header(s)")
     return table_regions
 
 
@@ -3901,6 +5965,115 @@ def stabilize_page_local_table_grids(table_regions: List[TableRegion],
 
     if fixed:
         logger.log(f"Stabilized {fixed} page-local table grid(s) from adjacent page schemas")
+    return table_regions
+
+
+def trim_empty_trailing_table_columns(table_regions: List[TableRegion], logger: Logger) -> List[TableRegion]:
+    """
+    Remove detector-only right-edge columns that contain no text anywhere.
+
+    This is a geometry/schema cleanup, not a document-specific rule. Structure
+    recognizers sometimes create a narrow extra column at the right border when
+    a merged header touches the table edge. Keeping that empty column prevents
+    continued-page schema matching, so drop only columns that are empty in every
+    row and only from the trailing edge.
+    """
+    trimmed = 0
+    for table in table_regions or []:
+        if getattr(table, "skip_render", False):
+            continue
+        cols = int(getattr(table, "col_count", 0) or 0)
+        rows = [list(row) for row in (getattr(table, "cells", []) or [])]
+        boxes = [list(row) for row in (getattr(table, "cell_bboxes", []) or [])]
+        if cols <= 1 or not rows:
+            continue
+
+        remove_count = 0
+        while cols - remove_count > 1:
+            col_idx = cols - remove_count - 1
+            has_text = any(
+                col_idx < len(row) and _clean_extracted_text(str(row[col_idx]))
+                for row in rows
+            )
+            if has_text:
+                break
+            remove_count += 1
+
+        if not remove_count:
+            continue
+
+        new_cols = cols - remove_count
+        table.cells = [row[:new_cols] for row in rows]
+        table.cell_bboxes = [row[:new_cols] for row in boxes]
+        table.col_count = new_cols
+        trimmed += remove_count
+
+    if trimmed:
+        logger.log(f"Trimmed {trimmed} empty trailing table column(s)")
+    return table_regions
+
+
+def _continued_table_geometry_signal(prev: TableRegion,
+                                     nxt: TableRegion,
+                                     layout_regions_by_page: Dict[int, List[dict]],
+                                     page_info: dict,
+                                     pdf_lines: List[TextLine]) -> bool:
+    if getattr(prev, "skip_render", False) or getattr(nxt, "skip_render", False):
+        return False
+    if int(nxt.page) != int(prev.page) + 1:
+        return False
+    if not _table_starts_near_page_top(nxt, page_info):
+        return False
+    if not _table_ends_near_page_bottom(prev, page_info):
+        return False
+    if _table_header_signal(nxt, pdf_lines):
+        return False
+
+    prev_bbox = _matching_layout_bbox_for_table(prev, layout_regions_by_page) or _table_bbox(prev)
+    next_bbox = _matching_layout_bbox_for_table(nxt, layout_regions_by_page) or _table_bbox(nxt)
+    if _horizontal_overlap_ratio(prev_bbox, next_bbox) < 0.82:
+        return False
+    edge_delta = abs(prev_bbox[0] - next_bbox[0]) + abs(prev_bbox[2] - next_bbox[2])
+    return edge_delta <= max(48.0, (prev_bbox[2] - prev_bbox[0]) * 0.14)
+
+
+def stabilize_continuation_table_schemas_from_geometry(
+    table_regions: List[TableRegion],
+    layout_regions_by_page: Dict[int, List[dict]],
+    page_info: dict,
+    pdf_lines: List[TextLine],
+    logger: Logger,
+) -> List[TableRegion]:
+    """
+    Expand continuation-page segments to the previous page's ruled schema.
+
+    Real multi-page tables often lose a narrow index/notes column on pages that
+    start mid-row or have no repeated header. The continuation decision is made
+    from page geometry and table borders; then OCR text is assigned again to the
+    normalized grid by cell area, so repeated text in different cells is kept.
+    """
+    ordered = [
+        table for table in sorted(table_regions or [], key=lambda t: (int(t.page), float(t.y_top)))
+        if not getattr(table, "skip_render", False)
+    ]
+    fixed = 0
+    prev: Optional[TableRegion] = None
+    for table in ordered:
+        if prev is not None and _continued_table_geometry_signal(
+            prev, table, layout_regions_by_page, page_info, pdf_lines
+        ):
+            prev_cols = int(getattr(prev, "col_count", 0) or 0)
+            cols = int(getattr(table, "col_count", 0) or 0)
+            if 3 <= cols < prev_cols <= 8:
+                ratios = _canonical_column_ratios([prev], layout_regions_by_page)
+                if len(ratios) == prev_cols:
+                    intervals = _intervals_from_ratios(table, ratios, layout_regions_by_page)
+                    if len(intervals) == prev_cols and _regrid_table_columns(table, intervals, logger):
+                        fixed += 1
+        prev = table
+
+    if fixed:
+        logger.log(f"Stabilized {fixed} continuation table schema(s) from previous page geometry")
     return table_regions
 
 
@@ -4148,6 +6321,40 @@ def _append_continuation_text(dst: str, src: str) -> str:
     return dst + "\n" + src
 
 
+def _row_leading_fragment_matches_anchor(fragment: str, anchor: str) -> bool:
+    fragment_key = _norm_table_key(fragment)
+    anchor_key = _norm_table_key(anchor)
+    if not fragment_key or not anchor_key or len(fragment_key) > 12:
+        return False
+    return fragment_key in anchor_key and fragment_key != anchor_key
+
+
+def _row_has_left_anchor(row: List[str]) -> bool:
+    if not row:
+        return False
+    first = _clean_extracted_text(str(row[0])) if len(row) > 0 else ""
+    second = _clean_extracted_text(str(row[1])) if len(row) > 1 else ""
+    if _looks_like_table_index_marker(first) or _looks_like_table_index_marker(second):
+        return True
+    for value in (first, second):
+        if not value or _starts_like_continuation_tail(value):
+            continue
+        words = [w for w in re.split(r"\s+", value) if w]
+        if 1 <= len(words) <= 8 and len(value) <= 80:
+            return True
+    return False
+
+
+def _row_middle_starts_like_continuation(row: List[str], cols: int) -> bool:
+    for c in range(1, max(1, cols - 1)):
+        if c >= len(row):
+            continue
+        text = _clean_extracted_text(str(row[c]))
+        if text:
+            return _starts_like_continuation_tail(text)
+    return False
+
+
 def fuse_page_local_continuation_rows(table_regions: List[TableRegion], logger: Logger) -> List[TableRegion]:
     """
     Merge detector-created continuation rows back into the logical row.
@@ -4185,12 +6392,30 @@ def fuse_page_local_continuation_rows(table_regions: List[TableRegion], logger: 
                 if prev_first or prev_second:
                     previous_anchor = previous
                     break
+            previous_row = out_rows[-1] if out_rows else None
+            previous_first = _clean_extracted_text(str(previous_row[0])) if previous_row else ""
+            previous_second = _clean_extracted_text(str(previous_row[1])) if previous_row and len(previous_row) > 1 else ""
+            leading_matches_previous = (
+                bool(first)
+                and (
+                    _row_leading_fragment_matches_anchor(first, previous_first)
+                    or _row_leading_fragment_matches_anchor(first, previous_second)
+                )
+            )
+            current_has_left_anchor = _row_has_left_anchor(row)
             is_continuation = (
-                not first
-                and not score
+                not score
                 and middle_has_text
-                and bool(out_rows)
-                and _looks_like_table_index_marker(_clean_extracted_text(str(out_rows[-1][0])))
+                and bool(previous_row)
+                and _row_has_left_anchor(previous_row)
+                and not current_has_left_anchor
+                and (
+                    not first
+                    or (
+                        leading_matches_previous
+                        and _row_middle_starts_like_continuation(row, cols)
+                    )
+                )
             )
             if is_continuation:
                 target = out_rows[-1]
@@ -5753,6 +7978,449 @@ def detect_tables_doclayout_rapidtable(
         return []
 
 
+def _is_digital_text_pdf(pdf_path: str) -> bool:
+    """True when the companion OCR JSON came from native digital PDF extraction."""
+    try:
+        from scanindex.core.pdf.text_extractor import is_digital_ocr_output
+
+        return bool(is_digital_ocr_output(pdf_path))
+    except Exception:
+        return False
+
+
+def _page_source_modes_from_companion(companion_data: Optional[dict]) -> Dict[int, str]:
+    pages = (companion_data or {}).get("pages") or []
+    pipeline_mode = (
+        ((companion_data or {}).get("pipeline") or {}).get("ocr") or {}
+    ).get("source_mode")
+    modes: Dict[int, str] = {}
+    for idx, page in enumerate(pages, 1):
+        mode = str((page or {}).get("source_mode") or pipeline_mode or "").lower()
+        if mode in {"scan", "digital", "mixed"}:
+            modes[idx] = mode
+    return modes
+
+
+def _filter_lines_to_pages(lines: List[TextLine], pages: Set[int]) -> List[TextLine]:
+    if not pages:
+        return []
+    return [line for line in lines or [] if int(line.page) in pages]
+
+
+def _filter_layout_regions_to_pages(
+    layout_regions_by_page: Optional[Dict[int, List[dict]]],
+    pages: Set[int],
+) -> Dict[int, List[dict]]:
+    if not layout_regions_by_page or not pages:
+        return {}
+    return {
+        int(page): regions
+        for page, regions in layout_regions_by_page.items()
+        if int(page) in pages
+    }
+
+
+def _table_overlap_ratio(a: TableRegion, b: TableRegion) -> float:
+    if int(getattr(a, "page", 0) or 0) != int(getattr(b, "page", 0) or 0):
+        return 0.0
+    ax0, ay0, ax1, ay1 = _table_bbox(a)
+    bx0, by0, bx1, by1 = _table_bbox(b)
+    ix0 = max(ax0, bx0)
+    iy0 = max(ay0, by0)
+    ix1 = min(ax1, bx1)
+    iy1 = min(ay1, by1)
+    inter = max(0.0, ix1 - ix0) * max(0.0, iy1 - iy0)
+    area_a = max(1.0, (ax1 - ax0) * (ay1 - ay0))
+    area_b = max(1.0, (bx1 - bx0) * (by1 - by0))
+    return max(inter / area_a, inter / area_b)
+
+
+def _merge_native_and_model_tables(
+    native_tables: List[TableRegion],
+    model_tables: List[TableRegion],
+    logger: Logger,
+) -> List[TableRegion]:
+    """Prefer native table text for overlapping digital regions; keep model tables elsewhere."""
+    result = list(native_tables or [])
+    skipped = 0
+    for table in model_tables or []:
+        if any(_table_overlap_ratio(table, native) >= 0.70 for native in native_tables or []):
+            skipped += 1
+            continue
+        result.append(table)
+    if native_tables and model_tables:
+        logger.log(
+            f"Combined table engines: kept {len(native_tables)} native table(s), "
+            f"{len(model_tables) - skipped} model table(s), skipped {skipped} overlap(s)"
+        )
+    return sorted(result, key=lambda t: (t.page, t.y_top, t.y_bottom))
+
+
+def _model_table_candidate_pages(
+    page_modes: Dict[int, str],
+    layout_regions_by_page: Dict[int, List[dict]],
+) -> Set[int]:
+    candidate_pages = {
+        int(page)
+        for page, regions in (layout_regions_by_page or {}).items()
+        if regions
+    }
+    pages: Set[int] = set()
+    for page, mode in page_modes.items():
+        if mode in {"scan", "mixed"}:
+            pages.add(int(page))
+        elif mode == "digital" and int(page) in candidate_pages:
+            pages.add(int(page))
+    if not page_modes:
+        pages.update(candidate_pages)
+    return pages
+
+
+def _assign_table_lines_preserving_native_text(
+    native_tables: List[TableRegion],
+    model_tables: List[TableRegion],
+    pdf_lines: List[TextLine],
+    logger: Logger,
+) -> Set[int]:
+    assigned: Set[int] = set()
+    if native_tables:
+        assigned.update(assign_ocr_lines_to_table_cells_by_geometry(
+            native_tables,
+            pdf_lines,
+            logger,
+            rebuild_cells=False,
+        ))
+    if model_tables:
+        assigned.update(assign_ocr_lines_to_table_cells_by_geometry(
+            model_tables,
+            pdf_lines,
+            logger,
+        ))
+    return assigned
+
+
+def _native_bbox_tuple(bbox) -> Optional[Tuple[float, float, float, float]]:
+    if bbox is None:
+        return None
+    try:
+        values = tuple(float(v) for v in bbox[:4])
+    except Exception:
+        return None
+    if len(values) != 4 or values[2] <= values[0] or values[3] <= values[1]:
+        return None
+    return values
+
+
+def _cluster_axis_positions(values: List[float], tolerance: float = 2.0) -> List[float]:
+    if not values:
+        return []
+    clusters: List[List[float]] = []
+    for value in sorted(float(v) for v in values):
+        if clusters and abs(value - (sum(clusters[-1]) / len(clusters[-1]))) <= tolerance:
+            clusters[-1].append(value)
+        else:
+            clusters.append([value])
+    return [sum(cluster) / len(cluster) for cluster in clusters]
+
+
+def _even_intervals(start: float, end: float, count: int) -> List[Tuple[float, float]]:
+    if count <= 0 or end <= start:
+        return []
+    width = (end - start) / count
+    return [(start + width * idx, start + width * (idx + 1)) for idx in range(count)]
+
+
+def _native_table_column_intervals(table_obj, table_bbox: Tuple[float, float, float, float], col_count: int) -> List[Tuple[float, float]]:
+    rows = list(getattr(table_obj, "rows", []) or [])
+    for row in rows:
+        row_cells = list(getattr(row, "cells", []) or [])
+        if len(row_cells) < col_count:
+            continue
+        intervals: List[Tuple[float, float]] = []
+        ok = True
+        for col_idx in range(col_count):
+            bbox = _native_bbox_tuple(row_cells[col_idx])
+            if bbox is None:
+                ok = False
+                break
+            intervals.append((bbox[0], bbox[2]))
+        if ok and all(intervals[idx][1] <= intervals[idx + 1][0] + 2.0 for idx in range(len(intervals) - 1)):
+            return intervals
+
+    x_values = [table_bbox[0], table_bbox[2]]
+    for row in rows:
+        for cell_bbox in list(getattr(row, "cells", []) or []):
+            bbox = _native_bbox_tuple(cell_bbox)
+            if bbox is not None:
+                x_values.extend([bbox[0], bbox[2]])
+    boundaries = [
+        value for value in _cluster_axis_positions(x_values, 2.0)
+        if table_bbox[0] - 2.0 <= value <= table_bbox[2] + 2.0
+    ]
+    if len(boundaries) == col_count + 1:
+        return [(boundaries[idx], boundaries[idx + 1]) for idx in range(col_count)]
+    return _even_intervals(table_bbox[0], table_bbox[2], col_count)
+
+
+def _native_table_row_bands(table_obj, table_bbox: Tuple[float, float, float, float], row_count: int) -> List[Tuple[float, float]]:
+    rows = list(getattr(table_obj, "rows", []) or [])
+    bands: List[Tuple[float, float]] = []
+    for row in rows[:row_count]:
+        bbox = _native_bbox_tuple(getattr(row, "bbox", None))
+        if bbox is None:
+            row_cells = [_native_bbox_tuple(cell) for cell in list(getattr(row, "cells", []) or [])]
+            row_cells = [cell for cell in row_cells if cell is not None]
+            if row_cells:
+                bbox = (
+                    min(cell[0] for cell in row_cells),
+                    min(cell[1] for cell in row_cells),
+                    max(cell[2] for cell in row_cells),
+                    max(cell[3] for cell in row_cells),
+                )
+        if bbox is not None:
+            bands.append((bbox[1], bbox[3]))
+    if len(bands) == row_count and all(bands[idx][1] <= bands[idx + 1][0] + 2.0 for idx in range(len(bands) - 1)):
+        return bands
+
+    y_values = [table_bbox[1], table_bbox[3]]
+    for row in rows:
+        for cell_bbox in list(getattr(row, "cells", []) or []):
+            bbox = _native_bbox_tuple(cell_bbox)
+            if bbox is not None:
+                y_values.extend([bbox[1], bbox[3]])
+    boundaries = [
+        value for value in _cluster_axis_positions(y_values, 2.0)
+        if table_bbox[1] - 2.0 <= value <= table_bbox[3] + 2.0
+    ]
+    if len(boundaries) == row_count + 1:
+        return [(boundaries[idx], boundaries[idx + 1]) for idx in range(row_count)]
+    return _even_intervals(table_bbox[1], table_bbox[3], row_count)
+
+
+def _normalize_native_cells(raw_cells, row_count: int, col_count: int) -> List[List[str]]:
+    rows: List[List[str]] = []
+    for row_idx in range(row_count):
+        raw_row = raw_cells[row_idx] if raw_cells and row_idx < len(raw_cells) else []
+        row: List[str] = []
+        for col_idx in range(col_count):
+            value = raw_row[col_idx] if col_idx < len(raw_row) else ""
+            row.append(_clean_extracted_text(str(value or "")))
+        rows.append(row)
+    return rows
+
+
+def _native_span_columns(
+    bbox: Tuple[float, float, float, float],
+    col_intervals: List[Tuple[float, float]],
+    fallback_col: int,
+) -> Tuple[int, int]:
+    overlapping: List[int] = []
+    for idx, (col_x0, col_x1) in enumerate(col_intervals):
+        col_width = max(col_x1 - col_x0, 1e-6)
+        overlap = max(0.0, min(bbox[2], col_x1) - max(bbox[0], col_x0))
+        center = (col_x0 + col_x1) / 2.0
+        if overlap / col_width >= 0.45 or bbox[0] - 1.0 <= center <= bbox[2] + 1.0:
+            overlapping.append(idx)
+    if not overlapping:
+        col = min(max(0, fallback_col), max(0, len(col_intervals) - 1))
+        return (col, col)
+    return (min(overlapping), max(overlapping))
+
+
+def _native_table_spans(
+    table_obj,
+    cells: List[List[str]],
+    col_intervals: List[Tuple[float, float]],
+) -> Dict[int, List[Tuple[int, int, str]]]:
+    span_rows: Dict[int, List[Tuple[int, int, str]]] = {}
+    rows = list(getattr(table_obj, "rows", []) or [])
+    row_count = len(cells)
+    col_count = len(cells[0]) if cells else 0
+    for row_idx, row_obj in enumerate(rows[:row_count]):
+        row_cells = list(getattr(row_obj, "cells", []) or [])
+        row_spans: List[Tuple[int, int, str]] = []
+        for cell_idx, cell_bbox in enumerate(row_cells[:col_count]):
+            bbox = _native_bbox_tuple(cell_bbox)
+            if bbox is None:
+                continue
+            text = cells[row_idx][cell_idx] if cell_idx < len(cells[row_idx]) else ""
+            if not text:
+                continue
+            start_col, end_col = _native_span_columns(bbox, col_intervals, cell_idx)
+            if end_col <= start_col:
+                continue
+            row_spans.append((start_col, end_col, text))
+            cells[row_idx][start_col] = text
+            for col_idx in range(start_col + 1, end_col + 1):
+                if col_idx < len(cells[row_idx]):
+                    cells[row_idx][col_idx] = ""
+        if row_spans:
+            seen = set()
+            unique_spans = []
+            for span in sorted(row_spans, key=lambda item: (item[0], item[1])):
+                key = (span[0], span[1], _norm_table_key(span[2]))
+                if key in seen:
+                    continue
+                seen.add(key)
+                unique_spans.append(span)
+            span_rows[row_idx] = unique_spans
+    return span_rows
+
+
+def _native_table_region_from_pymupdf(
+    page_num: int,
+    table_obj,
+    source: str,
+    page_size: Optional[Tuple[float, float]] = None,
+) -> Optional[TableRegion]:
+    table_bbox = _native_bbox_tuple(getattr(table_obj, "bbox", None))
+    if table_bbox is None:
+        return None
+    row_count = int(getattr(table_obj, "row_count", 0) or 0)
+    col_count = int(getattr(table_obj, "col_count", 0) or 0)
+    if row_count < 2 or col_count < 2 or col_count > 30:
+        return None
+
+    try:
+        raw_cells = table_obj.extract()
+    except Exception:
+        raw_cells = []
+    cells = _normalize_native_cells(raw_cells, row_count, col_count)
+    nonempty = sum(1 for row in cells for cell in row if cell)
+    if nonempty < 2 or nonempty / max(row_count * col_count, 1) < 0.08:
+        return None
+    if source == "pymupdf_native_text" and page_size:
+        page_w, page_h = page_size
+        width_cover = (table_bbox[2] - table_bbox[0]) / max(float(page_w), 1.0)
+        height_cover = (table_bbox[3] - table_bbox[1]) / max(float(page_h), 1.0)
+        nonempty_texts = [cell for row in cells for cell in row if cell]
+        short_fragment_ratio = sum(
+            1 for cell in nonempty_texts
+            if len(cell) <= 2 and not re.fullmatch(r"\d+([.,]\d+)?", cell)
+        ) / max(len(nonempty_texts), 1)
+        if (
+            (row_count > 25 and width_cover > 0.55 and height_cover > 0.35)
+            or (row_count > 40 and height_cover > 0.50)
+            or (col_count > 8 and row_count > 15)
+            or (col_count >= 6 and short_fragment_ratio > 0.30)
+        ):
+            return None
+
+    col_intervals = _native_table_column_intervals(table_obj, table_bbox, col_count)
+    row_bands = _native_table_row_bands(table_obj, table_bbox, row_count)
+    if len(col_intervals) != col_count or len(row_bands) != row_count:
+        return None
+
+    cell_bboxes = [
+        [
+            (col_intervals[col_idx][0], row_bands[row_idx][0], col_intervals[col_idx][1], row_bands[row_idx][1])
+            for col_idx in range(col_count)
+        ]
+        for row_idx in range(row_count)
+    ]
+    horizontal_text_spans = _native_table_spans(table_obj, cells, col_intervals)
+
+    region = TableRegion(
+        page=page_num,
+        y_top=table_bbox[1],
+        y_bottom=table_bbox[3],
+        cells=cells,
+        row_count=row_count,
+        col_count=col_count,
+        cell_bboxes=cell_bboxes,
+    )
+    setattr(region, "x_left", table_bbox[0])
+    setattr(region, "x_right", table_bbox[2])
+    setattr(region, "source", source)
+    setattr(region, "native_table", True)
+    if horizontal_text_spans:
+        setattr(region, "horizontal_text_spans", horizontal_text_spans)
+    return region
+
+
+def _native_table_seen_key(region: TableRegion) -> Tuple[int, int, int, int, int]:
+    bbox = _table_bbox(region)
+    return (
+        int(region.page),
+        int(round(bbox[0])),
+        int(round(bbox[1])),
+        int(round(bbox[2])),
+        int(round(bbox[3])),
+    )
+
+
+def detect_tables_pymupdf_native(
+    pdf_path: str,
+    logger: Logger,
+    pdf_lines: List[TextLine],
+    include_text_strategy: bool = False,
+) -> List[TableRegion]:
+    """
+    Extract tables from digital PDFs using PyMuPDF's vector/text table finder.
+
+    This path trusts native PDF geometry and extracted cell text, then only uses
+    OCR line geometry later to suppress duplicate paragraph output. It avoids
+    OCR/model table repairs that can rewrite correct digital cell values.
+    """
+    strategies = [
+        ("pymupdf_native_lines", {}),
+    ]
+    if include_text_strategy or os.environ.get("OCRTOOL_ENABLE_PYMUPDF_TEXT_TABLES") == "1":
+        strategies.append((
+            "pymupdf_native_text",
+            {
+                "vertical_strategy": "text",
+                "horizontal_strategy": "text",
+                "min_words_vertical": 2,
+                "min_words_horizontal": 1,
+            },
+        ))
+
+    tables: List[TableRegion] = []
+    seen = set()
+    try:
+        with fitz.open(pdf_path) as doc:
+            for page_idx, page in enumerate(doc):
+                page_added = False
+                for source, kwargs in strategies:
+                    if source == "pymupdf_native_text" and page_added:
+                        continue
+                    try:
+                        import contextlib
+                        import io
+
+                        with contextlib.redirect_stdout(io.StringIO()):
+                            found = page.find_tables(**kwargs)
+                    except Exception as exc:
+                        if source == "pymupdf_native_lines":
+                            logger.log(f"PyMuPDF native table finder failed on page {page_idx + 1}: {exc}")
+                        continue
+                    for table_obj in list(getattr(found, "tables", []) or []):
+                        region = _native_table_region_from_pymupdf(
+                            page_idx + 1,
+                            table_obj,
+                            source,
+                            (float(page.rect.width), float(page.rect.height)),
+                        )
+                        if region is None:
+                            continue
+                        key = _native_table_seen_key(region)
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        tables.append(region)
+                        page_added = True
+    except Exception as exc:
+        logger.log(f"PyMuPDF native table extraction failed: {exc}")
+        return []
+
+    if tables:
+        logger.log(f"PyMuPDF native table extractor: selected {len(tables)} tables with native cell text")
+    else:
+        logger.log("PyMuPDF native table extractor: no tables found")
+    return tables
+
+
 def detect_tables(
     pdf_path: str, 
     logger: Logger, 
@@ -6177,6 +8845,20 @@ def add_table_to_doc(doc: Document, table_region: TableRegion, pdf_lines_page: L
 
     visited = set()
     horizontal_text_spans = getattr(table_region, "horizontal_text_spans", {}) or {}
+    native_table = bool(getattr(table_region, "native_table", False))
+
+    def _row_horizontal_spans(row_idx: int) -> List[Tuple[int, int, str]]:
+        raw = horizontal_text_spans.get(row_idx)
+        if not raw:
+            return []
+        if isinstance(raw, tuple) and len(raw) >= 3:
+            return [(int(raw[0]), int(raw[1]), str(raw[2]))]
+        spans: List[Tuple[int, int, str]] = []
+        if isinstance(raw, list):
+            for item in raw:
+                if isinstance(item, (tuple, list)) and len(item) >= 3:
+                    spans.append((int(item[0]), int(item[1]), str(item[2])))
+        return spans
     
     for row_idx in range(rows):
         # Calculate table occurrences for this row 
@@ -6193,6 +8875,19 @@ def add_table_to_doc(doc: Document, table_region: TableRegion, pdf_lines_page: L
         for col_idx in range(cols):
             if (row_idx, col_idx) in visited:
                 continue
+
+            row_span_specs = _row_horizontal_spans(row_idx)
+            active_span = None
+            covered_by_span = False
+            for span_start, span_end, span_text in row_span_specs:
+                if col_idx == span_start:
+                    active_span = (span_start, span_end, span_text)
+                    break
+                if span_start < col_idx <= span_end:
+                    covered_by_span = True
+            if covered_by_span and active_span is None:
+                visited.add((row_idx, col_idx))
+                continue
                 
             # Get current text
             current_text = ""
@@ -6202,9 +8897,8 @@ def add_table_to_doc(doc: Document, table_region: TableRegion, pdf_lines_page: L
             colspan = 1
             rowspan = 1 # Always 1 as requested (No vertical merging)
             row_vals = table_region.cells[row_idx] if row_idx < len(table_region.cells) else []
-            span_spec = horizontal_text_spans.get(row_idx)
-            if span_spec:
-                span_start, span_end, span_text = span_spec
+            if active_span:
+                span_start, span_end, span_text = active_span
                 if col_idx == span_start:
                     current_text = str(span_text)
                     colspan = max(1, int(span_end) - int(span_start) + 1)
@@ -6213,7 +8907,7 @@ def add_table_to_doc(doc: Document, table_region: TableRegion, pdf_lines_page: L
             # multi-column span with empty neighbor cells. Start the merge from
             # the first empty neighbor so the DOCX has one logical header cell
             # instead of a blank + text + blank sequence.
-            if not current_text.strip() and row_idx == 0 and row_idx < len(table_region.cells):
+            if not native_table and not current_text.strip() and row_idx == 0 and row_idx < len(table_region.cells):
                 next_col = col_idx + 1
                 while next_col < cols:
                     next_text = str(row_vals[next_col]) if next_col < len(row_vals) else ""
@@ -6225,6 +8919,12 @@ def add_table_to_doc(doc: Document, table_region: TableRegion, pdf_lines_page: L
                                 tail_text = str(row_vals[col_idx + colspan]) if col_idx + colspan < len(row_vals) else ""
                                 if tail_text.strip():
                                     break
+                                lower_text = ""
+                                if row_idx + 1 < len(table_region.cells):
+                                    lower_row = table_region.cells[row_idx + 1]
+                                    lower_text = str(lower_row[col_idx + colspan]) if col_idx + colspan < len(lower_row) else ""
+                                if colspan >= 2 and _clean_extracted_text(lower_text):
+                                    break
                                 colspan += 1
                         break
                     next_col += 1
@@ -6234,7 +8934,7 @@ def add_table_to_doc(doc: Document, table_region: TableRegion, pdf_lines_page: L
             # the label only to the columns its glyphs touch and leave trailing
             # cells empty, so merge the whole row tail when the tail contains
             # only one distinct non-empty text value.
-            if current_text.strip() and col_idx == 1 and row_vals:
+            if not native_table and current_text.strip() and col_idx == 1 and row_vals:
                 marker = _clean_extracted_text(str(row_vals[0])) if row_vals else ""
                 tail = [
                     _clean_extracted_text(str(row_vals[c])) if c < len(row_vals) else ""
@@ -6250,7 +8950,7 @@ def add_table_to_doc(doc: Document, table_region: TableRegion, pdf_lines_page: L
                     colspan = cols - col_idx
              
             # Merge Logic: Horizontal Only + PDF Verification
-            if current_text.strip():
+            if current_text.strip() and not native_table:
                 # Count in PDF
                 # Use simple substring count. 
                 # Normalize spaces for robust check?
@@ -6703,23 +9403,28 @@ def create_docx_from_pdf(
 
         # Step 1b: Enrich lines with Screen AI metadata + layout regions from companion JSON
         layout_regions_by_page = {}  # page_num -> [regions]
-        for json_candidate in [pdf_path + ".json"]:
-            if os.path.exists(json_candidate):
-                enrich_lines_from_json(pdf_lines, json_candidate, logger)
-                # Also load layout regions if present
-                try:
-                    import json as _json
-                    with open(json_candidate, "r", encoding="utf-8") as _f:
-                        _jdata = _json.load(_f)
-                    for _pi, _pg in enumerate(_jdata.get("pages", [])):
-                        _lr = _pg.get("layout_regions", [])
-                        if _lr:
-                            layout_regions_by_page[_pi + 1] = _lr
-                    if layout_regions_by_page:
-                        logger.log(f"Loaded layout regions for {len(layout_regions_by_page)} pages")
-                except Exception:
-                    pass
-                break
+        companion_data, companion_path = _load_canonical_companion_data(pdf_path, logger, "layout/enrichment")
+        if companion_data:
+            enrich_lines_from_json(pdf_lines, str(companion_path or pdf_path), logger)
+            for _pi, _pg in enumerate(companion_data.get("pages", [])):
+                _lr = _pg.get("layout_regions", [])
+                if _lr:
+                    layout_regions_by_page[_pi + 1] = _lr
+            if layout_regions_by_page:
+                logger.log(f"Loaded layout regions for {len(layout_regions_by_page)} pages")
+
+        if not layout_regions_by_page:
+            layout_regions_by_page = analyze_layout_regions_for_pdf(pdf_path, page_info, logger)
+            if layout_regions_by_page:
+                save_layout_regions_to_companion(
+                    companion_path,
+                    companion_data,
+                    layout_regions_by_page,
+                    logger,
+                )
+
+        if layout_regions_by_page:
+            prepare_layout_region_reading_orders(layout_regions_by_page, page_info, logger)
 
         # Step 1c: Match lines to layout regions (assigns semantic_type)
         if layout_regions_by_page:
@@ -6755,42 +9460,124 @@ def create_docx_from_pdf(
 
         pdf_lines = filter_figure_ocr_noise(pdf_lines, layout_regions_by_page, logger)
 
-        # Step 2: Detect tables (using unified function with config)
-        table_regions = detect_tables(pdf_path, logger, page_info, pdf_lines, layout_regions_by_page)
-        table_regions = repair_continued_tables(
-            table_regions, layout_regions_by_page, pdf_lines, page_info, logger
-        )
-        table_regions = split_stacked_tables(table_regions, logger)
-        table_regions = postprocess_table_layout_grids(table_regions, layout_regions_by_page, logger)
-        table_regions = stabilize_page_local_table_grids(
-            table_regions, layout_regions_by_page, page_info, logger
-        )
-        table_regions = filter_false_positive_tables(table_regions, layout_regions_by_page, logger)
-        table_regions = repair_table_row_gaps_from_ocr(table_regions, pdf_lines, logger)
-        table_assigned_ids = assign_ocr_lines_to_table_cells_by_geometry(
-            table_regions,
+        # Step 2: Detect tables. Digital PDFs get a native/vector-first path
+        # so correct embedded text is not rewritten by OCR/model table repairs.
+        table_cache_meta = _current_table_cache_meta(
+            pdf_path,
             pdf_lines,
+            layout_regions_by_page,
+            companion_data,
+        )
+        table_regions = load_table_structures_from_companion(
+            companion_data,
+            table_cache_meta,
             logger,
         )
-        try:
-            from scanindex.core.tables.postprocess_v2 import postprocess_tables_v2
-
-            postprocess_tables_v2(table_regions, pdf_lines, logger)
-        except Exception as exc:
-            logger.log(f"V2 table postprocess failed, keeping V1 cells: {exc}")
-        table_regions = repair_shifted_leading_table_cells(table_regions, logger)
-        table_regions = fuse_page_local_continuation_rows(table_regions, logger)
-        table_regions = stabilize_continued_table_column_schemas(
-            table_regions, layout_regions_by_page, page_info, pdf_lines, logger
-        )
-        if os.environ.get("OCRTOOL_ENABLE_CONTINUED_TABLE_FLOW") == "1":
-            table_regions = compose_continued_tables_for_word_flow(
-                table_regions, layout_regions_by_page, page_info, pdf_lines, logger
+        if table_regions is not None:
+            table_assigned_ids = assign_ocr_lines_to_table_cells_by_geometry(
+                table_regions,
+                pdf_lines,
+                logger,
+                rebuild_cells=False,
             )
-        table_regions = repair_section_heading_rows(table_regions, logger)
-        for table in table_regions:
-            if not getattr(table, "skip_render", False):
-                setattr(table, "enable_blank_continuation_vmerge", True)
+        else:
+            page_source_modes = _page_source_modes_from_companion(companion_data)
+            digital_text_pdf = _is_digital_text_pdf(pdf_path)
+            if digital_text_pdf and not page_source_modes:
+                page_source_modes = {page: "digital" for page in page_info.keys()}
+
+            native_candidate_pages = {
+                page for page, mode in page_source_modes.items()
+                if mode in {"digital", "mixed"}
+            }
+            native_tables: List[TableRegion] = []
+            if native_candidate_pages:
+                native_tables = [
+                    table for table in detect_tables_pymupdf_native(pdf_path, logger, pdf_lines)
+                    if int(getattr(table, "page", 0) or 0) in native_candidate_pages
+                ]
+                if native_tables:
+                    native_tables = filter_false_positive_tables(native_tables, layout_regions_by_page, logger)
+                else:
+                    logger.log("Native table extraction found no candidate tables; model table pipeline may be used")
+
+            model_candidate_pages = _model_table_candidate_pages(
+                page_source_modes,
+                layout_regions_by_page,
+            )
+            model_tables: List[TableRegion] = []
+            if model_candidate_pages:
+                model_tables = detect_tables(
+                    pdf_path,
+                    logger,
+                    page_info,
+                    _filter_lines_to_pages(pdf_lines, model_candidate_pages),
+                    _filter_layout_regions_to_pages(layout_regions_by_page, model_candidate_pages),
+                )
+
+            if model_tables:
+                model_layout_regions = _filter_layout_regions_to_pages(
+                    layout_regions_by_page,
+                    {int(getattr(table, "page", 0) or 0) for table in model_tables},
+                )
+                model_tables = repair_continued_tables(
+                    model_tables, model_layout_regions, pdf_lines, page_info, logger
+                )
+                model_tables = split_stacked_tables(model_tables, logger)
+                model_tables = postprocess_table_layout_grids(model_tables, model_layout_regions, logger)
+                model_tables = trim_empty_trailing_table_columns(model_tables, logger)
+                model_tables = stabilize_page_local_table_grids(
+                    model_tables, model_layout_regions, page_info, logger
+                )
+                model_tables = stabilize_continuation_table_schemas_from_geometry(
+                    model_tables, model_layout_regions, page_info, pdf_lines, logger
+                )
+                model_tables = filter_false_positive_tables(model_tables, model_layout_regions, logger)
+                model_tables = repair_table_row_gaps_from_ocr(model_tables, pdf_lines, logger)
+                table_assigned_ids = _assign_table_lines_preserving_native_text(
+                    native_tables,
+                    model_tables,
+                    pdf_lines,
+                    logger,
+                )
+                try:
+                    from scanindex.core.tables.postprocess_v2 import postprocess_tables_v2
+
+                    postprocess_tables_v2(model_tables, pdf_lines, logger)
+                except Exception as exc:
+                    logger.log(f"V2 table postprocess failed, keeping V1 cells: {exc}")
+                model_tables = repair_shifted_leading_table_cells(model_tables, logger)
+                model_tables = fuse_page_local_continuation_rows(model_tables, logger)
+                model_tables = stabilize_continued_table_column_schemas(
+                    model_tables, model_layout_regions, page_info, pdf_lines, logger
+                )
+                if _continued_table_flow_enabled():
+                    model_tables = compose_continued_tables_for_word_flow(
+                        model_tables, model_layout_regions, page_info, pdf_lines, logger
+                    )
+                model_tables = repair_section_heading_rows(model_tables, logger)
+                model_tables = repair_split_table_header_fragments(model_tables, logger)
+                model_tables = repair_wrapped_group_header_tokens(model_tables, logger)
+                for table in model_tables:
+                    if not getattr(table, "skip_render", False):
+                        setattr(table, "enable_blank_continuation_vmerge", True)
+                table_regions = _merge_native_and_model_tables(native_tables, model_tables, logger)
+            else:
+                table_regions = list(native_tables)
+                table_assigned_ids = assign_ocr_lines_to_table_cells_by_geometry(
+                    table_regions,
+                    pdf_lines,
+                    logger,
+                    rebuild_cells=False,
+                )
+
+            save_table_structures_to_companion(
+                companion_path,
+                companion_data,
+                table_regions,
+                table_cache_meta,
+                logger,
+            )
 
         # --- NEW: Refine Structure ---
         # User requested to disable custom geometric refinement.
@@ -6853,8 +9640,13 @@ def create_docx_from_pdf(
         # Step 4: Filter out table-assigned lines, then merge the rest into paragraphs
         filtered_lines = []
         unresolved_table_lines = []
+        preserved_table_residuals = 0
         for line in pdf_lines:
             if id(line) in table_assigned_ids:
+                residuals = getattr(line, "_table_residual_fragments", []) or []
+                if residuals:
+                    filtered_lines.extend(residuals)
+                    preserved_table_residuals += len(residuals)
                 continue
             if _looks_like_qr_access_artifact(line.text):
                 logger.log(f"Skipped QR/link access artifact line on page {line.page}")
@@ -6862,10 +9654,9 @@ def create_docx_from_pdf(
 
             inside_rendered_table = False
             inside_skipped_table = False
-            line_cy = line.y + line.height / 2.0
             if line.page in table_map:
                 for y_top, y_bottom, table in table_map[line.page]:
-                    if y_top <= line_cy <= y_bottom:
+                    if y_top <= line.y + line.height / 2.0 <= y_bottom and _line_overlaps_table_area(line, table):
                         if getattr(table, "skip_render", False):
                             inside_skipped_table = True
                         else:
@@ -6880,6 +9671,20 @@ def create_docx_from_pdf(
 
         if unresolved_table_lines:
             logger.log(f"Skipped {len(unresolved_table_lines)} unresolved table-overlap lines after table mapping")
+        if preserved_table_residuals:
+            logger.log(f"Kept {preserved_table_residuals} non-table text fragment(s) from table-crossing OCR lines")
+
+        filtered_lines = split_digital_dual_header_spans(filtered_lines, page_info, logger)
+        filtered_lines = filter_publication_running_edge_lines(filtered_lines, page_info, logger)
+        filtered_lines = split_lines_crossing_multi_column_gutters(filtered_lines, page_info, logger)
+        filtered_lines = apply_multi_column_reading_order(filtered_lines, page_info, logger)
+        if layout_regions_by_page:
+            filtered_lines = apply_layout_region_reading_order(
+                filtered_lines,
+                layout_regions_by_page,
+                page_info,
+                logger,
+            )
 
         # Detect dual-column headers before merging
         dual_headers = detect_dual_column_headers(filtered_lines, page_info, logger, layout_regions_by_page)
@@ -7009,6 +9814,12 @@ def create_docx_from_pdf(
                 if l.page == table.page and table.y_top <= l.y_center <= table.y_bottom
             ]
             table_order = min((l.order for l in table_lines), default=1000000)
+            table_order = _layout_order_for_bbox(
+                table.page,
+                _matching_layout_bbox_for_table(table, layout_regions_by_page) or _table_bbox(table),
+                layout_regions_by_page,
+                table_order,
+            )
             doc_elements.append({
                 "type": "table",
                 "page": table.page,
@@ -7064,8 +9875,13 @@ def create_docx_from_pdf(
                         "type": "figure",
                         "page": pg_num,
                         "y": bbox_pdf[1],
-                        "order": 1000000 + int(bbox_pdf[1]),
-                        "data": {"bbox": region["bbox"], "page": pg_num, "idx": r_idx}
+                        "order": _layout_order_for_bbox(
+                            pg_num,
+                            fig_bbox,
+                            layout_regions_by_page,
+                            1000000 + int(bbox_pdf[1]),
+                        ),
+                        "data": {"bbox": region["bbox"], "page": pg_num, "idx": r_idx, "bbox_pdf": fig_bbox}
                     })
 
         # Add dual-column headers
@@ -7173,6 +9989,7 @@ def create_docx_from_pdf(
 
             if elem["type"] == "para":
                 para_text, first_line, is_footnote = elem["data"]
+                para_text = _repair_drop_cap_join(para_text, first_line)
 
                 # Skip separators (horizontal rules)
                 if first_line.content_type == 4:
@@ -7291,21 +10108,40 @@ def create_docx_from_pdf(
                                           bold=is_bold, font_size_pt=para_font_size,
                                           italic=is_italic)
 
-            elif elem["type"] in ("dual_header", "dual_footer"):
+            elif elem["type"] == "dual_header":
                 left_lines, right_lines = elem["data"]
-                pw = page_info.get(elem["page"], {}).get("width", 595)
-                add_dual_header_table(doc, left_lines, right_lines, pw, logger)
+                section = doc.sections[-1]
+                content_width_pt = max(
+                    float(section.page_width.pt - section.left_margin.pt - section.right_margin.pt),
+                    120.0,
+                )
+                add_dual_header_paragraphs(doc, left_lines, right_lines, content_width_pt, logger)
+
+            elif elem["type"] == "dual_footer":
+                left_lines, right_lines = elem["data"]
+                section = doc.sections[-1]
+                content_width_pt = max(
+                    float(section.page_width.pt - section.left_margin.pt - section.right_margin.pt),
+                    120.0,
+                )
+                add_dual_header_table(doc, left_lines, right_lines, content_width_pt, logger)
 
             elif elem["type"] == "figure":
                 # Extract figure image from PDF page
                 try:
                     fig_data = elem["data"]
                     fig_page = doc_pdf[fig_data["page"] - 1]  # 0-based
-                    bx = fig_data["bbox"]  # image pixel coords
                     # Render page at 200 DPI and crop
                     fig_pix = fig_page.get_pixmap(dpi=200)
                     from PIL import Image as PILImage
                     fig_img = PILImage.frombytes("RGB", [fig_pix.width, fig_pix.height], fig_pix.samples)
+                    if fig_data.get("bbox_pdf"):
+                        fx0, fy0, fx1, fy1 = (float(v) for v in fig_data["bbox_pdf"][:4])
+                        sx = fig_pix.width / max(float(fig_page.rect.width), 1.0)
+                        sy = fig_pix.height / max(float(fig_page.rect.height), 1.0)
+                        bx = (fx0 * sx, fy0 * sy, fx1 * sx, fy1 * sy)
+                    else:
+                        bx = fig_data["bbox"]  # image pixel coords
                     # Crop with padding
                     pad = 5
                     crop_box = (

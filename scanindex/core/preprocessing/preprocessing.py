@@ -838,7 +838,20 @@ def pre_process_pdf(input_path: str, output_path: str, update_callback=None,
                         _n = len(_tmp_doc)
                 except Exception:
                     _n = 0
-                return True, "Digital passthrough", {"page_rotations": [0] * _n}
+                return True, "Digital passthrough", {
+                    "page_rotations": [0] * _n,
+                    "page_preprocess": [
+                        {
+                            "page_index": idx,
+                            "branch": "digital_passthrough",
+                            "rotation": 0,
+                            "skew_angle": 0.0,
+                            "rasterized": False,
+                            "coord_transform": [1, 0, 0, 1, 0, 0],
+                        }
+                        for idx in range(_n)
+                    ],
+                }
             return True, "Digital passthrough"
 
         # Debug: Check for text layer
@@ -1074,11 +1087,31 @@ def pre_process_pdf(input_path: str, output_path: str, update_callback=None,
         )
         if return_metadata:
             rotations = [0] * total_pages
+            page_preprocess = []
             for r in results:
                 idx = r.get("index")
                 if isinstance(idx, int) and 0 <= idx < total_pages:
                     rotations[idx] = int(r.get("rotate_angle", 0) or 0) % 360
-            return True, summary, {"page_rotations": rotations}
+                    rotate_angle = int(r.get("rotate_angle", 0) or 0) % 360
+                    skew_angle = float(r.get("skew_angle", 0.0) or 0.0)
+                    needs_cardinal = rotate_angle != 0
+                    needs_deskew = abs(skew_angle) > _DESKEW_THRESHOLD_DEG
+                    if not needs_cardinal and not needs_deskew:
+                        branch = "insert_pdf"
+                    elif needs_cardinal and not needs_deskew:
+                        branch = "set_rotation"
+                    else:
+                        branch = "raster_deskew"
+                    page_preprocess.append({
+                        "page_index": idx,
+                        "branch": branch,
+                        "rotation": rotate_angle,
+                        "skew_angle": round(skew_angle, 4),
+                        "rasterized": bool(needs_deskew),
+                        "coord_transform": [1, 0, 0, 1, 0, 0],
+                    })
+            page_preprocess.sort(key=lambda item: item["page_index"])
+            return True, summary, {"page_rotations": rotations, "page_preprocess": page_preprocess}
         return True, summary
 
     except Exception as e:

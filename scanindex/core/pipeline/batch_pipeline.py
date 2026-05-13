@@ -51,7 +51,7 @@ class FileTask:
     file_id: str                      # caller-supplied unique id (filename, etc.)
     input_path: str
     output_pdf_path: str              # _ocr.pdf destination
-    output_json_path: str             # _ocr.pdf.json destination
+    output_json_path: str             # _ocr.pdf.json.zst destination
     source_document_path: Optional[str] = None
     num_pages: int = 0
 

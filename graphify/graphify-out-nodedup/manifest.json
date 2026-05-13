@@ -1,0 +1,1322 @@
+{
+  "D:\\App\\ocrtool\\ocr_app.py": {
+    "mtime": 1778481930.4385126,
+    "hash": "d490f0ca5b2631f4480258f4ddbba5c0"
+  },
+  "D:\\App\\ocrtool\\archive_store\\__init__.py": {
+    "mtime": 1778133372.0309997,
+    "hash": "fef338a5849c932f0f1f8fa8ca36cacb"
+  },
+  "D:\\App\\ocrtool\\bin\\chrome-win64\\resources\\accessibility\\reading_mode_gdocs_helper\\content.js": {
+    "mtime": 1768648106.0,
+    "hash": "e72984c0364d70a622bb1088da7cdd35"
+  },
+  "D:\\App\\ocrtool\\bin\\chrome-win64\\resources\\accessibility\\reading_mode_gdocs_helper\\gdocs_script.js": {
+    "mtime": 1768648106.0,
+    "hash": "0818ea5737462bfe5c021b9d4b922e31"
+  },
+  "D:\\App\\ocrtool\\gui\\__init__.py": {
+    "mtime": 1778133372.0294542,
+    "hash": "055a7e09556ba3c6de23da6070a4228c"
+  },
+  "D:\\App\\ocrtool\\kie_core\\__init__.py": {
+    "mtime": 1778133372.0309997,
+    "hash": "240ebbbbd558645b402fc694a4c50ad8"
+  },
+  "D:\\App\\ocrtool\\kie_viewer\\__init__.py": {
+    "mtime": 1778133372.0325584,
+    "hash": "46809e8db4a336273d449c9c92035968"
+  },
+  "D:\\App\\ocrtool\\scanindex\\__init__.py": {
+    "mtime": 1778133372.015133,
+    "hash": "f5e9e6b329b9bb1e19368a17035206b3"
+  },
+  "D:\\App\\ocrtool\\scanindex\\app\\__init__.py": {
+    "mtime": 1778133372.0257711,
+    "hash": "2f25bcb437f52a48659411ec787bdea0"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\__init__.py": {
+    "mtime": 1778133372.027279,
+    "hash": "3ea5c60f3ae0e12f7d8774bb239ddfb2"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\correction\\engine.py": {
+    "mtime": 1778168431.9719641,
+    "hash": "799820c66dbae29e2f61f20b5c662949"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\correction\\__init__.py": {
+    "mtime": 1778134117.0483298,
+    "hash": "8b48b5ac8b71e6ad9c0255441235f760"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\digitization\\doctype.py": {
+    "mtime": 1778134692.8023784,
+    "hash": "e7a25d6eadc0b25fb00b2733cf367a7a"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\digitization\\fuzzy.py": {
+    "mtime": 1777208088.13303,
+    "hash": "141c82a0fef9e78a5a206f100a1473a9"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\digitization\\metadata_export.py": {
+    "mtime": 1778142756.352742,
+    "hash": "d53d4b7a43130e557b880ebf1ebd8af2"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\digitization\\metadata_extractor.py": {
+    "mtime": 1776240271.085207,
+    "hash": "47dba86947cabcf7daea1853f2180c3f"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\digitization\\page_splitter.py": {
+    "mtime": 1778150185.5559206,
+    "hash": "ccc824f2e82e7b500cecac62abd690ae"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\digitization\\runner.py": {
+    "mtime": 1778481930.4400196,
+    "hash": "2eb31b10e4e1dd8d1c19c578ae9243dc"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\digitization\\session.py": {
+    "mtime": 1777851762.577484,
+    "hash": "c0e73ec6fadbfa9e6294feab86ab151b"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\digitization\\__init__.py": {
+    "mtime": 1778134117.0462143,
+    "hash": "ad2dc12c673adc1d7534b4ccc6755b67"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\kie\\adjudication.py": {
+    "mtime": 1778134894.0349042,
+    "hash": "7147aa7ee027b8aa88cb49c43e7ac0bc"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\kie\\common.py": {
+    "mtime": 1776244770.0973575,
+    "hash": "511216164d406a8117a8339aa4fab0ee"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\kie\\engine.py": {
+    "mtime": 1778157233.1952014,
+    "hash": "d8021f7d8c3e6e575b2e77c7db31a251"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\kie\\exporters.py": {
+    "mtime": 1778134894.0394552,
+    "hash": "d1d0c616897bf59be9b48a1f134d9adb"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\kie\\inference_pipeline.py": {
+    "mtime": 1778134894.0409825,
+    "hash": "4294e75be40d078e0fa1dcbd5edbac87"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\kie\\json_utils.py": {
+    "mtime": 1777892231.3590615,
+    "hash": "3951cb81d99fb04c364d75da7d10577a"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\kie\\labeling_workspace.py": {
+    "mtime": 1778134894.0424993,
+    "hash": "75cb12a546a1c8495f97aa3ba9b1a39d"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\kie\\ontology.py": {
+    "mtime": 1777903450.3369372,
+    "hash": "648ebe4f52f1017afc3c511fe99bd7aa"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\kie\\postprocess.py": {
+    "mtime": 1778481930.4400196,
+    "hash": "3bbbc8cc2eb04abd182e15ee73c77736"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\kie\\semantic_fields.py": {
+    "mtime": 1778133836.7283607,
+    "hash": "1491a647a26349d24759bac37dc3e062"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\kie\\text_normalize.py": {
+    "mtime": 1777893062.3891811,
+    "hash": "20c8fc391344ad1293a589dea771e5e0"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\kie\\__init__.py": {
+    "mtime": 1777894472.6157937,
+    "hash": "0280cdbabc613674281202c51bd98265"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\ocr\\accuracy_baseline.py": {
+    "mtime": 1778238490.2345088,
+    "hash": "1c3d0d68e86e466ab812d3f0b9eb63ee"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\ocr\\accuracy_metrics.py": {
+    "mtime": 1778238491.259398,
+    "hash": "b5123268c1c67aec452c7b1d8ad1f02c"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\ocr\\direct_engine.py": {
+    "mtime": 1778481930.4415622,
+    "hash": "39937f1c538845c7540e3374ae85c914"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\ocr\\screen_ai.py": {
+    "mtime": 1778134692.8240392,
+    "hash": "6be87ace76b61c799ba1700bc4624e2d"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\ocr\\screen_ai_downloader.py": {
+    "mtime": 1778205264.386348,
+    "hash": "52d31b81e1af7cf1d358455bfbaade83"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\ocr\\text_normalizer.py": {
+    "mtime": 1776423309.2002392,
+    "hash": "7b56d94ac6a1662b2b8ef6a6ad5cbaba"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\ocr\\__init__.py": {
+    "mtime": 1778134117.0477314,
+    "hash": "81126b03ae243d3b7c4d14257275df1f"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\pdf\\pdfa_converter.py": {
+    "mtime": 1777806980.4855137,
+    "hash": "e9949a742f301b8736a4c6085754a6c9"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\pdf\\signer.py": {
+    "mtime": 1778134692.8299086,
+    "hash": "c36af880940361d8dd5d5ad22a6a42b6"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\pdf\\splitter.py": {
+    "mtime": 1778408592.828161,
+    "hash": "136cf967e9148508df47bf75f28cd9dd"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\pdf\\text_extractor.py": {
+    "mtime": 1778481930.4415622,
+    "hash": "746817c94ecb3304e640a8a763c745c5"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\pdf\\utils.py": {
+    "mtime": 1778134894.055761,
+    "hash": "e8f4e270036d6291c04f64b581bae56b"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\pdf\\win_cert_store.py": {
+    "mtime": 1777948777.8049998,
+    "hash": "8891f59c019d3f820e71c9641eea1cf5"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\pdf\\__init__.py": {
+    "mtime": 1778134117.0492077,
+    "hash": "8efae6a9e854fb2bec84e1eb14ee6842"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\pipeline\\batch_pipeline.py": {
+    "mtime": 1778481930.4415622,
+    "hash": "d816826a2cb39bb22c0098faab83803b"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\pipeline\\__init__.py": {
+    "mtime": 1778134117.0462143,
+    "hash": "ee3cc58ad13de03a17ee9ec026d4778f"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\preprocessing\\preprocessing.py": {
+    "mtime": 1778134692.836024,
+    "hash": "cc063cd0b37b1773efe3304581274f08"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\repository\\admin.py": {
+    "mtime": 1778473247.6873486,
+    "hash": "2d73aa1402a03f5571672c5cbb450cc1"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\repository\\chunker.py": {
+    "mtime": 1778474493.9316752,
+    "hash": "10e260eb7c8247ca1a4b6f3708ac0ecc"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\repository\\constants.py": {
+    "mtime": 1778474077.1679645,
+    "hash": "23e9d1cb2c0c726831b13a88838e0ab1"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\repository\\filter_builder.py": {
+    "mtime": 1777949204.5822892,
+    "hash": "7ded0cd970807636cc91027b078e84e0"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\repository\\importer.py": {
+    "mtime": 1778479445.2089424,
+    "hash": "f2654a84b46ed6b8c045364bb63c45f8"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\repository\\indexer.py": {
+    "mtime": 1778499329.504967,
+    "hash": "f5c1cbbc35d390986c071757f5d02bcc"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\repository\\repair.py": {
+    "mtime": 1778472986.3993464,
+    "hash": "ad243b0efda49952a83757bc2e434658"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\repository\\schema.sql": {
+    "mtime": 1778471748.550119,
+    "hash": "390c0edde81e75d6b9d3e96de1a1039e"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\repository\\search_engine.py": {
+    "mtime": 1778499454.1181934,
+    "hash": "0631785bf659f5918003f3e18a598e94"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\repository\\store.py": {
+    "mtime": 1778471182.0909362,
+    "hash": "253305db5ccfe5efba96cc0fb9c7201f"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\repository\\tokenizer.py": {
+    "mtime": 1778139327.5161018,
+    "hash": "e581b97d363a95b58ab6b7aeec62f624"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\repository\\__init__.py": {
+    "mtime": 1778473941.9092846,
+    "hash": "fb1585c04a773b13b34e251ebfdbb7b6"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\tables\\docling_tableformer_engine.py": {
+    "mtime": 1778022717.102982,
+    "hash": "0d4ebbeac6d79051d3bf925560c1678f"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\tables\\docling_tableformer_v1_onnx_engine.py": {
+    "mtime": 1778134692.8509877,
+    "hash": "d229552f8903a7cd067ada03c0db79f4"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\tables\\docling_tableformer_v2_onnx_engine.py": {
+    "mtime": 1778134692.8527625,
+    "hash": "df4116e52e395bbc1c5acd803effb100"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\tables\\docling_tableformer_v2_torch_engine.py": {
+    "mtime": 1778134169.8616233,
+    "hash": "ff52dbaff2a0c20adc2baaa2251e65ea"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\tables\\docx_exporter.py": {
+    "mtime": 1778512087.6778245,
+    "hash": "04be291e8fdaa9354ebe0e2778b94775"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\tables\\eval_metrics.py": {
+    "mtime": 1778024974.6010828,
+    "hash": "c1b20fe634840d8b8b976789c61596b3"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\tables\\export_worker.py": {
+    "mtime": 1778238512.1969135,
+    "hash": "332057699817c8eec1b3818aff96b585"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\tables\\gmft_onnx_table_engine.py": {
+    "mtime": 1778134692.8792756,
+    "hash": "925c50312084cf832c1c5010aa3c463d"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\tables\\layout_analyzer.py": {
+    "mtime": 1778134692.8807936,
+    "hash": "e933deef3aec2ae4a5c1cd9eb2dfb7ef"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\tables\\postprocess_v2.py": {
+    "mtime": 1778070081.7245884,
+    "hash": "baa46b4bdbceedf242caecd033ef742f"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\tables\\rapidtable_structure_engine.py": {
+    "mtime": 1778134692.8823428,
+    "hash": "849198dead5d4ee20c276e4d684d9d9c"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\tables\\__init__.py": {
+    "mtime": 1778134117.0483298,
+    "hash": "ec3cebe40119e59ffe3e441e0f1d4743"
+  },
+  "D:\\App\\ocrtool\\scanindex\\infra\\file_utils.py": {
+    "mtime": 1769248577.0240803,
+    "hash": "17ede6bc506408846f3170d68c39016d"
+  },
+  "D:\\App\\ocrtool\\scanindex\\infra\\mp_safety.py": {
+    "mtime": 1778405930.649576,
+    "hash": "6c78978a4ff31ce1c0341479f4864840"
+  },
+  "D:\\App\\ocrtool\\scanindex\\infra\\paths.py": {
+    "mtime": 1778134672.6388109,
+    "hash": "3f1b9f2c5f9fdc9a6024873fe8c7c97d"
+  },
+  "D:\\App\\ocrtool\\scanindex\\infra\\translations.py": {
+    "mtime": 1778502769.069658,
+    "hash": "84a9172c6ae032e700eb2147484a23dd"
+  },
+  "D:\\App\\ocrtool\\scanindex\\infra\\version.py": {
+    "mtime": 1778293362.5430982,
+    "hash": "79395238bc2895b24b606b9c922eb18c"
+  },
+  "D:\\App\\ocrtool\\scanindex\\infra\\__init__.py": {
+    "mtime": 1778133372.0289297,
+    "hash": "b296f4879af402f6a340830081196896"
+  },
+  "D:\\App\\ocrtool\\scanindex\\tools\\__init__.py": {
+    "mtime": 1778133372.0294542,
+    "hash": "21890f09f658e6cb7c697ea3b321ee19"
+  },
+  "D:\\App\\ocrtool\\scanindex\\ui\\icons.py": {
+    "mtime": 1774144356.413105,
+    "hash": "2a03dc774b8a78abb1b4cc5de609a34a"
+  },
+  "D:\\App\\ocrtool\\scanindex\\ui\\main_window.py": {
+    "mtime": 1778502744.7115574,
+    "hash": "595e4e479cca4b9391a7fb571a545064"
+  },
+  "D:\\App\\ocrtool\\scanindex\\ui\\model_manager.py": {
+    "mtime": 1778151153.499097,
+    "hash": "6f18a88d52266be7652e1019627f17e0"
+  },
+  "D:\\App\\ocrtool\\scanindex\\ui\\signals.py": {
+    "mtime": 1777874508.5797806,
+    "hash": "5e85df0bda218453486bf6474e50a668"
+  },
+  "D:\\App\\ocrtool\\scanindex\\ui\\splash_screen.py": {
+    "mtime": 1778481930.4501214,
+    "hash": "4225b79694a7adc14432bff650b10648"
+  },
+  "D:\\App\\ocrtool\\scanindex\\ui\\theme.py": {
+    "mtime": 1778496317.5527258,
+    "hash": "828984117330961d9281f69ba2d07187"
+  },
+  "D:\\App\\ocrtool\\scanindex\\ui\\__init__.py": {
+    "mtime": 1774144298.8481452,
+    "hash": "219e9c45c3043eabfe6ec464fd3c72e2"
+  },
+  "D:\\App\\ocrtool\\scanindex\\ui\\dialogs\\archive_session_dialog.py": {
+    "mtime": 1778134692.8879447,
+    "hash": "20a990a39e269e045d4c3e607a6f965b"
+  },
+  "D:\\App\\ocrtool\\scanindex\\ui\\dialogs\\comparison_dialog.py": {
+    "mtime": 1778481930.443075,
+    "hash": "f28c2b5a003795024be7faae85386697"
+  },
+  "D:\\App\\ocrtool\\scanindex\\ui\\dialogs\\metadata_dialog.py": {
+    "mtime": 1778134692.8927195,
+    "hash": "9641234b8fa8e21095644653cea3f635"
+  },
+  "D:\\App\\ocrtool\\scanindex\\ui\\dialogs\\text_preview_dialog.py": {
+    "mtime": 1778133836.742409,
+    "hash": "00c2740fe3cefe8b3db4253b87692211"
+  },
+  "D:\\App\\ocrtool\\scanindex\\ui\\dialogs\\__init__.py": {
+    "mtime": 1774144302.2843862,
+    "hash": "befe147862860ad9ac79cd789ebafbce"
+  },
+  "D:\\App\\ocrtool\\scanindex\\ui\\digitization\\container.py": {
+    "mtime": 1778483022.6418622,
+    "hash": "a9fc2472484bc32e7ed355f4bb05a3f0"
+  },
+  "D:\\App\\ocrtool\\scanindex\\ui\\digitization\\extraction_step.py": {
+    "mtime": 1778496665.6405158,
+    "hash": "b5c247e26769955b11ff6efbd4342b59"
+  },
+  "D:\\App\\ocrtool\\scanindex\\ui\\digitization\\signing_step.py": {
+    "mtime": 1778481930.4445848,
+    "hash": "c540f21af285964d4823a829891f1061"
+  },
+  "D:\\App\\ocrtool\\scanindex\\ui\\digitization\\split_step.py": {
+    "mtime": 1778481930.4460943,
+    "hash": "e185bf083f9f7362ad7aa7be51c52868"
+  },
+  "D:\\App\\ocrtool\\scanindex\\ui\\digitization\\__init__.py": {
+    "mtime": 1778133622.3724878,
+    "hash": "b217baef07a0680201bb38971acda0e5"
+  },
+  "D:\\App\\ocrtool\\scanindex\\ui\\kie_viewer\\kie_viewer.py": {
+    "mtime": 1778481930.4476013,
+    "hash": "dd057993a131829ec8461d99892c26ed"
+  },
+  "D:\\App\\ocrtool\\scanindex\\ui\\kie_viewer\\__init__.py": {
+    "mtime": 1777894024.0822656,
+    "hash": "6413d95b8e88403bdf32306836be1d63"
+  },
+  "D:\\App\\ocrtool\\scanindex\\ui\\pdf_to_word\\view.py": {
+    "mtime": 1778496879.556097,
+    "hash": "1be95c6f8af32a068a69801db9e22c2b"
+  },
+  "D:\\App\\ocrtool\\scanindex\\ui\\pdf_to_word\\__init__.py": {
+    "mtime": 1778133622.3724878,
+    "hash": "02082fa46faaf4dde8c31d16baa869e2"
+  },
+  "D:\\App\\ocrtool\\scanindex\\ui\\repository\\screen.py": {
+    "mtime": 1778499473.7867177,
+    "hash": "49de8066c7328e18b0692279af70232d"
+  },
+  "D:\\App\\ocrtool\\scanindex\\ui\\repository\\__init__.py": {
+    "mtime": 1778133622.3740046,
+    "hash": "2f1689e81dc9c091f734fe7ee4f1c97c"
+  },
+  "D:\\App\\ocrtool\\scanindex\\ui\\screens\\accuracy_screen.py": {
+    "mtime": 1778134774.5961356,
+    "hash": "6fa6cc140ca1f140ac5de03744755c89"
+  },
+  "D:\\App\\ocrtool\\scanindex\\ui\\screens\\home_screen.py": {
+    "mtime": 1778481930.4501214,
+    "hash": "ca66fa5f6ea846226ba383156dbd4b4a"
+  },
+  "D:\\App\\ocrtool\\scanindex\\ui\\screens\\kho_luu_tru_screen.py": {
+    "mtime": 1778133622.3755229,
+    "hash": "d80c63d353f5a85f073315cff8320396"
+  },
+  "D:\\App\\ocrtool\\scanindex\\ui\\screens\\screen_base.py": {
+    "mtime": 1778483022.6418622,
+    "hash": "cea92ce2815b90da9069137aa411dbc9"
+  },
+  "D:\\App\\ocrtool\\scanindex\\ui\\screens\\secret_file_scan_screen.py": {
+    "mtime": 1778406039.052938,
+    "hash": "cd256d6be7ea043b3766e06ab0a5d537"
+  },
+  "D:\\App\\ocrtool\\scanindex\\ui\\screens\\support_tools_screen.py": {
+    "mtime": 1778252937.2717774,
+    "hash": "b40077b2eb5c3b696ec19058157a29fc"
+  },
+  "D:\\App\\ocrtool\\scanindex\\ui\\screens\\__init__.py": {
+    "mtime": 1778481930.449614,
+    "hash": "974cd1b7c5f11c50037dde44bb716e95"
+  },
+  "D:\\App\\ocrtool\\scanindex\\ui\\tabs\\about_tab.py": {
+    "mtime": 1778293393.8488667,
+    "hash": "a121cfeeaa9ed6d076dd2c440b153d89"
+  },
+  "D:\\App\\ocrtool\\scanindex\\ui\\tabs\\dnd_tab.py": {
+    "mtime": 1778133636.9884956,
+    "hash": "b5e68527f5a9a7669a1080df811ff6d8"
+  },
+  "D:\\App\\ocrtool\\scanindex\\ui\\tabs\\settings_tab.py": {
+    "mtime": 1778481930.4501214,
+    "hash": "2d927ffb46e8f978fe2ff1c9e77d7c50"
+  },
+  "D:\\App\\ocrtool\\scanindex\\ui\\tabs\\__init__.py": {
+    "mtime": 1775883318.99302,
+    "hash": "1821bd75f94bae384e8530360da16802"
+  },
+  "D:\\App\\ocrtool\\scanindex\\ui\\widgets\\file_item_widget.py": {
+    "mtime": 1778502731.7203815,
+    "hash": "723e38fc301c812b00ee55c28ffe4002"
+  },
+  "D:\\App\\ocrtool\\scanindex\\ui\\widgets\\file_list_widget.py": {
+    "mtime": 1778133836.7894695,
+    "hash": "5f69d78a30682624949d9641f2519303"
+  },
+  "D:\\App\\ocrtool\\scanindex\\ui\\widgets\\fuzzy_combobox.py": {
+    "mtime": 1777950986.115849,
+    "hash": "3850301e33875738b9de08f5ddfbfcd7"
+  },
+  "D:\\App\\ocrtool\\scanindex\\ui\\widgets\\kie_archive_viewer.py": {
+    "mtime": 1778496329.0895326,
+    "hash": "ca3ba8cd7db63b3b60fd8f781eb4473f"
+  },
+  "D:\\App\\ocrtool\\scanindex\\ui\\widgets\\log_panel.py": {
+    "mtime": 1778134692.929337,
+    "hash": "23a98d5d97e82469d980014e45d7fe89"
+  },
+  "D:\\App\\ocrtool\\scanindex\\ui\\widgets\\pdf_split_viewer.py": {
+    "mtime": 1778133836.8005395,
+    "hash": "f446565931172901d38f422e4fff48fe"
+  },
+  "D:\\App\\ocrtool\\scanindex\\ui\\widgets\\pdf_viewer_widget.py": {
+    "mtime": 1778481930.453191,
+    "hash": "9e1343bfdcaf421250fde40469f1a2e6"
+  },
+  "D:\\App\\ocrtool\\scanindex\\ui\\widgets\\section_card.py": {
+    "mtime": 1778133836.8091588,
+    "hash": "808004849aaadb6fb7b45abc6b44444c"
+  },
+  "D:\\App\\ocrtool\\scanindex\\ui\\widgets\\splash_overlay.py": {
+    "mtime": 1778133836.8157165,
+    "hash": "e3e23281b41fb187061e617773c7f41e"
+  },
+  "D:\\App\\ocrtool\\scanindex\\ui\\widgets\\status_pill.py": {
+    "mtime": 1778134692.9408367,
+    "hash": "919c13d3cff0585b770db378b65bb8ca"
+  },
+  "D:\\App\\ocrtool\\scanindex\\ui\\widgets\\__init__.py": {
+    "mtime": 1774144300.2150078,
+    "hash": "25d71633154980275c648b164b910497"
+  },
+  "D:\\App\\ocrtool\\scripts\\benchmark_borderless_ctdar_current.py": {
+    "mtime": 1778238570.0601454,
+    "hash": "92fc23497fd209b1da86100bdd73e87f"
+  },
+  "D:\\App\\ocrtool\\scripts\\benchmark_ctdar_pair_ensembles_ocr.py": {
+    "mtime": 1778238570.08938,
+    "hash": "ef254ca4b4b02fb01f51ac17f41b6f3e"
+  },
+  "D:\\App\\ocrtool\\scripts\\benchmark_ctdar_single_engines_v2.py": {
+    "mtime": 1778067077.3948863,
+    "hash": "2ce7a909e6857f2f4b374ae0fba7f8a6"
+  },
+  "D:\\App\\ocrtool\\scripts\\benchmark_current_table_pipeline.py": {
+    "mtime": 1778238570.1186788,
+    "hash": "1077f0273471fb5c34389d6b4d6ee625"
+  },
+  "D:\\App\\ocrtool\\scripts\\benchmark_docling_v2_onnx_5gt.py": {
+    "mtime": 1778238570.1405692,
+    "hash": "d60a931a84f70030fb390e0cb62bc12a"
+  },
+  "D:\\App\\ocrtool\\scripts\\benchmark_external_pair_ensembles.py": {
+    "mtime": 1778238570.170861,
+    "hash": "af1c16aa53ed4848377c26dc7223173a"
+  },
+  "D:\\App\\ocrtool\\scripts\\benchmark_external_single_engines_v2.py": {
+    "mtime": 1778067068.0816104,
+    "hash": "5ff9b7bd2c3f2749b2c1fa7758de6b9d"
+  },
+  "D:\\App\\ocrtool\\scripts\\benchmark_external_table_gt_samples.py": {
+    "mtime": 1778238570.2042627,
+    "hash": "91774b1c2d1e5343c477c9eb745ed07d"
+  },
+  "D:\\App\\ocrtool\\scripts\\benchmark_gmft_docling_final.py": {
+    "mtime": 1778238570.2251081,
+    "hash": "e7859835b4d94622d9569ce164ec436c"
+  },
+  "D:\\App\\ocrtool\\scripts\\benchmark_groundtruth_engine_matrix.py": {
+    "mtime": 1778238570.2420866,
+    "hash": "3d62bbe2e733b84886317309b3a9f8c0"
+  },
+  "D:\\App\\ocrtool\\scripts\\benchmark_pair_ensembles.py": {
+    "mtime": 1778238570.259338,
+    "hash": "76836b7ed936f0e48f75aed824afea20"
+  },
+  "D:\\App\\ocrtool\\scripts\\benchmark_rapidtable_slanet.py": {
+    "mtime": 1778238570.2781622,
+    "hash": "618b132aaf4a1e5bdd01eba7c5dbcaab"
+  },
+  "D:\\App\\ocrtool\\scripts\\benchmark_rapid_table_detection.py": {
+    "mtime": 1778238570.315129,
+    "hash": "f1de71e7c55480a2ca137cabae393065"
+  },
+  "D:\\App\\ocrtool\\scripts\\benchmark_structure_recognizer_only.py": {
+    "mtime": 1778238570.3343003,
+    "hash": "c857e4910fd0a522d74bd0b9e66849b0"
+  },
+  "D:\\App\\ocrtool\\scripts\\benchmark_table_detection_detectors.py": {
+    "mtime": 1778238570.369357,
+    "hash": "e275aa0adf299354bb997fd91de1b2ca"
+  },
+  "D:\\App\\ocrtool\\scripts\\benchmark_tflop.py": {
+    "mtime": 1777974059.5119038,
+    "hash": "bb6c309e10aeb02e5abcb682e53a1565"
+  },
+  "D:\\App\\ocrtool\\scripts\\benchmark_triple_ensembles_v2.py": {
+    "mtime": 1778238570.424901,
+    "hash": "34f70540ce212147ed38b141cb37ffac"
+  },
+  "D:\\App\\ocrtool\\scripts\\compare_exporter_versions.py": {
+    "mtime": 1777969671.635127,
+    "hash": "1a186af0e8b69ed4799a002b8c2081f1"
+  },
+  "D:\\App\\ocrtool\\scripts\\copy_portable_runtime.ps1": {
+    "mtime": 1778502479.2694132,
+    "hash": "d1354064c3e637b16d61405a47de0301"
+  },
+  "D:\\App\\ocrtool\\scripts\\download_offline_models.py": {
+    "mtime": 1778481930.453191,
+    "hash": "1bbfa629c40fd2b1e362d55690ec95ec"
+  },
+  "D:\\App\\ocrtool\\scripts\\export_docling_v1_tableformer_onnx.py": {
+    "mtime": 1778052970.9746337,
+    "hash": "b84b3259f521430f35d5a1cc308e3577"
+  },
+  "D:\\App\\ocrtool\\scripts\\export_page1_images.py": {
+    "mtime": 1775717443.6768036,
+    "hash": "7ef46a281a326ec99f7441156f0a0c39"
+  },
+  "D:\\App\\ocrtool\\scripts\\kie_dataset_converters.py": {
+    "mtime": 1778238570.4959495,
+    "hash": "7c59205d5161f840b465332a38a68eb1"
+  },
+  "D:\\App\\ocrtool\\scripts\\prepare_table_gt_samples.py": {
+    "mtime": 1777992528.8474312,
+    "hash": "809bfae55b0a6d13936f8416d54cabba"
+  },
+  "D:\\App\\ocrtool\\scripts\\refresh_model_hashes.py": {
+    "mtime": 1778481930.4547012,
+    "hash": "882598ce0d3a78665f36d8382923189e"
+  },
+  "D:\\App\\ocrtool\\scripts\\run_groundtruth_full_pipeline.py": {
+    "mtime": 1778238570.524711,
+    "hash": "af026362af5341f2732e2f7111455dcc"
+  },
+  "D:\\App\\ocrtool\\scripts\\upload_models_to_hf.py": {
+    "mtime": 1778481930.4547012,
+    "hash": "becb3d4b2b811a97efdce08fb41cfc1e"
+  },
+  "D:\\App\\ocrtool\\tests\\test_hsltcq_mapper.py": {
+    "mtime": 1778238570.0082264,
+    "hash": "d17a86a492bc0faa106be0a2e2594303"
+  },
+  "D:\\App\\ocrtool\\tests\\test_kie_archive_viewer_editing.py": {
+    "mtime": 1778417862.753528,
+    "hash": "1dd2c2ec0fc9d180d581576d08e1846d"
+  },
+  "D:\\App\\ocrtool\\tests\\test_kie_postprocess_doc_number.py": {
+    "mtime": 1778423932.084429,
+    "hash": "8192879616002404bc6736d0106afd7c"
+  },
+  "D:\\App\\ocrtool\\tests\\test_mp_safety.py": {
+    "mtime": 1778406065.3243837,
+    "hash": "6caff2e4efef1c10d180842b64874472"
+  },
+  "D:\\App\\ocrtool\\tests\\test_page_splitter_portable_imports.py": {
+    "mtime": 1778150191.001955,
+    "hash": "0d2b8df0d68be6ff31d9177b21afd59d"
+  },
+  "D:\\App\\ocrtool\\tests\\test_paragraph_merge_style.py": {
+    "mtime": 1778512112.5746,
+    "hash": "402087aef6254df2a0fe768ef56b6fb9"
+  },
+  "D:\\App\\ocrtool\\tests\\test_pdf_splitter_preserves_appearances.py": {
+    "mtime": 1778408691.4465263,
+    "hash": "173102547852f84ecb46f6e1b7330715"
+  },
+  "D:\\App\\ocrtool\\tests\\test_repository_search_ui.py": {
+    "mtime": 1778499392.9611447,
+    "hash": "ce94b3a34c85b1a683b48e81a2fb67d4"
+  },
+  "D:\\App\\ocrtool\\tests\\test_table_footnotes.py": {
+    "mtime": 1778238570.029052,
+    "hash": "a80b4b60cb533c774d20f3883c0776f2"
+  },
+  "D:\\App\\ocrtool\\tests\\__init__.py": {
+    "mtime": 1777686431.423347,
+    "hash": "d41d8cd98f00b204e9800998ecf8427e"
+  },
+  "D:\\App\\ocrtool\\train-convert\\archive-embedder\\convert\\export_e5_mix50_to_onnx_fp32.py": {
+    "mtime": 1777790733.8723798,
+    "hash": "15ce867aac65515d423979b67706c94a"
+  },
+  "D:\\App\\ocrtool\\train-convert\\archive-embedder\\train\\mix50_v2\\evaluate_onnx_retrieval.py": {
+    "mtime": 1777790742.3768651,
+    "hash": "cbca43505bab23139a064bc6b8062d4d"
+  },
+  "D:\\App\\ocrtool\\train-convert\\archive-embedder\\train\\mix50_v2\\prep_mixed_e5_dataset.py": {
+    "mtime": 1777799445.099929,
+    "hash": "0324f95433344689c660ec88f4544bb2"
+  },
+  "D:\\App\\ocrtool\\train-convert\\archive-embedder\\train\\mix50_v2\\train_e5_small.py": {
+    "mtime": 1777790725.68856,
+    "hash": "282a0de30a816ae7aa0dda6704d48593"
+  },
+  "D:\\App\\ocrtool\\train-convert\\archive-page-splitter\\train\\lightgbm_splitter\\1-build_dataset_splitter.py": {
+    "mtime": 1777634484.71316,
+    "hash": "d8423ded71473c5bad98d83e98b36fa7"
+  },
+  "D:\\App\\ocrtool\\train-convert\\archive-page-splitter\\train\\lightgbm_splitter\\2-train_splitter.py": {
+    "mtime": 1777634023.1985335,
+    "hash": "4459064436ea3fad0607b20b6174c156"
+  },
+  "D:\\App\\ocrtool\\train-convert\\archive-page-splitter\\train\\lightgbm_splitter\\3-benchmark_page_selection.py": {
+    "mtime": 1777894605.3145776,
+    "hash": "0455ed28777cdf173914ad755670063e"
+  },
+  "D:\\App\\ocrtool\\train-convert\\archive-page-splitter\\train\\lightgbm_splitter\\4-benchmark_mnv4_vs_lgbm.py": {
+    "mtime": 1777600557.5192077,
+    "hash": "93f2cbb08d0153b699216720f2ba585c"
+  },
+  "D:\\App\\ocrtool\\train-convert\\doclayoutyolo\\convert\\export_doclayout_yolo_to_onnx.py": {
+    "mtime": 1778120138.6933055,
+    "hash": "311713ff42bdeb8a0064b66e0bb4dc40"
+  },
+  "D:\\App\\ocrtool\\train-convert\\docling-tableformer-v1\\convert\\export_docling_v1_tableformer_stepcache_onnx.py": {
+    "mtime": 1778070143.4791045,
+    "hash": "50147828a80a2b1a3af506914cdc603d"
+  },
+  "D:\\App\\ocrtool\\train-convert\\docling-tableformer-v1\\convert\\onnx_stepcache_runner_reference.py": {
+    "mtime": 1778069329.3544993,
+    "hash": "c12df8f972425fff79b594f65f45e3f8"
+  },
+  "D:\\App\\ocrtool\\train-convert\\gmft\\convert\\export_gmft_tatr_to_onnx.py": {
+    "mtime": 1777883081.1141686,
+    "hash": "72278e61b9be2403389c94d6591eeba9"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\adjudication.py": {
+    "mtime": 1776134053.832575,
+    "hash": "0d593c6d58d16d041fde181d1d384e2a"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\common.py": {
+    "mtime": 1776244770.0973575,
+    "hash": "511216164d406a8117a8339aa4fab0ee"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\exporters.py": {
+    "mtime": 1776603689.7313988,
+    "hash": "3dd9dd2fdcda98533700a8c2a5b1c510"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\inference_pipeline.py": {
+    "mtime": 1777195213.5191996,
+    "hash": "12b2af408ff24307efb43f98a3c50408"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\labeling_workspace.py": {
+    "mtime": 1777355444.6111188,
+    "hash": "dc4ef4dd78177ca97a8fc01433ff6cb6"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\ontology.py": {
+    "mtime": 1776594775.3315885,
+    "hash": "99d8f904732bf03ff9eb189425494807"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\semantic_fields.py": {
+    "mtime": 1776594647.4095712,
+    "hash": "423e32f8460b56093dc0df8d5e2c675d"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\__init__.py": {
+    "mtime": 1775885998.718631,
+    "hash": "f23d1bd095deaeda900c6f752f7dcc87"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\dataset_bootstrap\\1-setup_project.py": {
+    "mtime": 1777211889.4978743,
+    "hash": "a0df9f04da6b531d454f96480fc2d79e"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\dataset_bootstrap\\2-run_ocr_pipeline.py": {
+    "mtime": 1777211889.507593,
+    "hash": "ba3862fe61c3d6e050e3437077eb5cc4"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\dataset_bootstrap\\3-prepare_label_inputs.py": {
+    "mtime": 1777211889.5091105,
+    "hash": "3932655b7d24db1b1c6ce94a6c6c401e"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\dataset_bootstrap\\4-adjudicate_votes.py": {
+    "mtime": 1777211889.5175908,
+    "hash": "405676253d34cc1c105e35f32428e79b"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\dataset_bootstrap\\5-export_training_sets.py": {
+    "mtime": 1777211889.5206945,
+    "hash": "6324be7df946b6262b0a5cb24cde1d31"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\dataset_bootstrap\\batch_autolabel_v3.py": {
+    "mtime": 1777211889.53083,
+    "hash": "4daa01f95db613ecdbf6b2d8c4c1ee9b"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\dataset_bootstrap\\batch_rerun_canonical.py": {
+    "mtime": 1777211889.5409095,
+    "hash": "4da2dc0a661668344555051820ff129b"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\layoutlmv3_fontgray_norm\\code\\train_layoutlmv3\\1-build_dataset.py": {
+    "mtime": 1778214693.170725,
+    "hash": "21f7541f966caaa43bac94a1812be602"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\layoutlmv3_fontgray_norm\\code\\train_layoutlmv3\\10-benchmark_three_pdfs_cpu.py": {
+    "mtime": 1777131553.2269685,
+    "hash": "3f79ccc2f20ad784e5e0fdc4b9c156c0"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\layoutlmv3_fontgray_norm\\code\\train_layoutlmv3\\11-benchmark_lightgbm_pdfs.py": {
+    "mtime": 1777131553.2284975,
+    "hash": "84e31f19dc4b2a7243048c8762e6dcbd"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\layoutlmv3_fontgray_norm\\code\\train_layoutlmv3\\12-benchmark_layoutlmv3_onnx_pdfs.py": {
+    "mtime": 1777131669.0211635,
+    "hash": "a9a45a2216612a6ce28782b7da25919b"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\layoutlmv3_fontgray_norm\\code\\train_layoutlmv3\\13-evaluate_lightgbm_batch_cpu.py": {
+    "mtime": 1777159121.7259693,
+    "hash": "aa399dcc31fd7e80e6158ec315ad8d01"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\layoutlmv3_fontgray_norm\\code\\train_layoutlmv3\\14-evaluate_layoutlmv3_batch_onnx_cpu.py": {
+    "mtime": 1777159176.6849005,
+    "hash": "0ade7c01a137217388d840ccd7b90215"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\layoutlmv3_fontgray_norm\\code\\train_layoutlmv3\\15-benchmark_layoutlmv3_grid_cpu.py": {
+    "mtime": 1777163102.3584046,
+    "hash": "e998229add8215009557973d34077fc1"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\layoutlmv3_fontgray_norm\\code\\train_layoutlmv3\\2-sanity_check.py": {
+    "mtime": 1777164360.9954567,
+    "hash": "26fcb75b5a4137123e9d2d32f089a25e"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\layoutlmv3_fontgray_norm\\code\\train_layoutlmv3\\3-train_layoutlmv3.py": {
+    "mtime": 1777164428.0274253,
+    "hash": "32f00169c4d4eb848ae7d2bf25fca138"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\layoutlmv3_fontgray_norm\\code\\train_layoutlmv3\\4-evaluate_layoutlmv3.py": {
+    "mtime": 1777115921.8741283,
+    "hash": "d3dd76346e573c38e5f02732f0905ba9"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\layoutlmv3_fontgray_norm\\code\\train_layoutlmv3\\5-run_inference.py": {
+    "mtime": 1777123963.8520749,
+    "hash": "57efdeb6833cf66994c0e940b6fb0633"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\layoutlmv3_fontgray_norm\\code\\train_layoutlmv3\\6-export_onnx.py": {
+    "mtime": 1778399711.0394056,
+    "hash": "913e4915ab2acdef554a06f7537c3797"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\layoutlmv3_fontgray_norm\\code\\train_layoutlmv3\\7-benchmark_onnx_variants.py": {
+    "mtime": 1777124852.2615166,
+    "hash": "b96601e4a781b081e1979f4062824b64"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\layoutlmv3_fontgray_norm\\code\\train_layoutlmv3\\8-evaluate_batch.py": {
+    "mtime": 1777126485.3836381,
+    "hash": "0798201a53184d1535e50ecd1033c96b"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\layoutlmv3_fontgray_norm\\code\\train_layoutlmv3\\9-benchmark_lightgbm_batch.py": {
+    "mtime": 1777127981.9644089,
+    "hash": "6a3a378e420726b785833db1df0e53fa"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\layoutlmv3_fontgray_norm\\code\\train_layoutlmv3\\common.py": {
+    "mtime": 1778399711.0409224,
+    "hash": "eaf1925d2250ccfbd47e9d10d6630644"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\layoutlmv3_fontgray_norm\\code\\train_layoutlmv3\\hf_utils.py": {
+    "mtime": 1777123942.1297479,
+    "hash": "5b19931c079fcb3f984caa167be56031"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\layoutlmv3_fontgray_norm\\code\\train_layoutlmv3\\__init__.py": {
+    "mtime": 1777115264.9999409,
+    "hash": "6dad38b6eeb0fc4012b18a6883ac7465"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\layoutlmv3_fontgray_norm\\code\\train_layoutlmv3_style\\1-build_dataset.py": {
+    "mtime": 1778214711.736636,
+    "hash": "b2d94b3dcd0e86c9e3441f9079b8fd78"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\layoutlmv3_fontgray_norm\\code\\train_layoutlmv3_style\\2-sanity_check.py": {
+    "mtime": 1777187545.5286484,
+    "hash": "35e226bfe7897f154b24b576e1bfc984"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\layoutlmv3_fontgray_norm\\code\\train_layoutlmv3_style\\3-train_layoutlmv3_style.py": {
+    "mtime": 1778481930.456212,
+    "hash": "a3a6ce65afc071c52b845762c84390b6"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\layoutlmv3_fontgray_norm\\code\\train_layoutlmv3_style\\4-evaluate_layoutlmv3_style.py": {
+    "mtime": 1777187717.1267886,
+    "hash": "f23585590dfe01c99ab3a9f368548af5"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\layoutlmv3_fontgray_norm\\code\\train_layoutlmv3_style\\5-run_inference.py": {
+    "mtime": 1777187739.7398014,
+    "hash": "d2271999bfe3fb7df71920f246d64abc"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\layoutlmv3_fontgray_norm\\code\\train_layoutlmv3_style\\6-export_onnx.py": {
+    "mtime": 1778399711.0409224,
+    "hash": "12252e5dc2f95f811ccfb53553826e16"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\layoutlmv3_fontgray_norm\\code\\train_layoutlmv3_style\\8-evaluate_batch_style.py": {
+    "mtime": 1777198815.1177368,
+    "hash": "8d1265cd8fc208bb039e776fd8016243"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\layoutlmv3_fontgray_norm\\code\\train_layoutlmv3_style\\common.py": {
+    "mtime": 1778399711.0424433,
+    "hash": "9ad19587102a802ece3c6df7a41d052a"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\layoutlmv3_fontgray_norm\\code\\train_layoutlmv3_style\\hf_utils.py": {
+    "mtime": 1778481930.456212,
+    "hash": "3f3b1092b07baefc9a14508379d4df11"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\layoutlmv3_fontgray_norm\\code\\train_layoutlmv3_style\\__init__.py": {
+    "mtime": 1777187397.4384987,
+    "hash": "6453b2d82ff7a4eeb810b53474a42edb"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\lightgbm\\code\\train_lightgbm\\0-create_kie_subset.py": {
+    "mtime": 1777078643.4808106,
+    "hash": "5453c49ad84e5e094d084570d6acf7c9"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\lightgbm\\code\\train_lightgbm\\1-setup_project.py": {
+    "mtime": 1777075836.962387,
+    "hash": "13b2873feef266bccfb818a5dc619c63"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\lightgbm\\code\\train_lightgbm\\10-analyze_error_causes.py": {
+    "mtime": 1777104819.525163,
+    "hash": "3a4bf73d7d4b65383f60bfc94ea772bf"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\lightgbm\\code\\train_lightgbm\\11-assess_lm_fixability.py": {
+    "mtime": 1777107738.863804,
+    "hash": "5dfc24edc260deb4f0e1fc78bfae92dd"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\lightgbm\\code\\train_lightgbm\\12-benchmark_rerankers.py": {
+    "mtime": 1777160181.4642868,
+    "hash": "0c72e7b6fbb4e923f53985f4945c7eef"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\lightgbm\\code\\train_lightgbm\\13-build_cross_encoder_dataset.py": {
+    "mtime": 1777118961.6270769,
+    "hash": "35245c8cf31c2907dd63ff50b4c1f651"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\lightgbm\\code\\train_lightgbm\\14-finetune_cross_encoder.py": {
+    "mtime": 1777124665.299089,
+    "hash": "813445c82a342a09fd4397d084f4a15a"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\lightgbm\\code\\train_lightgbm\\15-export_cross_encoder_onnx.py": {
+    "mtime": 1777159817.6164398,
+    "hash": "76f2313895b9b61bec264b90c52b042b"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\lightgbm\\code\\train_lightgbm\\16-evaluate_reranker_decode.py": {
+    "mtime": 1777163742.6882377,
+    "hash": "3ac88adf5227f7ac726de87ce0267c12"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\lightgbm\\code\\train_lightgbm\\17-benchmark_batch_reranker.py": {
+    "mtime": 1777165826.4676878,
+    "hash": "5e694e04e253e0c585c339941d4db020"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\lightgbm\\code\\train_lightgbm\\18-benchmark_batch_inference_reranker.py": {
+    "mtime": 1777167425.846907,
+    "hash": "978149f613cc1cb4f5591de3062f9611"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\lightgbm\\code\\train_lightgbm\\2-build_fieldwise_dataset.py": {
+    "mtime": 1777077508.5929453,
+    "hash": "413f89bfeb38d7f5a2b1870ef39e7323"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\lightgbm\\code\\train_lightgbm\\3-train_field_models.py": {
+    "mtime": 1777075836.9638982,
+    "hash": "c7edd4f040b76c8a7f991bb95e7870a9"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\lightgbm\\code\\train_lightgbm\\4-evaluate_models.py": {
+    "mtime": 1777075836.964904,
+    "hash": "9dfcd02472f58ab636b324801e01430c"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\lightgbm\\code\\train_lightgbm\\5-run_field_inference.py": {
+    "mtime": 1777081749.0614507,
+    "hash": "29be4f69bc7d06d9f2defddffc2dab6d"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\lightgbm\\code\\train_lightgbm\\6-candidate_oracle.py": {
+    "mtime": 1777086157.6985168,
+    "hash": "16e8bc9e51f71a651004b38b870448da"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\lightgbm\\code\\train_lightgbm\\7-tune_thresholds.py": {
+    "mtime": 1777087047.014721,
+    "hash": "f8c29ec71986e512468a73161da98e1f"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\lightgbm\\code\\train_lightgbm\\8-semantic_rerank_eval.py": {
+    "mtime": 1777089897.3768525,
+    "hash": "5537ce8958b0237bb381c7ec4de77937"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\lightgbm\\code\\train_lightgbm\\9-detailed_error_report.py": {
+    "mtime": 1777103297.1965766,
+    "hash": "7de21749be96ce28841a7a89ac31acab"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\lightgbm\\code\\train_lightgbm\\common.py": {
+    "mtime": 1777075516.4852717,
+    "hash": "fe2701c1f8ed4bcffe5fe37c7d0fd3b4"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\lightgbm\\code\\train_lightgbm\\config.py": {
+    "mtime": 1777075516.4852717,
+    "hash": "2f00436df39f8e0b12f61ef19f911069"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\lightgbm\\code\\train_lightgbm\\dataset.py": {
+    "mtime": 1777185273.3945532,
+    "hash": "caf9ee2d97a517b952fcc6f70a7d8691"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\lightgbm\\code\\train_lightgbm\\reranker_common.py": {
+    "mtime": 1777115177.422297,
+    "hash": "3b67c382c9e558d401d220335621cf85"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\lightgbm\\code\\train_lightgbm\\schema_decoder.py": {
+    "mtime": 1777170056.1297545,
+    "hash": "6833a98c806c9381ec905c666253e430"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\lightgbm\\code\\train_lightgbm\\training.py": {
+    "mtime": 1777098646.3710244,
+    "hash": "0e74b39693f4dd23b1b7bc870fbd9aa3"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\lightgbm\\code\\train_lightgbm\\__init__.py": {
+    "mtime": 1777075516.4847527,
+    "hash": "06110722c555af33529b4047e4bc3e40"
+  },
+  "D:\\App\\ocrtool\\train-convert\\layoutlmv3\\train\\fontgray_norm_final_epoch25\\train_layoutlmv3\\1-build_dataset.py": {
+    "mtime": 1778214681.9155993,
+    "hash": "21f7541f966caaa43bac94a1812be602"
+  },
+  "D:\\App\\ocrtool\\train-convert\\layoutlmv3\\train\\fontgray_norm_final_epoch25\\train_layoutlmv3\\10-benchmark_three_pdfs_cpu.py": {
+    "mtime": 1777894546.2752168,
+    "hash": "04ffae70e63e8df6f64c6c1aab47c6d2"
+  },
+  "D:\\App\\ocrtool\\train-convert\\layoutlmv3\\train\\fontgray_norm_final_epoch25\\train_layoutlmv3\\11-benchmark_lightgbm_pdfs.py": {
+    "mtime": 1777894546.2757268,
+    "hash": "4affc03e62f25f0269ce03144d7ae28e"
+  },
+  "D:\\App\\ocrtool\\train-convert\\layoutlmv3\\train\\fontgray_norm_final_epoch25\\train_layoutlmv3\\12-benchmark_layoutlmv3_onnx_pdfs.py": {
+    "mtime": 1777894546.2762377,
+    "hash": "6953a0826a42c9b9119895704a7438ab"
+  },
+  "D:\\App\\ocrtool\\train-convert\\layoutlmv3\\train\\fontgray_norm_final_epoch25\\train_layoutlmv3\\13-evaluate_lightgbm_batch_cpu.py": {
+    "mtime": 1777894546.2762377,
+    "hash": "af76db690005fb7798a9f8eba65f1246"
+  },
+  "D:\\App\\ocrtool\\train-convert\\layoutlmv3\\train\\fontgray_norm_final_epoch25\\train_layoutlmv3\\14-evaluate_layoutlmv3_batch_onnx_cpu.py": {
+    "mtime": 1777159176.6849005,
+    "hash": "0ade7c01a137217388d840ccd7b90215"
+  },
+  "D:\\App\\ocrtool\\train-convert\\layoutlmv3\\train\\fontgray_norm_final_epoch25\\train_layoutlmv3\\15-benchmark_layoutlmv3_grid_cpu.py": {
+    "mtime": 1777163102.3584046,
+    "hash": "e998229add8215009557973d34077fc1"
+  },
+  "D:\\App\\ocrtool\\train-convert\\layoutlmv3\\train\\fontgray_norm_final_epoch25\\train_layoutlmv3\\2-sanity_check.py": {
+    "mtime": 1777164360.9954567,
+    "hash": "26fcb75b5a4137123e9d2d32f089a25e"
+  },
+  "D:\\App\\ocrtool\\train-convert\\layoutlmv3\\train\\fontgray_norm_final_epoch25\\train_layoutlmv3\\3-train_layoutlmv3.py": {
+    "mtime": 1777164428.0274253,
+    "hash": "32f00169c4d4eb848ae7d2bf25fca138"
+  },
+  "D:\\App\\ocrtool\\train-convert\\layoutlmv3\\train\\fontgray_norm_final_epoch25\\train_layoutlmv3\\4-evaluate_layoutlmv3.py": {
+    "mtime": 1777115921.8741283,
+    "hash": "d3dd76346e573c38e5f02732f0905ba9"
+  },
+  "D:\\App\\ocrtool\\train-convert\\layoutlmv3\\train\\fontgray_norm_final_epoch25\\train_layoutlmv3\\5-run_inference.py": {
+    "mtime": 1777123963.8520749,
+    "hash": "57efdeb6833cf66994c0e940b6fb0633"
+  },
+  "D:\\App\\ocrtool\\train-convert\\layoutlmv3\\train\\fontgray_norm_final_epoch25\\train_layoutlmv3\\6-export_onnx.py": {
+    "mtime": 1778399711.0424433,
+    "hash": "913e4915ab2acdef554a06f7537c3797"
+  },
+  "D:\\App\\ocrtool\\train-convert\\layoutlmv3\\train\\fontgray_norm_final_epoch25\\train_layoutlmv3\\7-benchmark_onnx_variants.py": {
+    "mtime": 1777124852.2615166,
+    "hash": "b96601e4a781b081e1979f4062824b64"
+  },
+  "D:\\App\\ocrtool\\train-convert\\layoutlmv3\\train\\fontgray_norm_final_epoch25\\train_layoutlmv3\\8-evaluate_batch.py": {
+    "mtime": 1777126485.3836381,
+    "hash": "0798201a53184d1535e50ecd1033c96b"
+  },
+  "D:\\App\\ocrtool\\train-convert\\layoutlmv3\\train\\fontgray_norm_final_epoch25\\train_layoutlmv3\\9-benchmark_lightgbm_batch.py": {
+    "mtime": 1777894546.2737095,
+    "hash": "756f467ca48e3cb945b909051cf79e4b"
+  },
+  "D:\\App\\ocrtool\\train-convert\\layoutlmv3\\train\\fontgray_norm_final_epoch25\\train_layoutlmv3\\common.py": {
+    "mtime": 1778399711.0444796,
+    "hash": "eaf1925d2250ccfbd47e9d10d6630644"
+  },
+  "D:\\App\\ocrtool\\train-convert\\layoutlmv3\\train\\fontgray_norm_final_epoch25\\train_layoutlmv3\\hf_utils.py": {
+    "mtime": 1777123942.1297479,
+    "hash": "5b19931c079fcb3f984caa167be56031"
+  },
+  "D:\\App\\ocrtool\\train-convert\\layoutlmv3\\train\\fontgray_norm_final_epoch25\\train_layoutlmv3\\__init__.py": {
+    "mtime": 1777115264.9999409,
+    "hash": "6dad38b6eeb0fc4012b18a6883ac7465"
+  },
+  "D:\\App\\ocrtool\\train-convert\\layoutlmv3\\train\\fontgray_norm_final_epoch25\\train_layoutlmv3_style\\1-build_dataset.py": {
+    "mtime": 1778214701.4644916,
+    "hash": "8cc508a574dd3b436f797ea358644bcc"
+  },
+  "D:\\App\\ocrtool\\train-convert\\layoutlmv3\\train\\fontgray_norm_final_epoch25\\train_layoutlmv3_style\\2-sanity_check.py": {
+    "mtime": 1777383616.0458136,
+    "hash": "6bce807c99e5408bf7c4d30aaa0c20b6"
+  },
+  "D:\\App\\ocrtool\\train-convert\\layoutlmv3\\train\\fontgray_norm_final_epoch25\\train_layoutlmv3_style\\3-train_layoutlmv3_style.py": {
+    "mtime": 1778481930.4577315,
+    "hash": "79a4a7b8f0930e29e5268acd89cef0de"
+  },
+  "D:\\App\\ocrtool\\train-convert\\layoutlmv3\\train\\fontgray_norm_final_epoch25\\train_layoutlmv3_style\\4-evaluate_layoutlmv3_style.py": {
+    "mtime": 1777279553.0533533,
+    "hash": "f88da7f6d6d20224743679402e82234a"
+  },
+  "D:\\App\\ocrtool\\train-convert\\layoutlmv3\\train\\fontgray_norm_final_epoch25\\train_layoutlmv3_style\\5-run_inference.py": {
+    "mtime": 1777279483.7760618,
+    "hash": "e361bfba49447a1f4d8b5e4d0b15d0f7"
+  },
+  "D:\\App\\ocrtool\\train-convert\\layoutlmv3\\train\\fontgray_norm_final_epoch25\\train_layoutlmv3_style\\6-export_onnx.py": {
+    "mtime": 1778399711.0444796,
+    "hash": "b718b61738477a94ac23a0b77cdf96dc"
+  },
+  "D:\\App\\ocrtool\\train-convert\\layoutlmv3\\train\\fontgray_norm_final_epoch25\\train_layoutlmv3_style\\8-evaluate_batch_style.py": {
+    "mtime": 1777279557.323325,
+    "hash": "eb230cb76713d78b216ca8e5f3eb546b"
+  },
+  "D:\\App\\ocrtool\\train-convert\\layoutlmv3\\train\\fontgray_norm_final_epoch25\\train_layoutlmv3_style\\9-benchmark_batches_onnx.py": {
+    "mtime": 1777445819.2882638,
+    "hash": "1035d1aeaa9208868113fb3a006d3ff7"
+  },
+  "D:\\App\\ocrtool\\train-convert\\layoutlmv3\\train\\fontgray_norm_final_epoch25\\train_layoutlmv3_style\\common.py": {
+    "mtime": 1778399711.0449843,
+    "hash": "e189ce2ec3e963a86ff0559d9b99a71b"
+  },
+  "D:\\App\\ocrtool\\train-convert\\layoutlmv3\\train\\fontgray_norm_final_epoch25\\train_layoutlmv3_style\\hf_utils.py": {
+    "mtime": 1778481930.4577315,
+    "hash": "8a0c4d528b0a70c675c0c643f38e81d0"
+  },
+  "D:\\App\\ocrtool\\train-convert\\layoutlmv3\\train\\fontgray_norm_final_epoch25\\train_layoutlmv3_style\\__init__.py": {
+    "mtime": 1777187397.4384987,
+    "hash": "6453b2d82ff7a4eeb810b53474a42edb"
+  },
+  "D:\\App\\ocrtool\\train-convert\\_tools\\benchmark\\benchmark_onnx_vs_original_layout_tables.py": {
+    "mtime": 1777894044.2963557,
+    "hash": "41a0c24cd9be2aa0433d9cb70785fe8d"
+  },
+  "D:\\App\\ocrtool\\train-convert\\_tools\\ocr\\run_ocr_temp_pdf.py": {
+    "mtime": 1777891153.0203996,
+    "hash": "4628e0859ab81882f8f2a666d9339846"
+  },
+  "D:\\App\\ocrtool\\CLAUDE.md": {
+    "mtime": 1778168431.9719641,
+    "hash": "09e5fd87eb39479b4927c186531a8884"
+  },
+  "D:\\App\\ocrtool\\ignored_words.txt": {
+    "mtime": 1777724079.8137486,
+    "hash": "259bc0b02d3c189e5d450908f13b1449"
+  },
+  "D:\\App\\ocrtool\\README.md": {
+    "mtime": 1778513430.4835277,
+    "hash": "5f780fd8e926f300a7c88924a5595e92"
+  },
+  "D:\\App\\ocrtool\\requirements_qt.txt": {
+    "mtime": 1778502479.2709248,
+    "hash": "b873dfdf8fa736f70ac995f064bb5be6"
+  },
+  "D:\\App\\ocrtool\\t_verify.txt": {
+    "mtime": 1778304567.5184028,
+    "hash": "d41d8cd98f00b204e9800998ecf8427e"
+  },
+  "D:\\App\\ocrtool\\bin\\Tesseract-OCR\\ambiguous_words.1.html": {
+    "mtime": 1717685138.0,
+    "hash": "b79f037021f0dad0bfae194a39a29c35"
+  },
+  "D:\\App\\ocrtool\\bin\\Tesseract-OCR\\classifier_tester.1.html": {
+    "mtime": 1717685138.0,
+    "hash": "592a41340cd07568fe900b4e67d9a76a"
+  },
+  "D:\\App\\ocrtool\\bin\\Tesseract-OCR\\cntraining.1.html": {
+    "mtime": 1717685140.0,
+    "hash": "ad622b005553df28625cd1b665888174"
+  },
+  "D:\\App\\ocrtool\\bin\\Tesseract-OCR\\combine_lang_model.1.html": {
+    "mtime": 1717685136.0,
+    "hash": "32f1902bff19bd740b104efb63c22488"
+  },
+  "D:\\App\\ocrtool\\bin\\Tesseract-OCR\\combine_tessdata.1.html": {
+    "mtime": 1717685136.0,
+    "hash": "5157be2d6d4b4703e93a20e1fc1f369f"
+  },
+  "D:\\App\\ocrtool\\bin\\Tesseract-OCR\\dawg2wordlist.1.html": {
+    "mtime": 1717685136.0,
+    "hash": "ccba794416244a937d1e8b82183be313"
+  },
+  "D:\\App\\ocrtool\\bin\\Tesseract-OCR\\lstmeval.1.html": {
+    "mtime": 1717685136.0,
+    "hash": "6954b701b8bb4151c78f4be98346da45"
+  },
+  "D:\\App\\ocrtool\\bin\\Tesseract-OCR\\lstmtraining.1.html": {
+    "mtime": 1717685136.0,
+    "hash": "364b1705b63e30c11ac96363c94dd56d"
+  },
+  "D:\\App\\ocrtool\\bin\\Tesseract-OCR\\merge_unicharsets.1.html": {
+    "mtime": 1717685138.0,
+    "hash": "aca9061c4448ea6b1c8bf573f8caf8f0"
+  },
+  "D:\\App\\ocrtool\\bin\\Tesseract-OCR\\mftraining.1.html": {
+    "mtime": 1717685140.0,
+    "hash": "40c84f34def693213ad5dd1bf7995592"
+  },
+  "D:\\App\\ocrtool\\bin\\Tesseract-OCR\\set_unicharset_properties.1.html": {
+    "mtime": 1717685138.0,
+    "hash": "740f854f25912f1da00d2519ae41adf4"
+  },
+  "D:\\App\\ocrtool\\bin\\Tesseract-OCR\\shapeclustering.1.html": {
+    "mtime": 1717685140.0,
+    "hash": "351555f81844b4f43729b9ba2234c0bf"
+  },
+  "D:\\App\\ocrtool\\bin\\Tesseract-OCR\\tesseract.1.html": {
+    "mtime": 1717685138.0,
+    "hash": "83f9fdf46a1572e55a107e828e71b53b"
+  },
+  "D:\\App\\ocrtool\\bin\\Tesseract-OCR\\text2image.1.html": {
+    "mtime": 1717685138.0,
+    "hash": "20d6fb679e0ef7d899a31f6ce677ceae"
+  },
+  "D:\\App\\ocrtool\\bin\\Tesseract-OCR\\unicharambigs.5.html": {
+    "mtime": 1717685140.0,
+    "hash": "4c77efa9d9157125f4ca8a47b1e2fab1"
+  },
+  "D:\\App\\ocrtool\\bin\\Tesseract-OCR\\unicharset.5.html": {
+    "mtime": 1717685138.0,
+    "hash": "add858b22059097884e051b23d6804c8"
+  },
+  "D:\\App\\ocrtool\\bin\\Tesseract-OCR\\unicharset_extractor.1.html": {
+    "mtime": 1717685138.0,
+    "hash": "80d8793c79fad44eabdce71c6d2909e2"
+  },
+  "D:\\App\\ocrtool\\bin\\Tesseract-OCR\\wordlist2dawg.1.html": {
+    "mtime": 1717685138.0,
+    "hash": "531355ca6b05220053715e73f94b8cb1"
+  },
+  "D:\\App\\ocrtool\\bin\\Tesseract-OCR\\doc\\README.md": {
+    "mtime": 1716116662.0,
+    "hash": "3c71a7b24fc040067094b76ca6545bae"
+  },
+  "D:\\App\\ocrtool\\dictionaries\\party_frequency_lexicon_v8_no_person_names.txt": {
+    "mtime": 1777723325.3414586,
+    "hash": "50688f996ea967423ba36aafc2c092ae"
+  },
+  "D:\\App\\ocrtool\\dictionaries\\person_surnames_vi_top200.txt": {
+    "mtime": 1777723324.3961878,
+    "hash": "339276efa538b329336bb2b9638bd37f"
+  },
+  "D:\\App\\ocrtool\\dictionaries\\trusted_party_terms.txt": {
+    "mtime": 1777682887.3961074,
+    "hash": "4a46f415f08b212c1a2e8fe1cd1eac48"
+  },
+  "D:\\App\\ocrtool\\scanindex\\core\\kie\\README.md": {
+    "mtime": 1777893956.7954724,
+    "hash": "78d01e7f45d75e4aa5c35f80edf9f96c"
+  },
+  "D:\\App\\ocrtool\\scanindex\\ui\\kie_viewer\\README.md": {
+    "mtime": 1778167563.472579,
+    "hash": "3d5f0c4706d886e06ee7cafb55cdd0a3"
+  },
+  "D:\\App\\ocrtool\\train-convert\\README.md": {
+    "mtime": 1778071841.1600053,
+    "hash": "240d06e1ecbc9c6d0b144df8fd9ef7da"
+  },
+  "D:\\App\\ocrtool\\train-convert\\archive-embedder\\README.md": {
+    "mtime": 1777893083.3537314,
+    "hash": "87fe20436ed040f79cd4e0a3786e921c"
+  },
+  "D:\\App\\ocrtool\\train-convert\\archive-page-splitter\\train\\lightgbm_splitter\\README.md": {
+    "mtime": 1777894409.764142,
+    "hash": "857e96996462459572f0eb08bc13bf71"
+  },
+  "D:\\App\\ocrtool\\train-convert\\docling-tableformer-v1\\README.md": {
+    "mtime": 1778071616.4818225,
+    "hash": "31c4983b41ad5ff1686e02aa64120093"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\README.md": {
+    "mtime": 1778399846.4916255,
+    "hash": "76435ad453507ccd2b55ac07351c549b"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\START_HERE.md": {
+    "mtime": 1777894618.08463,
+    "hash": "fa82c7dc75ce5f480e52a43abbb8aa77"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\dataset_bootstrap\\AUDIT_GUIDE.md": {
+    "mtime": 1776756435.2806432,
+    "hash": "3f3748a1ae7f8d37b071de5cfd08e1ac"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\dataset_bootstrap\\README.md": {
+    "mtime": 1777893128.969059,
+    "hash": "ad3ca24528f1c0e50f2c8d502ef2db7a"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\dataset_bootstrap\\requirements-train-kie.txt": {
+    "mtime": 1776781760.5790243,
+    "hash": "48275a047658628c8cb10bbdaabb2360"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\layoutlmv3_fontgray_norm\\README.md": {
+    "mtime": 1777212365.611577,
+    "hash": "6dcbabd6200b364c9f6c1f15ed312f83"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\layoutlmv3_fontgray_norm\\artifacts\\checkpoint-34000\\merges.txt": {
+    "mtime": 1777203762.7858324,
+    "hash": "75a37753dd7a28a2c5df80c28bf06e4e"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\layoutlmv3_fontgray_norm\\artifacts\\final_model\\merges.txt": {
+    "mtime": 1777203762.7858324,
+    "hash": "75a37753dd7a28a2c5df80c28bf06e4e"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\layoutlmv3_fontgray_norm\\code\\train_layoutlmv3\\README.md": {
+    "mtime": 1777115880.8663926,
+    "hash": "70317341b7b4a1772d857b79d40743f9"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\layoutlmv3_fontgray_norm\\code\\train_layoutlmv3\\requirements-layoutlmv3.txt": {
+    "mtime": 1777122837.3494906,
+    "hash": "91b9d506646fc209fa97acbb4b8884e8"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\layoutlmv3_fontgray_norm\\code\\train_layoutlmv3_style\\README.md": {
+    "mtime": 1777193126.3004677,
+    "hash": "47a5191b39d3a332f7cf41133620fece"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\layoutlmv3_fontgray_norm\\code\\train_layoutlmv3_style\\requirements-layoutlmv3-style.txt": {
+    "mtime": 1777187810.2989664,
+    "hash": "cdd34e7d8108365ac9e2dca798c168e1"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\lightgbm\\README.md": {
+    "mtime": 1777210666.2858913,
+    "hash": "b0d6c6e876ed7b63e3d6f01e708c8a00"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\lightgbm\\code\\train_lightgbm\\README.md": {
+    "mtime": 1777078735.8924186,
+    "hash": "8ec79eefab55de35437e6456a49bfecc"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\lightgbm\\code\\train_lightgbm\\requirements-train-lightgbm.txt": {
+    "mtime": 1777075804.666855,
+    "hash": "e1c2bd789e18ead229c4a5475ca96876"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\results\\README.md": {
+    "mtime": 1777210719.0940053,
+    "hash": "a85c7b6f36a35913719023f8ec1b0fa5"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\runbooks\\portable_training.md": {
+    "mtime": 1777211925.6186354,
+    "hash": "ac74f8509286e5087c4a756e6e99c828"
+  },
+  "D:\\App\\ocrtool\\train-convert\\kie\\train_kie\\samples\\digital_140\\README.md": {
+    "mtime": 1778399752.9626572,
+    "hash": "57be88844658d7d8a1c9fc0fcfabf8ed"
+  },
+  "D:\\App\\ocrtool\\train-convert\\layoutlmv3\\train\\fontgray_norm_final_epoch25\\README.md": {
+    "mtime": 1777893031.6379182,
+    "hash": "9003a33589001b10feffea4abb2c7e96"
+  },
+  "D:\\App\\ocrtool\\train-convert\\layoutlmv3\\train\\fontgray_norm_final_epoch25\\train_layoutlmv3\\README.md": {
+    "mtime": 1777115880.8663926,
+    "hash": "70317341b7b4a1772d857b79d40743f9"
+  },
+  "D:\\App\\ocrtool\\train-convert\\layoutlmv3\\train\\fontgray_norm_final_epoch25\\train_layoutlmv3\\requirements-layoutlmv3.txt": {
+    "mtime": 1777122837.3494906,
+    "hash": "91b9d506646fc209fa97acbb4b8884e8"
+  },
+  "D:\\App\\ocrtool\\train-convert\\layoutlmv3\\train\\fontgray_norm_final_epoch25\\train_layoutlmv3_style\\requirements-layoutlmv3-style.txt": {
+    "mtime": 1777187810.2989664,
+    "hash": "cdd34e7d8108365ac9e2dca798c168e1"
+  },
+  "D:\\App\\ocrtool\\train-convert\\_archived-runtime-models\\README.md": {
+    "mtime": 1778071852.610621,
+    "hash": "09bef245dc9805157c03cc185316d285"
+  }
+}

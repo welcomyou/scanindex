@@ -33,7 +33,7 @@ git clone https://github.com/welcomyou/scanindex.git
 cd scanindex
 python -m venv .venv_build
 .venv_build\Scripts\activate
-pip install -r requirements_qt.txt
+pip install -r requirements.txt
 ```
 
 ### Tải model (~1.9 GB) — có verify SHA256

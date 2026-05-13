@@ -151,5 +151,5 @@ Input PDF -> Preprocessing (rotate/deskew)
 - All temp/test/debug files go in `temp/` directory
 - `temp/` is gitignored
 - CPU-only: CUDA_VISIBLE_DEVICES="" set at startup
-- If adding/removing a library, update `build_portable.bat` and `requirements_qt.txt`
+- If adding/removing a library, update `build_portable.bat` and `requirements.txt`
 - Settings changes must update `settings.ini.example` as reference

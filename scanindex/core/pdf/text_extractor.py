@@ -32,7 +32,7 @@ OCR_DPI = 200
 def is_digital_ocr_output(ocr_pdf_path: str) -> bool:
     """Kiểm tra _ocr.pdf là output của digital text extraction (không phải ScreenAI).
 
-    Resolve canonical companion (`.json` hoặc `.json.zst`), check `document.engine`.
+    Resolve canonical `.json.zst` companion, check `document.engine`.
     Trả True nếu engine = DIGITAL_TEXT_ENGINE → caller nên skip correction.
     """
     companion = resolve_companion(ocr_pdf_path)
@@ -40,7 +40,11 @@ def is_digital_ocr_output(ocr_pdf_path: str) -> bool:
         return False
     try:
         data = load_canonical(companion)
-        return data.get("document", {}).get("engine") == DIGITAL_TEXT_ENGINE
+        return (
+            data.get("document", {}).get("engine") == DIGITAL_TEXT_ENGINE
+            or data.get("pipeline", {}).get("ocr", {}).get("engine") == DIGITAL_TEXT_ENGINE
+            or data.get("engine") == DIGITAL_TEXT_ENGINE
+        )
     except Exception:
         return False
 
@@ -57,6 +61,25 @@ def _visual_line_sort_key(items: list[dict]) -> tuple[int, float, float]:
     y1 = max(float(item["bbox"][3]) for item in items)
     center_y = (y0 + y1) / 2.0
     return (round(center_y / 8.0), min(float(item["bbox"][0]) for item in items), center_y)
+
+
+def _median(values: list[float], default: float = 0.0) -> float:
+    clean = sorted(float(value) for value in values)
+    if not clean:
+        return default
+    mid = len(clean) // 2
+    if len(clean) % 2:
+        return clean[mid]
+    return (clean[mid - 1] + clean[mid]) / 2.0
+
+
+def _items_bbox(items: list[dict]) -> tuple[float, float, float, float]:
+    return (
+        min(float(item["bbox"][0]) for item in items),
+        min(float(item["bbox"][1]) for item in items),
+        max(float(item["bbox"][2]) for item in items),
+        max(float(item["bbox"][3]) for item in items),
+    )
 
 
 def _group_visual_items(items: list[dict]) -> dict[tuple[int, int], list[dict]]:
@@ -115,9 +138,155 @@ def _group_visual_items(items: list[dict]) -> dict[tuple[int, int], list[dict]]:
     return grouped
 
 
+def _group_native_block_lines(items: list[dict]) -> dict[tuple[int, int], list[dict]]:
+    grouped: dict[tuple[int, int], list[dict]] = {}
+    for item in items:
+        grouped.setdefault((int(item["block_no"]), int(item["line_no"])), []).append(item)
+    for group in grouped.values():
+        group.sort(key=lambda item: (int(item["word_no"]), float(item["bbox"][0]), float(item["bbox"][1])))
+    return grouped
+
+
+def _native_block_lines_are_usable(groups: dict[tuple[int, int], list[dict]]) -> bool:
+    if not groups:
+        return False
+    sizes = [len(group) for group in groups.values() if group]
+    if not sizes:
+        return False
+    one_word_ratio = sum(1 for size in sizes if size <= 1) / len(sizes)
+    avg_words = sum(sizes) / len(sizes)
+    return avg_words >= 2.0 and one_word_ratio <= 0.45
+
+
+def _detect_two_column_group_profile(
+    groups: dict[tuple[int, int], list[dict]],
+    page_width: float,
+    page_height: float,
+) -> dict | None:
+    candidates: list[tuple[float, float, float, float]] = []
+    for group in groups.values():
+        if not group:
+            continue
+        text_len = sum(len(str(item.get("text") or "")) for item in group)
+        if text_len < 3:
+            continue
+        x0, y0, x1, y1 = _items_bbox(group)
+        width = x1 - x0
+        height = y1 - y0
+        if width <= 0 or height <= 0:
+            continue
+        if y0 < page_height * 0.07 or y1 > page_height * 0.94:
+            continue
+        if width > page_width * 0.58:
+            continue
+        center_x = (x0 + x1) / 2.0
+        candidates.append((x0, y0, x1, y1))
+
+    if len(candidates) < 12:
+        return None
+
+    left = [
+        box for box in candidates
+        if box[0] < page_width * 0.45 and ((box[0] + box[2]) / 2.0) < page_width * 0.52
+    ]
+    right = [
+        box for box in candidates
+        if box[0] > page_width * 0.43 and ((box[0] + box[2]) / 2.0) > page_width * 0.52
+    ]
+    if min(len(left), len(right)) < max(5, int(len(candidates) * 0.16)):
+        return None
+
+    left_start = _median([box[0] for box in left])
+    right_start = _median([box[0] for box in right])
+    if right_start - left_start < page_width * 0.24:
+        return None
+
+    start_tolerance = page_width * 0.08
+    left_core = [box for box in left if abs(box[0] - left_start) <= start_tolerance]
+    right_core = [box for box in right if abs(box[0] - right_start) <= start_tolerance]
+    if min(len(left_core), len(right_core)) < max(4, int(min(len(left), len(right)) * 0.55)):
+        return None
+
+    left_end = _median([box[2] for box in left_core], left_start + page_width * 0.35)
+    gutter = (left_end + right_start) / 2.0
+    if not (page_width * 0.38 <= gutter <= page_width * 0.62):
+        return None
+
+    return {
+        "gutter": gutter,
+        "start_y": min(min(box[1] for box in left_core), min(box[1] for box in right_core)),
+        "end_y": max(max(box[3] for box in left_core), max(box[3] for box in right_core)),
+    }
+
+
+def _split_two_column_line_groups(
+    groups: dict[tuple[int, int], list[dict]],
+    page_width: float,
+    page_height: float,
+) -> dict[tuple[int, int], list[dict]]:
+    profile = _detect_two_column_group_profile(groups, page_width, page_height)
+    if not profile:
+        return groups
+
+    gutter = float(profile["gutter"])
+    start_y = float(profile["start_y"])
+    end_y = float(profile["end_y"])
+    split_min_width = page_width * 0.40
+    y_margin = max(8.0, page_height * 0.01)
+    result: dict[tuple[int, int], list[dict]] = {}
+
+    for key, group in groups.items():
+        if not group:
+            continue
+        x0, y0, x1, y1 = _items_bbox(group)
+        should_consider = (
+            start_y - y_margin <= y0 <= end_y + y_margin
+            and x0 < gutter < x1
+            and (x1 - x0) >= split_min_width
+        )
+        if not should_consider:
+            segments = [sorted(group, key=lambda item: (float(item["bbox"][0]), float(item["bbox"][1]), int(item["word_no"])))]
+        else:
+            ordered = sorted(group, key=lambda item: (float(item["bbox"][0]), float(item["bbox"][1]), int(item["word_no"])))
+            gaps = [
+                max(0.0, float(ordered[idx]["bbox"][0]) - float(ordered[idx - 1]["bbox"][2]))
+                for idx in range(1, len(ordered))
+            ]
+            median_gap = _median(gaps, 0.0)
+            split_idx = None
+            best_gap = 0.0
+            for idx in range(1, len(ordered)):
+                prev = ordered[idx - 1]
+                item = ordered[idx]
+                gap = max(0.0, float(item["bbox"][0]) - float(prev["bbox"][2]))
+                gap_mid = (float(prev["bbox"][2]) + float(item["bbox"][0])) / 2.0
+                split_gap = max(8.0, median_gap * 1.8)
+                if page_width * 0.38 <= gap_mid <= page_width * 0.62 and gap >= split_gap and gap > best_gap:
+                    split_idx = idx
+                    best_gap = gap
+            if split_idx is not None:
+                segments = [ordered[:split_idx], ordered[split_idx:]]
+            else:
+                segments = [ordered]
+
+        base_line = int(key[1]) * 10
+        block_no = int(key[0])
+        for seg_idx, segment in enumerate(segments):
+            if not segment:
+                continue
+            for word_idx, item in enumerate(segment):
+                item["word_no"] = word_idx
+            new_key = (block_no, base_line + seg_idx)
+            while new_key in result:
+                new_key = (new_key[0], new_key[1] + 1)
+            result[new_key] = segment
+
+    return result or groups
+
+
 def _extract_page_words(page):
     items: list[dict] = []
-    for x0, y0, x1, y1, text, block_no, line_no, word_no in page.get_text("words", sort=True) or []:
+    for x0, y0, x1, y1, text, block_no, line_no, word_no in page.get_text("words", sort=False) or []:
         items.append({
             "text": text or "",
             "ocr_text": text or "",
@@ -130,7 +299,13 @@ def _extract_page_words(page):
             "content_type": DEFAULT_DIGITAL_CONTENT_TYPE,
             "source_layer": "native",
         })
-    return _group_visual_items(items)
+    native_groups = _group_native_block_lines(items)
+    if _native_block_lines_are_usable(native_groups):
+        groups = native_groups
+    else:
+        groups = _group_visual_items(items)
+    return _split_two_column_line_groups(groups, float(page.rect.width), float(page.rect.height))
+
 
 
 def _build_page_record_from_line_groups(
@@ -147,7 +322,10 @@ def _build_page_record_from_line_groups(
         render_width=render_width,
         render_height=render_height,
     )
-    sorted_groups = sorted(line_groups.items(), key=lambda item: (*_visual_line_sort_key(item[1]), item[0][0], item[0][1]))
+    if any(block_no != 0 for block_no, _ in line_groups):
+        sorted_groups = sorted(line_groups.items(), key=lambda item: (item[0][0], item[0][1], *_visual_line_sort_key(item[1])))
+    else:
+        sorted_groups = sorted(line_groups.items(), key=lambda item: (*_visual_line_sort_key(item[1]), item[0][0], item[0][1]))
 
     for line_index, ((block_no, line_no), group_words) in enumerate(sorted_groups):
         ordered_words = sorted(group_words, key=lambda item: item["word_no"])
@@ -174,6 +352,7 @@ def _build_page_record_from_line_groups(
                 content_type=int(word.get("content_type", DEFAULT_DIGITAL_CONTENT_TYPE) or 0),
                 ocr_text=raw_text,
             ))
+            line_words[-1]["source_layer"] = word.get("source_layer") or "native"
 
         if not line_words:
             continue
@@ -185,7 +364,8 @@ def _build_page_record_from_line_groups(
         line_height = max(1.0, line_bbox[3] - line_bbox[1])
         fg_values = [int(word.get("fg_gray", DEFAULT_DIGITAL_FG_GRAY) or DEFAULT_DIGITAL_FG_GRAY) for word in line_words]
         fg_gray = round(sum(fg_values) / len(fg_values)) if fg_values else DEFAULT_DIGITAL_FG_GRAY
-        page_record["lines"].append(make_line_record(
+        line_source_layers = {str(word.get("source_layer") or "native") for word in line_words}
+        line_record = make_line_record(
             page_index=page_index,
             line_index=line_index,
             text=line_text,
@@ -201,7 +381,23 @@ def _build_page_record_from_line_groups(
             fg_gray=fg_gray,
             word_ids=[word["id"] for word in line_words],
             ocr_text=line_ocr_text,
-        ))
+        )
+        line_record["source_layer"] = next(iter(line_source_layers)) if len(line_source_layers) == 1 else "mixed"
+        page_record["lines"].append(line_record)
+    return page_record
+
+
+def build_native_page_record(page_index: int, page) -> dict:
+    render_width, render_height = _page_render_size(page)
+    page_record = _build_page_record_from_line_groups(
+        page_index,
+        page,
+        render_width,
+        render_height,
+        _extract_page_words(page),
+    )
+    page_record["coord_origin"] = "top-left"
+    page_record["source_mode"] = "digital"
     return page_record
 
 
@@ -256,9 +452,56 @@ def _word_items_from_page_record(page: dict, source_layer: str) -> list[dict]:
             "confidence": float(word.get("confidence", DEFAULT_DIGITAL_CONFIDENCE) or DEFAULT_DIGITAL_CONFIDENCE),
             "fg_gray": int(word.get("fg_gray", DEFAULT_DIGITAL_FG_GRAY) or DEFAULT_DIGITAL_FG_GRAY),
             "content_type": int(word.get("content_type", DEFAULT_DIGITAL_CONTENT_TYPE) or DEFAULT_DIGITAL_CONTENT_TYPE),
-            "source_layer": source_layer,
+            "source_layer": str(word.get("source_layer") or source_layer),
         })
     return items
+
+
+def merge_native_and_ocr_page_records(page_index: int, native_page, ocr_record: dict) -> dict:
+    render_width, render_height = _page_render_size(native_page)
+    native_record = _build_page_record_from_line_groups(
+        page_index,
+        native_page,
+        render_width,
+        render_height,
+        _extract_page_words(native_page),
+    )
+    native_items = _word_items_from_page_record(native_record, "native")
+    ocr_items = _word_items_from_page_record(ocr_record or {}, "ocr")
+    native_broken = _looks_like_broken_native_text(_items_text(native_items))
+    if native_broken and ocr_items:
+        merge_items = ocr_items
+        ocr_only: list[dict] = []
+        primary_layer = "ocr"
+    else:
+        native_boxes = [item["bbox"] for item in native_items]
+        ocr_only = []
+        for item in ocr_items:
+            box = item["bbox"]
+            if any(
+                _bbox_coverage(box, native_box) >= 0.55
+                or _bbox_coverage(native_box, box) >= 0.55
+                for native_box in native_boxes
+            ):
+                continue
+            ocr_only.append(item)
+        merge_items = native_items + ocr_only
+        primary_layer = "native"
+    merged_record = _build_page_record_from_line_groups(
+        page_index,
+        native_page,
+        render_width,
+        render_height,
+        _group_visual_items(merge_items),
+    )
+    merged_record["coord_origin"] = "top-left"
+    merged_record["source_mode"] = "mixed"
+    merged_record["text_layers"] = {
+        "primary": primary_layer,
+        "native_mojibake_rejected": bool(native_broken and ocr_items),
+        "merged_ocr_only_words": len(ocr_only),
+    }
+    return merged_record
 
 
 def _items_text(items: list[dict]) -> str:
@@ -363,7 +606,9 @@ def merge_native_text_layer_into_canonical_json(
     finally:
         doc.close()
 
-    data.setdefault("pipeline", {}).setdefault("ocr", {})["digital_layer_merge"] = details
+    ocr_pipeline = data.setdefault("pipeline", {}).setdefault("ocr", {})
+    ocr_pipeline["digital_layer_merge"] = details
+    ocr_pipeline["source_mode"] = "mixed"
     save_canonical(canonical_json_path, data, profile=canonical_profile)
     return {"pages": details}
 
@@ -400,6 +645,7 @@ def extract_digital_pdf_as_ocr(
             source_path=source_document_path or input_path,
             text_normalization=OCR_TEXT_NORMALIZATION,
             raw_text_preserved=True,
+            source_mode="digital",
         )
 
         total_pages = len(doc)
@@ -418,7 +664,7 @@ def extract_digital_pdf_as_ocr(
             ocr_data["pages"].append(page_record)
 
         doc.close()
-        json_path = output_path + ".json"
+        json_path = output_path + ".json.zst"
         save_canonical(json_path, ocr_data, profile=canonical_profile)
 
         log(f"Digital extraction completed: {output_path}", "success")

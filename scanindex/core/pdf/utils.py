@@ -226,7 +226,7 @@ def _sync_companion_json(original_pdf_path: str, output_path: str,
     source_json = resolve_companion(original_pdf_path)
     if source_json is None:
         return
-    target_json = output_path + ".json"
+    target_json = output_path + ".json.zst"
     try:
         write_corrected_companion_json(
             source_json_path=source_json,

@@ -735,9 +735,15 @@ class ArchiveStep1Split(QWidget):
             )
             return
 
-        json_path = f"{ocr_pdf_path}.json" if ocr_pdf_path else ""
+        json_path = ""
+        resolved_json = None
+        if ocr_pdf_path:
+            from scanindex.core.canonical_io import companion_for_pdf, resolve_companion
+
+            resolved_json = resolve_companion(ocr_pdf_path)
+            json_path = str(resolved_json or companion_for_pdf(ocr_pdf_path))
         self.session.step1_ocr_pdf_path = ocr_pdf_path
-        self.session.step1_ocr_json_path = json_path if os.path.exists(json_path) else None
+        self.session.step1_ocr_json_path = str(resolved_json) if resolved_json is not None else None
 
         result = split_result if isinstance(split_result, dict) else {}
         starts = [int(p) for p in result.get("start_pages", [0]) if isinstance(p, int)]
@@ -901,8 +907,11 @@ class ArchiveStep1Split(QWidget):
                             warm_thread.join(timeout=0.2)
                     from scanindex.core.digitization import page_splitter as archive_page_splitter
                     split_t0 = time.monotonic()
+                    from scanindex.core.canonical_io import companion_for_pdf, resolve_companion
+
+                    canonical_path = resolve_companion(ocr_pdf_path) or companion_for_pdf(ocr_pdf_path)
                     split_result = archive_page_splitter.predict_doc_starts(
-                        f"{ocr_pdf_path}.json",
+                        str(canonical_path),
                         threshold=0.50,
                     )
                     self.log_message.emit(

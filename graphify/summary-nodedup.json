@@ -1,0 +1,62 @@
+{
+  "root": "D:\\App\\ocrtool",
+  "out": "D:\\App\\ocrtool\\graphify\\graphify-out-nodedup",
+  "mode": "ast_only_no_dedup",
+  "nodes": 4953,
+  "edges": 10824,
+  "communities": 251,
+  "god_nodes_top10": [
+    {
+      "id": "kie_viewer_kie_viewer_kieviewer",
+      "label": "KieViewer",
+      "degree": 108
+    },
+    {
+      "id": "repository_screen_repositoryscreen",
+      "label": "RepositoryScreen",
+      "degree": 93
+    },
+    {
+      "id": "digitization_extraction_step_archivestep2kie",
+      "label": "ArchiveStep2Kie",
+      "degree": 92
+    },
+    {
+      "id": "ui_main_window_mainwindow",
+      "label": "MainWindow",
+      "degree": 80
+    },
+    {
+      "id": "digitization_signing_step_archivestep3sign",
+      "label": "ArchiveStep3Sign",
+      "degree": 73
+    },
+    {
+      "id": "widgets_kie_archive_viewer_kiearchiveviewer",
+      "label": "KieArchiveViewer",
+      "degree": 69
+    },
+    {
+      "id": "widgets_pdf_viewer_widget_pdfviewerwidget",
+      "label": "PdfViewerWidget",
+      "degree": 57
+    },
+    {
+      "id": "dialogs_archive_session_dialog_dossierinfodialog",
+      "label": "DossierInfoDialog",
+      "degree": 52
+    },
+    {
+      "id": "repository_store_archivestore",
+      "label": "ArchiveStore",
+      "degree": 51
+    },
+    {
+      "id": "repository_indexer_hybridindex",
+      "label": "HybridIndex",
+      "degree": 45
+    }
+  ],
+  "html_status": "written",
+  "built_at_commit": "acab4b891004fc42e2a678a4857592a500258c51"
+}

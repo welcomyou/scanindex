@@ -953,7 +953,7 @@ def scan_one_file_for_secret(
     os.makedirs(file_work_dir, exist_ok=True)
     first_page_only = not thorough
     mode = "Tìm kỹ" if thorough else "Trang đầu"
-    canonical_json_path = os.path.join(file_work_dir, "ocr.json")
+    canonical_json_path = os.path.join(file_work_dir, "ocr.json.zst")
 
     if prefer_native_text:
         native_canonical, native_note = _native_canonical_for_source(

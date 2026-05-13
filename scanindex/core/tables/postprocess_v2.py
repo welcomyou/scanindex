@@ -192,6 +192,81 @@ def _best_cell_for_fragment(fragment: OcrFragment, table: Any, table_bbox: BBox)
     return best
 
 
+def _first_alpha(text: str) -> str:
+    for ch in _clean_text(text):
+        if ch.isalpha():
+            return ch
+    return ""
+
+
+def _starts_like_continuation_tail(text: str) -> bool:
+    cleaned = _clean_text(text)
+    if not cleaned:
+        return False
+    if re.match(r"^(?:\d+(?:\.\d+)*|[IVXLCDM]{1,6})[.)]?\s+", cleaned, flags=re.IGNORECASE):
+        return False
+    if re.match(r"^[+\-•]\s+", cleaned):
+        return False
+    first = _first_alpha(cleaned)
+    if first and first.islower():
+        return True
+    return bool(re.match(r"^[,.;:)\]}]", cleaned))
+
+
+def _ends_like_open_continuation(text: str) -> bool:
+    cleaned = _clean_text(text)
+    return bool(cleaned) and not bool(re.search(r"[.?!;:]\s*$", cleaned))
+
+
+def _axis_overlap(a0: float, a1: float, b0: float, b1: float) -> float:
+    return max(0.0, min(a1, b1) - max(a0, b0))
+
+
+def _repair_boundary_continuation_buckets(
+    table: Any,
+    buckets: Dict[Tuple[int, int], List[OcrFragment]],
+) -> int:
+    moved = 0
+    rows = int(getattr(table, "row_count", 0) or 0)
+    cols = int(getattr(table, "col_count", 0) or 0)
+    boxes = getattr(table, "cell_bboxes", []) or []
+    if rows < 2 or cols <= 0:
+        return 0
+    for r in range(1, rows):
+        if r >= len(boxes) or r - 1 >= len(boxes):
+            continue
+        for c in range(cols):
+            if c >= len(boxes[r]) or c >= len(boxes[r - 1]):
+                continue
+            current = sorted(buckets.get((r, c), []), key=lambda f: (f.line_order, f.bbox[1], f.bbox[0], f.word_order))
+            if not current:
+                continue
+            frag = current[0]
+            if not _starts_like_continuation_tail(frag.text):
+                continue
+            cell_bbox = tuple(float(v) for v in boxes[r][c][:4])
+            prev_bbox = tuple(float(v) for v in boxes[r - 1][c][:4])
+            if cell_bbox[3] <= cell_bbox[1] or prev_bbox[3] <= prev_bbox[1]:
+                continue
+            line_h = max(frag.bbox[3] - frag.bbox[1], 1.0)
+            near_top = frag.bbox[1] <= cell_bbox[1] + max(line_h * 1.6, 14.0)
+            hugs_boundary = frag.bbox[1] <= cell_bbox[1] + max(line_h * 0.55, 5.0) or frag.bbox[3] <= cell_bbox[1] + max(line_h * 2.2, 22.0)
+            if not (near_top and hugs_boundary):
+                continue
+            x_cover = _axis_overlap(frag.bbox[0], frag.bbox[2], prev_bbox[0], prev_bbox[2]) / max(frag.bbox[2] - frag.bbox[0], 1.0)
+            if x_cover < 0.45:
+                continue
+            previous_bucket = buckets.get((r - 1, c), [])
+            previous_text = _rebuild_cell_text(previous_bucket)
+            same_source_as_previous = any(item.source_id == frag.source_id for item in previous_bucket)
+            if previous_text and not _ends_like_open_continuation(previous_text) and not same_source_as_previous:
+                continue
+            buckets[(r, c)] = [item for item in buckets.get((r, c), []) if item is not frag]
+            buckets.setdefault((r - 1, c), []).append(frag)
+            moved += 1
+    return moved
+
+
 def _rebuild_cell_text(fragments: List[OcrFragment]) -> str:
     if not fragments:
         return ""
@@ -253,6 +328,8 @@ def match_table_ocr_v2(
         buckets.setdefault((r, c), []).append(frag)
         assigned += 1
 
+    moved_boundary = _repair_boundary_continuation_buckets(table, buckets)
+
     existing = getattr(table, "cells", []) or []
     rebuilt = [[""] * cols for _ in range(rows)]
     for r in range(rows):
@@ -280,6 +357,8 @@ def match_table_ocr_v2(
             "V2 cell matcher: "
             f"assigned={assigned}/{len(in_table)} orphan={orphan} weak={weak}"
         )
+        if moved_boundary:
+            logger.log(f"V2 cell matcher: repaired {moved_boundary} boundary continuation fragment(s)")
     return stats
 
 

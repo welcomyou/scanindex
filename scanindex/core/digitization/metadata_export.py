@@ -2,7 +2,7 @@
 
 Two artefacts per output folder:
   1. Per-file canonical JSON enriched with KIE annotations (named
-     `<stem>_ocr.pdf.json`, written next to its `_ocr.pdf` if present).
+     `<stem>_ocr.pdf.json.zst`, written next to its `_ocr.pdf` if present).
   2. A single Excel workbook `MetaDuLieu.xlsx` aggregating every file's
      extracted metadata in the schema of the official "Văn bản" sheet.
 

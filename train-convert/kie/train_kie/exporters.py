@@ -183,6 +183,10 @@ def _prepare_page_surface_tokens(page):
         line_tokens.setdefault(line["id"], [])
         line_texts[line["id"]] = line.get("text", "")
 
+    if not page.get("kie_tokens"):
+        from scanindex.core.kie.json_utils import build_kie_tokens_in_place
+
+        build_kie_tokens_in_place({"pages": [page], "annotations": {}})
     page_tokens = sorted(page.get("kie_tokens", []), key=lambda item: item.get("order", 0))
     for token in page_tokens:
         line_id = token["line_id"]

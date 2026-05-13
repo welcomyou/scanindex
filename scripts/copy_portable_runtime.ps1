@@ -216,6 +216,9 @@ if (Is-Enabled $IncludeCorrection) {
     Write-Host "  [-] Skipped optional CT2 correction model (set INCLUDE_CORRECTION=1 to include)"
 }
 
+# Google ***REMOVED*** (EN<->VI) — ***REMOVED***.dll + lib***REMOVED*** + en_vi NMT (~96 MB)
+Copy-DirIfExists "models\translate" "models\translate" "***REMOVED*** EN<->VI"
+
 if (Is-Enabled $IncludeLegacyChrome) {
     Copy-FileIfExists "drivers\chromedriver.exe" "drivers\chromedriver.exe" "chromedriver"
     Copy-DirIfExists "bin\chrome-win64" "bin\chrome-win64" "bundled Chrome"

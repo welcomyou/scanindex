@@ -112,6 +112,9 @@ def _run_preprocess_and_ocr(input_path, output_path, num_pages, parallel_files,
         comparison_interval=comparison_interval,
         source_document_path=source_document_path,
         preprocess_rotations=rotations,
+        preprocess_metadata=pre_meta,
+        canonical_profile="docx_export",
+        include_layout_analysis=True,
     )
 
     if pre_ok and os.path.exists(pre_path):
@@ -133,10 +136,10 @@ def _log_optional(log_callback, msg, level=LOG_INFO):
 
 
 def _cleanup_ocr_intermediate(pdf_path, source_path=None, log_callback=None):
-    """Remove OCR PDF artifacts after DOCX export succeeds.
+    """Remove legacy OCR JSON artifacts after DOCX export succeeds.
 
-    The OCR PDF is still the internal input for DOCX generation, but in Word
-    output mode it should not remain as the user-facing result.
+    The OCR PDF and its `.json.zst` sidecar are kept as the reusable Word
+    export cache. The UI still points users at the final DOCX.
     """
     if not pdf_path:
         return
@@ -146,7 +149,7 @@ def _cleanup_ocr_intermediate(pdf_path, source_path=None, log_callback=None):
             return
         if not abs_pdf.lower().endswith(".pdf"):
             return
-        for path in (abs_pdf, abs_pdf + ".json"):
+        for path in (abs_pdf + ".json",):
             if os.path.exists(path):
                 os.remove(path)
                 _log_optional(
@@ -432,6 +435,9 @@ class MainWindow(QMainWindow):
         self.dnd_tab.stop_clicked.connect(self.stop_ocr)
         self.dnd_tab.clear_clicked.connect(self.clear_list)
         self.dnd_tab.file_list.files_dropped.connect(self.drop_files)
+        # Persist the "translate to Vietnamese" toggle without forcing the user
+        # to open Settings — write directly to settings.ini on each change.
+        self.dnd_tab.chk_translate_vi.toggled.connect(self._on_translate_vi_toggled)
 
         # Archive tab
         self.archive_tab.browse_input_clicked.connect(self._arc_browse_input)
@@ -446,6 +452,28 @@ class MainWindow(QMainWindow):
         self.settings_tab.model_changed.connect(self.on_model_change)
         self.settings_tab.log_panel_toggled.connect(self._toggle_log_panel)
         self.settings_tab.reset_archive_requested.connect(self._reset_archive_data_from_settings)
+
+    def _on_translate_vi_toggled(self, checked: bool) -> None:
+        """Persist the PDF→Word "Translate to Vietnamese" toggle to settings.ini
+        and mirror it on the Settings tab checkbox without re-triggering."""
+        # Mirror to Settings tab so both views stay in sync if user opens it.
+        if hasattr(self, "settings_tab") and hasattr(self.settings_tab, "chk_translate_vi"):
+            self.settings_tab.chk_translate_vi.blockSignals(True)
+            self.settings_tab.chk_translate_vi.setChecked(bool(checked))
+            self.settings_tab.chk_translate_vi.blockSignals(False)
+        # Persist the single OCR.TranslateVietnamese key without rewriting the
+        # whole settings dict (avoids touching catalogs / KIE values).
+        try:
+            settings_path = get_resource_path("settings.ini")
+            if "OCR" not in self.config:
+                self.config["OCR"] = {}
+            self.config["OCR"]["TranslateVietnamese"] = str(bool(checked))
+            self._saved["translate_vi"] = bool(checked)
+            portable_utils.ensure_writable(settings_path)
+            with open(settings_path, "w", encoding="utf-8") as f:
+                self.config.write(f)
+        except Exception as e:
+            self.log(f"Could not persist translate toggle: {e}", LOG_ERROR)
 
     # ================================================================
     # NAVIGATION (QStackedWidget)
@@ -872,6 +900,7 @@ class MainWindow(QMainWindow):
             "export_workers": "1",
             "model": "", "gpu": "CPU", "verbose": True,
             "correct": True, "export": True,
+            "translate_vi": False,
             "show_log_panel": True,
             "kie_mode": None,
             "doc_types": doc_type_defaults,
@@ -906,6 +935,7 @@ class MainWindow(QMainWindow):
                     # PDF-to-Word now always exports DOCX; keep the old
                     # setting ignored so stale settings.ini cannot disable it.
                     self._saved["export"] = True
+                    self._saved["translate_vi"] = self.config["OCR"].getboolean("TranslateVietnamese", False)
                     self._saved["verbose"] = self.config["OCR"].getboolean("VerboseLog", True)
                     self._saved["show_log_panel"] = self.config["OCR"].getboolean("ShowLogPanel", True)
 
@@ -981,7 +1011,14 @@ class MainWindow(QMainWindow):
             doc_types=s.get("doc_types", []),
             catalogs=s.get("catalogs"),
             theme=s.get("theme", ACTIVE_THEME),
+            translate_vi=s.get("translate_vi", False),
         )
+
+        # Sync the visible PDF→Word toolbar checkbox with the persisted value.
+        # Block signals so this initial load does not re-write settings.ini.
+        self.dnd_tab.chk_translate_vi.blockSignals(True)
+        self.dnd_tab.chk_translate_vi.setChecked(bool(s.get("translate_vi", False)))
+        self.dnd_tab.chk_translate_vi.blockSignals(False)
 
         self.log_panel.set_verbose(s["verbose"])
         self._toggle_log_panel(s["show_log_panel"])
@@ -1017,10 +1054,12 @@ class MainWindow(QMainWindow):
             "MaxConcurrentOCR": str(val_ocr),
             "CorrectEnabled": str(bool(vals.get("correct", True))),
             "ExportEnabled": "True",
+            "TranslateVietnamese": str(bool(vals.get("translate_vi", False))),
             "VerboseLog": str(vals["verbose"]),
             "ShowLogPanel": str(vals["show_log_panel"]),
         }
         self._saved["correct"] = bool(vals.get("correct", True))
+        self._saved["translate_vi"] = bool(vals.get("translate_vi", False))
         self.config["Correction"] = {
             "Model": vals["model"],
             "Acceleration": "CPU",
@@ -2262,7 +2301,15 @@ class MainWindow(QMainWindow):
             kie_pdf = doc.get("output_path") or ""
             json_path = doc.get("json_path") or ""
             if not json_path and kie_pdf:
-                json_path = kie_pdf + ".json"
+                from scanindex.core.canonical_io import companion_for_pdf
+
+                json_path = str(companion_for_pdf(kie_pdf))
+            if json_path:
+                from scanindex.core.canonical_io import resolve_companion
+
+                resolved_json = resolve_companion(json_path)
+                if resolved_json is not None:
+                    json_path = str(resolved_json)
             if not (kie_pdf and os.path.exists(kie_pdf)
                     and json_path and os.path.exists(json_path)):
                 skipped_no_data += 1
@@ -2991,7 +3038,7 @@ class ProcessingPipeline:
         if not output_path:
             return
 
-        # Find JSON companion: try _ocr.pdf.json or _ocr.pdf.json.zst
+        # Find canonical .json.zst companion for the OCR PDF.
         from scanindex.core.canonical_io import resolve_companion
         json_path = resolve_companion(output_path)
         if json_path is None:
@@ -3046,6 +3093,10 @@ class ProcessingPipeline:
                     item["dnd_item"].get("path"),
                     self.app.log,
                 )
+                # Optional Vietnamese translation: write {name}_vi.docx alongside.
+                # Runs synchronously in this export worker thread (UI not blocked).
+                if self.app.dnd_tab.chk_translate_vi.isChecked():
+                    self._translate_export_to_vi(docx_out, item, idx)
                 self.app.update_item_status(item["list_type"], idx, "Done", docx_out)
             else:
                 self.app.log(f"Export Failed: {res['msg']}", LOG_ERROR)
@@ -3060,3 +3111,39 @@ class ProcessingPipeline:
                         self.app.log(f"  [Exp] {line}", LOG_DEBUG)
         except Exception as e:
             self.app.log(f"Export Exception: {e}", LOG_ERROR)
+
+    def _translate_export_to_vi(self, docx_out: str, item: dict, idx: int) -> None:
+        """Produce a {name}_vi.docx Vietnamese translation alongside the exported Word file.
+
+        Called only when the "Translate to Vietnamese" checkbox is on. Runs in
+        this export-pipeline thread (already off the UI thread), so synchronous
+        translation is fine — translator is module-singleton and reused across
+        files for the batch.
+        """
+        try:
+            base, ext = os.path.splitext(docx_out)
+            vi_out = base + "_vi" + ext
+            t1 = time.time()
+            self.app.update_item_status(item["list_type"], idx, "Đang dịch tiếng Việt...")
+            from scanindex.core.translate import translate_docx_to_vietnamese
+            res_vi = translate_docx_to_vietnamese(docx_out, vi_out)
+            dt_vi = time.time() - t1
+            if res_vi.get("success"):
+                self.app.log(
+                    f"Translation Success: {vi_out} ({dt_vi:.1f}s, {res_vi['msg']})",
+                    LOG_SUCCESS,
+                )
+            elif res_vi.get("skipped_already_vi"):
+                # Document is Vietnamese — translating EN→VI would produce
+                # garbage, so we deliberately did not write _vi.docx.
+                self.app.log(
+                    f"Bỏ qua dịch: {res_vi['msg']}",
+                    LOG_INFO,
+                )
+            else:
+                self.app.log(
+                    f"Translation Failed: {res_vi.get('msg', 'unknown error')}",
+                    LOG_ERROR,
+                )
+        except Exception as e:
+            self.app.log(f"Translation Exception: {e}", LOG_ERROR)

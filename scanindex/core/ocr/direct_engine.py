@@ -12,15 +12,16 @@ matching Chrome's "Save as PDF" output quality.
 import copy
 import os
 import re
-import json
 import threading
 import logging
 import atexit
 import unicodedata
 
 from scanindex.core.canonical_io import (
+    DOCX_EXPORT_PROFILE_V1,
     save_canonical,
     load_canonical,
+    resolve_profile,
 )
 from scanindex.core.ocr.screen_ai import ScreenAIOCR
 from scanindex.core.kie.json_utils import (
@@ -834,6 +835,7 @@ def _ocr_result_to_page_data(page_idx, ocr_lines, scale_x, scale_y):
                 content_type=word.get("content_type", 0),
                 ocr_text=raw_text,
             ))
+            page_line_words[-1]["source_layer"] = "ocr"
 
         # Preserve line-level OCR even when word boxes are missing.
         if not page_line_words and line_text and line_bbox:
@@ -852,6 +854,7 @@ def _ocr_result_to_page_data(page_idx, ocr_lines, scale_x, scale_y):
                 content_type=line.get("content_type", 0),
                 ocr_text=raw_line_text or line_text,
             ))
+            page_line_words[-1]["source_layer"] = "ocr"
 
         if not page_line_words:
             continue
@@ -882,7 +885,7 @@ def _ocr_result_to_page_data(page_idx, ocr_lines, scale_x, scale_y):
         word_grays = [w["fg_gray"] for w in page_line_words if w.get("fg_gray", 128) != 128]
         avg_fg_gray = round(sum(word_grays) / len(word_grays)) if word_grays else 128
 
-        lines_data.append(make_line_record(
+        line_record = make_line_record(
             page_index=page_idx,
             line_index=line_index,
             text=display_text,
@@ -898,7 +901,9 @@ def _ocr_result_to_page_data(page_idx, ocr_lines, scale_x, scale_y):
             fg_gray=avg_fg_gray,
             word_ids=[w["id"] for w in page_line_words],
             ocr_text=display_ocr_text,
-        ))
+        )
+        line_record["source_layer"] = "ocr"
+        lines_data.append(line_record)
 
     return lines_data, words_data
 
@@ -918,12 +923,311 @@ def setup_library():
     return False, "chrome_screen_ai.dll not found in models/screen_ai/"
 
 
+def _preprocess_metadata_from_legacy_rotations(preprocess_metadata, preprocess_rotations):
+    """Normalize old and new preprocess metadata into the manifest contract."""
+    if isinstance(preprocess_metadata, dict):
+        data = dict(preprocess_metadata)
+    else:
+        data = {}
+    if preprocess_rotations and "page_rotations" not in data:
+        data["page_rotations"] = list(preprocess_rotations)
+    return data
+
+
+def _pick_native_text_page(original_doc, visual_doc, page_idx: int):
+    """Prefer the original vector page when it shares the visual coordinate space."""
+    visual_page = visual_doc[page_idx]
+    try:
+        original_page = original_doc[page_idx]
+    except Exception:
+        return visual_page
+    if (
+        abs(float(original_page.rect.width) - float(visual_page.rect.width)) <= 1.0
+        and abs(float(original_page.rect.height) - float(visual_page.rect.height)) <= 1.0
+    ):
+        return original_page
+    return visual_page
+
+
+def _attach_docx_manifest_to_page(page_record: dict, manifest_entry: dict) -> None:
+    """Stamp provenance on a canonical DOCX-export page record."""
+    page_record["coord_origin"] = "top-left"
+    page_record["coord_space"] = "visual_page_after_preprocess"
+    page_record["source_mode"] = manifest_entry.get("source_mode") or "scan"
+    page_record["text_source"] = manifest_entry.get("text_source") or "ocr"
+    page_record["visual_source"] = dict(manifest_entry.get("visual_source") or {})
+    page_record["preprocess"] = dict(manifest_entry.get("preprocess") or {})
+    page_record["classification"] = dict(manifest_entry.get("classification") or {})
+
+
+def _source_layer_for_page_mode(source_mode: str, text_source: str) -> str:
+    if source_mode == "digital" or text_source == "native":
+        return "native"
+    if source_mode == "mixed" or "+" in str(text_source):
+        return "mixed"
+    return "ocr"
+
+
+def _ensure_page_source_layer(page_record: dict, manifest_entry: dict) -> None:
+    fallback = _source_layer_for_page_mode(
+        str(manifest_entry.get("source_mode") or "scan"),
+        str(manifest_entry.get("text_source") or "ocr"),
+    )
+    for word in page_record.get("words") or []:
+        if isinstance(word, dict):
+            word.setdefault("source_layer", fallback if fallback != "mixed" else "ocr")
+    for line in page_record.get("lines") or []:
+        if isinstance(line, dict):
+            if line.get("source_layer"):
+                continue
+            line_word_ids = set(line.get("word_ids") or [])
+            word_layers = {
+                str(word.get("source_layer") or "")
+                for word in page_record.get("words") or []
+                if isinstance(word, dict) and word.get("id") in line_word_ids
+            }
+            word_layers.discard("")
+            line["source_layer"] = next(iter(word_layers)) if len(word_layers) == 1 else fallback
+
+
+def _ocr_page_record_from_result(page_idx: int, page, page_result: dict, manifest_entry: dict) -> tuple[dict, bool]:
+    lines_data = copy.deepcopy((page_result or {}).get("lines_data") or [])
+    words_data = copy.deepcopy((page_result or {}).get("words_data") or [])
+    coord_flipped = _normalize_page_coord_to_top_left(lines_data, words_data, page.rect.height)
+
+    page_record = make_page_record(
+        page_index=page_idx,
+        width=page.rect.width,
+        height=page.rect.height,
+        render_width=(page_result or {}).get("render_width", 0),
+        render_height=(page_result or {}).get("render_height", 0),
+        applied_rotation=(manifest_entry.get("preprocess") or {}).get("rotation", 0),
+    )
+    page_record["lines"] = lines_data
+    page_record["words"] = words_data
+    if coord_flipped:
+        page_record["coord_origin_source"] = "normalized_from_bottom_left"
+    _attach_docx_manifest_to_page(page_record, manifest_entry)
+    _ensure_page_source_layer(page_record, manifest_entry)
+    return page_record, coord_flipped
+
+
+def process_pdf_for_docx_export(input_path, output_path, num_pages=None, update_callback=None,
+                                source_document_path=None,
+                                allow_page_parallel=True,
+                                preprocess_rotations=None,
+                                preprocess_metadata=None,
+                                include_layout_analysis=True):
+    """Build the DOCX-export canonical sidecar from a page-wise source manifest.
+
+    This path is intentionally separate from the production KIE OCR path:
+    it does not build LayoutLM/KIE tokens and it classifies digital/scan/mixed
+    at page level instead of routing the whole file through one branch.
+    """
+    def log(msg, level="info"):
+        if update_callback:
+            try:
+                update_callback(msg, level)
+            except Exception:
+                try:
+                    update_callback(msg)
+                except Exception:
+                    pass
+        logger.info(msg)
+
+    try:
+        import fitz
+        from scanindex.core.pdf.docx_page_manifest import (
+            build_page_source_manifest,
+            manifest_source_mode,
+        )
+        from scanindex.core.pdf.text_extractor import (
+            build_native_page_record,
+            merge_native_and_ocr_page_records,
+        )
+
+        original_path = source_document_path or input_path
+        pre_meta = _preprocess_metadata_from_legacy_rotations(
+            preprocess_metadata,
+            preprocess_rotations,
+        )
+        manifest = build_page_source_manifest(
+            original_pdf_path=original_path,
+            visual_pdf_path=input_path,
+            preprocess_metadata=pre_meta,
+        )
+
+        original_doc = fitz.open(original_path)
+        visual_doc = fitz.open(input_path)
+        try:
+            total_pages = min(len(visual_doc), len(original_doc), len(manifest))
+            if num_pages:
+                try:
+                    total_pages = min(total_pages, max(0, int(num_pages)))
+                except (TypeError, ValueError):
+                    pass
+            manifest = manifest[:total_pages]
+
+            source_mode = manifest_source_mode(manifest)
+            log(f"DOCX export source manifest: {total_pages} page(s), source_mode={source_mode}", "info")
+
+            ocr_page_indices = [
+                int(item["page_index"])
+                for item in manifest
+                if item.get("source_mode") in {"scan", "mixed"}
+            ]
+            all_page_results = {}
+            if ocr_page_indices:
+                use_parallel = bool(
+                    allow_page_parallel
+                    and len(ocr_page_indices) >= 2
+                    and _NUM_PAGE_WORKERS > 1
+                )
+                if use_parallel:
+                    try:
+                        _get_pool()
+                        log(
+                            f"Parallel OCR: {_NUM_PAGE_WORKERS} page workers for "
+                            f"{len(ocr_page_indices)}/{total_pages} OCR page(s)",
+                            "info",
+                        )
+                        all_page_results = _process_selected_pages_parallel(
+                            input_path,
+                            ocr_page_indices,
+                            total_pages,
+                            log,
+                        )
+                    except Exception as e:
+                        log(f"Parallel init failed, using serial OCR: {e}", "info")
+                        all_page_results = _process_selected_pages_serial(
+                            input_path,
+                            visual_doc,
+                            ocr_page_indices,
+                            total_pages,
+                            log,
+                        )
+                else:
+                    all_page_results = _process_selected_pages_serial(
+                        input_path,
+                        visual_doc,
+                        ocr_page_indices,
+                        total_pages,
+                        log,
+                    )
+            else:
+                log("DOCX export: all pages use native text; OCR skipped", "info")
+
+            font_path = _find_unicode_font() if ocr_page_indices else None
+            if ocr_page_indices and not font_path:
+                return False, "No Unicode font found (need arial.ttf or similar)"
+
+            _layout_analyzers = (
+                _init_layout_analyzers(log)
+                if include_layout_analysis
+                else (None, None, None)
+            )
+
+            ocr_data = make_document_stub(
+                input_path=input_path,
+                engine="docx_pagewise_export",
+                ocr_dpi=OCR_DPI,
+                source_path=original_path,
+                text_normalization=OCR_TEXT_NORMALIZATION,
+                raw_text_preserved=True,
+                source_mode=source_mode,
+            )
+            ocr_data.setdefault("pipeline", {}).setdefault("docx_export", {}).update({
+                "page_source_manifest_version": "docx_page_manifest_v1",
+                "page_source_manifest": copy.deepcopy(manifest),
+                "original_pdf_path": os.path.abspath(original_path),
+                "visual_pdf_path": os.path.abspath(input_path),
+                "coordinate_contract": "top_left_pdf_points_on_visual_page_after_preprocess",
+            })
+
+            pending_line_overlays = []
+            background_specs = []
+            for page_idx, manifest_entry in enumerate(manifest):
+                visual_page = visual_doc[page_idx]
+                source_mode_page = manifest_entry.get("source_mode")
+                coord_flipped = False
+
+                if source_mode_page == "digital":
+                    native_page = _pick_native_text_page(original_doc, visual_doc, page_idx)
+                    page_record = build_native_page_record(page_idx, native_page)
+                    _attach_docx_manifest_to_page(page_record, manifest_entry)
+                    _ensure_page_source_layer(page_record, manifest_entry)
+                elif source_mode_page == "mixed":
+                    native_page = _pick_native_text_page(original_doc, visual_doc, page_idx)
+                    ocr_record, coord_flipped = _ocr_page_record_from_result(
+                        page_idx,
+                        visual_page,
+                        all_page_results.get(page_idx) or {},
+                        manifest_entry,
+                    )
+                    page_record = merge_native_and_ocr_page_records(page_idx, native_page, ocr_record)
+                    _attach_docx_manifest_to_page(page_record, manifest_entry)
+                    _ensure_page_source_layer(page_record, manifest_entry)
+                else:
+                    page_record, coord_flipped = _ocr_page_record_from_result(
+                        page_idx,
+                        visual_page,
+                        all_page_results.get(page_idx) or {},
+                        manifest_entry,
+                    )
+
+                layout_regions = _analyze_combined_layout_regions(
+                    visual_page,
+                    page_idx,
+                    visual_page.rect.width,
+                    visual_page.rect.height,
+                    _layout_analyzers,
+                    log,
+                )
+                if layout_regions:
+                    page_record["layout_regions"] = layout_regions
+
+                ocr_data["pages"].append(page_record)
+                should_overlay = source_mode_page in {"scan", "mixed"}
+                pending_line_overlays.append(page_record.get("lines") if should_overlay else [])
+                background_specs.append({
+                    "page_idx": page_idx,
+                    "page_w": visual_page.rect.width,
+                    "page_h": visual_page.rect.height,
+                    "bake_angle": 180 if coord_flipped else 0,
+                })
+
+            doc_out = fitz.open()
+            _append_backgrounds_preserving_inline_images(doc_out, visual_doc, background_specs)
+            if font_path:
+                for page_idx, lines_data in enumerate(pending_line_overlays):
+                    if page_idx >= len(doc_out):
+                        break
+                    _build_text_page_lines(doc_out[page_idx], lines_data or [], font_path)
+            doc_out.save(output_path, deflate=True, garbage=4)
+            doc_out.close()
+        finally:
+            original_doc.close()
+            visual_doc.close()
+
+        json_path = output_path + ".json.zst"
+        save_canonical(json_path, ocr_data, profile="docx_export")
+
+        log(f"DOCX-export OCR completed: {output_path}", "success")
+        return True, None
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return False, str(e)
+
+
 def process_pdf(input_path, output_path, num_pages=None, update_callback=None,
                 wait_per_page=None, comparison_interval=None,
                 source_document_path=None,
                 allow_page_parallel=True,
                 preprocess_rotations=None,
                 canonical_profile=None,
+                preprocess_metadata=None,
                 include_layout_analysis=True):
     """
     OCR a PDF and produce output with positioned text.
@@ -951,8 +1255,20 @@ def process_pdf(input_path, output_path, num_pages=None, update_callback=None,
 
     try:
         import fitz  # PyMuPDF - lazy import
-        import time
         from scanindex.core.preprocessing.preprocessing import classify_pdf
+
+        if resolve_profile(canonical_profile) == DOCX_EXPORT_PROFILE_V1:
+            return process_pdf_for_docx_export(
+                input_path,
+                output_path,
+                num_pages=num_pages,
+                update_callback=update_callback,
+                source_document_path=source_document_path,
+                allow_page_parallel=allow_page_parallel,
+                preprocess_rotations=preprocess_rotations,
+                preprocess_metadata=preprocess_metadata,
+                include_layout_analysis=include_layout_analysis,
+            )
 
         pdf_type = classify_pdf(input_path)
         if pdf_type == "digital":
@@ -1021,6 +1337,7 @@ def process_pdf(input_path, output_path, num_pages=None, update_callback=None,
             source_path=source_document_path or input_path,
             text_normalization=OCR_TEXT_NORMALIZATION,
             raw_text_preserved=True,
+            source_mode="scan",
         )
 
         doc_out = fitz.open()
@@ -1102,7 +1419,7 @@ def process_pdf(input_path, output_path, num_pages=None, update_callback=None,
         doc_out.close()
         doc_in.close()
 
-        json_path = output_path + ".json"
+        json_path = output_path + ".json.zst"
         save_canonical(json_path, ocr_data, profile=canonical_profile)
 
         log(f"OCR completed: {output_path}", "success")
@@ -1175,6 +1492,7 @@ def assemble_pdf_from_page_results(input_path, output_path, all_page_results,
             source_path=source_document_path or input_path,
             text_normalization=OCR_TEXT_NORMALIZATION,
             raw_text_preserved=True,
+            source_mode="scan",
         )
 
         doc_out = fitz.open()
@@ -1249,7 +1567,7 @@ def assemble_pdf_from_page_results(input_path, output_path, all_page_results,
         doc_out.close()
         doc_in.close()
 
-        json_path = output_path + ".json"
+        json_path = output_path + ".json.zst"
         save_canonical(json_path, ocr_data, profile=canonical_profile)
 
         log(f"Assembled (cached OCR): {output_path}", "success")
@@ -1302,6 +1620,106 @@ def _process_pages_serial(input_path, doc_in, total_pages, log):
         }
 
     return results
+
+
+def _empty_page_ocr_result():
+    return {
+        "lines_data": [],
+        "words_data": [],
+        "render_width": 0,
+        "render_height": 0,
+    }
+
+
+def _process_selected_pages_serial(input_path, doc_in, page_indices, total_pages, log):
+    """Serial OCR for a selected page subset used by page-wise DOCX export."""
+    from PIL import Image
+
+    ocr = _get_ocr()
+    results = {}
+    page_indices = sorted({int(idx) for idx in page_indices if 0 <= int(idx) < total_pages})
+
+    for page_idx in page_indices:
+        page = doc_in[page_idx]
+        page_w = page.rect.width
+        page_h = page.rect.height
+
+        log(f"OCR page {page_idx + 1}/{total_pages}...", "debug")
+
+        import fitz
+        dpi = OCR_DPI
+        mat = fitz.Matrix(dpi / 72, dpi / 72)
+        pix = page.get_pixmap(matrix=mat, annots=True)
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+
+        scale_x = page_w / pix.width
+        scale_y = page_h / pix.height
+
+        with _ocr_lock:
+            result = ocr.perform_ocr(img)
+
+        ocr_lines = result.get("lines", [])
+        log(f"  Page {page_idx + 1}: {len(ocr_lines)} lines detected", "debug")
+
+        lines_data, words_data = _ocr_result_to_page_data(
+            page_idx, ocr_lines, scale_x, scale_y
+        )
+
+        results[page_idx] = {
+            "lines_data": lines_data,
+            "words_data": words_data,
+            "render_width": pix.width,
+            "render_height": pix.height,
+        }
+
+    return results
+
+
+def _process_selected_pages_parallel(input_path, page_indices, total_pages, log,
+                                     page_timeout: float = 120.0):
+    """Submit only OCR-required pages to the shared page-level pool."""
+    import time
+
+    pool = _get_pool()
+    t0 = time.perf_counter()
+    results = {}
+    page_indices = sorted({int(idx) for idx in page_indices if 0 <= int(idx) < total_pages})
+
+    try:
+        async_results = [
+            (page_idx, pool.apply_async(_worker_ocr_single, (input_path, page_idx)))
+            for page_idx in page_indices
+        ]
+        for page_idx, ar in async_results:
+            try:
+                _, page_result = ar.get(timeout=page_timeout)
+            except Exception as e:
+                log(f"  Page {page_idx + 1}/{total_pages}: OCR error: {e}", "error")
+                page_result = None
+            if page_result is not None:
+                results[page_idx] = page_result
+                n_lines = len(page_result["lines_data"])
+                log(f"  Page {page_idx + 1}/{total_pages}: {n_lines} lines detected", "debug")
+            else:
+                log(f"  Page {page_idx + 1}/{total_pages}: OCR failed", "error")
+                results[page_idx] = _empty_page_ocr_result()
+
+        dt = time.perf_counter() - t0
+        log(
+            f"Parallel OCR completed: {len(page_indices)} selected page(s) in {dt:.1f}s "
+            f"({_NUM_PAGE_WORKERS} workers, {dt/max(len(page_indices),1):.2f}s/page avg)",
+            "info",
+        )
+        return results
+
+    except Exception as e:
+        log(f"Parallel OCR failed, falling back to serial: {e}", "error")
+        import fitz
+        doc_in = fitz.open(input_path)
+        try:
+            return _process_selected_pages_serial(input_path, doc_in, page_indices, total_pages, log)
+        finally:
+            doc_in.close()
 
 
 def _process_pages_parallel(input_path, total_pages, log,

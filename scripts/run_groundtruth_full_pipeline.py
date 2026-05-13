@@ -70,14 +70,14 @@ def process_one(src: Path, summary_path: Path) -> dict:
         "file": src.name,
         "input": str(src),
         "ocr_pdf": str(ocr_path),
-        "ocr_json": str(ocr_path) + ".json",
+        "ocr_json": str(ocr_path) + ".json.zst",
         "docx": str(docx_path),
         "ok": False,
     }
 
     try:
         _log(f"=== START {src.name} ===")
-        for path in (pre_path, ocr_path, Path(str(ocr_path) + ".json"), docx_path):
+        for path in (pre_path, ocr_path, Path(str(ocr_path) + ".json.zst"), docx_path):
             if path.exists():
                 path.unlink()
                 _log(f"  removed old derivative: {path.name}")
@@ -119,7 +119,10 @@ def process_one(src: Path, summary_path: Path) -> dict:
             update_callback=_progress_callback,
             source_document_path=str(src),
             preprocess_rotations=rotations,
+            preprocess_metadata=pre_meta,
             allow_page_parallel=True,
+            canonical_profile="docx_export",
+            include_layout_analysis=True,
         )
         row["ocr_ok"] = bool(ok)
         row["ocr_msg"] = msg
