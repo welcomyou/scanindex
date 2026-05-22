@@ -4,15 +4,17 @@ from __future__ import annotations
 import os
 import json
 import re
+import shutil
+import uuid
 from dataclasses import dataclass
 from typing import Optional
 
-from PySide6.QtCore import QPoint, Qt, QThread, Signal
-from PySide6.QtGui import QColor, QBrush, QPainter, QPolygon
+from PySide6.QtCore import QPoint, QSize, Qt, QThread, Signal
+from PySide6.QtGui import QColor, QBrush, QPainter, QPixmap, QPolygon
 from PySide6.QtWidgets import (
-    QAbstractItemView, QCheckBox, QComboBox, QFileDialog, QFrame, QGridLayout, QHBoxLayout,
+    QAbstractItemView, QButtonGroup, QCheckBox, QComboBox, QFileDialog, QFrame, QGridLayout, QHBoxLayout,
     QHeaderView, QLabel, QLineEdit, QInputDialog, QMessageBox, QPushButton,
-    QAbstractSpinBox, QDoubleSpinBox, QScrollArea, QSizePolicy, QSpinBox, QSplitter, QTableWidget,
+    QAbstractSpinBox, QDoubleSpinBox, QRadioButton, QScrollArea, QSizePolicy, QSpinBox, QSplitter, QTableWidget,
     QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget,
 )
 
@@ -35,6 +37,7 @@ try:
     from scanindex.core.pdf.win_cert_store import free_cert_contexts, list_certificates
     from scanindex.core.pdf.signer import (
         DEFAULT_STAMP_TEMPLATE, DEFAULT_TSA_URL, SIG_BOX_DEFAULT, STAMP_TEMPLATE_FIELDS,
+        STAMP_TEXT_BELOW, STAMP_TEXT_RIGHT,
         compute_stamp_natural_size, render_stamp_template, sign_single_pdf,
     )
     _DEPS_OK = True
@@ -42,8 +45,10 @@ try:
 except Exception as exc:  # pyHanko/Pillow may be missing on dev machines.
     _DEPS_OK = False
     _IMPORT_ERR = str(exc)
-    DEFAULT_STAMP_TEMPLATE = "Xác nhận sao tại kho lưu trữ\n{unit_org}"
+    DEFAULT_STAMP_TEMPLATE = "Xác nhận sao tại kho lưu trữ ... {datetime}"
     DEFAULT_TSA_URL = "http://tsa.ca.gov.vn"
+    STAMP_TEXT_BELOW = "below"
+    STAMP_TEXT_RIGHT = "right"
     STAMP_TEMPLATE_FIELDS = (
         "cn", "org", "ou", "unit_org", "subject", "issuer", "serial",
         "not_after", "ts", "datetime", "date", "time", "reason", "location",
@@ -59,6 +64,7 @@ _DEFAULT_TEMPLATE_NAME = "Mặc định"
 _CONFIG_DIR = os.path.join(get_base_dir(), "config")
 _TEMPLATE_FILE = os.path.join(_CONFIG_DIR, "sign_templates.json")
 _SETTINGS_FILE = os.path.join(_CONFIG_DIR, "sign_settings.json")
+_STAMP_IMAGE_DIR = os.path.join(_CONFIG_DIR, "sign_stamp_images")
 _VISIBLE_TEMPLATE_FIELDS = tuple(
     f for f in STAMP_TEMPLATE_FIELDS if f not in {"reason", "location"}
 )
@@ -153,6 +159,8 @@ class _SignWorker(QThread):
         sig_box: tuple[float, float, float, float],
         custom_page: int,
         stamp_template: str,
+        stamp_image_path: str = "",
+        stamp_text_position: str = STAMP_TEXT_BELOW,
         tsa_url: str = "",
         enable_pdfa: bool = False,
         parent=None,
@@ -164,6 +172,12 @@ class _SignWorker(QThread):
         self._sig_box = sig_box
         self._custom_page = custom_page
         self._stamp_template = stamp_template
+        self._stamp_image_path = str(stamp_image_path or "").strip()
+        self._stamp_text_position = (
+            STAMP_TEXT_RIGHT
+            if str(stamp_text_position or "").strip() == STAMP_TEXT_RIGHT
+            else STAMP_TEXT_BELOW
+        )
         self._tsa_url = str(tsa_url or "").strip()
         self._enable_pdfa = bool(enable_pdfa)
         self._cancelled = False
@@ -212,6 +226,8 @@ class _SignWorker(QThread):
                         location=None,
                         stamp_template=self._stamp_template,
                         tsa_url=self._tsa_url,
+                        stamp_image_path=self._stamp_image_path or None,
+                        stamp_text_position=self._stamp_text_position,
                     )
                     result = {
                         "index": idx,
@@ -264,6 +280,7 @@ class ArchiveStep3Sign(QWidget):
         self._current_template_name = _DEFAULT_TEMPLATE_NAME
         self._worker: Optional[_SignWorker] = None
         self._loading_template = False
+        self._stamp_image_path = ""
 
         self.setStyleSheet(f"background: {COLOR_BG}; color: {COLOR_TEXT};")
         self._setup_ui()
@@ -530,7 +547,66 @@ class ArchiveStep3Sign(QWidget):
         tpl_btns.setColumnStretch(1, 1)
         layout.addLayout(tpl_btns)
 
-        layout.addWidget(self._label("Nội dung hiển thị:"))
+        stamp_header = QHBoxLayout()
+        stamp_header.setSpacing(6)
+        stamp_header.addWidget(self._label("Hình dấu:"))
+        self._btn_stamp_image_choose = self._button("Chọn ảnh", "ghost")
+        self._btn_stamp_image_choose.clicked.connect(self._choose_stamp_image)
+        self._style_stamp_choose_button(self._btn_stamp_image_choose)
+        stamp_header.addWidget(self._btn_stamp_image_choose)
+        stamp_header.addStretch()
+        layout.addLayout(stamp_header)
+
+        stamp_row = QHBoxLayout()
+        stamp_row.setSpacing(6)
+        self.lbl_stamp_image_preview = QLabel("Không có")
+        self.lbl_stamp_image_preview.setFixedSize(QSize(96, 52))
+        self.lbl_stamp_image_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_stamp_image_preview.setStyleSheet(
+            f"background: {COLOR_INPUT}; color: {COLOR_TEXT_MUTED}; "
+            f"border: 1px solid {COLOR_BORDER_DEFAULT}; border-radius: {_RAD}px; "
+            f"font-size: 10px;"
+        )
+        stamp_row.addWidget(self.lbl_stamp_image_preview)
+        self._btn_stamp_image_clear = QPushButton("×")
+        self._btn_stamp_image_clear.setFixedSize(24, 24)
+        self._btn_stamp_image_clear.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_stamp_image_clear.setToolTip("Xóa hình dấu")
+        self._btn_stamp_image_clear.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent; border: none; border-radius: 12px;
+                color: {COLOR_RED}; font-size: 18px; font-weight: 700;
+                font-family: {FONT_UI};
+            }}
+            QPushButton:hover {{
+                background: {COLOR_RED}; color: #fff;
+            }}
+            QPushButton:disabled {{
+                color: {COLOR_TEXT_MUTED}; background: transparent;
+            }}
+        """)
+        self._btn_stamp_image_clear.clicked.connect(self._clear_stamp_image)
+        stamp_row.addWidget(self._btn_stamp_image_clear, alignment=Qt.AlignmentFlag.AlignTop)
+        stamp_row.addStretch()
+        layout.addLayout(stamp_row)
+
+        content_row = QHBoxLayout()
+        content_row.setSpacing(8)
+        content_row.addWidget(self._label("Nội dung hiển thị:"))
+        content_row.addStretch()
+        self._stamp_text_group = QButtonGroup(self)
+        self._stamp_text_group.setExclusive(True)
+        self.radio_text_below = QRadioButton("Dưới dấu")
+        self.radio_text_right = QRadioButton("Bên phải dấu")
+        for radio in (self.radio_text_below, self.radio_text_right):
+            self._style_stamp_radio(radio)
+            self._stamp_text_group.addButton(radio)
+            content_row.addWidget(radio)
+        self.radio_text_below.setChecked(True)
+        self.radio_text_below.toggled.connect(lambda *_: self._save_settings())
+        self.radio_text_right.toggled.connect(lambda *_: self._save_settings())
+        layout.addLayout(content_row)
+
         self.text_template = QTextEdit()
         self.text_template.setFixedHeight(76)
         self.text_template.setAcceptRichText(False)
@@ -659,6 +735,49 @@ class ArchiveStep3Sign(QWidget):
         lbl.setStyleSheet(f"color: {COLOR_TEXT_SECONDARY}; font-size: {_FONT_SM}px;")
         return lbl
 
+    def _style_stamp_choose_button(self, button: QPushButton):
+        button.setStyleSheet(f"""
+            QPushButton {{
+                background: {COLOR_BG}; border: 1px solid {COLOR_BORDER_DEFAULT};
+                border-radius: {_RAD}px; color: {COLOR_TEXT}; font-size: {_FONT_SM}px;
+                font-family: {FONT_UI}; padding: 0 10px;
+            }}
+            QPushButton:hover {{
+                background: {COLOR_ELEVATED}; border-color: {COLOR_ACCENT};
+            }}
+            QPushButton:disabled {{
+                color: {COLOR_TEXT_MUTED}; background: {COLOR_BG};
+                border-color: {COLOR_BORDER};
+            }}
+        """)
+
+    def _style_stamp_radio(self, radio: QRadioButton):
+        radio.setStyleSheet(f"""
+            QRadioButton {{
+                background: {COLOR_BG}; color: {COLOR_TEXT}; font-size: {_FONT_SM}px;
+                font-family: {FONT_UI}; padding: 4px 8px; border-radius: {_RAD}px;
+            }}
+            QRadioButton:checked {{
+                background: {COLOR_BG}; color: {COLOR_TEXT};
+            }}
+            QRadioButton::indicator {{
+                width: 14px; height: 14px; border-radius: 7px;
+                border: 1px solid {COLOR_TEXT_SECONDARY}; background: transparent;
+            }}
+            QRadioButton::indicator:checked {{
+                border: 1px solid #fff; background: #fff;
+            }}
+            QRadioButton::indicator:unchecked {{
+                background: transparent;
+            }}
+            QRadioButton:disabled {{
+                color: {COLOR_TEXT_MUTED};
+            }}
+            QRadioButton::indicator:disabled {{
+                border-color: {COLOR_TEXT_MUTED}; background: transparent;
+            }}
+        """)
+
     def _form_label(self, text: str) -> QLabel:
         lbl = self._label(text)
         lbl.setFixedWidth(54)
@@ -724,6 +843,121 @@ class ArchiveStep3Sign(QWidget):
 
     # ------------------------------------------------------------- templates
 
+    def _stamp_image_dir(self) -> str:
+        return os.path.abspath(_STAMP_IMAGE_DIR)
+
+    def _resolve_stamp_image_path(self, value: str) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        path = text if os.path.isabs(text) else os.path.join(get_base_dir(), text)
+        return os.path.abspath(os.path.normpath(path))
+
+    def _stored_stamp_image_value(self, path: str) -> str:
+        if not path:
+            return ""
+        abs_path = os.path.abspath(os.path.normpath(path))
+        base = os.path.abspath(get_base_dir())
+        try:
+            if os.path.commonpath([base, abs_path]) == base:
+                return os.path.relpath(abs_path, base).replace("\\", "/")
+        except Exception:
+            pass
+        return abs_path
+
+    def _copy_stamp_image_to_store(self, source_path: str) -> str:
+        source_path = os.path.abspath(os.path.normpath(source_path))
+        pix = QPixmap(source_path)
+        if pix.isNull():
+            raise RuntimeError("File ảnh không hợp lệ.")
+        store_dir = self._stamp_image_dir()
+        os.makedirs(store_dir, exist_ok=True)
+        try:
+            if os.path.commonpath([store_dir, source_path]) == store_dir:
+                return source_path
+        except ValueError:
+            pass
+        ext = os.path.splitext(source_path)[1].lower()
+        if ext not in {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}:
+            ext = ".png"
+        dst = os.path.join(store_dir, f"{uuid.uuid4().hex}{ext}")
+        if ext == os.path.splitext(source_path)[1].lower():
+            shutil.copy2(source_path, dst)
+        elif not pix.save(dst, "PNG"):
+            raise RuntimeError("Không lưu được hình dấu.")
+        return os.path.abspath(dst)
+
+    def _current_stamp_image_path(self) -> str:
+        return str(getattr(self, "_stamp_image_path", "") or "").strip()
+
+    def _current_stamp_text_position(self) -> str:
+        if hasattr(self, "radio_text_right") and self.radio_text_right.isChecked():
+            return STAMP_TEXT_RIGHT
+        return STAMP_TEXT_BELOW
+
+    def _set_stamp_text_position(self, value: str) -> None:
+        position = STAMP_TEXT_RIGHT if str(value or "").strip() == STAMP_TEXT_RIGHT else STAMP_TEXT_BELOW
+        if hasattr(self, "radio_text_right") and hasattr(self, "radio_text_below"):
+            self.radio_text_right.blockSignals(True)
+            self.radio_text_below.blockSignals(True)
+            self.radio_text_right.setChecked(position == STAMP_TEXT_RIGHT)
+            self.radio_text_below.setChecked(position != STAMP_TEXT_RIGHT)
+            self.radio_text_right.blockSignals(False)
+            self.radio_text_below.blockSignals(False)
+
+    def _set_stamp_image_path(self, path: str) -> None:
+        self._stamp_image_path = self._resolve_stamp_image_path(path) if path else ""
+        self._update_stamp_image_preview()
+
+    def _update_stamp_image_preview(self) -> None:
+        if not hasattr(self, "lbl_stamp_image_preview"):
+            return
+        path = self._current_stamp_image_path()
+        pix = QPixmap(path) if path and os.path.exists(path) else QPixmap()
+        if pix.isNull():
+            self.lbl_stamp_image_preview.setPixmap(QPixmap())
+            self.lbl_stamp_image_preview.setText("Mất ảnh" if path else "Không có")
+            self.lbl_stamp_image_preview.setToolTip(path)
+            if hasattr(self, "_btn_stamp_image_clear"):
+                self._btn_stamp_image_clear.setEnabled(bool(path))
+            return
+        self.lbl_stamp_image_preview.setText("")
+        self.lbl_stamp_image_preview.setToolTip(path)
+        preview_size = QSize(
+            max(1, self.lbl_stamp_image_preview.width() - 8),
+            max(1, self.lbl_stamp_image_preview.height() - 8),
+        )
+        self.lbl_stamp_image_preview.setPixmap(
+            pix.scaled(
+                preview_size,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
+        if hasattr(self, "_btn_stamp_image_clear"):
+            self._btn_stamp_image_clear.setEnabled(True)
+
+    def _choose_stamp_image(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Chọn hình dấu",
+            "",
+            "Ảnh (*.png *.jpg *.jpeg *.bmp *.webp *.tif *.tiff)",
+        )
+        if not path:
+            return
+        try:
+            stored = self._copy_stamp_image_to_store(path)
+        except Exception as exc:
+            QMessageBox.warning(self, "Hình dấu", str(exc))
+            return
+        self._set_stamp_image_path(stored)
+        self._save_settings()
+
+    def _clear_stamp_image(self):
+        self._set_stamp_image_path("")
+        self._save_settings()
+
     def _template_path(self) -> str:
         return os.path.abspath(_TEMPLATE_FILE)
 
@@ -761,10 +995,25 @@ class ArchiveStep3Sign(QWidget):
         if isinstance(value, dict):
             text = str(value.get("text") or value.get("template") or "").strip()
             position = self._coerce_position(value.get("position") or value)
+            image_path = self._resolve_stamp_image_path(
+                value.get("stamp_image_path") or value.get("image_path") or ""
+            )
+            stamp_text_position = (
+                STAMP_TEXT_RIGHT
+                if str(value.get("stamp_text_position") or "").strip() == STAMP_TEXT_RIGHT
+                else STAMP_TEXT_BELOW
+            )
         else:
             text = str(value or "").strip()
             position = self._default_position()
-        return {"text": text, "position": position}
+            image_path = ""
+            stamp_text_position = STAMP_TEXT_BELOW
+        return {
+            "text": text,
+            "position": position,
+            "stamp_image_path": image_path,
+            "stamp_text_position": stamp_text_position,
+        }
 
     def _template_text(self, name: str) -> str:
         profile = self._templates.get(name) or {}
@@ -786,6 +1035,8 @@ class ArchiveStep3Sign(QWidget):
         self._templates[name] = {
             "text": text,
             "position": self._current_position(),
+            "stamp_image_path": self._current_stamp_image_path(),
+            "stamp_text_position": self._current_stamp_text_position(),
         }
 
     def _apply_template_profile(self, name: str) -> None:
@@ -794,6 +1045,8 @@ class ArchiveStep3Sign(QWidget):
             return
         self.text_template.setPlainText(str(profile.get("text") or ""))
         self._apply_position(profile.get("position") or self._default_position())
+        self._set_stamp_image_path(str(profile.get("stamp_image_path") or ""))
+        self._set_stamp_text_position(str(profile.get("stamp_text_position") or STAMP_TEXT_BELOW))
         self._current_template_name = name
 
     def _load_templates(self):
@@ -801,6 +1054,8 @@ class ArchiveStep3Sign(QWidget):
             _DEFAULT_TEMPLATE_NAME: {
                 "text": DEFAULT_STAMP_TEMPLATE,
                 "position": self._default_position(),
+                "stamp_image_path": "",
+                "stamp_text_position": STAMP_TEXT_BELOW,
             }
         }
         path = self._template_path()
@@ -839,7 +1094,17 @@ class ArchiveStep3Sign(QWidget):
             data[name] = {
                 "text": text,
                 "position": self._coerce_position((profile or {}).get("position")),
+                "stamp_text_position": (
+                    STAMP_TEXT_RIGHT
+                    if str((profile or {}).get("stamp_text_position") or "").strip() == STAMP_TEXT_RIGHT
+                    else STAMP_TEXT_BELOW
+                ),
             }
+            image_path = self._resolve_stamp_image_path(
+                str((profile or {}).get("stamp_image_path") or "")
+            )
+            if image_path:
+                data[name]["stamp_image_path"] = self._stored_stamp_image_value(image_path)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
 
@@ -933,7 +1198,12 @@ class ArchiveStep3Sign(QWidget):
             )
             if confirm != QMessageBox.StandardButton.Yes:
                 return
-        self._templates[name] = {"text": text, "position": self._current_position()}
+        self._templates[name] = {
+            "text": text,
+            "position": self._current_position(),
+            "stamp_image_path": self._current_stamp_image_path(),
+            "stamp_text_position": self._current_stamp_text_position(),
+        }
         self._save_templates()
         self._reload_template_combo(name)
 
@@ -943,7 +1213,12 @@ class ArchiveStep3Sign(QWidget):
         if not text:
             QMessageBox.warning(self, "Mẫu chữ ký", "Nội dung mẫu không được để trống.")
             return
-        self._templates[name] = {"text": text, "position": self._current_position()}
+        self._templates[name] = {
+            "text": text,
+            "position": self._current_position(),
+            "stamp_image_path": self._current_stamp_image_path(),
+            "stamp_text_position": self._current_stamp_text_position(),
+        }
         self._current_template_name = name
         self._save_templates()
         self.lbl_status.setText(f"Đã lưu mẫu '{name}'.")
@@ -1174,9 +1449,8 @@ class ArchiveStep3Sign(QWidget):
             c = self._certs[idx]
             self.lbl_cert_detail.setText(
                 f"CN:     {c.get('cn', '')}\n"
-                f"Org:    {c.get('org', '')}\n"
                 f"OU:     {c.get('ou', '')}\n"
-                f"Issuer: {str(c.get('issuer', ''))[:70]}"
+                f"ORG:    {c.get('org', '')}"
             )
         else:
             self.lbl_cert_detail.setText("")
@@ -1242,6 +1516,8 @@ class ArchiveStep3Sign(QWidget):
                 stamp_template=self.text_template.toPlainText().strip(),
                 reason=None,
                 location=None,
+                stamp_image_path=self._current_stamp_image_path() or None,
+                stamp_text_position=self._current_stamp_text_position(),
             )
             self.spin_w.setValue(float(w))
             min_h = self._minimum_visible_stamp_height(
@@ -1264,6 +1540,8 @@ class ArchiveStep3Sign(QWidget):
                 stamp_template=stamp_template,
                 reason=None,
                 location=None,
+                stamp_image_path=self._current_stamp_image_path() or None,
+                stamp_text_position=self._current_stamp_text_position(),
             )
             return float(height)
         except Exception:
@@ -1289,10 +1567,15 @@ class ArchiveStep3Sign(QWidget):
         out_dir = self._signed_dir()
         os.makedirs(out_dir, exist_ok=True)
         stamp_template = self.text_template.toPlainText().strip()
+        stamp_image_path = self._current_stamp_image_path()
+        stamp_text_position = self._current_stamp_text_position()
         use_tsa = bool(self.chk_tsa.isChecked()) if hasattr(self, "chk_tsa") else True
         tsa_url = self.edit_tsa_url.text().strip() if use_tsa and hasattr(self, "edit_tsa_url") else ""
         if not stamp_template:
             QMessageBox.warning(self, "Mẫu chữ ký", "Mẫu hiển thị không được để trống.")
+            return
+        if stamp_image_path and not os.path.exists(stamp_image_path):
+            QMessageBox.warning(self, "Hình dấu", f"Không tìm thấy hình dấu:\n{stamp_image_path}")
             return
         if use_tsa and not tsa_url:
             QMessageBox.warning(self, "Máy chủ TSA", "Nhập địa chỉ máy chủ TSA hoặc tắt chức năng cấp dấu thời gian.")
@@ -1344,6 +1627,8 @@ class ArchiveStep3Sign(QWidget):
             sig_box=sig_box,
             custom_page=max(0, self.spin_page.value() - 1),
             stamp_template=stamp_template,
+            stamp_image_path=stamp_image_path,
+            stamp_text_position=stamp_text_position,
             tsa_url=tsa_url,
             enable_pdfa=bool(self.chk_pdfa.isChecked()) if hasattr(self, "chk_pdfa") else False,
             parent=self,
@@ -1406,10 +1691,14 @@ class ArchiveStep3Sign(QWidget):
             self._btn_clear, self.combo_cert, self.combo_template,
             self._btn_template_save, self._btn_template_new,
             self._btn_template_delete, self._btn_template_default,
+            self._btn_stamp_image_choose, self._btn_stamp_image_clear,
+            self.radio_text_below, self.radio_text_right,
             self.spin_page, self.spin_x, self.spin_y, self.spin_w, self.spin_h,
             self.text_template, self.chk_tsa, self.edit_tsa_url,
         ]:
             widget.setEnabled(enabled)
+        if enabled:
+            self._update_stamp_image_preview()
         self._sync_tsa_enabled(enabled)
 
     # ------------------------------------------------------------- lifecycle

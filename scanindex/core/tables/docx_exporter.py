@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import List, Tuple, Optional, Dict, Set
 from docx import Document
 from docx.shared import Pt, Inches, Twips, Cm, Mm
-from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_PARAGRAPH_ALIGNMENT, WD_TAB_ALIGNMENT
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_PARAGRAPH_ALIGNMENT, WD_TAB_ALIGNMENT, WD_LINE_SPACING
 from docx.enum.table import WD_TABLE_ALIGNMENT, WD_CELL_VERTICAL_ALIGNMENT
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
@@ -509,13 +509,6 @@ def _looks_like_person_name(text: str) -> bool:
 
 def _is_signature_footer_line(text: str) -> bool:
     return _looks_like_header_emphasis_line(text) or _looks_like_person_name(text)
-
-
-def _looks_like_qr_access_artifact(text: str) -> bool:
-    normalized = _unaccent_upper(_clean_extracted_text(text))
-    if "QR" not in normalized:
-        return False
-    return any(token in normalized for token in ("MA QR", "TRUY CAP", "DUONG LINK", "LINK", "THONG KE"))
 
 
 def _line_overlaps_layout_type(line: TextLine,
@@ -1654,12 +1647,12 @@ def detect_dual_column_footers(lines: List[TextLine], page_info: dict, logger: L
             [l for l in candidates if l.x + l.width / 2 >= page_center],
             key=lambda l: (l.y, l.x)
         )
-        right = [l for l in right if _is_signature_footer_line(l.text)]
-        if not left or not right:
+        signature_lines = [l for l in right if _is_signature_footer_line(l.text)]
+        if not left or not signature_lines:
             continue
 
-        has_signature_title = any(_looks_like_header_emphasis_line(l.text) for l in right)
-        has_signature_name = any(_looks_like_person_name(l.text) for l in right)
+        has_signature_title = any(_looks_like_header_emphasis_line(l.text) for l in signature_lines)
+        has_signature_name = any(_looks_like_person_name(l.text) for l in signature_lines)
         if not has_signature_title or not has_signature_name:
             continue
 
@@ -1705,6 +1698,82 @@ def _borderless_table_xml(table) -> None:
             tcPr.append(tc_borders)
 
 
+def _local_name(element) -> str:
+    return str(element.tag).rsplit("}", 1)[-1]
+
+
+def _top_bottom_picture_from_inline(inline_shape, *, align: str = "center") -> None:
+    """
+    Convert python-docx's default inline picture into a floating DrawingML
+    anchor with Word's "Top and Bottom" text wrapping.
+    """
+    inline = getattr(inline_shape, "_inline", None)
+    if inline is None:
+        return
+    parent = inline.getparent()
+    if parent is None:
+        return
+
+    children = {_local_name(child): child for child in list(inline)}
+    extent = children.get("extent")
+    doc_pr = children.get("docPr")
+    graphic = children.get("graphic")
+    if extent is None or doc_pr is None or graphic is None:
+        return
+
+    anchor = OxmlElement("wp:anchor")
+    anchor.set("distT", "0")
+    anchor.set("distB", "0")
+    anchor.set("distL", "0")
+    anchor.set("distR", "0")
+    anchor.set("simplePos", "0")
+    anchor.set("relativeHeight", "251658240")
+    anchor.set("behindDoc", "0")
+    anchor.set("locked", "0")
+    anchor.set("layoutInCell", "1")
+    anchor.set("allowOverlap", "0")
+
+    simple_pos = OxmlElement("wp:simplePos")
+    simple_pos.set("x", "0")
+    simple_pos.set("y", "0")
+    anchor.append(simple_pos)
+
+    position_h = OxmlElement("wp:positionH")
+    position_h.set("relativeFrom", "column")
+    align_el = OxmlElement("wp:align")
+    align_el.text = align if align in {"left", "center", "right"} else "center"
+    position_h.append(align_el)
+    anchor.append(position_h)
+
+    position_v = OxmlElement("wp:positionV")
+    position_v.set("relativeFrom", "paragraph")
+    pos_offset = OxmlElement("wp:posOffset")
+    pos_offset.text = "0"
+    position_v.append(pos_offset)
+    anchor.append(position_v)
+
+    # Move DrawingML children from wp:inline to wp:anchor in schema order.
+    anchor.append(extent)
+    effect_extent = children.get("effectExtent")
+    if effect_extent is None:
+        effect_extent = OxmlElement("wp:effectExtent")
+        effect_extent.set("l", "0")
+        effect_extent.set("t", "0")
+        effect_extent.set("r", "0")
+        effect_extent.set("b", "0")
+    anchor.append(effect_extent)
+
+    anchor.append(OxmlElement("wp:wrapTopAndBottom"))
+
+    anchor.append(doc_pr)
+    c_nv = children.get("cNvGraphicFramePr")
+    if c_nv is not None:
+        anchor.append(c_nv)
+    anchor.append(graphic)
+
+    parent.replace(inline, anchor)
+
+
 def add_dual_header_table(doc: Document, left_lines: List[TextLine], right_lines: List[TextLine],
                           page_width_pt: float, logger: Logger):
     """Render dual-column header as a borderless 1x2 table."""
@@ -1720,6 +1789,8 @@ def add_dual_header_table(doc: Document, left_lines: List[TextLine], right_lines
     left_w = max((float(l.width) for l in left_lines), default=content_width / 2.0)
     right_w = max((float(l.width) for l in right_lines), default=content_width / 2.0)
     total = left_w + right_w
+    left_pt = content_width / 2.0
+    right_pt = content_width - left_pt
     if total > 0:
         left_pt = content_width * left_w / total
         right_pt = content_width - left_pt
@@ -1745,10 +1816,12 @@ def add_dual_header_table(doc: Document, left_lines: List[TextLine], right_lines
     cell_l.text = ""
     for i, line in enumerate(left_lines):
         para = cell_l.paragraphs[0] if i == 0 else cell_l.add_paragraph()
-        para.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+        para.alignment = WD_PARAGRAPH_ALIGNMENT.LEFT
+        para.paragraph_format.left_indent = Pt(0)
+        para.paragraph_format.first_line_indent = Pt(0)
         run = para.add_run(line.text)
         run.font.name = "Times New Roman"
-        run.font.size = Pt(14)
+        run.font.size = Pt(12.5)
         if _looks_like_header_emphasis_line(line.text):
             run.font.bold = True
 
@@ -2857,12 +2930,64 @@ def _multi_column_candidate(line: TextLine, page_w: float, page_h: float) -> boo
 
 
 def _build_multi_column_profile(candidates: List[TextLine], page_w: float, page_h: float, column_count: int) -> Optional[dict]:
+    def merged_y_intervals(cluster: List[TextLine]) -> List[Tuple[float, float]]:
+        intervals = sorted(
+            (float(line.y), float(line.y + line.height))
+            for line in cluster
+            if float(line.height or 0.0) > 0.0
+        )
+        merged: List[Tuple[float, float]] = []
+        merge_gap = max(8.0, page_h * 0.012)
+        for y0, y1 in intervals:
+            if not merged or y0 > merged[-1][1] + merge_gap:
+                merged.append((y0, y1))
+            else:
+                prev_y0, prev_y1 = merged[-1]
+                merged[-1] = (prev_y0, max(prev_y1, y1))
+        return merged
+
+    def interval_height(intervals: List[Tuple[float, float]]) -> float:
+        return sum(max(0.0, y1 - y0) for y0, y1 in intervals)
+
+    def overlap_height(a: List[Tuple[float, float]], b: List[Tuple[float, float]]) -> float:
+        overlap = 0.0
+        for a0, a1 in a:
+            for b0, b1 in b:
+                overlap += max(0.0, min(a1, b1) - max(a0, b0))
+        return overlap
+
+    def has_parallel_column_coverage(clusters: List[List[TextLine]]) -> bool:
+        """Reject form fragments such as left notes plus right signatures.
+
+        True multi-column pages have adjacent columns that are populated over
+        the same vertical band. Forms often contain left/right islands, but
+        they do not run in parallel long enough to justify column-major order.
+        """
+        if len(clusters) < 2:
+            return False
+        unions = [merged_y_intervals(cluster) for cluster in clusters]
+        if any(not union for union in unions):
+            return False
+        top = min(union[0][0] for union in unions)
+        bottom = max(union[-1][1] for union in unions)
+        span = max(1.0, bottom - top)
+        min_parallel_height = max(72.0, min(page_h * 0.18, span * 0.30))
+        if min(interval_height(union) for union in unions) < min_parallel_height:
+            return False
+        adjacent_overlap = min(
+            overlap_height(unions[idx], unions[idx + 1])
+            for idx in range(len(unions) - 1)
+        )
+        return adjacent_overlap >= min_parallel_height and adjacent_overlap / span >= 0.25
+
     min_total = 18 if column_count == 3 else 12
     if len(candidates) < min_total:
         return None
 
     clusters = _cluster_objects_by_x(candidates, column_count, lambda line: line.x)
     if len(clusters) != column_count:
+        return None
+    if not has_parallel_column_coverage(clusters):
         return None
 
     min_cluster = max(4 if column_count == 3 else 5, int(len(candidates) * (0.12 if column_count == 3 else 0.16)))
@@ -3310,8 +3435,19 @@ def split_digital_dual_header_spans(lines: List[TextLine], page_info: dict, logg
         right_start = min(float(span.x) for span in right_spans)
         left_text = _clean_extracted_text("".join(span.text for span in left_spans))
         right_text = _clean_extracted_text("".join(span.text for span in right_spans))
+
+        # Split only when there is a real visual gutter between the two span
+        # groups. A centered title can cross the page center and still have
+        # all-caps text on both sides; splitting it would invent a two-column
+        # administrative header. Independent header blocks have a wide blank
+        # gutter, while one title line only has normal word spacing.
+        gap = right_start - left_end
+        if gap < max(24.0, page_w * 0.075):
+            result.append(line)
+            continue
+
         header_pair = _looks_like_header_emphasis_line(left_text) and _looks_like_header_emphasis_line(right_text)
-        if right_start - left_end < max(18.0, page_w * 0.045) and not header_pair:
+        if not header_pair:
             result.append(line)
             continue
 
@@ -3489,6 +3625,53 @@ def _layout_center_inside(bbox: Tuple[float, float, float, float],
 
 
 def _layout_multi_column_profile_from_items(items: List[dict], page_w: float, page_h: float) -> Optional[dict]:
+    def merged_y_intervals(cluster: List[dict]) -> List[Tuple[float, float]]:
+        intervals = sorted((float(item["y0"]), float(item["y1"])) for item in cluster)
+        merged: List[Tuple[float, float]] = []
+        merge_gap = max(8.0, page_h * 0.012)
+        for y0, y1 in intervals:
+            if not merged or y0 > merged[-1][1] + merge_gap:
+                merged.append((y0, y1))
+            else:
+                prev_y0, prev_y1 = merged[-1]
+                merged[-1] = (prev_y0, max(prev_y1, y1))
+        return merged
+
+    def interval_height(intervals: List[Tuple[float, float]]) -> float:
+        return sum(max(0.0, y1 - y0) for y0, y1 in intervals)
+
+    def overlap_height(a: List[Tuple[float, float]], b: List[Tuple[float, float]]) -> float:
+        overlap = 0.0
+        for a0, a1 in a:
+            for b0, b1 in b:
+                overlap += max(0.0, min(a1, b1) - max(a0, b0))
+        return overlap
+
+    def has_parallel_column_coverage(clusters: List[List[dict]]) -> bool:
+        """Reject local two-sided blocks such as letterhead/signature columns.
+
+        A real multi-column page has columns that run in parallel over a
+        meaningful vertical band. Header/footer pairs are also left/right
+        clusters, but their vertical co-coverage is short and discontinuous, so
+        they must not make the whole page column-major.
+        """
+        if len(clusters) < 2:
+            return False
+        unions = [merged_y_intervals(cluster) for cluster in clusters]
+        if any(not union for union in unions):
+            return False
+        top = min(union[0][0] for union in unions)
+        bottom = max(union[-1][1] for union in unions)
+        span = max(1.0, bottom - top)
+        min_parallel_height = max(72.0, min(page_h * 0.18, span * 0.30))
+        if min(interval_height(union) for union in unions) < min_parallel_height:
+            return False
+        adjacent_overlap = min(
+            overlap_height(unions[idx], unions[idx + 1])
+            for idx in range(len(unions) - 1)
+        )
+        return adjacent_overlap >= min_parallel_height and adjacent_overlap / span >= 0.25
+
     candidates = [
         item for item in items
         if item["kind"] not in {"page header", "page footer"}
@@ -3507,6 +3690,8 @@ def _layout_multi_column_profile_from_items(items: List[dict], page_w: float, pa
         if len(clusters) != column_count:
             continue
         if min(len(cluster) for cluster in clusters) < 2:
+            continue
+        if not has_parallel_column_coverage(clusters):
             continue
         starts = [_median([item["x0"] for item in cluster], 0.0) for cluster in clusters]
         gaps = [starts[idx + 1] - starts[idx] for idx in range(column_count - 1)]
@@ -4000,7 +4185,7 @@ def _continued_table_flow_enabled() -> bool:
 
 def _table_options_hash(layout_regions_by_page: Dict[int, List[dict]]) -> str:
     payload = {
-        "cache_schema": "docx_table_cache_v7",
+        "cache_schema": "docx_table_cache_v10",
         "continued_table_flow": _continued_table_flow_enabled(),
         "layout_region_pages": sorted(int(page) for page in (layout_regions_by_page or {}).keys()),
         "engines": ["doclayout", "gmft_onnx", "docling_tableformer"],
@@ -4630,6 +4815,77 @@ def _best_cell_for_text_bbox(
     return best_key
 
 
+def _line_words_are_vertically_coherent(words: List[dict]) -> bool:
+    boxes = [_word_bbox_for_assignment(word) for word in words]
+    if len(boxes) < 2:
+        return True
+    centers = [(box[1] + box[3]) / 2.0 for box in boxes]
+    heights = [max(box[3] - box[1], 1.0) for box in boxes]
+    median_h = _median(heights, 1.0)
+    return max(centers) - min(centers) <= max(8.0, median_h * 0.85)
+
+
+def _word_assignment_width(words: List[dict]) -> float:
+    if not words:
+        return 0.0
+    boxes = [_word_bbox_for_assignment(word) for word in words]
+    return sum(max(0.0, box[2] - box[0]) for box in boxes)
+
+
+def _same_column_adjacent_row_consensus_key(
+    line: TextLine,
+    word_keys: List[Tuple[dict, Tuple[int, int, int]]],
+    table_regions: List[TableRegion],
+    table_bboxes: Dict[int, Tuple[float, float, float, float]],
+) -> Optional[Tuple[int, int, int]]:
+    """
+    If one OCR line is split across adjacent rows of the same table column,
+    trust the line-level/baseline consensus over a single word box near a grid
+    boundary. This fixes descender/baseline jitter without phrase-specific
+    rules and deliberately does not merge across columns.
+    """
+    if len(word_keys) < 2:
+        return None
+    keys = {key for _word, key in word_keys}
+    if len(keys) < 2:
+        return None
+    table_ids = {key[0] for key in keys}
+    cols = {key[2] for key in keys}
+    rows = sorted({key[1] for key in keys})
+    if len(table_ids) != 1 or len(cols) != 1:
+        return None
+    if rows[-1] - rows[0] != 1:
+        return None
+    if not _line_words_are_vertically_coherent([word for word, _key in word_keys]):
+        return None
+
+    groups: Dict[Tuple[int, int, int], List[dict]] = {}
+    for word, key in word_keys:
+        groups.setdefault(key, []).append(word)
+
+    dominant = max(groups, key=lambda key: (len(groups[key]), _word_assignment_width(groups[key])))
+    line_key = _best_cell_for_text_bbox(
+        _line_bbox_for_assignment(line),
+        line.page,
+        table_regions,
+        table_bboxes,
+    )
+    if line_key in groups and len(groups[line_key]) == len(groups[dominant]):
+        target = line_key
+    else:
+        target = dominant
+
+    target_count = len(groups.get(target, []))
+    total_count = len(word_keys)
+    target_width = _word_assignment_width(groups.get(target, []))
+    total_width = sum(_word_assignment_width(group) for group in groups.values())
+    if target_count < 2:
+        return None
+    if target_count / max(total_count, 1) < 0.60 and target_width / max(total_width, 1.0) < 0.65:
+        return None
+    return target
+
+
 def _word_bbox_for_assignment(word: dict) -> Tuple[float, float, float, float]:
     x = float(word.get("x", 0.0) or 0.0)
     y = float(word.get("y", 0.0) or 0.0)
@@ -4898,6 +5154,7 @@ def assign_ocr_lines_to_table_cells_by_geometry(
     cell_lines: Dict[Tuple[int, int, int], List[TextLine]] = {}
     assigned_source_ids = set()
     residual_fragment_count = 0
+    line_consensus_count = 0
 
     def add_to_cell(key: Tuple[int, int, int], line: TextLine):
         t_idx, r, c = key
@@ -4909,13 +5166,28 @@ def assign_ocr_lines_to_table_cells_by_geometry(
     for line in candidates:
         words = [word for word in getattr(line, "word_items", []) or [] if _clean_extracted_text(str(word.get("text") or ""))]
         if words:
+            word_keys: List[Tuple[dict, Tuple[int, int, int]]] = []
             grouped_words: Dict[Tuple[int, int, int], List[dict]] = {}
             assigned_word_ids: Set[int] = set()
             for word in words:
                 key = _best_cell_for_text_bbox(_word_bbox_for_assignment(word), line.page, table_regions, table_bboxes)
                 if key is not None:
-                    grouped_words.setdefault(key, []).append(word)
+                    word_keys.append((word, key))
                     assigned_word_ids.add(id(word))
+            consensus_key = _same_column_adjacent_row_consensus_key(
+                line,
+                word_keys,
+                table_regions,
+                table_bboxes,
+            )
+            if consensus_key is not None:
+                original_keys = {key for _word, key in word_keys}
+                if len(original_keys) > 1:
+                    line_consensus_count += 1
+                grouped_words[consensus_key] = [word for word, _key in word_keys]
+            else:
+                for word, key in word_keys:
+                    grouped_words.setdefault(key, []).append(word)
             if grouped_words:
                 assigned_source_ids.add(id(line))
                 all_words_assigned = len(assigned_word_ids) == len(words)
@@ -4978,6 +5250,8 @@ def assign_ocr_lines_to_table_cells_by_geometry(
         logger.log(f"Assigned {len(assigned_source_ids)} OCR table lines by geometry cell mapping")
     if residual_fragment_count:
         logger.log(f"Preserved {residual_fragment_count} non-table fragment(s) from OCR lines crossing table boundaries")
+    if line_consensus_count:
+        logger.log(f"Applied line-consensus table assignment to {line_consensus_count} boundary line(s)")
     return assigned_source_ids
 
 
@@ -5520,6 +5794,87 @@ def _normalize_grouped_header_rows(table: TableRegion) -> bool:
     return True
 
 
+def _repair_adjacent_top_header_fragments(
+    rows: List[List[str]],
+    cols: int,
+    numeric_idx: int,
+    spans: Dict[int, object],
+) -> bool:
+    """
+    Join short adjacent top-header fragments into one group header span.
+
+    The signal is structural rather than lexical: two or more short fragments
+    sit above populated subheader cells, with a numeric column-index row below.
+    This handles OCR/TSR splits such as a group title broken over neighboring
+    cells without inventing any text.
+    """
+    if numeric_idx < 2 or cols < 4:
+        return False
+    top = rows[0]
+    lower = rows[1]
+    numeric = rows[numeric_idx]
+    start_min = 2 if cols >= 5 else 1
+    changed = False
+    c = start_min
+    while c < cols - 1:
+        first = _clean_extracted_text(str(top[c]))
+        if not first:
+            c += 1
+            continue
+        run = [c]
+        nxt = c + 1
+        while nxt < cols:
+            text = _clean_extracted_text(str(top[nxt]))
+            if not text:
+                break
+            run.append(nxt)
+            nxt += 1
+        if len(run) < 2:
+            c += 1
+            continue
+
+        fragments = [_clean_extracted_text(str(top[idx])) for idx in run]
+        if any(len(text) > 36 for text in fragments):
+            c = run[-1] + 1
+            continue
+        if sum(len(text.split()) for text in fragments) > 7:
+            c = run[-1] + 1
+            continue
+
+        lower_filled = [
+            idx for idx in run
+            if idx < len(lower) and _clean_extracted_text(str(lower[idx]))
+        ]
+        numeric_labels = [
+            idx for idx in run
+            if idx < len(numeric) and re.fullmatch(r"\d{1,3}", _clean_extracted_text(str(numeric[idx])) or "")
+        ]
+        if len(lower_filled) < len(run) or len(numeric_labels) < len(run):
+            c = run[-1] + 1
+            continue
+
+        continuation_case = any(
+            (_first_alpha_char(text).islower() if _first_alpha_char(text) else False)
+            for text in fragments[1:]
+        )
+        short_leader = len(fragments[0]) <= 10 and len(fragments[0].split()) <= 2
+        if not (continuation_case or short_leader):
+            c = run[-1] + 1
+            continue
+
+        combined = _collapse_spaced_acronym(" ".join(fragments))
+        if len(combined) < 4 or len(combined) > 90:
+            c = run[-1] + 1
+            continue
+        top[run[0]] = combined
+        for idx in run[1:]:
+            top[idx] = ""
+        spans[0] = (run[0], run[-1], combined)
+        changed = True
+        c = run[-1] + 1
+    return changed
+
+
 def repair_split_table_header_fragments(table_regions: List[TableRegion], logger: Logger) -> List[TableRegion]:
     """
     Normalize multi-row table headers whose fixed columns are OCR-split across
@@ -5555,6 +5910,8 @@ def repair_split_table_header_fragments(table_regions: List[TableRegion], logger
         lower = rows[1]
         numeric = rows[numeric_idx]
         changed = False
+        spans = dict(getattr(table, "horizontal_text_spans", {}) or {})
+        changed = _repair_adjacent_top_header_fragments(rows, cols, numeric_idx, spans) or changed
 
         for c in range(cols):
             top_text = _clean_extracted_text(str(top[c]))
@@ -5577,7 +5934,6 @@ def repair_split_table_header_fragments(table_regions: List[TableRegion], logger
             lower[c] = ""
             changed = True
 
-        spans = dict(getattr(table, "horizontal_text_spans", {}) or {})
         for c in range(1, cols):
             group_text = _clean_extracted_text(str(top[c]))
             if not group_text or _clean_extracted_text(str(top[c - 1])):
@@ -9208,6 +9564,304 @@ def refine_table_structure(tables: List[TableRegion], logger: Logger):
             logger.log(f"  Refined Table {t_idx+1}: Force-split {candidates} rows at x={dominant_x2:.1f}")
 
 
+def _companion_source_mode(companion_data: Optional[dict]) -> str:
+    pipeline_ocr = ((companion_data or {}).get("pipeline") or {}).get("ocr") or {}
+    mode = str(pipeline_ocr.get("source_mode") or "").strip().lower()
+    if mode in {"scan", "digital", "mixed"}:
+        return mode
+
+    modes = {
+        str(page.get("source_mode") or "").strip().lower()
+        for page in (companion_data or {}).get("pages") or []
+        if isinstance(page, dict)
+    }
+    modes.discard("")
+    if not modes:
+        return ""
+    if len(modes) == 1:
+        return next(iter(modes))
+    return "mixed"
+
+
+def _infer_native_pdf_source_mode(pdf_path: str, logger: Logger) -> str:
+    try:
+        doc = fitz.open(pdf_path)
+        try:
+            digital_pages = 0
+            scan_pages = 0
+            for page in doc:
+                text = (page.get_text() or "").strip()
+                word_count = len(text.split()) if text else 0
+                page_area = max(float(page.rect.width * page.rect.height), 1.0)
+                max_image_coverage = 0.0
+                try:
+                    infos = page.get_image_info() or []
+                except Exception:
+                    infos = []
+                for info in infos:
+                    try:
+                        bbox = fitz.Rect(info.get("bbox"))
+                    except Exception:
+                        continue
+                    max_image_coverage = max(
+                        max_image_coverage,
+                        max(0.0, float(bbox.width * bbox.height) / page_area),
+                    )
+                if max_image_coverage >= 0.80:
+                    scan_pages += 1
+                elif word_count > 12:
+                    digital_pages += 1
+            if digital_pages and not scan_pages:
+                return "digital"
+            if digital_pages and scan_pages:
+                return "mixed"
+            if scan_pages:
+                return "scan"
+        finally:
+            doc.close()
+    except Exception as exc:
+        logger.log(f"Native PDF source-mode inference skipped: {exc}")
+    return ""
+
+
+def _try_pdf2docx_native_export(
+    pdf_path: str,
+    output_path: str,
+    metadata: Optional[dict],
+    logger: Logger,
+) -> bool:
+    """Convert a native digital PDF using pdf2docx when available.
+
+    This path preserves editable PDF text. It is deliberately used only for
+    digital PDFs; scan/mixed OCR exports continue through the OCR/table
+    structure pipeline below.
+    """
+    try:
+        from pdf2docx import Converter
+    except Exception as exc:
+        logger.log(f"pdf2docx unavailable for digital PDF export: {exc}")
+        return False
+
+    converter = None
+    try:
+        converter = Converter(pdf_path)
+        converter.convert(output_path, start=0, end=None, multi_processing=False)
+        _sanitize_pdf2docx_ooxml(output_path, logger)
+        _repair_pdf2docx_visual_spaces(pdf_path, output_path, logger)
+        if metadata:
+            try:
+                doc = Document(output_path)
+                _set_metadata_properties(doc, metadata, logger)
+                doc.save(output_path)
+            except Exception as exc:
+                logger.log(f"Warning: Failed to set DOCX properties after pdf2docx export: {exc}")
+        logger.log("Digital PDF exported through pdf2docx native converter")
+        return True
+    except Exception as exc:
+        logger.log(f"pdf2docx native export failed: {exc}")
+        return False
+    finally:
+        if converter is not None:
+            try:
+                converter.close()
+            except Exception:
+                pass
+
+
+def _sanitize_pdf2docx_ooxml(docx_path: str, logger: Logger) -> None:
+    """Normalize small OOXML issues emitted by pdf2docx.
+
+    Some pdf2docx versions write border/font `w:sz` values as decimal strings
+    (for example `4.7999999999999545`). Word tolerates this, but stricter
+    OpenXML readers require unsigned integer values.
+    """
+    import re
+    import tempfile
+    import zipfile
+
+    def fix_xml(raw: bytes) -> tuple[bytes, int]:
+        text = raw.decode("utf-8")
+        changed = 0
+
+        def repl(match):
+            nonlocal changed
+            changed += 1
+            value = max(0, int(round(float(match.group(1)))))
+            return f'w:sz="{value}"'
+
+        fixed = re.sub(r'w:sz="([0-9]+\.[0-9]+)"', repl, text)
+        return fixed.encode("utf-8"), changed
+
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".docx", dir=os.path.dirname(os.path.abspath(docx_path)))
+    os.close(tmp_fd)
+    total_changed = 0
+    try:
+        with zipfile.ZipFile(docx_path, "r") as zin, zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_DEFLATED) as zout:
+            for info in zin.infolist():
+                data = zin.read(info.filename)
+                if info.filename.endswith(".xml"):
+                    try:
+                        data, changed = fix_xml(data)
+                        total_changed += changed
+                    except UnicodeDecodeError:
+                        pass
+                zout.writestr(info, data)
+        os.replace(tmp_path, docx_path)
+        if total_changed:
+            logger.log(f"Sanitized {total_changed} pdf2docx OOXML size value(s)")
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+
+def _pdf_visual_space_replacements(pdf_path: str) -> Dict[str, str]:
+    """Return raw PDF text lines whose visual glyph gaps imply missing spaces."""
+    replacements: Dict[str, str] = {}
+    doc = fitz.open(pdf_path)
+    try:
+        for page in doc:
+            raw = page.get_text("rawdict") or {}
+            for block in raw.get("blocks") or []:
+                if block.get("type") != 0:
+                    continue
+                for line in block.get("lines") or []:
+                    chars = [
+                        ch
+                        for span in line.get("spans") or []
+                        for ch in span.get("chars", []) or []
+                    ]
+                    if len(chars) < 2:
+                        continue
+                    raw_text = "".join(str(ch.get("c") or "") for ch in chars)
+                    if not raw_text.strip():
+                        continue
+
+                    fixed = [str(chars[0].get("c") or "")]
+                    inserted = False
+                    for prev, cur in zip(chars, chars[1:]):
+                        prev_c = str(prev.get("c") or "")
+                        cur_c = str(cur.get("c") or "")
+                        try:
+                            gap = float(cur["bbox"][0]) - float(prev["bbox"][2])
+                        except Exception:
+                            gap = 0.0
+                        try:
+                            prev_w = max(0.0, float(prev["bbox"][2]) - float(prev["bbox"][0]))
+                            cur_w = max(0.0, float(cur["bbox"][2]) - float(cur["bbox"][0]))
+                        except Exception:
+                            prev_w = cur_w = 0.0
+                        glyph_w = max(1.0, min(prev_w or 999.0, cur_w or 999.0))
+                        missing_space_gap = max(2.0, min(3.0, glyph_w * 0.30))
+                        if (
+                            gap >= missing_space_gap
+                            and prev_c
+                            and cur_c
+                            and not prev_c.isspace()
+                            and not cur_c.isspace()
+                        ):
+                            fixed.append(" ")
+                            inserted = True
+                        fixed.append(cur_c)
+
+                    if inserted:
+                        fixed_text = "".join(fixed)
+                        replacements[raw_text] = fixed_text
+                        replacements[raw_text.rstrip()] = fixed_text
+    finally:
+        doc.close()
+    return {
+        raw: fixed
+        for raw, fixed in replacements.items()
+        if raw and fixed and raw != fixed
+    }
+
+
+def _repair_pdf2docx_visual_spaces(pdf_path: str, docx_path: str, logger: Logger) -> None:
+    """Patch pdf2docx text nodes when the source PDF encodes spaces as glyph gaps.
+
+    Some digital PDFs omit literal spaces inside their text layer and rely on
+    glyph coordinates instead. PDF viewers render those gaps visually, but Word
+    receives joined words after pdf2docx conversion. This pass keeps the DOCX
+    editable while inserting the spaces implied by PDF character positions.
+    """
+    import re
+    import tempfile
+    import zipfile
+    from xml.sax.saxutils import escape, unescape
+
+    try:
+        replacements = _pdf_visual_space_replacements(pdf_path)
+    except Exception as exc:
+        logger.log(f"Warning: Failed to infer visual spaces from PDF: {exc}")
+        return
+    if not replacements:
+        return
+
+    ordered = sorted(replacements.items(), key=lambda item: len(item[0]), reverse=True)
+    text_re = re.compile(r"<w:t(?=\s|>)(?P<attrs>[^>]*)>(?P<text>.*?)</w:t>", re.DOTALL)
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".docx", dir=os.path.dirname(os.path.abspath(docx_path)))
+    os.close(tmp_fd)
+    changed_nodes = 0
+
+    def repl_text(match):
+        nonlocal changed_nodes
+        attrs = match.group("attrs") or ""
+        text = unescape(match.group("text") or "")
+        fixed = text
+        for raw, replacement in ordered:
+            if raw in fixed:
+                fixed = fixed.replace(raw, replacement)
+        if fixed == text:
+            return match.group(0)
+        changed_nodes += 1
+        if fixed[:1].isspace() or fixed[-1:].isspace():
+            attrs = re.sub(r'\s+xml:space="[^"]*"', "", attrs)
+            attrs = attrs + ' xml:space="preserve"'
+        return f"<w:t{attrs}>{escape(fixed)}</w:t>"
+
+    try:
+        with zipfile.ZipFile(docx_path, "r") as zin, zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_DEFLATED) as zout:
+            for info in zin.infolist():
+                data = zin.read(info.filename)
+                if info.filename.startswith("word/") and info.filename.endswith(".xml"):
+                    try:
+                        xml = data.decode("utf-8")
+                    except UnicodeDecodeError:
+                        zout.writestr(info, data)
+                        continue
+                    data = text_re.sub(repl_text, xml).encode("utf-8")
+                zout.writestr(info, data)
+        os.replace(tmp_path, docx_path)
+        if changed_nodes:
+            logger.log(f"Repaired pdf2docx visual spaces in {changed_nodes} text node(s)")
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+
+def _set_metadata_properties(doc: Document, metadata: Optional[dict], logger: Logger) -> None:
+    if not metadata:
+        return
+    try:
+        props = doc.core_properties
+        if metadata.get("co_quan_ban_hanh"):
+            props.author = metadata["co_quan_ban_hanh"]
+        if metadata.get("trich_yeu"):
+            props.title = metadata["trich_yeu"]
+        if metadata.get("loai_van_ban"):
+            props.subject = metadata["loai_van_ban"]
+        if metadata.get("so_ky_hieu"):
+            props.keywords = metadata["so_ky_hieu"]
+    except Exception as exc:
+        logger.log(f"Warning: Failed to set DOCX properties: {exc}")
+
+
 def create_docx_from_pdf(
     pdf_path: str,
     output_path: str,
@@ -9412,6 +10066,21 @@ def create_docx_from_pdf(
                     layout_regions_by_page[_pi + 1] = _lr
             if layout_regions_by_page:
                 logger.log(f"Loaded layout regions for {len(layout_regions_by_page)} pages")
+
+        source_mode_for_export = _companion_source_mode(companion_data) or _infer_native_pdf_source_mode(pdf_path, logger)
+        if source_mode_for_export == "digital" and _try_pdf2docx_native_export(
+            pdf_path,
+            output_path,
+            metadata,
+            logger,
+        ):
+            logger.log("\n" + "=" * 60)
+            logger.log("SUMMARY")
+            logger.log("=" * 60)
+            logger.log("Export mode: pdf2docx native digital PDF")
+            logger.log(f"Output: {output_path}")
+            logger.save()
+            return True, f"Success: {output_path}", logger.get_log_text()
 
         if not layout_regions_by_page:
             layout_regions_by_page = analyze_layout_regions_for_pdf(pdf_path, page_info, logger)
@@ -9648,9 +10317,6 @@ def create_docx_from_pdf(
                     filtered_lines.extend(residuals)
                     preserved_table_residuals += len(residuals)
                 continue
-            if _looks_like_qr_access_artifact(line.text):
-                logger.log(f"Skipped QR/link access artifact line on page {line.page}")
-                continue
 
             inside_rendered_table = False
             inside_skipped_table = False
@@ -9834,43 +10500,6 @@ def create_docx_from_pdf(
                 if region["type"] == "figure":
                     bbox_pdf = region.get("bbox_pdf", region["bbox"])
                     fig_bbox = tuple(float(v) for v in bbox_pdf[:4])
-                    nearby_qr_text = False
-                    for line in pdf_lines:
-                        if line.page != pg_num or not _looks_like_qr_access_artifact(line.text):
-                            continue
-                        lx0, ly0, lx1, ly1 = _line_bbox(line)
-                        x_overlap = max(0.0, min(lx1, fig_bbox[2]) - max(lx0, fig_bbox[0]))
-                        near_y = ly0 <= fig_bbox[3] + 45.0 and ly1 >= fig_bbox[1] - 20.0
-                        if _bbox_overlap_ratio((lx0, ly0, lx1, ly1), fig_bbox) > 0.01 or (near_y and x_overlap > 0):
-                            nearby_qr_text = True
-                            break
-                    if nearby_qr_text:
-                        logger.log(f"Skipped QR/link access figure on page {pg_num}")
-                        continue
-                    pg_width = page_info.get(pg_num, {}).get("width", 595)
-                    fig_center_x = (fig_bbox[0] + fig_bbox[2]) / 2
-                    if pg_num in dual_footers:
-                        footer_left, footer_right = dual_footers[pg_num]
-                        footer_lines = footer_left + footer_right
-                        footer_y0 = min((line.y for line in footer_lines), default=fig_bbox[1]) - 30
-                        footer_y1 = max((line.y + line.height for line in footer_lines), default=fig_bbox[3]) + 50
-                        overlaps_footer_band = fig_bbox[1] <= footer_y1 and fig_bbox[3] >= footer_y0
-                        if (
-                            any(_bbox_overlap_ratio(_line_bbox(line), fig_bbox) > 0.05 for line in footer_right)
-                            or (fig_center_x >= pg_width * 0.45 and overlaps_footer_band)
-                        ):
-                            logger.log(f"Skipped signature/stamp figure on page {pg_num}")
-                            continue
-                    else:
-                        anchors = [
-                            line for line in pdf_lines
-                            if line.page == pg_num and _unaccent_upper(line.text).startswith("NOI NHAN")
-                        ]
-                        if anchors:
-                            anchor = sorted(anchors, key=lambda line: line.y)[-1]
-                            if fig_center_x >= pg_width * 0.45 and fig_bbox[1] >= anchor.y - 30:
-                                logger.log(f"Skipped signature/stamp figure on page {pg_num}")
-                                continue
                     doc_elements.append({
                         "type": "figure",
                         "page": pg_num,
@@ -10135,8 +10764,9 @@ def create_docx_from_pdf(
                     fig_pix = fig_page.get_pixmap(dpi=200)
                     from PIL import Image as PILImage
                     fig_img = PILImage.frombytes("RGB", [fig_pix.width, fig_pix.height], fig_pix.samples)
-                    if fig_data.get("bbox_pdf"):
-                        fx0, fy0, fx1, fy1 = (float(v) for v in fig_data["bbox_pdf"][:4])
+                    bbox_pdf = fig_data.get("bbox_pdf") or []
+                    if bbox_pdf:
+                        fx0, fy0, fx1, fy1 = (float(v) for v in bbox_pdf[:4])
                         sx = fig_pix.width / max(float(fig_page.rect.width), 1.0)
                         sy = fig_pix.height / max(float(fig_page.rect.height), 1.0)
                         bx = (fx0 * sx, fy0 * sy, fx1 * sx, fy1 * sy)
@@ -10154,14 +10784,86 @@ def create_docx_from_pdf(
                     tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
                     cropped.save(tmp.name)
                     tmp.close()
-                    # Size: fit within page width
-                    fig_w_inches = cropped.width / 200  # 200 DPI
-                    max_w = 5.5  # inches, safe for portrait
-                    if fig_w_inches > max_w:
-                        fig_w_inches = max_w
-                    doc.add_picture(tmp.name, width=Inches(fig_w_inches))
+                    natural_w_inches = cropped.width / 200  # 200 DPI
+                    natural_h_inches = cropped.height / 200
+                    section = doc.sections[-1]
+                    content_w_inches = max(
+                        float(section.page_width.inches - section.left_margin.inches - section.right_margin.inches),
+                        1.0,
+                    )
+                    body_font_pt = float(page_info.get(fig_data["page"], {}).get("docx_body_font_pt", 14.0) or 14.0)
+                    line_height_pt = max(body_font_pt * 1.35, body_font_pt + 3.0)
+                    content_h_inches = max(
+                        float(section.page_height.inches - section.top_margin.inches - section.bottom_margin.inches),
+                        1.0,
+                    )
+                    max_h_inches = max(1.0, content_h_inches * 0.65)
+                    scale = min(
+                        1.0,
+                        content_w_inches / max(natural_w_inches, 0.01),
+                        max_h_inches / max(natural_h_inches, 0.01),
+                    )
+                    fig_w_inches = max(0.1, natural_w_inches * scale)
+                    fig_h_inches = max(0.1, natural_h_inches * scale)
+
+                    keep_with_caption = False
+                    if bbox_pdf and len(bbox_pdf) >= 4:
+                        next_elem = doc_elements[elem_index + 1] if elem_index + 1 < len(doc_elements) else None
+                        if next_elem and next_elem.get("type") == "para":
+                            next_text, next_line, _next_is_footnote = next_elem.get("data", ("", None, False))
+                            next_sem = (getattr(next_line, "semantic_type", "") or "").strip().lower() if next_line else ""
+                            vertical_gap = float(getattr(next_line, "y", 0.0) or 0.0) - float(bbox_pdf[3])
+                            near_below = (
+                                next_line is not None
+                                and int(getattr(next_line, "page", 0) or 0) == int(fig_data["page"])
+                                and -3.0 <= vertical_gap <= max(60.0, float(fig_page.rect.height) * 0.08)
+                            )
+                            caption_shape = (
+                                next_sem in {"figure_caption", "figure caption", "table_caption", "table caption"}
+                                or (near_below and len(_clean_extracted_text(str(next_text))) <= 180)
+                            )
+                            keep_with_caption = near_below and caption_shape
+                    if keep_with_caption and bbox_pdf and float(bbox_pdf[1]) >= float(fig_page.rect.height) * 0.72:
+                        doc.add_page_break()
+
+                    figure_para = doc.add_paragraph()
+                    pf = figure_para.paragraph_format
+                    pf.first_line_indent = Pt(0)
+                    pf.left_indent = Pt(0)
+                    pf.right_indent = Pt(0)
+                    pf.space_before = Pt(6)
+                    pf.space_after = Pt(6)
+                    pf.keep_together = True
+                    pf.keep_with_next = keep_with_caption
+                    pf.line_spacing_rule = WD_LINE_SPACING.EXACTLY
+                    pf.line_spacing = Pt(max(fig_h_inches * 72.0, line_height_pt))
+
+                    page_width = float(page_info.get(fig_data["page"], {}).get("width", fig_page.rect.width) or fig_page.rect.width)
+                    if bbox_pdf and len(bbox_pdf) >= 4 and page_width > 0:
+                        fig_center = (float(bbox_pdf[0]) + float(bbox_pdf[2])) / 2.0
+                        if fig_center < page_width * 0.40:
+                            figure_para.alignment = WD_PARAGRAPH_ALIGNMENT.LEFT
+                        elif fig_center > page_width * 0.60:
+                            figure_para.alignment = WD_PARAGRAPH_ALIGNMENT.RIGHT
+                        else:
+                            figure_para.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+                    else:
+                        figure_para.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+
+                    run = figure_para.add_run()
+                    inline_shape = run.add_picture(tmp.name, width=Inches(fig_w_inches))
+                    if figure_para.alignment == WD_PARAGRAPH_ALIGNMENT.LEFT:
+                        anchor_align = "left"
+                    elif figure_para.alignment == WD_PARAGRAPH_ALIGNMENT.RIGHT:
+                        anchor_align = "right"
+                    else:
+                        anchor_align = "center"
+                    _top_bottom_picture_from_inline(
+                        inline_shape,
+                        align=anchor_align,
+                    )
                     os.unlink(tmp.name)
-                    logger.log(f"  Added figure from page {fig_data['page']}")
+                    logger.log(f"  Added figure from page {fig_data['page']} (top_bottom)")
                 except Exception as e:
                     logger.log(f"  Figure extraction failed: {e}")
 

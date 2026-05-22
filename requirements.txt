@@ -10,6 +10,7 @@ configparser
 zstandard>=0.22
 
 PyMuPDF>=1.24.0
+pdf2docx>=0.5.13
 pikepdf>=10.0.0
 python-docx>=1.1.0
 rapidfuzz>=3.5.0
@@ -25,7 +26,8 @@ asn1crypto>=1.5.1
 Pillow>=10.0.0
 tzlocal>=5.0
 
-opencv-contrib-python>=4.9.0
+opencv-contrib-python-headless>=4.9.0,<4.10
+opencv-python-headless>=4.9.0,<4.10
 numpy>=1.26.0,<2.4
 onnxruntime>=1.20.0
 docling-core>=2.75.0,<3

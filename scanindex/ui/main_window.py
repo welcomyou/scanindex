@@ -12,6 +12,7 @@ import hashlib
 import configparser
 import concurrent.futures
 import json
+import tempfile
 
 from PySide6.QtWidgets import (
     QMainWindow, QSplitter, QStackedWidget, QWidget, QVBoxLayout,
@@ -52,6 +53,13 @@ from scanindex.infra import translations
 from scanindex.infra.translations import get_text
 from scanindex.infra import paths as portable_utils
 from scanindex.infra.paths import get_resource_path
+from scanindex.core.pdf.input_conversion import (
+    image_page_count,
+    image_to_pdf,
+    is_image_path,
+    is_supported_document_path,
+    ocr_pdf_output_path,
+)
 
 # Heavy modules — all None at startup; populated lazily by ModelManager loaders
 # when user navigates into a screen that needs them.
@@ -126,6 +134,55 @@ def _run_preprocess_and_ocr(input_path, output_path, num_pages, parallel_files,
     return res, msg
 
 
+def _source_page_count(source_path: str) -> int:
+    if is_image_path(source_path):
+        try:
+            return image_page_count(source_path)
+        except Exception:
+            return 1
+    try:
+        with open(source_path, "rb") as f_in:
+            return len(pypdf.PdfReader(f_in).pages)
+    except Exception:
+        return 1
+
+
+def _run_source_to_ocr_pdf(input_path, output_path, num_pages, parallel_files,
+                           update_callback, debug_mode, wait_per_page,
+                           comparison_interval, ocr_log_callback=None):
+    """Normalize supported inputs to PDF, then run the existing OCR pipeline."""
+    if is_image_path(input_path):
+        with tempfile.TemporaryDirectory(prefix="ocrtool_image_pdf_") as temp_dir:
+            source_stem = os.path.splitext(os.path.basename(input_path))[0] or "image"
+            temp_pdf = os.path.join(temp_dir, source_stem + ".pdf")
+            image_to_pdf(input_path, temp_pdf)
+            return _run_preprocess_and_ocr(
+                input_path=temp_pdf,
+                output_path=output_path,
+                num_pages=num_pages,
+                parallel_files=parallel_files,
+                update_callback=update_callback,
+                debug_mode=debug_mode,
+                wait_per_page=wait_per_page,
+                comparison_interval=comparison_interval,
+                source_document_path=temp_pdf,
+                ocr_log_callback=ocr_log_callback,
+            )
+
+    return _run_preprocess_and_ocr(
+        input_path=input_path,
+        output_path=output_path,
+        num_pages=num_pages,
+        parallel_files=parallel_files,
+        update_callback=update_callback,
+        debug_mode=debug_mode,
+        wait_per_page=wait_per_page,
+        comparison_interval=comparison_interval,
+        source_document_path=input_path,
+        ocr_log_callback=ocr_log_callback,
+    )
+
+
 def _log_optional(log_callback, msg, level=LOG_INFO):
     if not log_callback:
         return
@@ -136,20 +193,22 @@ def _log_optional(log_callback, msg, level=LOG_INFO):
 
 
 def _cleanup_ocr_intermediate(pdf_path, source_path=None, log_callback=None):
-    """Remove legacy OCR JSON artifacts after DOCX export succeeds.
-
-    The OCR PDF and its `.json.zst` sidecar are kept as the reusable Word
-    export cache. The UI still points users at the final DOCX.
-    """
+    """Remove OCR/cache artifacts after DOCX export succeeds."""
     if not pdf_path:
         return
     try:
         abs_pdf = os.path.abspath(pdf_path)
-        if source_path and abs_pdf == os.path.abspath(source_path):
-            return
         if not abs_pdf.lower().endswith(".pdf"):
             return
-        for path in (abs_pdf + ".json",):
+        source_abs = os.path.abspath(source_path) if source_path else None
+        cleanup_paths = [
+            abs_pdf + ".json",
+            abs_pdf + ".json.zst",
+            abs_pdf + ".tmp",
+        ]
+        if not source_abs or abs_pdf != source_abs:
+            cleanup_paths.insert(0, abs_pdf)
+        for path in cleanup_paths:
             if os.path.exists(path):
                 os.remove(path)
                 _log_optional(
@@ -1350,12 +1409,15 @@ class MainWindow(QMainWindow):
 
     def add_files_dialog(self):
         files, _ = QFileDialog.getOpenFileNames(
-            self, "Select PDF Files", "", "PDF Files (*.pdf)"
+            self,
+            "Select PDF or Image Files",
+            "",
+            "Documents (*.pdf *.png *.bmp *.jpeg *.jpg *.tif *.tiff);;PDF Files (*.pdf);;Image Files (*.png *.bmp *.jpeg *.jpg *.tif *.tiff)",
         )
         count = 0
         existing = {item["path"] for item in self.dnd_files}
         for f in files:
-            if f not in existing:
+            if is_supported_document_path(f) and f not in existing:
                 self.dnd_files.append({"path": f, "status": "Pending", "output_path": None})
                 existing.add(f)
                 count += 1
@@ -1367,7 +1429,7 @@ class MainWindow(QMainWindow):
         count = 0
         existing = {item["path"] for item in self.dnd_files}
         for f in file_paths:
-            if f not in existing:
+            if is_supported_document_path(f) and f not in existing:
                 self.dnd_files.append({"path": f, "status": "Pending", "output_path": None})
                 existing.add(f)
                 count += 1
@@ -2508,6 +2570,8 @@ class MainWindow(QMainWindow):
             target_path = f.get("output_path")
             if target_path and not str(target_path).lower().endswith(".pdf"):
                 target_path = None
+            if not is_supported_document_path(f.get("path", "")):
+                continue
             pipeline_items.append({
                 "index": i, "dnd_item": f,
                 "target_path": target_path, "list_type": "dnd",
@@ -2601,8 +2665,7 @@ class MainWindow(QMainWindow):
         if f.get("target_ocr_path"):
             final_out = f["target_ocr_path"]
         else:
-            base, ext = os.path.splitext(fpath)
-            final_out = base + "_ocr" + ext
+            final_out = ocr_pdf_output_path(fpath)
         os.makedirs(os.path.dirname(final_out), exist_ok=True)
 
         # OCR
@@ -2611,19 +2674,14 @@ class MainWindow(QMainWindow):
             res, msg, dt = True, None, 0
             self.update_item_status("dnd", idx, "OCR Done", final_out)
         else:
-            num_pages = 1
-            try:
-                r = pypdf.PdfReader(fpath)
-                num_pages = len(r.pages)
-            except Exception:
-                pass
+            num_pages = _source_page_count(fpath)
 
             if self.ocr_executor is None:
                 self.ocr_executor = concurrent.futures.ThreadPoolExecutor(
                     max_workers=self.max_parallel_ocr_files)
 
             def _ocr_work():
-                return _run_preprocess_and_ocr(
+                return _run_source_to_ocr_pdf(
                     input_path=fpath,
                     output_path=final_out,
                     num_pages=num_pages,
@@ -2632,7 +2690,6 @@ class MainWindow(QMainWindow):
                     debug_mode=self.settings_tab.chk_verbose.isChecked(),
                     wait_per_page=cfg_wait_page,
                     comparison_interval=cfg_wait_int,
-                    source_document_path=fpath,
                 )
 
             future = self.ocr_executor.submit(_ocr_work)
@@ -2908,8 +2965,7 @@ class ProcessingPipeline:
         elif f.get("target_ocr_path"):
             final_out = f["target_ocr_path"]
         else:
-            base, ext = os.path.splitext(file_path)
-            final_out = base + "_ocr" + ext
+            final_out = ocr_pdf_output_path(file_path)
 
         os.makedirs(os.path.dirname(final_out), exist_ok=True)
 
@@ -2917,12 +2973,7 @@ class ProcessingPipeline:
             self.app.log(f"Output exists {os.path.basename(final_out)}. Skipping OCR.")
             return True, "Exists", final_out
 
-        num_pages = 1
-        try:
-            with open(file_path, "rb") as f_in:
-                num_pages = len(pypdf.PdfReader(f_in).pages)
-        except Exception:
-            pass
+        num_pages = _source_page_count(file_path)
 
         def _log_cb(msg, level=LOG_INFO):
             verbose = self.app.settings_tab.chk_verbose.isChecked()
@@ -2930,7 +2981,7 @@ class ProcessingPipeline:
                 self.app.log(f"[{os.path.basename(file_path)}] {msg}", level)
 
         t0 = time.time()
-        res, msg = _run_preprocess_and_ocr(
+        res, msg = _run_source_to_ocr_pdf(
             input_path=file_path,
             output_path=final_out,
             num_pages=num_pages,
@@ -2939,7 +2990,6 @@ class ProcessingPipeline:
             debug_mode=self.app.settings_tab.chk_verbose.isChecked(),
             wait_per_page=self.config["wait_page"],
             comparison_interval=self.config["wait_int"],
-            source_document_path=file_path,
             ocr_log_callback=_log_cb,
         )
         dt = time.time() - t0

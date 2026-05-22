@@ -1,6 +1,6 @@
 """
 FileListWidget — QListWidget managing a list of FileItemWidgets.
-Supports drag-and-drop of PDF files and empty state display.
+Supports drag-and-drop of PDF/image files and empty state display.
 """
 import os
 from PySide6.QtWidgets import QListWidget, QListWidgetItem, QLabel, QVBoxLayout, QWidget
@@ -9,6 +9,7 @@ from PySide6.QtGui import QDragEnterEvent, QDropEvent
 
 from scanindex.ui.theme import COLOR_TEXT_MUTED, COLOR_ACCENT, FONT_UI, SP
 from scanindex.ui.widgets.file_item_widget import FileItemWidget
+from scanindex.core.pdf.input_conversion import is_supported_document_path
 
 
 class FileListWidget(QListWidget):
@@ -89,7 +90,7 @@ class FileListWidget(QListWidget):
             files = []
             for url in event.mimeData().urls():
                 path = url.toLocalFile()
-                if path and path.lower().endswith(".pdf"):
+                if path and is_supported_document_path(path):
                     files.append(path)
             if files:
                 self.files_dropped.emit(files)

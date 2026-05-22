@@ -160,12 +160,15 @@ _RotatedTextStampStyle = _CustomTextStampStyle
 from scanindex.core.pdf.win_cert_store import sign_data
 
 
-DEFAULT_STAMP_TEMPLATE = "Xác nhận sao tại kho lưu trữ\n{unit_org}"
+DEFAULT_STAMP_TEMPLATE = "Xác nhận sao tại kho lưu trữ ... {datetime}"
 DEFAULT_TSA_URL = "http://tsa.ca.gov.vn"
 STAMP_TEMPLATE_FIELDS = (
     "cn", "org", "ou", "unit_org", "subject", "issuer", "serial",
     "not_after", "ts", "datetime", "date", "time", "reason", "location",
 )
+STAMP_TEXT_BELOW = "below"
+STAMP_TEXT_RIGHT = "right"
+_STAMP_IMAGE_GAP_PT = 3.0
 
 
 def _unique_nonempty(values: List[str]) -> List[str]:
@@ -191,6 +194,31 @@ def _find_windows_font_path() -> Optional[str]:
         if os.path.exists(path):
             return path
     return None
+
+
+def _normalise_stamp_text_position(value: Optional[str]) -> str:
+    return STAMP_TEXT_RIGHT if str(value or "").strip().lower() == STAMP_TEXT_RIGHT else STAMP_TEXT_BELOW
+
+
+def _load_stamp_image(path: Optional[str]) -> Optional[Image.Image]:
+    if not path:
+        return None
+    if not _HAS_PIL:
+        raise RuntimeError("Pillow is required for stamp image appearance")
+    try:
+        if not os.path.exists(path):
+            return None
+        with Image.open(path) as img:
+            return img.convert("RGBA")
+    except Exception as exc:
+        raise RuntimeError(f"Cannot load stamp image '{path}': {exc}") from exc
+
+
+def _scaled_size(src_w: float, src_h: float, max_w: float, max_h: float) -> Tuple[int, int]:
+    if src_w <= 0 or src_h <= 0 or max_w <= 0 or max_h <= 0:
+        return (1, 1)
+    scale = min(max_w / src_w, max_h / src_h)
+    return (max(1, int(round(src_w * scale))), max(1, int(round(src_h * scale))))
 
 
 def _timestamp_params(fmt: str) -> dict:
@@ -337,6 +365,103 @@ def _render_text_image(
     return img
 
 
+def _render_signature_image(
+    lines: List[str],
+    box_w_pt: float,
+    box_h_pt: float,
+    *,
+    font_size_pt: float,
+    font_path: Optional[str],
+    compact_scale: float = 0.86,
+    padding_pt: float = 2.0,
+    dpi_scale: int = 4,
+    stamp_image_path: Optional[str] = None,
+    stamp_text_position: str = STAMP_TEXT_BELOW,
+) -> Image.Image:
+    if not stamp_image_path:
+        return _render_text_image(
+            lines,
+            box_w_pt,
+            box_h_pt,
+            font_size_pt=font_size_pt,
+            font_path=font_path,
+            compact_scale=compact_scale,
+            padding_pt=padding_pt,
+            dpi_scale=dpi_scale,
+        )
+
+    if not _HAS_PIL:
+        raise RuntimeError("Pillow is required for bitmap signature appearance")
+
+    seal = _load_stamp_image(stamp_image_path)
+    if seal is None:
+        return _render_text_image(
+            lines,
+            box_w_pt,
+            box_h_pt,
+            font_size_pt=font_size_pt,
+            font_path=font_path,
+            compact_scale=compact_scale,
+            padding_pt=padding_pt,
+            dpi_scale=dpi_scale,
+        )
+
+    width_px = max(1, int(round(box_w_pt * dpi_scale)))
+    height_px = max(1, int(round(box_h_pt * dpi_scale)))
+    pad_px = max(0, int(round(padding_pt * dpi_scale)))
+    gap_px = max(1, int(round(_STAMP_IMAGE_GAP_PT * dpi_scale)))
+    avail_w = max(1, width_px - 2 * pad_px)
+    avail_h = max(1, height_px - 2 * pad_px)
+    canvas = Image.new("RGBA", (width_px, height_px), (255, 255, 255, 0))
+    position = _normalise_stamp_text_position(stamp_text_position)
+
+    if position == STAMP_TEXT_RIGHT and avail_w > gap_px + 2:
+        max_img_w = max(1, min(avail_w - gap_px - 1, int(round(avail_w * 0.42))))
+        img_w, img_h = _scaled_size(seal.width, seal.height, max_img_w, avail_h)
+        seal_resized = seal.resize((img_w, img_h), Image.Resampling.LANCZOS)
+        img_x = pad_px
+        img_y = pad_px + max(0, (avail_h - img_h) // 2)
+        canvas.alpha_composite(seal_resized, (img_x, img_y))
+
+        text_w = max(1, avail_w - img_w - gap_px)
+        text_h = avail_h
+        text_img = _render_text_image(
+            lines,
+            text_w / dpi_scale,
+            text_h / dpi_scale,
+            font_size_pt=font_size_pt,
+            font_path=font_path,
+            compact_scale=compact_scale,
+            padding_pt=0.0,
+            dpi_scale=dpi_scale,
+        )
+        canvas.alpha_composite(text_img, (pad_px + img_w + gap_px, pad_px))
+        return canvas
+
+    max_img_h = max(1, min(avail_h - gap_px - 1, int(round(avail_h * 0.58))))
+    img_w, img_h = _scaled_size(seal.width, seal.height, avail_w, max_img_h)
+    seal_resized = seal.resize((img_w, img_h), Image.Resampling.LANCZOS)
+    img_x = pad_px + max(0, (avail_w - img_w) // 2)
+    img_y = pad_px
+    canvas.alpha_composite(seal_resized, (img_x, img_y))
+
+    text_y = pad_px + img_h + gap_px
+    text_w = avail_w
+    text_h = max(1, height_px - pad_px - text_y)
+    text_img = _render_text_image(
+        lines,
+        text_w / dpi_scale,
+        text_h / dpi_scale,
+        font_size_pt=font_size_pt,
+        font_path=font_path,
+        compact_scale=compact_scale,
+        padding_pt=0.0,
+        dpi_scale=dpi_scale,
+    )
+    canvas.alpha_composite(text_img, (pad_px, text_y))
+    return canvas
+
+
 def _measure_text_image_box(
     lines: List[str],
     *,
@@ -380,6 +505,74 @@ def _measure_text_image_box(
     return max(1, math.ceil(width_px / dpi_scale)), max(1, math.ceil(height_px / dpi_scale))
 
 
+def _stamp_image_natural_size_pt(image: Image.Image) -> Tuple[float, float]:
+    max_dim = 80.0
+    scale = min(max_dim / max(float(image.width), 1.0), max_dim / max(float(image.height), 1.0), 1.0)
+    return max(1.0, float(image.width) * scale), max(1.0, float(image.height) * scale)
+
+
+def _measure_signature_image_box(
+    lines: List[str],
+    *,
+    font_size_pt: float,
+    font_path: Optional[str],
+    compact_scale: float = 0.86,
+    padding_pt: float = 2.0,
+    stamp_image_path: Optional[str] = None,
+    stamp_text_position: str = STAMP_TEXT_BELOW,
+) -> Tuple[int, int]:
+    text_w, text_h = _measure_text_image_box(
+        lines,
+        font_size_pt=font_size_pt,
+        font_path=font_path,
+        compact_scale=compact_scale,
+        padding_pt=padding_pt,
+    )
+    seal = _load_stamp_image(stamp_image_path)
+    if seal is None:
+        return text_w, text_h
+
+    img_w, img_h = _stamp_image_natural_size_pt(seal)
+    gap = _STAMP_IMAGE_GAP_PT
+    pad = padding_pt * 2
+    if _normalise_stamp_text_position(stamp_text_position) == STAMP_TEXT_RIGHT:
+        return (
+            max(1, math.ceil(img_w + gap + text_w + pad)),
+            max(1, math.ceil(max(img_h, text_h) + pad)),
+        )
+    return (
+        max(1, math.ceil(max(img_w, text_w) + pad)),
+        max(1, math.ceil(img_h + gap + text_h + pad)),
+    )
+
+
+def _signature_text_area_for_box(
+    box_w: float,
+    box_h: float,
+    *,
+    stamp_image_path: Optional[str] = None,
+    stamp_text_position: str = STAMP_TEXT_BELOW,
+    padding_pt: float = 2.0,
+) -> Tuple[float, float]:
+    if not stamp_image_path:
+        return box_w, box_h
+    seal = _load_stamp_image(stamp_image_path)
+    if seal is None:
+        return box_w, box_h
+
+    gap = _STAMP_IMAGE_GAP_PT
+    avail_w = max(1.0, float(box_w) - 2 * padding_pt)
+    avail_h = max(1.0, float(box_h) - 2 * padding_pt)
+    if _normalise_stamp_text_position(stamp_text_position) == STAMP_TEXT_RIGHT:
+        max_img_w = max(1.0, min(avail_w - gap - 1.0, avail_w * 0.42))
+        img_w, _ = _scaled_size(seal.width, seal.height, max_img_w, avail_h)
+        return max(1.0, avail_w - float(img_w) - gap), avail_h
+
+    max_img_h = max(1.0, min(avail_h - gap - 1.0, avail_h * 0.58))
+    _, img_h = _scaled_size(seal.width, seal.height, avail_w, max_img_h)
+    return avail_w, max(1.0, avail_h - float(img_h) - gap)
+
+
 class _ImageTextStamp(BaseStamp):
     def __init__(self, *, writer, style, box, text_params,
                  page_rotation: int = 0,
@@ -398,7 +591,7 @@ class _ImageTextStamp(BaseStamp):
     def _render_inner_content(self):
         text = self._stamp_text()
         lines = text.splitlines()
-        img = _render_text_image(
+        img = _render_signature_image(
             lines,
             self.box.width,
             self.box.height,
@@ -406,6 +599,8 @@ class _ImageTextStamp(BaseStamp):
             font_path=self.style.image_font_path,
             compact_scale=self.style.compact_scale,
             padding_pt=self.style.image_padding,
+            stamp_image_path=self.style.stamp_image_path,
+            stamp_text_position=self.style.stamp_text_position,
         )
         content = PdfImage(
             img,
@@ -452,6 +647,8 @@ class _ImageTextStampStyle(TextStampStyle):
     image_font_size: float = 10.0
     compact_scale: float = 0.86
     image_padding: float = 2.0
+    stamp_image_path: Optional[str] = None
+    stamp_text_position: str = STAMP_TEXT_BELOW
 
     def create_stamp(self, writer, box, text_params):
         rot = self.page_rotation % 360
@@ -630,7 +827,9 @@ def _build_stamp_style(cert_info: dict, font_size: float = 10.0,
                        page_rotation: int = 0,
                        stamp_template: Optional[str] = None,
                        reason: Optional[str] = None,
-                       location: Optional[str] = None) -> TextStampStyle:
+                       location: Optional[str] = None,
+                       stamp_image_path: Optional[str] = None,
+                       stamp_text_position: str = STAMP_TEXT_BELOW) -> TextStampStyle:
     """
     Build a TextStampStyle showing Ký bởi / Cơ quan / Đơn vị / Thời gian.
 
@@ -677,8 +876,13 @@ def _build_stamp_style(cert_info: dict, font_size: float = 10.0,
             image_font_size=font_size,
             compact_scale=0.86,
             image_padding=2.0,
+            stamp_image_path=stamp_image_path,
+            stamp_text_position=_normalise_stamp_text_position(stamp_text_position),
             **common_kwargs,
         )
+
+    if stamp_image_path:
+        raise RuntimeError("Pillow is required for stamp image appearance")
 
     return _CustomTextStampStyle(page_rotation=page_rotation, h_scale=100,
                                  **common_kwargs)
@@ -688,7 +892,9 @@ def compute_stamp_natural_size(cert_info: dict, font_size: int = 10,
                                h_scale: int = 100,
                                stamp_template: Optional[str] = None,
                                reason: Optional[str] = None,
-                               location: Optional[str] = None) -> Tuple[int, int]:
+                               location: Optional[str] = None,
+                               stamp_image_path: Optional[str] = None,
+                               stamp_text_position: str = STAMP_TEXT_BELOW) -> Tuple[int, int]:
     """Legacy helper: returns natural (width, height) of stamp text at the
     given font size. Kept for the old "Vừa text" button (sets box to fit
     text). For the standard fixed-box auto-fit behaviour, use
@@ -716,12 +922,14 @@ def compute_stamp_natural_size(cert_info: dict, font_size: int = 10,
 
     if _HAS_PIL:
         try:
-            return _measure_text_image_box(
+            return _measure_signature_image_box(
                 text_lines,
                 font_size_pt=float(font_size),
                 font_path=_find_windows_font_path(),
                 compact_scale=0.86,
                 padding_pt=2.0,
+                stamp_image_path=stamp_image_path,
+                stamp_text_position=stamp_text_position,
             )
         except Exception:
             pass
@@ -747,6 +955,8 @@ def compute_fit_font_size(cert_info: dict, box_w: float, box_h: float,
                           stamp_template: Optional[str] = None,
                           reason: Optional[str] = None,
                           location: Optional[str] = None,
+                          stamp_image_path: Optional[str] = None,
+                          stamp_text_position: str = STAMP_TEXT_BELOW,
                           ) -> float:
     """
     Fixed-box auto-fit: given a fixed signature box, compute the
@@ -794,14 +1004,22 @@ def compute_fit_font_size(cert_info: dict, box_w: float, box_h: float,
     if max_unit_w <= 0:
         return 9.0
 
+    text_box_w, text_box_h = _signature_text_area_for_box(
+        box_w,
+        box_h,
+        stamp_image_path=stamp_image_path,
+        stamp_text_position=stamp_text_position,
+        padding_pt=2.0,
+    )
+
     # Inner padding (left+right, top+bottom) — keep some breathing room.
     pad_x = 4.0
     pad_y = 4.0
     leading_factor = 1.15        # leading ≈ 1.15 × font_size (typical)
     n = len(text_lines)
 
-    avail_w = max(box_w - pad_x, 1.0)
-    avail_h = max(box_h - pad_y, 1.0)
+    avail_w = max(text_box_w - pad_x, 1.0)
+    avail_h = max(text_box_h - pad_y, 1.0)
 
     size_by_w = avail_w / max(max_unit_w * compact_scale, 0.1)
     size_by_h = avail_h / (n * leading_factor)
@@ -857,6 +1075,8 @@ def sign_single_pdf(
     location: Optional[str] = None,
     stamp_template: Optional[str] = None,
     tsa_url: Optional[str] = None,
+    stamp_image_path: Optional[str] = None,
+    stamp_text_position: str = STAMP_TEXT_BELOW,
 ) -> None:
     """Sign one PDF file, writing to *output_path*."""
 
@@ -877,6 +1097,8 @@ def sign_single_pdf(
     fit_font_size = compute_fit_font_size(
         cert_info, box_w, box_h,
         stamp_template=stamp_template, reason=reason, location=location,
+        stamp_image_path=stamp_image_path,
+        stamp_text_position=stamp_text_position,
     )
 
     with open(input_path, "rb") as inf:
@@ -894,6 +1116,8 @@ def sign_single_pdf(
             stamp_template=stamp_template,
             reason=reason,
             location=location,
+            stamp_image_path=stamp_image_path,
+            stamp_text_position=stamp_text_position,
         )
 
         # Convert (left, top, w, h) margin-from-top-left into PDF coords for THIS page
@@ -942,6 +1166,8 @@ def batch_sign(
     stamp_template: Optional[str] = None,
     progress_cb: Optional[Callable[[int, int, Tuple[str, bool, str]], None]] = None,
     tsa_url: Optional[str] = None,
+    stamp_image_path: Optional[str] = None,
+    stamp_text_position: str = STAMP_TEXT_BELOW,
 ) -> List[Tuple[str, bool, str]]:
     """
     Sign all PDFs in *input_paths*, writing results to *output_dir*.
@@ -967,6 +1193,8 @@ def batch_sign(
                 src, dst, cert_info, sig_box, page, reason, location,
                 stamp_template=stamp_template,
                 tsa_url=tsa_url,
+                stamp_image_path=stamp_image_path,
+                stamp_text_position=stamp_text_position,
             )
             entry = (src, True, "")
         except Exception as exc:
