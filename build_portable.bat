@@ -79,7 +79,7 @@ if "%MODE%"=="1" (
     call :check_dir "models\lightgbm_splitter" "Archive page splitter"
     call :check_dir "models\layoutlmv3_fontgray_norm_final_epoch25" "LayoutLMv3 text KIE"
     if "%INCLUDE_CORRECTION%"=="1" call :check_dir "models\distilled_ct2" "Distilled Proton CT2"
-    call :check_dir "models\translate" "***REMOVED*** EN<->VI"
+    call :check_dir "models\translate" "***REMOVED*** EN-VI"
 )
 
 echo.

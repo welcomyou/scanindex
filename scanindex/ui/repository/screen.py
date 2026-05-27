@@ -1870,7 +1870,11 @@ class _LegacyPdfPane(QWidget):
 # pixmap scaling, and async page rendering.
 class _PdfPane(PdfViewerWidget):
     def __init__(self, parent=None):
-        super().__init__(parent, fit_on_load=False)
+        super().__init__(
+            parent,
+            fit_on_load=False,
+            text_selection_available=True,
+        )
         self._zoom = 0.5
         self._fit_mode = False
         self._update_zoom_label()
@@ -2134,6 +2138,7 @@ class RepositoryScreen(ScreenContent):
         self._mode = self._MODE_DOSSIERS
         self._current_dossier: Optional[DossierRow] = None
         self._current_file: Optional[FileRow] = None
+        self._metadata_edit_dialog = None
         self._search_hits: List[FileHit] = []
         self._hits_by_doc: dict[str, FileHit] = {}
         self._active_doc_id = ""
@@ -3907,7 +3912,15 @@ class RepositoryScreen(ScreenContent):
     def _on_edit_current_file_metadata(self) -> None:
         if self._current_file is None or self._store is None or self._index is None:
             return
-        from scanindex.core.repository import admin
+        existing = self._metadata_edit_dialog
+        if existing is not None:
+            try:
+                if existing.isVisible():
+                    existing.raise_()
+                    existing.activateWindow()
+                    return
+            except RuntimeError:
+                self._metadata_edit_dialog = None
 
         doc_id = self._current_file.doc_id
         fields = self._fetch_document_kie_fields(doc_id)
@@ -3929,13 +3942,33 @@ class RepositoryScreen(ScreenContent):
             ),
             parent=self,
         )
-        if dlg.exec() != dlg.DialogCode.Accepted:
-            return
-        new_fields = dlg.get_fields()
         chunk_hits = None
         if self._mode == self._MODE_SEARCH:
             hit = self._hits_by_doc.get(doc_id)
             chunk_hits = hit.chunks if hit is not None else None
+
+        dlg.setModal(False)
+        dlg.setWindowModality(Qt.WindowModality.NonModal)
+        dlg.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        dlg.accepted.connect(
+            lambda d=dlg, did=doc_id, hits=chunk_hits: (
+                self._apply_current_file_metadata_edit(did, d, hits)
+            )
+        )
+        dlg.destroyed.connect(lambda *_: setattr(self, "_metadata_edit_dialog", None))
+        self._metadata_edit_dialog = dlg
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def _apply_current_file_metadata_edit(self, doc_id: str, dlg,
+                                          chunk_hits=None) -> None:
+        if self._store is None or self._index is None:
+            return
+        from scanindex.core.repository import admin
+
+        new_fields = dlg.get_fields()
         try:
             if not self.release_index_for_writer():
                 QMessageBox.warning(

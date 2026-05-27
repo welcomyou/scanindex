@@ -682,6 +682,47 @@ def _build_text_page_lines(page, lines_data, font_path):
     tw.write_text(page, render_mode=3)  # invisible
 
 
+def _build_text_page_words(page, words_data, font_path, *, fallback_lines=None):
+    """Add invisible text overlay at WORD level.
+
+    PyMuPDF derives copy-selection bboxes from the hidden text layer. Rendering
+    a whole OCR line as one text run lets font metrics drift across the line,
+    so late-line word bboxes no longer match the OCR boxes. Writing each word
+    with a horizontal morph keeps the PDF text layer aligned with word bboxes.
+    """
+    if not words_data:
+        _build_text_page_lines(page, fallback_lines or [], font_path)
+        return
+
+    import fitz  # PyMuPDF - lazy import (not needed by screenshot tool)
+    font = fitz.Font(fontfile=font_path)
+    font_name = "F0"
+    for wd in words_data:
+        text = str(wd.get("text") or "")
+        if not text.strip():
+            continue
+        x, y, w, h = _line_xywh(wd)
+        if w <= 0 or h <= 0:
+            continue
+        font_size = max(h * 0.90, 4.0)
+        baseline = fitz.Point(x, y + h * 0.81)
+        natural_w = max(font.text_length(text, fontsize=font_size), 0.01)
+        hscale = max(0.05, min(20.0, w / natural_w))
+        try:
+            page.insert_text(
+                baseline,
+                text,
+                fontname=font_name,
+                fontfile=font_path,
+                fontsize=font_size,
+                render_mode=3,
+                morph=(baseline, fitz.Matrix(hscale, 1.0)),
+                overlay=True,
+            )
+        except Exception:
+            continue
+
+
 def _copy_source_page_background(doc_out, doc_in, page_idx, page_w, page_h, bake_angle=0):
     """
     Copy one source page into the output PDF.
@@ -1144,7 +1185,7 @@ def process_pdf_for_docx_export(input_path, output_path, num_pages=None, update_
                 "coordinate_contract": "top_left_pdf_points_on_visual_page_after_preprocess",
             })
 
-            pending_line_overlays = []
+            pending_text_overlays = []
             background_specs = []
             for page_idx, manifest_entry in enumerate(manifest):
                 visual_page = visual_doc[page_idx]
@@ -1188,7 +1229,18 @@ def process_pdf_for_docx_export(input_path, output_path, num_pages=None, update_
 
                 ocr_data["pages"].append(page_record)
                 should_overlay = source_mode_page in {"scan", "mixed"}
-                pending_line_overlays.append(page_record.get("lines") if should_overlay else [])
+                if should_overlay:
+                    overlay_words = [
+                        w for w in (page_record.get("words") or [])
+                        if (w.get("source_layer") or "ocr") != "native"
+                    ]
+                    overlay_lines = [
+                        ln for ln in (page_record.get("lines") or [])
+                        if (ln.get("source_layer") or "ocr") != "native"
+                    ]
+                    pending_text_overlays.append((overlay_words, overlay_lines))
+                else:
+                    pending_text_overlays.append(([], []))
                 background_specs.append({
                     "page_idx": page_idx,
                     "page_w": visual_page.rect.width,
@@ -1199,10 +1251,15 @@ def process_pdf_for_docx_export(input_path, output_path, num_pages=None, update_
             doc_out = fitz.open()
             _append_backgrounds_preserving_inline_images(doc_out, visual_doc, background_specs)
             if font_path:
-                for page_idx, lines_data in enumerate(pending_line_overlays):
+                for page_idx, (words_data, lines_data) in enumerate(pending_text_overlays):
                     if page_idx >= len(doc_out):
                         break
-                    _build_text_page_lines(doc_out[page_idx], lines_data or [], font_path)
+                    _build_text_page_words(
+                        doc_out[page_idx],
+                        words_data or [],
+                        font_path,
+                        fallback_lines=lines_data or [],
+                    )
             doc_out.save(output_path, deflate=True, garbage=4)
             doc_out.close()
         finally:
@@ -1341,7 +1398,7 @@ def process_pdf(input_path, output_path, num_pages=None, update_callback=None,
         )
 
         doc_out = fitz.open()
-        pending_line_overlays = []
+        pending_text_overlays = []
         background_specs = []
         for page_idx in range(total_pages):
             page = doc_in[page_idx]
@@ -1400,7 +1457,7 @@ def process_pdf(input_path, output_path, num_pages=None, update_callback=None,
             # output renders correctly in EVERY PDF viewer, not just those
             # that honor the /Rotate metadata flag.
             bake_angle = 180 if coord_flipped else 0
-            pending_line_overlays.append(lines_data)
+            pending_text_overlays.append((words_data, lines_data))
             background_specs.append({
                 "page_idx": page_idx,
                 "page_w": page_w,
@@ -1410,10 +1467,15 @@ def process_pdf(input_path, output_path, num_pages=None, update_callback=None,
 
         _append_backgrounds_preserving_inline_images(doc_out, doc_in, background_specs)
 
-        for page_idx, lines_data in enumerate(pending_line_overlays):
+        for page_idx, (words_data, lines_data) in enumerate(pending_text_overlays):
             if page_idx >= len(doc_out):
                 break
-            _build_text_page_lines(doc_out[page_idx], lines_data, font_path)
+            _build_text_page_words(
+                doc_out[page_idx],
+                words_data,
+                font_path,
+                fallback_lines=lines_data,
+            )
 
         doc_out.save(output_path, deflate=True, garbage=4)
         doc_out.close()
@@ -1496,7 +1558,7 @@ def assemble_pdf_from_page_results(input_path, output_path, all_page_results,
         )
 
         doc_out = fitz.open()
-        pending_line_overlays = []
+        pending_text_overlays = []
         background_specs = []
         for page_idx in range(total_pages):
             source_page_idx = page_map[page_idx]
@@ -1548,7 +1610,7 @@ def assemble_pdf_from_page_results(input_path, output_path, all_page_results,
             ocr_data["pages"].append(page_data)
 
             bake_angle = 180 if coord_flipped else 0
-            pending_line_overlays.append(lines_data)
+            pending_text_overlays.append((words_data, lines_data))
             background_specs.append({
                 "page_idx": source_page_idx,
                 "page_w": page_w,
@@ -1558,10 +1620,15 @@ def assemble_pdf_from_page_results(input_path, output_path, all_page_results,
 
         _append_backgrounds_preserving_inline_images(doc_out, doc_in, background_specs)
 
-        for page_idx, lines_data in enumerate(pending_line_overlays):
+        for page_idx, (words_data, lines_data) in enumerate(pending_text_overlays):
             if page_idx >= len(doc_out):
                 break
-            _build_text_page_lines(doc_out[page_idx], lines_data, font_path)
+            _build_text_page_words(
+                doc_out[page_idx],
+                words_data,
+                font_path,
+                fallback_lines=lines_data,
+            )
 
         doc_out.save(output_path, deflate=True, garbage=4)
         doc_out.close()
@@ -1817,7 +1884,7 @@ def rebuild_pdf_with_text(original_input_path, output_path, ocr_json_path,
 
         replacements = replacements or {}
         doc_out = fitz.open()
-        pending_corrected_lines = []
+        pending_corrected_text = []
         background_specs = []
         total_replaced = 0
 
@@ -1881,15 +1948,22 @@ def rebuild_pdf_with_text(original_input_path, output_path, ocr_json_path,
             corrected_lines = _rebuild_lines_from_words(
                 page_data.get("lines", []), corrected_words
             )
-            pending_corrected_lines.append(corrected_lines)
+            pending_corrected_text.append((corrected_words, corrected_lines))
 
         if not source_has_text:
             _append_backgrounds_preserving_inline_images(doc_out, doc_in, background_specs)
 
-        for page_idx, corrected_lines in enumerate(pending_corrected_lines):
+        for page_idx, (corrected_words, corrected_lines) in enumerate(
+            pending_corrected_text
+        ):
             if page_idx >= len(doc_out):
                 break
-            _build_text_page_lines(doc_out[page_idx], corrected_lines, font_path)
+            _build_text_page_words(
+                doc_out[page_idx],
+                corrected_words,
+                font_path,
+                fallback_lines=corrected_lines,
+            )
 
         doc_out.save(output_path, deflate=True, garbage=4)
         doc_out.close()

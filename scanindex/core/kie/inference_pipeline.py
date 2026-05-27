@@ -688,6 +688,14 @@ def _tokenize_for_stamp_match(text: str) -> list[str]:
     return _re.findall(r"\w+", _strip_accents_upper(text))
 
 
+def _uppercase_ratio(text: str) -> float:
+    alpha_count = sum(1 for c in text if c.isalpha())
+    if alpha_count == 0:
+        return 0.0
+    upper_count = sum(1 for c in text if c.isupper())
+    return upper_count / alpha_count
+
+
 def _line_matches_stamp_keyword(line_text: str, keyword: str) -> bool:
     """Return True iff ``line_text`` equals ``keyword`` at the token level.
 
@@ -699,15 +707,43 @@ def _line_matches_stamp_keyword(line_text: str, keyword: str) -> bool:
     return _tokenize_for_stamp_match(line_text) == _tokenize_for_stamp_match(keyword)
 
 
+def _line_matches_secrecy_keyword(line_text: str, keyword: str) -> bool:
+    """Match a secrecy file signal without trusting OCR coordinates.
+
+    Exact standalone stamps are accepted. A short uppercase line containing a
+    document-number marker such as "So ... Mat" is also accepted because some
+    scans expose the secrecy marker in the number/symbol line instead of as a
+    separate stamp line.
+    """
+    tokens = _tokenize_for_stamp_match(line_text)
+    kw_tokens = _tokenize_for_stamp_match(keyword)
+    if not tokens or not kw_tokens:
+        return False
+    if tokens == kw_tokens:
+        return _is_stamp_like_line(line_text)
+
+    marker_at = None
+    if len(tokens) > len(kw_tokens) and tokens[-len(kw_tokens):] == kw_tokens:
+        marker_at = len(tokens) - len(kw_tokens)
+    else:
+        for idx in range(1, len(tokens) - len(kw_tokens) + 1):
+            if tokens[idx:idx + len(kw_tokens)] == kw_tokens:
+                marker_at = idx
+                break
+    if marker_at is None:
+        return False
+    if "SO" not in tokens[:marker_at]:
+        return False
+    if len(line_text or "") > 180:
+        return False
+    return _uppercase_ratio(line_text or "") > 0.6
+
+
 def _is_stamp_like_line(text: str) -> bool:
     """Heuristic: short line, mostly uppercase → likely a stamp, not body text."""
     if not text or len(text) > 60:
         return False
-    upper_count = sum(1 for c in text if c.isupper())
-    alpha_count = sum(1 for c in text if c.isalpha())
-    if alpha_count == 0:
-        return False
-    return upper_count / alpha_count > 0.6
+    return _uppercase_ratio(text) > 0.6
 
 
 def _line_center(line: dict, page_width: float, page_height: float) -> tuple[float, float]:
@@ -717,18 +753,42 @@ def _line_center(line: dict, page_width: float, page_height: float) -> tuple[flo
     return cx, cy
 
 
-def detect_secrecy_mark(canonical_doc: dict) -> str | None:
-    """Detection-only variant of the SECRECY_MARK rule from
-    :func:`apply_rule_based_marks`. Returns the matched keyword
-    (``"TUYỆT MẬT"`` / ``"TỐI MẬT"`` / ``"MẬT"``) or ``None``.
+def _detect_secrecy_mark_on_page(page: dict, *, require_roi: bool) -> str | None:
+    page_width = page.get("width") or 595.28
+    page_height = page.get("height") or 841.89
+    for line in page.get("lines") or []:
+        text = line.get("text", "")
+        if require_roi:
+            if not _is_stamp_like_line(text):
+                continue
+            cx, cy = _line_center(line, page_width, page_height)
+            if cx > 0.5 or cy > 0.33:
+                continue
+            matcher = _line_matches_stamp_keyword
+        else:
+            matcher = _line_matches_secrecy_keyword
+
+        # Longest keyword first because "TUYỆT MẬT" also contains "MẬT" as
+        # tokens and we want the more specific classification.
+        for kw in _SECRECY_KEYWORDS:
+            if matcher(text, kw):
+                return kw
+    return None
+
+
+def detect_secrecy_mark(canonical_doc: dict, *, text_fallback: bool = True) -> str | None:
+    """Return the file-level secrecy mark, if any.
 
     Pure function — never mutates the input. Intended for UI layers (e.g.
     the KIE viewer) that need to know whether a document is classified
     without re-running the full auto-label pipeline.
 
-    The rule is intentionally identical to the one in apply_rule_based_marks
-    so a positive here matches exactly what the pipeline would add to
-    ``field_instances``. Keep the two in sync.
+    The detector first applies the same top-left ROI stamp rule used by the
+    rule-based KIE mark. By default it then falls back to coordinate-free text
+    matching so rotated pages or unreliable OCR bboxes are handled consistently
+    by archive splitting, KIE viewer highlighting, and the support tool.
+    Pass ``text_fallback=False`` only when a caller needs exact KIE-field
+    parity with :func:`apply_rule_based_marks`.
     """
     if not isinstance(canonical_doc, dict):
         return None
@@ -736,22 +796,10 @@ def detect_secrecy_mark(canonical_doc: dict) -> str | None:
     page0 = next((p for p in pages if p.get("page_index") == 0), None)
     if not page0:
         return None
-    page_width = page0.get("width") or 595.28
-    page_height = page0.get("height") or 841.89
-    for line in page0.get("lines") or []:
-        text = line.get("text", "")
-        if not _is_stamp_like_line(text):
-            continue
-        cx, cy = _line_center(line, page_width, page_height)
-        if cx > 0.5 or cy > 0.33:
-            continue
-        # Token-level equality (see _line_matches_stamp_keyword) — longest
-        # keyword first because "TUYỆT MẬT" also contains "MẬT" as tokens
-        # and we want the more specific classification.
-        for kw in _SECRECY_KEYWORDS:
-            if _line_matches_stamp_keyword(text, kw):
-                return kw
-    return None
+    matched = _detect_secrecy_mark_on_page(page0, require_roi=True)
+    if matched or not text_fallback:
+        return matched
+    return _detect_secrecy_mark_on_page(page0, require_roi=False)
 
 
 def apply_rule_based_marks(doc: dict, annotation: dict) -> dict:

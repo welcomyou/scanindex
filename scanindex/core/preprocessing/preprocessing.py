@@ -72,6 +72,13 @@ _ORIENTATION_GUARD_MAX_SIDE = 1200
 _ORIENTATION_GUARD_SPARSE_FG_RATIO = 0.025
 _ORIENTATION_GUARD_SPARSE_BBOX_COVERAGE = 0.25
 _ORIENTATION_GUARD_RULED_HORIZONTAL_SHARE = 0.25
+_UVDOC_MODEL_PATH = os.path.join(APP_BASE_DIR, "models", "uvdoc", "uvdoc_fp32.onnx")
+_UVDOC_INPUT_W = 488
+_UVDOC_INPUT_H = 712
+_UVDOC_MIN_PAGE_AREA_RATIO = 0.18
+_UVDOC_MAX_PAGE_AREA_RATIO = 0.88
+_UVDOC_MAX_SIDE_COVERAGE = 0.95
+_UVDOC_MIN_CONTOUR_CONFIDENCE = 0.04
 
 # ── Quality-preserving preprocessing (v2) ─────────────────────────────
 _DESKEW_THRESHOLD_DEG = 0.5         # below this magnitude → no deskew applied
@@ -750,6 +757,124 @@ def _rotate_image_keep_canvas(image: np.ndarray, angle: float) -> np.ndarray:
     )
 
 
+@lru_cache(maxsize=1)
+def _get_uvdoc_session():
+    if ort is None or not os.path.exists(_UVDOC_MODEL_PATH):
+        return None
+    sess_opts = ort.SessionOptions()
+    sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    sess_opts.intra_op_num_threads = max(1, min(4, os.cpu_count() or 1))
+    return ort.InferenceSession(
+        _UVDOC_MODEL_PATH,
+        sess_options=sess_opts,
+        providers=["CPUExecutionProvider"],
+    )
+
+
+def _uvdoc_enabled() -> bool:
+    value = os.environ.get("OCRTOOL_UVDOC_DEWARP", "1").strip().lower()
+    return value not in {"0", "false", "no", "off"}
+
+
+def _largest_document_quad(image: np.ndarray) -> Optional[np.ndarray]:
+    h, w = image.shape[:2]
+    if h < 40 or w < 40:
+        return None
+    sample = _resize_for_orientation_analysis(image)
+    sh, sw = sample.shape[:2]
+    gray = cv2.cvtColor(sample, cv2.COLOR_BGR2GRAY) if len(sample.shape) == 3 else sample
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blur, 40, 140)
+    edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    page_area = float(sh * sw)
+    for contour in sorted(contours, key=cv2.contourArea, reverse=True)[:8]:
+        area = float(cv2.contourArea(contour))
+        if area < page_area * _UVDOC_MIN_PAGE_AREA_RATIO:
+            continue
+        peri = cv2.arcLength(contour, True)
+        approx = cv2.approxPolyDP(contour, 0.025 * peri, True)
+        if len(approx) != 4:
+            continue
+        quad = approx.reshape(4, 2).astype(np.float32)
+        x, y, bw, bh = cv2.boundingRect(quad.astype(np.int32))
+        confidence = area / max(1.0, float(bw * bh))
+        if confidence < _UVDOC_MIN_CONTOUR_CONFIDENCE:
+            continue
+        quad[:, 0] *= w / float(sw)
+        quad[:, 1] *= h / float(sh)
+        return quad
+    return None
+
+
+def _should_uvdoc_dewarp(
+    image: np.ndarray,
+    has_dominant_image: bool,
+    skew_angle: float = 0.0,
+) -> Tuple[bool, dict]:
+    enabled = _uvdoc_enabled()
+    meta = {
+        "enabled": enabled,
+        "available": _get_uvdoc_session() is not None if enabled else False,
+        "reason": None,
+        "page_area_ratio": None,
+        "side_coverage": None,
+    }
+    if not enabled:
+        meta["reason"] = "disabled"
+        return False, meta
+    if not meta["available"]:
+        meta["reason"] = "model_unavailable"
+        return False, meta
+    if not has_dominant_image:
+        meta["reason"] = "no_dominant_image"
+        return False, meta
+
+    quad = _largest_document_quad(image)
+    if quad is None:
+        if abs(float(skew_angle or 0.0)) > _DESKEW_KEEP_CANVAS_MAX_DEG:
+            meta["reason"] = "large_skew_camera_candidate"
+            return True, meta
+        meta["reason"] = "no_page_quad"
+        return False, meta
+    h, w = image.shape[:2]
+    area_ratio = float(cv2.contourArea(quad)) / max(1.0, float(h * w))
+    x, y, bw, bh = cv2.boundingRect(quad.astype(np.int32))
+    side_coverage = max(float(bw) / max(1.0, w), float(bh) / max(1.0, h))
+    meta["page_area_ratio"] = round(area_ratio, 4)
+    meta["side_coverage"] = round(side_coverage, 4)
+    if area_ratio >= _UVDOC_MAX_PAGE_AREA_RATIO and side_coverage >= _UVDOC_MAX_SIDE_COVERAGE:
+        meta["reason"] = "flat_scan_like"
+        return False, meta
+    if area_ratio < _UVDOC_MIN_PAGE_AREA_RATIO:
+        meta["reason"] = "page_too_small"
+        return False, meta
+    meta["reason"] = "camera_or_distorted_page"
+    return True, meta
+
+
+def _apply_uvdoc_dewarp(image: np.ndarray) -> np.ndarray:
+    session = _get_uvdoc_session()
+    if session is None:
+        return image
+    rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB) if len(image.shape) == 3 else cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+    inp = cv2.resize(rgb.astype(np.float32) / 255.0, (_UVDOC_INPUT_W, _UVDOC_INPUT_H), interpolation=cv2.INTER_LINEAR)
+    inp = inp.transpose(2, 0, 1)[None].astype(np.float32)
+    grid = session.run(None, {session.get_inputs()[0].name: inp})[0][0].transpose(1, 2, 0).astype(np.float32)
+    h, w = image.shape[:2]
+    grid = cv2.resize(grid, (w, h), interpolation=cv2.INTER_LINEAR)
+    map_x = ((grid[:, :, 0] + 1.0) * 0.5 * (w - 1)).astype(np.float32)
+    map_y = ((grid[:, :, 1] + 1.0) * 0.5 * (h - 1)).astype(np.float32)
+    return cv2.remap(
+        image, map_x, map_y,
+        interpolation=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(255, 255, 255),
+    )
+
+
 def _find_dominant_embedded_image(page) -> Optional[dict]:
     """Return metadata of the SINGLE dominant raster image on this page.
 
@@ -940,12 +1065,19 @@ def pre_process_pdf(input_path: str, output_path: str, update_callback=None,
             # Skew detection on cardinally-corrected preview (in-memory only)
             test_img = img if rotate_angle == 0 else _rotate_right_angle(img, rotate_angle)
             skew_angle = get_fine_deskew_angle(test_img)
+            uvdoc_needed, uvdoc_meta = _should_uvdoc_dewarp(
+                test_img,
+                bool(pd.get("has_dominant_image")),
+                skew_angle,
+            )
 
             return {
                 "index": pd["index"],
                 "rotate_angle": rotate_angle,
                 "skew_angle": skew_angle,
                 "orientation_meta": orientation_meta,
+                "uvdoc_needed": uvdoc_needed,
+                "uvdoc_meta": uvdoc_meta,
                 "estimated_dpi": pd["estimated_dpi"],
                 "has_dominant_image": pd["has_dominant_image"],
             }
@@ -963,7 +1095,7 @@ def pre_process_pdf(input_path: str, output_path: str, update_callback=None,
         # =================================================================
         out_doc = fitz.open()
         processed_count = 0
-        branch_counts = {"A": 0, "B": 0, "C": 0, "D": 0}
+        branch_counts = {"A": 0, "B": 0, "C": 0, "D": 0, "E": 0}
 
         for r in results:
             i = r["index"]
@@ -973,8 +1105,11 @@ def pre_process_pdf(input_path: str, output_path: str, update_callback=None,
 
             needs_cardinal = rotate_angle != 0
             needs_deskew = abs(skew_angle) > _DESKEW_THRESHOLD_DEG
+            needs_uvdoc = bool(r.get("uvdoc_needed"))
 
-            if not needs_cardinal and not needs_deskew:
+            if needs_uvdoc:
+                branch = "E"
+            elif not needs_cardinal and not needs_deskew:
                 branch = "A"
             elif needs_cardinal and not needs_deskew:
                 branch = "B"
@@ -1021,7 +1156,17 @@ def pre_process_pdf(input_path: str, output_path: str, update_callback=None,
                         arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w)
                         native_img = cv2.cvtColor(arr, cv2.COLOR_GRAY2BGR)
 
-                    if branch == "C":
+                    if branch == "E":
+                        if rotate_angle:
+                            native_img = _rotate_right_angle(native_img, rotate_angle)
+                        if abs(skew_angle) > _DESKEW_THRESHOLD_DEG:
+                            native_img = (
+                                _rotate_image_keep_canvas(native_img, skew_angle)
+                                if abs(skew_angle) <= _DESKEW_KEEP_CANVAS_MAX_DEG
+                                else rotate_image(native_img, skew_angle)
+                            )
+                        rotated = _apply_uvdoc_dewarp(native_img)
+                    elif branch == "C":
                         if abs(skew_angle) <= _DESKEW_KEEP_CANVAS_MAX_DEG:
                             rotated = _rotate_image_keep_canvas(native_img, skew_angle)
                         else:
@@ -1083,7 +1228,7 @@ def pre_process_pdf(input_path: str, output_path: str, update_callback=None,
         summary = (
             f"Processed {processed_count}/{total_pages} pages "
             f"(A={branch_counts['A']}, B={branch_counts['B']}, "
-            f"C={branch_counts['C']}, D={branch_counts['D']})"
+            f"C={branch_counts['C']}, D={branch_counts['D']}, E_uvdoc={branch_counts['E']})"
         )
         if return_metadata:
             rotations = [0] * total_pages
@@ -1096,7 +1241,10 @@ def pre_process_pdf(input_path: str, output_path: str, update_callback=None,
                     skew_angle = float(r.get("skew_angle", 0.0) or 0.0)
                     needs_cardinal = rotate_angle != 0
                     needs_deskew = abs(skew_angle) > _DESKEW_THRESHOLD_DEG
-                    if not needs_cardinal and not needs_deskew:
+                    needs_uvdoc = bool(r.get("uvdoc_needed"))
+                    if needs_uvdoc:
+                        branch = "uvdoc_dewarp"
+                    elif not needs_cardinal and not needs_deskew:
                         branch = "insert_pdf"
                     elif needs_cardinal and not needs_deskew:
                         branch = "set_rotation"
@@ -1107,7 +1255,9 @@ def pre_process_pdf(input_path: str, output_path: str, update_callback=None,
                         "branch": branch,
                         "rotation": rotate_angle,
                         "skew_angle": round(skew_angle, 4),
-                        "rasterized": bool(needs_deskew),
+                        "rasterized": bool(needs_deskew or needs_uvdoc),
+                        "uvdoc_dewarp": bool(needs_uvdoc),
+                        "uvdoc_meta": r.get("uvdoc_meta") or {},
                         "coord_transform": [1, 0, 0, 1, 0, 0],
                     })
             page_preprocess.sort(key=lambda item: item["page_index"])

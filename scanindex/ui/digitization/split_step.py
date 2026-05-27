@@ -83,8 +83,8 @@ class ArchiveStep1Split(QWidget):
         # Per-source-page secrecy mark cache, keyed by 0-based page index.
         # Populated once after the canonical OCR JSON for the whole source PDF
         # exists; consulted by `_refresh_segments` to flag classified docs
-        # in the segment list. Detection re-uses the rule from kie_viewer
-            # (`scanindex.core.kie.inference_pipeline.detect_secrecy_mark`).
+        # in the segment list. Detection re-uses the shared core detector
+        # (`scanindex.core.kie.inference_pipeline.detect_secrecy_mark`).
         self._page_secrecy: dict[int, str] = {}
 
         self.setAcceptDrops(True)

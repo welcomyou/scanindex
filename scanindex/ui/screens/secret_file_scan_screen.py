@@ -1,6 +1,7 @@
 """Tool screen for scanning folders for classified document stamps."""
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
@@ -9,7 +10,6 @@ import subprocess
 import textwrap
 import threading
 import time
-import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
@@ -18,7 +18,6 @@ from PySide6.QtCore import Qt, QUrl, Signal
 from PySide6.QtGui import QColor, QDesktopServices
 from PySide6.QtWidgets import (
     QAbstractItemView,
-    QCheckBox,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -54,7 +53,6 @@ from scanindex.ui.theme import (
 
 
 SUPPORTED_EXTS = {".pdf", ".png", ".jpg", ".jpeg", ".doc", ".docx"}
-_SECRECY_KEYWORDS = ("TUYỆT MẬT", "TỐI MẬT", "MẬT")
 _MIN_NATIVE_TEXT_CHARS = 40
 _DOC_NATIVE_FIRST_PAGE_LINE_LIMIT = 70
 
@@ -72,6 +70,14 @@ class SecretScanMatch:
     mode: str
     ocr_pdf_path: str
     note: str = ""
+
+
+@dataclass
+class SecretScanArtifact:
+    matches: list[SecretScanMatch]
+    source_pdf: str
+    canonical: dict
+    rotations: list[int] | None = None
 
 
 def _iter_supported_files(folder: str) -> Iterable[str]:
@@ -140,17 +146,7 @@ def _convert_docx_text_fallback(
     from docx import Document
 
     document = Document(source_path)
-    parts: list[str] = []
-    for paragraph in document.paragraphs:
-        text = paragraph.text.strip()
-        if text:
-            parts.append(text)
-    for table in document.tables:
-        for row in table.rows:
-            cells = [" ".join(cell.text.split()) for cell in row.cells]
-            text = " | ".join(cell for cell in cells if cell)
-            if text:
-                parts.append(text)
+    parts = list(_iter_docx_body_texts(document))
 
     wrapped: list[str] = []
     for part in parts or [""]:
@@ -175,6 +171,27 @@ def _convert_docx_text_fallback(
     finally:
         doc.close()
     return out_pdf
+
+
+def _iter_docx_body_texts(document) -> Iterable[str]:
+    from docx.oxml.table import CT_Tbl
+    from docx.oxml.text.paragraph import CT_P
+    from docx.table import Table
+    from docx.text.paragraph import Paragraph
+
+    body = document.element.body
+    for child in body.iterchildren():
+        if isinstance(child, CT_P):
+            text = Paragraph(child, document).text.strip()
+            if text:
+                yield text
+        elif isinstance(child, CT_Tbl):
+            table = Table(child, document)
+            for row in table.rows:
+                cells = [" ".join(cell.text.split()) for cell in row.cells]
+                text = " | ".join(cell for cell in cells if cell)
+                if text:
+                    yield text
 
 
 def _append_text_page(doc, lines: list[str], font_path: str | None) -> None:
@@ -507,7 +524,8 @@ def _docx_text_lines(source_path: str, *, first_page_only: bool) -> list[str]:
             header = getattr(section, header_name, None)
             if header is not None:
                 add_container(header)
-    add_container(document)
+    for text in _iter_docx_body_texts(document):
+        add_text(text)
 
     if first_page_only:
         return lines[:_DOC_NATIVE_FIRST_PAGE_LINE_LIMIT]
@@ -677,6 +695,7 @@ def _preprocess_pdf_for_ocr(
     pdf_path: str,
     out_pdf: str,
     log_cb: Callable[[str], None],
+    max_workers: int | None = None,
 ) -> tuple[str, list[int] | None]:
     try:
         from scanindex.core.preprocessing import preprocessing
@@ -684,9 +703,11 @@ def _preprocess_pdf_for_ocr(
         result = preprocessing.pre_process_pdf(
             pdf_path,
             out_pdf,
-            update_callback=lambda m, lvl="info": log_cb(str(m)),
+            update_callback=lambda m, lvl="info": (
+                log_cb(str(m)) if str(lvl).lower() != "debug" else None
+            ),
             debug_mode=False,
-            max_workers=max(1, min(4, os.cpu_count() or 4)),
+            max_workers=max(1, int(max_workers or min(4, os.cpu_count() or 4))),
             return_metadata=True,
         )
         if isinstance(result, tuple) and len(result) == 3:
@@ -775,15 +796,31 @@ def _ocr_pdf_to_canonical(
         text_normalization=OCR_TEXT_NORMALIZATION,
         raw_text_preserved=True,
     )
-    if not use_pool and getattr(direct_ocr_engine, "_ocr_instance", None) is None:
+    all_page_results: dict[int, dict | None] = {}
+    if use_pool and page_count >= 2 and direct_ocr_engine.get_parallel_capacity() > 1:
+        if cancel_event.is_set():
+            raise _ScanCancelled()
+        log_cb(
+            f"Parallel OCR: {direct_ocr_engine.get_parallel_capacity()} page workers "
+            f"for {page_count} pages"
+        )
+        all_page_results = direct_ocr_engine._process_pages_parallel(
+            input_pdf,
+            page_count,
+            lambda msg, level="info": (
+                log_cb(str(msg)) if str(level).lower() != "debug" else None
+            ),
+            page_timeout=180.0,
+        )
+    elif not use_pool and getattr(direct_ocr_engine, "_ocr_instance", None) is None:
         log_cb("Khởi động ScreenAI OCR đơn (không dùng pool)...")
+    if not use_pool:
+        log_cb(f"OCR {page_count} trang...")
     for page_idx in range(page_count):
         if cancel_event.is_set():
             raise _ScanCancelled()
-        log_cb(f"OCR trang {page_idx + 1}/{page_count}")
-        if use_pool:
-            result = direct_ocr_engine.ocr_one_page(input_pdf, page_idx, timeout=180.0)
-        else:
+        result = all_page_results.get(page_idx)
+        if result is None:
             result = _ocr_one_page_single_worker(direct_ocr_engine, input_pdf, page_idx)
         if result is None:
             raise RuntimeError(f"OCR thất bại ở trang {page_idx + 1}")
@@ -832,46 +869,7 @@ def _detect_secret_on_page(canonical_doc: dict, page_index: int) -> str | None:
             continue
         clone = dict(page)
         clone["page_index"] = 0
-        return detect_secrecy_mark({"pages": [clone]}) or _detect_secret_text_only(clone)
-    return None
-
-
-def _strip_accents_upper(text: str) -> str:
-    nfd = unicodedata.normalize("NFD", (text or "").replace("đ", "d").replace("Đ", "D"))
-    return "".join(ch for ch in nfd if unicodedata.category(ch) != "Mn").upper()
-
-
-def _tokenize_stamp(text: str) -> list[str]:
-    return re.findall(r"\w+", _strip_accents_upper(text))
-
-
-def _is_stamp_like_line(text: str) -> bool:
-    text = text or ""
-    if not text or len(text) > 60:
-        return False
-    alpha_count = sum(1 for ch in text if ch.isalpha())
-    if alpha_count == 0:
-        return False
-    upper_count = sum(1 for ch in text if ch.isupper())
-    return upper_count / alpha_count > 0.6
-
-
-def _detect_secret_text_only(page: dict) -> str | None:
-    """BBox-free fallback for rotated pages whose OCR text is correct.
-
-    This intentionally keeps the same strict standalone-line keyword rule as
-    the KIE detector; it only drops the top-left ROI check because rotated
-    inputs can make bbox coordinates unreliable even when ScreenAI reads the
-    text correctly.
-    """
-    for line in page.get("lines") or []:
-        text = line.get("text") or ""
-        if not _is_stamp_like_line(text):
-            continue
-        tokens = _tokenize_stamp(text)
-        for keyword in _SECRECY_KEYWORDS:
-            if tokens == _tokenize_stamp(keyword):
-                return keyword
+        return detect_secrecy_mark({"pages": [clone]})
     return None
 
 
@@ -882,6 +880,17 @@ def _doc_start_pages(canonical_json_path: str) -> tuple[list[int], str]:
     pages = [int(p) for p in (result.get("start_pages") or [])]
     pages = sorted(set(p for p in pages if p >= 0))
     return pages or [0], f"LightGBM: {len(pages or [0])} trang đầu văn bản"
+
+
+def _all_page_indices(canonical: dict) -> list[int]:
+    page_indices: list[int] = []
+    for ordinal, page in enumerate(canonical.get("pages") or []):
+        try:
+            page_indices.append(int(page.get("page_index", ordinal)))
+        except (TypeError, ValueError):
+            page_indices.append(ordinal)
+    page_indices = sorted(set(idx for idx in page_indices if idx >= 0))
+    return page_indices or [0]
 
 
 def _canonical_has_text(canonical: dict) -> bool:
@@ -895,19 +904,32 @@ def _canonical_has_text(canonical: dict) -> bool:
     return False
 
 
+def page_results_from_canonical(canonical: dict) -> dict[int, dict]:
+    results: dict[int, dict] = {}
+    for ordinal, page in enumerate(canonical.get("pages") or []):
+        try:
+            page_index = int(page.get("page_index", ordinal))
+        except (TypeError, ValueError):
+            page_index = ordinal
+        results[page_index] = {
+            "lines_data": copy.deepcopy(page.get("lines") or []),
+            "words_data": copy.deepcopy(page.get("words") or []),
+            "render_width": int(page.get("render_width") or 0),
+            "render_height": int(page.get("render_height") or 0),
+        }
+    return results
+
+
 def _page_indices_to_check(
-    canonical_json_path: str,
+    canonical: dict,
     *,
     thorough: bool,
     note: str,
 ) -> tuple[list[int], str]:
     if not thorough:
         return [0], note
-    try:
-        page_indices, lgbm_note = _doc_start_pages(canonical_json_path)
-        return page_indices, f"{note}; {lgbm_note}"
-    except Exception as exc:
-        return [0], f"{note}; LightGBM lỗi, chỉ kiểm trang 1: {exc}"
+    page_indices = _all_page_indices(canonical)
+    return page_indices, f"{note}; kiểm tất cả {len(page_indices)} trang"
 
 
 def _collect_secret_matches(
@@ -941,7 +963,35 @@ def _collect_secret_matches(
     return matches
 
 
-def scan_one_file_for_secret(
+def _filter_matches_by_doc_start(
+    matches: list[SecretScanMatch],
+    canonical_json_path: str,
+    log_cb: Callable[[str], None],
+) -> list[SecretScanMatch]:
+    if not matches:
+        return []
+    try:
+        doc_start_pages, lgbm_note = _doc_start_pages(canonical_json_path)
+    except Exception as exc:
+        log_cb(f"LightGBM lỗi, không xác nhận trang đầu văn bản: {exc}")
+        return []
+
+    starts = set(doc_start_pages)
+    accepted: list[SecretScanMatch] = []
+    for match in matches:
+        page_index = max(0, int(match.page_number) - 1)
+        if page_index in starts:
+            match.note = f"{match.note}; {lgbm_note}; xác nhận trang đầu"
+            accepted.append(match)
+        else:
+            log_cb(
+                f"Bỏ qua dấu {match.keyword} ở trang {match.page_number}: "
+                "LightGBM không xác định là trang đầu văn bản"
+            )
+    return accepted
+
+
+def scan_one_file_for_secret_artifact(
     source_path: str,
     relative_path: str,
     file_work_dir: str,
@@ -949,23 +999,26 @@ def scan_one_file_for_secret(
     cancel_event: threading.Event,
     log_cb: Callable[[str], None],
     prefer_native_text: bool = True,
-) -> list[SecretScanMatch]:
+    ocr_workers: int | None = None,
+) -> SecretScanArtifact:
     os.makedirs(file_work_dir, exist_ok=True)
-    first_page_only = not thorough
-    mode = "Tìm kỹ" if thorough else "Trang đầu"
+    ext = os.path.splitext(source_path)[1].lower()
+    word_document = ext in {".doc", ".docx"}
+    first_page_only = word_document or not thorough
+    mode = "Trang đầu DOC/DOCX" if word_document else ("Tìm kỹ" if thorough else "Trang đầu")
     canonical_json_path = os.path.join(file_work_dir, "ocr.json.zst")
 
     if prefer_native_text:
         native_canonical, native_note = _native_canonical_for_source(
             source_path,
-            thorough=thorough,
+            thorough=False if word_document else thorough,
             json_path=canonical_json_path,
         )
         if native_canonical is not None:
             note = native_note
             page_indices, note = _page_indices_to_check(
-                canonical_json_path,
-                thorough=thorough,
+                native_canonical,
+                thorough=False if word_document else thorough,
                 note=note,
             )
             native_matches = _collect_secret_matches(
@@ -981,7 +1034,12 @@ def scan_one_file_for_secret(
             if native_matches or _native_text_is_usable(native_canonical):
                 chars, lines = _native_text_stats(native_canonical)
                 log_cb(f"Dùng text sẵn có, bỏ OCR ({lines} dòng, {chars} ký tự)")
-                return native_matches
+                return SecretScanArtifact(
+                    matches=native_matches,
+                    source_pdf="",
+                    canonical=native_canonical,
+                    rotations=None,
+                )
             log_cb("Text sẵn có quá ít, chuyển sang OCR trang đang quét")
 
     source_pdf, source_note = _source_to_pdf(
@@ -993,7 +1051,12 @@ def scan_one_file_for_secret(
         raise _ScanCancelled()
 
     scan_pdf = source_pdf
-    if not thorough:
+    rotations = None
+    try:
+        use_pool = max(1, int(ocr_workers or 1)) > 1
+    except (TypeError, ValueError):
+        use_pool = False
+    if first_page_only and ext == ".pdf":
         first_pdf = os.path.join(file_work_dir, "first_page.pdf")
         scan_pdf = _extract_pdf_pages(source_pdf, first_pdf, [0])
 
@@ -1004,12 +1067,19 @@ def scan_one_file_for_secret(
         cancel_event,
         log_cb,
         json_path=canonical_json_path,
+        use_pool=use_pool,
     )
     if not _canonical_has_text(canonical):
         log_cb("OCR không ra chữ, thử preprocess xoay/nghiêng trang đang quét...")
         pre_pdf = os.path.join(file_work_dir, "preprocessed.pdf")
-        ocr_input_pdf, rotations = _preprocess_pdf_for_ocr(scan_pdf, pre_pdf, log_cb)
+        ocr_input_pdf, rotations = _preprocess_pdf_for_ocr(
+            scan_pdf,
+            pre_pdf,
+            log_cb,
+            max_workers=ocr_workers,
+        )
         if os.path.abspath(ocr_input_pdf) != os.path.abspath(scan_pdf):
+            scan_pdf = ocr_input_pdf
             canonical = _ocr_pdf_to_canonical(
                 ocr_input_pdf,
                 source_path,
@@ -1017,15 +1087,20 @@ def scan_one_file_for_secret(
                 cancel_event,
                 log_cb,
                 json_path=canonical_json_path,
+                use_pool=use_pool,
             )
 
     note = source_note
-    page_indices, note = _page_indices_to_check(
-        canonical_json_path,
-        thorough=thorough,
-        note=note,
-    )
-    return _collect_secret_matches(
+    if word_document:
+        page_indices = [0]
+        note = f"{note}; DOC/DOCX chỉ kiểm trang đầu sau chuyển PDF"
+    else:
+        page_indices, note = _page_indices_to_check(
+            canonical,
+            thorough=thorough,
+            note=note,
+        )
+    matches = _collect_secret_matches(
         canonical,
         page_indices,
         source_path=source_path,
@@ -1035,6 +1110,36 @@ def scan_one_file_for_secret(
         note=note,
         cancel_event=cancel_event,
     )
+    if not word_document and thorough:
+        matches = _filter_matches_by_doc_start(matches, canonical_json_path, log_cb)
+    return SecretScanArtifact(
+        matches=matches,
+        source_pdf=scan_pdf,
+        canonical=canonical,
+        rotations=rotations,
+    )
+
+
+def scan_one_file_for_secret(
+    source_path: str,
+    relative_path: str,
+    file_work_dir: str,
+    thorough: bool,
+    cancel_event: threading.Event,
+    log_cb: Callable[[str], None],
+    prefer_native_text: bool = True,
+    ocr_workers: int | None = None,
+) -> list[SecretScanMatch]:
+    return scan_one_file_for_secret_artifact(
+        source_path=source_path,
+        relative_path=relative_path,
+        file_work_dir=file_work_dir,
+        thorough=thorough,
+        cancel_event=cancel_event,
+        log_cb=log_cb,
+        prefer_native_text=prefer_native_text,
+        ocr_workers=ocr_workers,
+    ).matches
 
 
 class SecretFileScanScreen(ScreenContent):
@@ -1097,24 +1202,6 @@ class SecretFileScanScreen(ScreenContent):
         picker_layout.addLayout(row)
 
         opts = QHBoxLayout()
-        self.chk_thorough = QCheckBox("Tìm kỹ tất cả các trang")
-        self.chk_thorough.setStyleSheet(
-            f"QCheckBox {{ color: {COLOR_TEXT}; font-size: 13px;"
-            f" font-family: '{FONT_UI}'; background-color: transparent;"
-            " border: 0px; }}"
-        )
-        opts.addWidget(self.chk_thorough)
-        self.chk_native_fast = QCheckBox("Ưu tiên text có sẵn (nhanh)")
-        self.chk_native_fast.setChecked(True)
-        self.chk_native_fast.setToolTip(
-            "Nếu PDF/Word đã có text đủ dùng thì bỏ OCR. Bỏ chọn khi nghi text layer xấu."
-        )
-        self.chk_native_fast.setStyleSheet(
-            f"QCheckBox {{ color: {COLOR_TEXT}; font-size: 13px;"
-            f" font-family: '{FONT_UI}'; background-color: transparent;"
-            " border: 0px; }}"
-        )
-        opts.addWidget(self.chk_native_fast)
         opts.addStretch(1)
 
         self.btn_run = QPushButton("Bắt đầu quét")
@@ -1220,8 +1307,8 @@ class SecretFileScanScreen(ScreenContent):
         self.progress.setValue(0)
         self.progress.setMaximum(1)
 
-        thorough = self.chk_thorough.isChecked()
-        prefer_native_text = self.chk_native_fast.isChecked()
+        thorough = True
+        prefer_native_text = False
         thread = threading.Thread(
             target=self._run_worker,
             args=(folder, thorough, prefer_native_text),
@@ -1237,8 +1324,6 @@ class SecretFileScanScreen(ScreenContent):
     def _set_running_ui(self, running: bool) -> None:
         self.btn_browse.setEnabled(not running)
         self.folder_edit.setEnabled(not running)
-        self.chk_thorough.setEnabled(not running)
-        self.chk_native_fast.setEnabled(not running)
         self.btn_run.setVisible(not running)
         self.btn_stop.setVisible(running)
 

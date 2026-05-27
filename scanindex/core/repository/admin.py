@@ -33,7 +33,7 @@ from . import constants as C
 from .chunker import Chunk, synthesize_metadata_chunk
 from .importer import (
     DossierCodes, KIE_COLUMNS, _kie_col, _file_sha256, _strip_ocr_suffix,
-    _replace_pdf_file,
+    _replace_pdf_file, _copy_companion_if_present,
 )
 from .indexer import HybridIndex
 from .store import ArchiveStore
@@ -642,6 +642,7 @@ def add_document(store: ArchiveStore, index: HybridIndex, *,
     target_name = _strip_ocr_suffix(pdf_path.name)
     target_pdf = target_subdir / target_name
     _replace_pdf_file(pdf_path, target_pdf)
+    _copy_companion_if_present(pdf_path, target_pdf)
 
     # documents row
     rel = str(target_pdf.relative_to(store.archive_path)).replace("\\", "/")

@@ -4,14 +4,16 @@ PDF Viewer Widget — Continuous-scroll viewer with:
 - Middle-click or left-click drag to pan
 - All pages stacked vertically, smooth scroll
 """
+import re
+
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QScrollArea, QLabel,
     QPushButton, QSizePolicy, QFrame, QApplication
 )
-from PySide6.QtCore import Qt, Signal, QRect, QTimer, QSize, QPoint
+from PySide6.QtCore import Qt, Signal, QRect, QRectF, QTimer, QSize, QPoint
 from PySide6.QtGui import (
     QPixmap, QImage, QPainter, QColor, QPen, QWheelEvent,
-    QMouseEvent, QCursor
+    QMouseEvent, QCursor, QKeySequence, QShortcut
 )
 
 import threading
@@ -73,6 +75,14 @@ _TEXT_BTN = f"""
     QPushButton:pressed {{ background: {COLOR_HOVER}; }}
 """
 
+_TOGGLE_TEXT_BTN = _TEXT_BTN + f"""
+    QPushButton:checked {{
+        background: {COLOR_ACCENT};
+        border-color: {COLOR_ACCENT};
+        color: white;
+    }}
+"""
+
 _LABEL_STYLE = f"color: {COLOR_TEXT_MUTED}; font-size: {_FONT_SM}px; font-family: {FONT_UI};"
 
 # Per-KIE-label color map (matches the conventions used by kie_viewer)
@@ -103,6 +113,8 @@ class _ContinuousPageWidget(QWidget):
       - `_zone`: a single transient highlight; takes precedence visually."""
 
     fuzzy_clicked = Signal(int, str, object)  # page_idx, text, bbox_pdf_or_pixel
+    text_selection_dragged = Signal(object, object)
+    text_selection_finished = Signal(object, object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -114,11 +126,18 @@ class _ContinuousPageWidget(QWidget):
         self._search_highlight = None  # (page_idx, [(x, y, w, h), ...], style)
         # Fuzzy match overlays — drawn in a distinct color, clickable
         self._fuzzy_overlays: list[dict] = []
+        self._text_selection_enabled = False
+        self._text_selecting = False
+        self._text_selection_start = None
+        self._text_selection_rects: list[tuple] = []
+        self._text_drag_rect = None
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
     def set_pages(self, pixmaps):
         self._page_pixmaps = pixmaps
         self._zone = None
         self._overlays = []
+        self._text_selection_rects = []
         self._recalc_offsets()
         self.update()
 
@@ -128,6 +147,8 @@ class _ContinuousPageWidget(QWidget):
         self._zone = None
         self._overlays = []
         self._search_highlight = None
+        self._text_selection_rects = []
+        self._text_drag_rect = None
         self.setFixedSize(0, 0)
         self.update()
 
@@ -167,7 +188,44 @@ class _ContinuousPageWidget(QWidget):
         self._fuzzy_overlays = []
         self.update()
 
+    def set_text_selection_enabled(self, enabled: bool):
+        self._text_selection_enabled = bool(enabled)
+        if not enabled:
+            self._text_selecting = False
+            self._text_selection_start = None
+            self._text_drag_rect = None
+        self.setCursor(
+            Qt.CursorShape.IBeamCursor if enabled else Qt.CursorShape.ArrowCursor
+        )
+        self.update()
+
+    def set_text_selection_rects(self, rects):
+        """Each rect is (page_idx, x, y, w, h) in rendered page pixels."""
+        self._text_selection_rects = list(rects or [])
+        self.update()
+
+    def clear_text_selection_rects(self):
+        self._text_selection_rects = []
+        self.update()
+
     def mousePressEvent(self, event):
+        if (
+            self._text_selection_enabled
+            and event.button() == Qt.MouseButton.LeftButton
+        ):
+            self.setFocus(Qt.FocusReason.MouseFocusReason)
+            self._text_selecting = True
+            self._text_selection_start = event.position().toPoint()
+            self._text_drag_rect = QRectF(
+                self._text_selection_start,
+                self._text_selection_start,
+            ).normalized()
+            self.text_selection_dragged.emit(
+                self._text_selection_start, self._text_selection_start
+            )
+            self.update()
+            event.accept()
+            return
         if event.button() == Qt.MouseButton.LeftButton and self._fuzzy_overlays:
             click_pos = event.position().toPoint()
             for ov in self._fuzzy_overlays:
@@ -187,6 +245,35 @@ class _ContinuousPageWidget(QWidget):
                     return
         # Otherwise let QScrollArea handle pan
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._text_selection_enabled and self._text_selecting:
+            if event.buttons() & Qt.MouseButton.LeftButton:
+                start = self._text_selection_start or event.position().toPoint()
+                current = event.position().toPoint()
+                self._text_drag_rect = QRectF(start, current).normalized()
+                self.text_selection_dragged.emit(start, current)
+                self.update()
+                event.accept()
+                return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if (
+            self._text_selection_enabled
+            and self._text_selecting
+            and event.button() == Qt.MouseButton.LeftButton
+        ):
+            self._text_selecting = False
+            start = self._text_selection_start or event.position().toPoint()
+            current = event.position().toPoint()
+            self._text_selection_start = None
+            self._text_drag_rect = None
+            self.text_selection_finished.emit(start, current)
+            self.update()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
     def page_y_offset(self, page_idx):
         if 0 <= page_idx < len(self._page_y_offsets):
@@ -333,6 +420,35 @@ class _ContinuousPageWidget(QWidget):
                 painter.setPen(pen)
                 painter.drawRect(QRect(rx, ry, rw, rh))
 
+        if self._text_selection_rects:
+            fill = QColor("#2563eb")
+            fill.setAlpha(70)
+            pen = QColor("#60a5fa")
+            pen.setAlpha(220)
+            for item in self._text_selection_rects:
+                try:
+                    pi, zx, zy, zw, zh = item
+                except (ValueError, TypeError):
+                    continue
+                if not (0 <= pi < len(self._page_y_offsets)):
+                    continue
+                y_off = self._page_y_offsets[pi]
+                pm = self._page_pixmaps[pi]
+                x_off = (widget_w - pm.width()) // 2
+                rx, ry = int(x_off + zx), int(y_off + zy)
+                rw, rh = max(1, int(zw)), max(1, int(zh))
+                rect = QRect(rx, ry, rw, rh)
+                painter.fillRect(rect, fill)
+                painter.setPen(QPen(pen, 1.5))
+                painter.drawRect(rect)
+
+        if self._text_drag_rect is not None:
+            drag_fill = QColor(0, 200, 255, 30)
+            drag_pen = QColor(0, 200, 255, 180)
+            painter.setBrush(drag_fill)
+            painter.setPen(QPen(drag_pen, 1.5, Qt.PenStyle.DashLine))
+            painter.drawRect(self._text_drag_rect)
+
         painter.end()
 
 
@@ -351,6 +467,17 @@ class _PanZoomScrollArea(QScrollArea):
         self._pan_start = QPoint()
         self._pan_hbar_start = 0
         self._pan_vbar_start = 0
+        self._text_selection_enabled = False
+
+    def set_text_selection_enabled(self, enabled: bool):
+        self._text_selection_enabled = bool(enabled)
+        if enabled and self._panning:
+            self._panning = False
+        self.setCursor(
+            Qt.CursorShape.IBeamCursor
+            if self._text_selection_enabled
+            else Qt.CursorShape.OpenHandCursor
+        )
 
     def wheelEvent(self, event: QWheelEvent):
         if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
@@ -363,7 +490,12 @@ class _PanZoomScrollArea(QScrollArea):
             super().wheelEvent(event)
 
     def mousePressEvent(self, event: QMouseEvent):
-        if event.button() in (Qt.MouseButton.LeftButton, Qt.MouseButton.MiddleButton):
+        can_left_pan = (
+            event.button() == Qt.MouseButton.LeftButton
+            and not self._text_selection_enabled
+        )
+        can_middle_pan = event.button() == Qt.MouseButton.MiddleButton
+        if can_left_pan or can_middle_pan:
             self._panning = True
             self._pan_start = event.globalPosition().toPoint()
             self._pan_hbar_start = self.horizontalScrollBar().value()
@@ -385,7 +517,11 @@ class _PanZoomScrollArea(QScrollArea):
     def mouseReleaseEvent(self, event: QMouseEvent):
         if self._panning:
             self._panning = False
-            self.setCursor(Qt.CursorShape.OpenHandCursor)
+            self.setCursor(
+                Qt.CursorShape.IBeamCursor
+                if self._text_selection_enabled
+                else Qt.CursorShape.OpenHandCursor
+            )
             event.accept()
         else:
             super().mouseReleaseEvent(event)
@@ -404,7 +540,8 @@ class PdfViewerWidget(QWidget):
     RENDER_DPI = 150
     ZOOM_STEPS = [0.25, 0.33, 0.5, 0.67, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0]
 
-    def __init__(self, parent=None, *, fit_on_load=True):
+    def __init__(self, parent=None, *, fit_on_load=True,
+                 text_selection_available=False):
         super().__init__(parent)
         self._doc = None
         self._page_count = 0
@@ -417,12 +554,20 @@ class PdfViewerWidget(QWidget):
         self._render_gen = 0
         self._current_search_highlight = None
         self._pending_view_scroll = None
+        self._text_selection_available = bool(text_selection_available)
+        self._text_selection_enabled = False
+        self._selection_words_by_page = None
+        self._selected_words = []
+        self._selected_text = ""
         self._pages_rendered.connect(self._on_pages_rendered)
         self._hires_timer = QTimer(self)
         self._hires_timer.setSingleShot(True)
         self._hires_timer.setInterval(300)
         self._hires_timer.timeout.connect(self._start_hires_render)
         self._setup_ui()
+        self._copy_shortcut = QShortcut(QKeySequence.StandardKey.Copy, self)
+        self._copy_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self._copy_shortcut.activated.connect(self.copy_selected_text)
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
@@ -497,6 +642,15 @@ class PdfViewerWidget(QWidget):
         self._btn_fit.clicked.connect(self._zoom_fit)
         toolbar.addWidget(self._btn_fit)
 
+        self._btn_select_text = QPushButton("Chọn chữ")
+        self._btn_select_text.setCheckable(True)
+        self._btn_select_text.setStyleSheet(_TOGGLE_TEXT_BTN)
+        self._btn_select_text.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_select_text.setToolTip("Bật chế độ kéo chọn chữ; Ctrl+C để copy")
+        self._btn_select_text.toggled.connect(self.set_text_selection_enabled)
+        self._btn_select_text.setVisible(self._text_selection_available)
+        toolbar.addWidget(self._btn_select_text)
+
         # Page indicator
         toolbar.addSpacing(4)
         self._lbl_page = QLabel()
@@ -536,6 +690,12 @@ class PdfViewerWidget(QWidget):
         self._scroll.verticalScrollBar().valueChanged.connect(self._on_scroll)
 
         self._pages_widget = _ContinuousPageWidget()
+        self._pages_widget.text_selection_dragged.connect(
+            self._on_text_selection_dragged
+        )
+        self._pages_widget.text_selection_finished.connect(
+            self._on_text_selection_finished
+        )
         self._scroll.setWidget(self._pages_widget)
         layout.addWidget(self._scroll, 1)
 
@@ -566,6 +726,8 @@ class PdfViewerWidget(QWidget):
         self._pages_widget.clear_pages()
         self._current_search_highlight = None
         self._pending_view_scroll = None
+        self._selection_words_by_page = None
+        self._clear_text_selection()
         self._pages_widget.clear_search_highlight()
         try:
             import fitz
@@ -597,9 +759,9 @@ class PdfViewerWidget(QWidget):
         if not bbox_pdf or len(bbox_pdf) < 4:
             self.scroll_to_page(page_idx)
             return
-        scale = self.RENDER_DPI / 72.0 * self._zoom
         page_y = self._pages_widget.page_y_offset(page_idx)
-        target_y = page_y + int(float(bbox_pdf[1]) * scale) - 96
+        _, y_scale, _, rect_y0 = self._page_view_transform(page_idx)
+        target_y = page_y + int((float(bbox_pdf[1]) - rect_y0) * y_scale) - 96
         self._scroll.verticalScrollBar().setValue(max(0, target_y))
 
     def show_pdf(self, pdf_path, page=1, bbox=None, bboxes=None, highlight_style="box"):
@@ -631,10 +793,8 @@ class PdfViewerWidget(QWidget):
             return
         if page_idx < 0 or page_idx >= self._page_count:
             return
-        scale = self.RENDER_DPI / 72.0 * self._zoom
-        x0, y0 = bbox_pdf[0] * scale, bbox_pdf[1] * scale
-        x1, y1 = bbox_pdf[2] * scale, bbox_pdf[3] * scale
-        self._pages_widget.set_zone(page_idx, (x0, y0, x1 - x0, y1 - y0))
+        x0, y0, w, h = self._pdf_bbox_to_view_rect(page_idx, bbox_pdf)
+        self._pages_widget.set_zone(page_idx, (x0, y0, w, h))
         page_y = self._pages_widget.page_y_offset(page_idx)
         target_y = page_y + int(y0) - 40
         self._scroll.verticalScrollBar().setValue(max(0, target_y))
@@ -669,15 +829,9 @@ class PdfViewerWidget(QWidget):
             self._pages_widget.clear_search_highlight()
             return
         page_idx, boxes, style = self._current_search_highlight
-        scale = self.RENDER_DPI / 72.0 * self._zoom
         rects = []
-        for x0, y0, x1, y1 in boxes:
-            rects.append((
-                float(x0) * scale,
-                float(y0) * scale,
-                (float(x1) - float(x0)) * scale,
-                (float(y1) - float(y0)) * scale,
-            ))
+        for box in boxes:
+            rects.append(self._pdf_bbox_to_view_rect(page_idx, box))
         self._pages_widget.set_search_highlight(page_idx, rects, style)
 
     # ── KIE field overlays (multiple bboxes, one per field) ─────────
@@ -695,7 +849,6 @@ class PdfViewerWidget(QWidget):
         if not self._doc:
             self._pages_widget.set_overlays([])
             return
-        scale = self.RENDER_DPI / 72.0 * self._zoom
         overlays = []
         for f in fields or []:
             bbox = f.get("bbox")
@@ -705,9 +858,7 @@ class PdfViewerWidget(QWidget):
             label = f.get("label") or ""
             color = f.get("color") or _LABEL_COLORS.get(label, COLOR_ACCENT)
             is_selected = bool(f.get("is_selected"))
-            x0, y0, x1, y1 = bbox[0], bbox[1], bbox[2], bbox[3]
-            zx, zy = x0 * scale, y0 * scale
-            zw, zh = (x1 - x0) * scale, (y1 - y0) * scale
+            zx, zy, zw, zh = self._pdf_bbox_to_view_rect(page_idx, bbox)
             overlays.append((page_idx, zx, zy, zw, zh, color, label, is_selected))
         self._pages_widget.set_overlays(overlays)
 
@@ -735,17 +886,17 @@ class PdfViewerWidget(QWidget):
         if not getattr(self, "_current_fuzzy_matches", None) or not self._doc:
             self._pages_widget.clear_fuzzy_overlays()
             return
-        scale = self.RENDER_DPI / 72.0 * self._zoom
         overlays = []
         for rank, m in enumerate(self._current_fuzzy_matches):
             bbox = m.get("bbox")
             if not bbox or len(bbox) < 4:
                 continue
-            x0, y0, x1, y1 = bbox[0], bbox[1], bbox[2], bbox[3]
+            page_idx = int(m.get("page_index", 0))
+            x, y, w, h = self._pdf_bbox_to_view_rect(page_idx, bbox)
             overlays.append({
-                "page_idx": int(m.get("page_index", 0)),
-                "x": x0 * scale, "y": y0 * scale,
-                "w": (x1 - x0) * scale, "h": (y1 - y0) * scale,
+                "page_idx": page_idx,
+                "x": x, "y": y,
+                "w": w, "h": h,
                 "text": m.get("text", ""),
                 "score": float(m.get("score", 0)),
                 "rank": rank,
@@ -768,6 +919,8 @@ class PdfViewerWidget(QWidget):
         self._close_doc()
         self._raw_pixmaps = []
         self._current_field_overlays = []
+        self._selection_words_by_page = None
+        self._clear_text_selection()
         self._pages_widget.clear_pages()
         self._hint_label.setText(translations.get_text("arc_no_preview"))
         self._hint_label.setVisible(True)
@@ -779,6 +932,383 @@ class PdfViewerWidget(QWidget):
         if self._doc is None:
             self._hint_label.setText(translations.get_text("arc_no_preview"))
         self._update_nav_state()
+
+    def set_text_selection_enabled(self, enabled: bool):
+        enabled = bool(enabled and self._text_selection_available)
+        self._text_selection_enabled = enabled
+        if hasattr(self, "_btn_select_text") and self._btn_select_text.isChecked() != enabled:
+            self._btn_select_text.blockSignals(True)
+            self._btn_select_text.setChecked(enabled)
+            self._btn_select_text.blockSignals(False)
+        self._pages_widget.set_text_selection_enabled(enabled)
+        self._scroll.set_text_selection_enabled(enabled)
+        if enabled:
+            self._pages_widget.setFocus(Qt.FocusReason.MouseFocusReason)
+        else:
+            self._clear_text_selection()
+
+    def copy_selected_text(self):
+        text = self._selected_text.strip()
+        if not text:
+            return False
+        clipboard = QApplication.clipboard()
+        if clipboard is None:
+            return False
+        clipboard.setText(text)
+        return True
+
+    def _clear_text_selection(self):
+        self._selected_words = []
+        self._selected_text = ""
+        if hasattr(self, "_pages_widget"):
+            self._pages_widget.clear_text_selection_rects()
+
+    def _current_pdf_to_view_scale(self) -> float:
+        return float(self.RENDER_DPI) / 72.0 * float(self._zoom or 1.0)
+
+    def _page_view_transform(self, page_idx: int):
+        fallback = self._current_pdf_to_view_scale()
+        try:
+            page = self._doc[int(page_idx)] if self._doc is not None else None
+            pixmaps = getattr(self._pages_widget, "_page_pixmaps", [])
+            pm = pixmaps[int(page_idx)] if 0 <= int(page_idx) < len(pixmaps) else None
+            rect = page.rect if page is not None else None
+            if pm is None or rect is None:
+                return fallback, fallback, 0.0, 0.0
+            rect_w = max(1.0, float(rect.width))
+            rect_h = max(1.0, float(rect.height))
+            return (
+                float(pm.width()) / rect_w,
+                float(pm.height()) / rect_h,
+                float(rect.x0),
+                float(rect.y0),
+            )
+        except Exception:
+            return fallback, fallback, 0.0, 0.0
+
+    def _pdf_bbox_to_view_rect(self, page_idx: int, bbox_pdf) -> tuple[float, float, float, float]:
+        if not bbox_pdf or len(bbox_pdf) < 4:
+            return 0.0, 0.0, 0.0, 0.0
+        x_scale, y_scale, rect_x0, rect_y0 = self._page_view_transform(page_idx)
+        x0, y0, x1, y1 = (float(v) for v in bbox_pdf[:4])
+        return (
+            (x0 - rect_x0) * x_scale,
+            (y0 - rect_y0) * y_scale,
+            max(1.0, (x1 - x0) * x_scale),
+            max(1.0, (y1 - y0) * y_scale),
+        )
+
+    @staticmethod
+    def _bbox_from_word_record(word: dict):
+        box = word.get("bbox")
+        if isinstance(box, (list, tuple)) and len(box) >= 4:
+            try:
+                x0, y0, x1, y1 = (float(v) for v in box[:4])
+            except (TypeError, ValueError):
+                return None
+            if x1 > x0 and y1 > y0:
+                return [x0, y0, x1, y1]
+        try:
+            x = float(word.get("x", 0.0) or 0.0)
+            y = float(word.get("y", 0.0) or 0.0)
+            w = float(word.get("w", 0.0) or 0.0)
+            h = float(word.get("h", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return None
+        if w <= 0 or h <= 0:
+            return None
+        return [x, y, x + w, y + h]
+
+    def _selection_words_from_companion(self) -> dict[int, list[dict]]:
+        if not self._pdf_path:
+            return {}
+        try:
+            from scanindex.core.canonical_io import load_canonical, resolve_companion
+            companion = resolve_companion(self._pdf_path)
+            if companion is None:
+                return {}
+            data = load_canonical(companion)
+        except Exception:
+            return {}
+
+        words_by_page: dict[int, list[dict]] = {}
+        pages = data.get("pages") or []
+        if not isinstance(pages, list):
+            return {}
+        for fallback_page_idx, page in enumerate(pages):
+            if not isinstance(page, dict):
+                continue
+            try:
+                page_idx = int(page.get("page_index", fallback_page_idx))
+            except Exception:
+                page_idx = fallback_page_idx
+            line_by_id = {}
+            line_by_order = {}
+            for line_order, line in enumerate(page.get("lines") or []):
+                if not isinstance(line, dict):
+                    continue
+                raw_line_order = line.get("order", line.get("line_index", line_order))
+                try:
+                    line_idx = int(raw_line_order or 0)
+                except (TypeError, ValueError):
+                    line_idx = line_order
+                try:
+                    block_id = int(line.get("block_id", 0) or 0)
+                except (TypeError, ValueError):
+                    block_id = 0
+                paragraph_id = line.get("paragraph_id")
+                if paragraph_id is None:
+                    paragraph_id = block_id
+                meta = {
+                    "block": block_id,
+                    "paragraph": str(paragraph_id),
+                    "line": line_idx,
+                    "line_id": str(line.get("id") or line.get("line_id") or ""),
+                }
+                if meta["line_id"]:
+                    line_by_id[meta["line_id"]] = meta
+                line_by_order[line_idx] = meta
+            page_words = []
+            for order, word in enumerate(page.get("words") or []):
+                if not isinstance(word, dict):
+                    continue
+                text = str(word.get("text") or word.get("ocr_text") or "")
+                if not text.strip():
+                    continue
+                bbox = self._bbox_from_word_record(word)
+                if not bbox:
+                    continue
+                line_id = str(word.get("line_id") or "")
+                line_meta = line_by_id.get(line_id)
+                if line_meta is None:
+                    try:
+                        line_idx = int(word.get("line_index", 0) or 0)
+                    except (TypeError, ValueError):
+                        line_idx = 0
+                    line_meta = line_by_order.get(line_idx, {})
+                try:
+                    block_id = int(word.get("block_id", line_meta.get("block", 0)) or 0)
+                except (TypeError, ValueError):
+                    block_id = int(line_meta.get("block", 0) or 0)
+                paragraph_id = word.get("paragraph_id", line_meta.get("paragraph"))
+                if paragraph_id is None:
+                    paragraph_id = block_id
+                try:
+                    line_idx = int(word.get("line_index", line_meta.get("line", 0)) or 0)
+                except (TypeError, ValueError):
+                    line_idx = int(line_meta.get("line", 0) or 0)
+                page_words.append({
+                    "page_idx": page_idx,
+                    "bbox": bbox,
+                    "text": text,
+                    "block": block_id,
+                    "paragraph": str(paragraph_id),
+                    "line": line_idx,
+                    "line_id": line_id or str(line_meta.get("line_id") or ""),
+                    "word": int(
+                        word.get("word_index", word.get("order", order)) or order
+                    ),
+                    "order": order,
+                    "has_space_after": bool(word.get("has_space_after", True)),
+                })
+            if page_words:
+                words_by_page[page_idx] = page_words
+        return words_by_page
+
+    def _ensure_selection_words_loaded(self) -> dict[int, list[dict]]:
+        if self._selection_words_by_page is not None:
+            return self._selection_words_by_page
+        companion_words = self._selection_words_from_companion()
+        if companion_words:
+            self._selection_words_by_page = companion_words
+            return companion_words
+        words_by_page: dict[int, list[dict]] = {}
+        if self._doc is None:
+            self._selection_words_by_page = words_by_page
+            return words_by_page
+        for page_idx in range(self._page_count):
+            page_words = []
+            try:
+                raw_words = self._doc[page_idx].get_text("words") or []
+            except Exception:
+                raw_words = []
+            for order, item in enumerate(raw_words):
+                if len(item) < 5:
+                    continue
+                text = str(item[4] or "")
+                if not text.strip():
+                    continue
+                try:
+                    x0, y0, x1, y1 = (float(item[i]) for i in range(4))
+                except Exception:
+                    continue
+                if x1 <= x0 or y1 <= y0:
+                    continue
+                page_words.append({
+                    "page_idx": page_idx,
+                    "bbox": [x0, y0, x1, y1],
+                    "text": text,
+                    "block": int(item[5]) if len(item) > 5 else 0,
+                    "paragraph": str(int(item[5]) if len(item) > 5 else 0),
+                    "line": int(item[6]) if len(item) > 6 else 0,
+                    "line_id": "",
+                    "word": int(item[7]) if len(item) > 7 else order,
+                    "order": order,
+                    "has_space_after": True,
+                })
+            words_by_page[page_idx] = page_words
+        self._selection_words_by_page = words_by_page
+        return words_by_page
+
+    @staticmethod
+    def _pdf_rect_intersects(a: list[float], b: tuple[float, float, float, float]) -> bool:
+        ax0, ay0, ax1, ay1 = (float(v) for v in a)
+        bx0, by0, bx1, by1 = b
+        return min(ax1, bx1) > max(ax0, bx0) and min(ay1, by1) > max(ay0, by0)
+
+    def _words_in_content_rect(self, start: QPoint, end: QPoint) -> list[dict]:
+        if self._doc is None or not self._pages_widget.page_count():
+            return []
+        selection_rect = QRectF(start, end).normalized()
+        if selection_rect.width() < 3 and selection_rect.height() < 3:
+            return []
+
+        widget_w = float(self._pages_widget.width())
+        words_by_page = self._ensure_selection_words_loaded()
+        selected: list[dict] = []
+        for page_idx, pm in enumerate(getattr(self._pages_widget, "_page_pixmaps", [])):
+            page_x0 = (widget_w - float(pm.width())) / 2.0
+            page_y0 = float(self._pages_widget.page_y_offset(page_idx))
+            page_rect = QRectF(page_x0, page_y0, float(pm.width()), float(pm.height()))
+            if not selection_rect.intersects(page_rect):
+                continue
+            page_selection = selection_rect.intersected(page_rect).translated(
+                -page_x0,
+                -page_y0,
+            )
+            for word in words_by_page.get(page_idx, []):
+                wx, wy, ww, wh = self._pdf_bbox_to_view_rect(page_idx, word["bbox"])
+                if page_selection.intersects(QRectF(wx, wy, ww, wh)):
+                    selected.append(word)
+        selected.sort(
+            key=lambda w: (
+                w["page_idx"], w["block"], w["line"], w["word"],
+                w["bbox"][1], w["bbox"][0], w["order"],
+            )
+        )
+        return selected
+
+    @staticmethod
+    def _clipboard_word_text(text: str) -> str:
+        text = str(text or "").replace("\xa0", " ").strip()
+        return "-" if text == "\xad" else text.replace("\xad", "-")
+
+    @staticmethod
+    def _clipboard_text_from_line_words(words: list[dict]) -> str:
+        parts: list[str] = []
+        for word in words:
+            text = PdfViewerWidget._clipboard_word_text(word.get("text") or "")
+            if not text:
+                continue
+            parts.append(text)
+            if word.get("has_space_after", True):
+                parts.append(" ")
+        text = "".join(parts).strip()
+        text = re.sub(r"\s+", " ", text)
+        text = re.sub(r"\s+([,.;:!?%)])", r"\1", text)
+        text = re.sub(r"([(])\s+", r"\1", text)
+        return text.strip()
+
+    @staticmethod
+    def _selection_lines_from_words(words: list[dict]) -> list[dict]:
+        if not words:
+            return []
+        lines: list[dict] = []
+        current_key = None
+        current_words: list[dict] = []
+
+        def flush():
+            if not current_words:
+                return
+            text = PdfViewerWidget._clipboard_text_from_line_words(current_words)
+            boxes = [w.get("bbox") or [0, 0, 0, 0] for w in current_words]
+            x0 = min(float(b[0]) for b in boxes)
+            y0 = min(float(b[1]) for b in boxes)
+            x1 = max(float(b[2]) for b in boxes)
+            y1 = max(float(b[3]) for b in boxes)
+            first = current_words[0]
+            lines.append({
+                "page_idx": int(first.get("page_idx", 0)),
+                "block": int(first.get("block", 0)),
+                "paragraph": str(first.get("paragraph", first.get("block", 0))),
+                "line": int(first.get("line", 0)),
+                "line_id": str(first.get("line_id", "")),
+                "text": text,
+                "bbox": [x0, y0, x1, y1],
+                "height": max(1.0, y1 - y0),
+            })
+
+        for word in words:
+            key = (
+                int(word.get("page_idx", 0)),
+                int(word.get("block", 0)),
+                str(word.get("paragraph", word.get("block", 0))),
+                int(word.get("line", 0)),
+            )
+            if current_key is None:
+                current_key = key
+            if key != current_key:
+                flush()
+                current_key = key
+                current_words = []
+            current_words.append(word)
+        flush()
+        return [line for line in lines if line.get("text")]
+
+    @staticmethod
+    def _selection_line_separator(prev: dict, cur: dict) -> str:
+        if int(prev.get("page_idx", 0)) != int(cur.get("page_idx", 0)):
+            return "\n\n"
+        if str(prev.get("paragraph")) != str(cur.get("paragraph")):
+            return "\n"
+        if int(prev.get("block", 0)) != int(cur.get("block", 0)):
+            return "\n"
+        return " "
+
+    def _selection_text_from_words(self, words: list[dict]) -> str:
+        if not words:
+            return ""
+        lines = self._selection_lines_from_words(words)
+        if not lines:
+            return ""
+        out = [str(lines[0].get("text") or "")]
+        for prev, cur in zip(lines, lines[1:]):
+            out.append(self._selection_line_separator(prev, cur))
+            out.append(str(cur.get("text") or ""))
+        return "".join(out)
+
+    def _reapply_text_selection(self):
+        if not self._selected_words:
+            self._pages_widget.clear_text_selection_rects()
+            return
+        rects = []
+        for word in self._selected_words:
+            page_idx = int(word.get("page_idx", 0))
+            rects.append((page_idx, *self._pdf_bbox_to_view_rect(page_idx, word["bbox"])))
+        self._pages_widget.set_text_selection_rects(rects)
+
+    def _select_text_between_points(self, start: QPoint, end: QPoint):
+        self._selected_words = self._words_in_content_rect(start, end)
+        self._selected_text = self._selection_text_from_words(self._selected_words)
+        self._reapply_text_selection()
+
+    def _on_text_selection_dragged(self, start: QPoint, end: QPoint):
+        if self._text_selection_enabled:
+            self._select_text_between_points(start, end)
+
+    def _on_text_selection_finished(self, start: QPoint, end: QPoint):
+        if self._text_selection_enabled:
+            self._select_text_between_points(start, end)
 
     # ------ Zoom (anchor to cursor) ------
 
@@ -873,6 +1403,7 @@ class PdfViewerWidget(QWidget):
         self._reapply_search_highlight()
         if getattr(self, "_current_fuzzy_matches", None):
             self._reapply_fuzzy_matches()
+        self._reapply_text_selection()
         self._update_zoom_label()
 
         # Schedule hi-res re-render if zoomed beyond base resolution
@@ -942,6 +1473,7 @@ class PdfViewerWidget(QWidget):
             self._reapply_search_highlight()
             if getattr(self, "_current_fuzzy_matches", None):
                 self._reapply_fuzzy_matches()
+            self._reapply_text_selection()
             self._apply_pending_view_scroll()
 
     def _start_hires_render(self):

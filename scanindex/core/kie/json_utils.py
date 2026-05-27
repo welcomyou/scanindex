@@ -581,7 +581,7 @@ def _slim_line_record(line):
     _copy_if_present(
         line,
         out,
-        ("id", "order", "text", "font_size", "fg_gray"),
+        ("id", "order", "text", "font_size", "fg_gray", "block_id", "paragraph_id"),
     )
     bbox = _record_bbox(line)
     if bbox is not None:

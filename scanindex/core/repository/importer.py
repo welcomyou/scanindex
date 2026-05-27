@@ -41,6 +41,7 @@ from .chunker import Block, Chunk, chunk_blocks, synthesize_metadata_chunk
 from .indexer import HybridIndex
 from .store import ArchiveStore
 from .tokenizer import segment, segment_many, to_no_diacritic
+from scanindex.core.canonical_io import companion_for_pdf, resolve_companion
 
 
 # ---------- Canonical KIE label list (14 fields) ----------
@@ -288,6 +289,16 @@ def _replace_pdf_file(src: Path, dst: Path) -> None:
             f"Không thể ghi đè PDF trong Kho: {dst}. "
             "Hãy đóng file PDF nếu đang mở rồi thử lại."
         ) from exc
+
+
+def _copy_companion_if_present(src: Path, dst_pdf: Path) -> None:
+    companion = resolve_companion(src)
+    if companion is None:
+        return
+    try:
+        shutil.copy2(companion, companion_for_pdf(dst_pdf))
+    except Exception:
+        pass
 
 
 def _bbox_from_obj(obj: dict) -> Tuple[float, float, float, float]:
@@ -751,6 +762,7 @@ class Importer:
             rename_strip_ocr=True,
             target_file_name=target_file_name,
             body_blocks=canonical_blocks,
+            canonical_path=canonical_path,
         )
 
     @staticmethod
@@ -767,7 +779,8 @@ class Importer:
                         dossier_id: int,
                         rename_strip_ocr: bool,
                         target_file_name: str = "",
-                        body_blocks: Optional[List[Block]] = None) -> bool:
+                        body_blocks: Optional[List[Block]] = None,
+                        canonical_path: Optional[Path] = None) -> bool:
         sha = _file_sha256(pdf)
         conn = self.store.connect()
         existing_same_dossier = conn.execute(
@@ -793,6 +806,7 @@ class Importer:
         )
         target_pdf = target_subdir / target_name
         _replace_pdf_file(pdf, target_pdf)
+        _copy_companion_if_present(canonical_path or pdf, target_pdf)
 
         blocks = list(body_blocks or [])
         if not blocks:
