@@ -49,7 +49,7 @@ repo HF cũng pin `revision=<commit_sha>`; bootstrap ***REMOVED*** pin URL asset
 SHA256 archive và SHA256 từng file. Hash mismatch → script raise
 `ModelIntegrityError` và dừng.
 
-ScreenAI tải từ Google CDN qua [scanindex/core/ocr/screen_ai_downloader.py](scanindex/core/ocr/screen_ai_downloader.py). Downloader kiểm tra URL HTTPS, SHA256 64 ký tự do Google updater XML công bố và chữ ký Authenticode của DLL Google.
+ScreenAI tải từ Google CDN qua [scanindex/core/ocr/screen_ai_downloader.py](scanindex/core/ocr/screen_ai_downloader.py). Downloader kiểm tra host Google + URL HTTPS, SHA256 64 ký tự do Google updater XML công bố hoặc fallback Google CDN được pin cứng, và chữ ký Authenticode của DLL Google.
 
 Kiểm tra manifest URL/hash mà không tải file:
 
@@ -131,7 +131,7 @@ Tổng hợp ở Collection [welcomyou/scanindex](https://huggingface.co/collect
 
 Mọi model semantic vẫn còn trên HF + train-convert scripts ([train-convert/archive-embedder/](train-convert/archive-embedder/)) để dễ bật lại sau. Bộ "dormant" không nằm trong `MODELS_CONFIG` nên `download_offline_models.py` không tự kéo.
 
-Chrome ScreenAI OCR DLL nằm ngoài HF — auto download từ Google CDN bởi [scanindex/core/ocr/screen_ai_downloader.py](scanindex/core/ocr/screen_ai_downloader.py), kèm SHA256 từ Google updater XML và Authenticode verify để chắc DLL ký bởi Google LLC.
+Chrome ScreenAI OCR DLL nằm ngoài HF — auto download từ Google CDN bởi [scanindex/core/ocr/screen_ai_downloader.py](scanindex/core/ocr/screen_ai_downloader.py), kèm SHA256 từ Google updater XML hoặc fallback CDN pin cứng và Authenticode verify để chắc DLL ký bởi Google LLC.
 
 Upload model sau khi retrain:
 

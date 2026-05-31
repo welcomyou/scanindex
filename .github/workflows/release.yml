@@ -21,6 +21,7 @@ jobs:
     env:
       RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
       GH_TOKEN: ${{ github.token }}
+      PYTHONUTF8: "1"
 
     steps:
       - name: Check out release tag

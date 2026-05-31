@@ -18,8 +18,9 @@ The manifest below (MODELS_CONFIG) is the trust anchor:
 Separate trust anchors:
 
   - Chrome ScreenAI: fetched from Google CDN by
-    scanindex.core.ocr.screen_ai_downloader. Trusted via the SHA256 announced
-    by Google's updater XML plus Authenticode verification of the extracted DLL.
+    scanindex.core.ocr.screen_ai_downloader. Trusted via a pinned Google CDN
+    fallback or the SHA256 announced by Google's updater XML, plus Authenticode
+    verification of the extracted DLL.
   - Chrome ***REMOVED*** bootstrap: downloaded from a versioned GitHub Release
     asset and verified against the archive SHA256 plus per-file SHA256 pins.
 Failure modes are loud: any hash mismatch, missing file, or HF error
@@ -295,6 +296,17 @@ def _validate_configs() -> None:
             _validate_sha256(expected, f"{model_id}:{rel}")
 
 
+def _validate_screen_ai_pins() -> int:
+    sys.path.insert(0, str(ROOT))
+    from scanindex.core.ocr.screen_ai_downloader import (
+        PINNED_SCREEN_AI_COMPONENTS,
+        validate_pinned_screen_ai_components,
+    )
+
+    validate_pinned_screen_ai_components()
+    return len(PINNED_SCREEN_AI_COMPONENTS)
+
+
 def _verify_one(file_path: Path, expected: str, label: str) -> None:
     _validate_sha256(expected, label)
     actual = _sha256_file(file_path)
@@ -458,6 +470,11 @@ def download_screen_ai() -> bool:
 
 # ── main ────────────────────────────────────────────────────────────
 def main() -> int:
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure:
+            reconfigure(errors="backslashreplace")
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--only", default=None,
                         help="Only download this model_id")
@@ -480,6 +497,7 @@ def main() -> int:
     print(f"Models dir:   {MODELS_DIR}")
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     _validate_configs()
+    screen_ai_pins = _validate_screen_ai_pins()
     if args.validate_config:
         hf_files = sum(len(c["integrity_files"]) for c in MODELS_CONFIG)
         direct_files = sum(
@@ -488,7 +506,8 @@ def main() -> int:
         print(
             f"OK: {len(MODELS_CONFIG)} HF sources / {hf_files} files, "
             f"{len(DIRECT_DOWNLOADS_CONFIG)} direct sources / {direct_files} "
-            "files; every URL and SHA256 pin is valid."
+            f"files, {screen_ai_pins} ScreenAI pins; "
+            "every URL and SHA256 pin is valid."
         )
         return 0
 

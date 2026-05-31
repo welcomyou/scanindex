@@ -22,12 +22,27 @@ import zipfile
 from pathlib import Path
 from urllib.request import urlopen, Request
 from urllib.error import URLError
+from urllib.parse import urlparse
 from xml.etree import ElementTree
 
 logger = logging.getLogger(__name__)
 
 COMPONENT_ID = "mfhmdacoffpmifoibamicehhklffanao"
 BASE_URL = "https://clients2.google.com/service/update2/crx"
+PINNED_SCREEN_AI_COMPONENTS = {
+    ("win", "x64"): {
+        "version": "148.4",
+        "url": (
+            "https://dl.google.com/release2/chrome_component/"
+            "gkpu5gigcigd7og6pako37xzfu_148.4/"
+            "mfhmdacoffpmifoibamicehhklffanao_148.04_win64_"
+            "adqpnd6jdryiojtxkjmdbuaii27a.crx3"
+        ),
+        "sha256": "0d1b251f1d89d7119d499e97be506e839a10dd4847f7cb45de594b68c50109ec",
+        "size": 112095563,
+    },
+}
+_GOOGLE_DOWNLOAD_HOSTS = {"dl.google.com", "redirector.gvt1.com"}
 
 
 class ScreenAIIntegrityError(RuntimeError):
@@ -137,6 +152,48 @@ def _get_platform_params():
     return os_name, arch, os_arch
 
 
+def _normalize_google_download_url(url):
+    parsed = urlparse(url)
+    if parsed.hostname not in _GOOGLE_DOWNLOAD_HOSTS:
+        return None
+    if parsed.scheme == "http":
+        parsed = parsed._replace(scheme="https")
+    if parsed.scheme != "https":
+        return None
+    return parsed.geturl()
+
+
+def validate_pinned_screen_ai_components():
+    for platform_key, component in PINNED_SCREEN_AI_COMPONENTS.items():
+        source_url = _normalize_google_download_url(component.get("url", ""))
+        if not source_url:
+            raise ScreenAIIntegrityError(
+                f"Invalid pinned ScreenAI URL for {platform_key}"
+            )
+        if not re.fullmatch(r"[0-9a-f]{64}", component.get("sha256", "")):
+            raise ScreenAIIntegrityError(
+                f"Invalid pinned ScreenAI SHA256 for {platform_key}"
+            )
+
+
+def _get_pinned_update():
+    os_name, arch, _ = _get_platform_params()
+    component = PINNED_SCREEN_AI_COMPONENTS.get((os_name, arch))
+    if not component:
+        return None
+    validate_pinned_screen_ai_components()
+    return dict(component)
+
+
+def _fallback_to_pinned_update(reason):
+    pinned = _get_pinned_update()
+    if pinned:
+        logger.warning(f"{reason}; using pinned ScreenAI v{pinned['version']}")
+    else:
+        logger.error(reason)
+    return pinned
+
+
 def _build_url(response_type="redirect"):
     """Build the Component Updater URL."""
     os_name, arch, os_arch = _get_platform_params()
@@ -166,8 +223,7 @@ def check_update():
         with urlopen(req, timeout=15) as resp:
             xml_data = resp.read().decode("utf-8")
     except (URLError, OSError) as e:
-        logger.error(f"Update check failed: {e}")
-        return None
+        return _fallback_to_pinned_update(f"Update check failed: {e}")
 
     try:
         root = ElementTree.fromstring(xml_data)
@@ -176,18 +232,23 @@ def check_update():
             if app.tag == "updatecheck" or app.tag.endswith("}updatecheck"):
                 status = app.get("status", "")
                 if status != "ok":
-                    logger.warning(f"Update check status: {status}")
-                    return None
+                    return _fallback_to_pinned_update(
+                        f"Update check status: {status}"
+                    )
 
-                codebase = app.get("codebase", "")
+                codebase = _normalize_google_download_url(
+                    app.get("codebase", "")
+                )
                 sha256 = app.get("hash_sha256", "")
                 size = int(app.get("size", "0"))
-                if not codebase.startswith("https://"):
-                    logger.error("Google update XML did not return an HTTPS codebase")
-                    return None
+                if not codebase:
+                    return _fallback_to_pinned_update(
+                        "Google update XML did not return an allowed HTTPS codebase"
+                    )
                 if not re.fullmatch(r"[0-9a-f]{64}", sha256):
-                    logger.error("Google update XML returned an invalid SHA256 digest")
-                    return None
+                    return _fallback_to_pinned_update(
+                        "Google update XML returned an invalid SHA256 digest"
+                    )
                 # Extract version from codebase URL
                 # URL format: ..._140.21/mfhmdacoffp..._140.21_win64_...crx3
                 version = app.get("version", "")
@@ -206,9 +267,9 @@ def check_update():
                     "size": size,
                 }
     except ElementTree.ParseError as e:
-        logger.error(f"Failed to parse update XML: {e}")
+        return _fallback_to_pinned_update(f"Failed to parse update XML: {e}")
 
-    return None
+    return _fallback_to_pinned_update("Google update XML had no updatecheck node")
 
 
 def download_crx(dest_path, progress_callback=None, source_url=None):
