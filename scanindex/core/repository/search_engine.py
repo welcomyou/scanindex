@@ -212,6 +212,74 @@ def _query_window_bboxes(
     return _dedupe_match_bboxes(boxes)
 
 
+def _compacted_query_window_bboxes(
+    words: List[dict],
+    qtokens: List[str],
+) -> List[List[float]]:
+    """Map exact queries onto legacy PDF text layers with glued words.
+
+    Older OCR PDFs can expose words such as ``soKhoa`` and ``ngheThanh``
+    even though the indexed canonical text contains spaces. This fallback is
+    intentionally separate from the normal matcher so clean text layers keep
+    the cheaper token-by-token path.
+    """
+    needle = "".join(str(token or "") for token in qtokens)
+    if len(needle) < 3 or not words:
+        return []
+
+    boxes: List[List[float]] = []
+    if len(qtokens) == 1:
+        for word in words:
+            token = str(word.get("token") or "")
+            if token == needle or not (
+                token.startswith(needle) or token.endswith(needle)
+            ):
+                continue
+            bbox = word.get("bbox") or []
+            if len(bbox) == 4:
+                boxes.append([float(v) for v in bbox])
+        return _dedupe_match_bboxes(boxes)
+
+    max_words = len(qtokens) + 2
+    for start in range(len(words)):
+        compacted = ""
+        spans: List[tuple[int, int, List[float]]] = []
+        for word in words[start:start + max_words]:
+            token = str(word.get("token") or "")
+            if not token:
+                break
+            bbox = word.get("bbox") or []
+            if len(bbox) != 4:
+                break
+            token_start = len(compacted)
+            compacted += token
+            spans.append((token_start, len(compacted), [float(v) for v in bbox]))
+
+            match_start = compacted.find(needle)
+            if match_start < 0:
+                continue
+            match_end = match_start + len(needle)
+            matched_boxes = [
+                bbox
+                for span_start, span_end, bbox in spans
+                if span_start < match_end and span_end > match_start
+            ]
+            if matched_boxes:
+                boxes.append(_bbox_union(matched_boxes))
+            break
+    return _dedupe_match_bboxes(boxes)
+
+
+def _exact_query_window_bboxes(
+    words: List[dict],
+    qtokens: List[str],
+) -> List[List[float]]:
+    boxes = _query_window_bboxes(words, qtokens, fuzzy=False)
+    if boxes:
+        return boxes
+    return _compacted_query_window_bboxes(words, qtokens)
+
+
 def _content_tokens(tokens: List[str]) -> List[str]:
     kept = [
         t for t in tokens
@@ -836,11 +904,11 @@ class SearchEngine:
         else:
             words = page_words
         if not words:
-            return _query_window_bboxes(page_words, qtokens, fuzzy=False)
-        boxes = _query_window_bboxes(words, qtokens, fuzzy=False)
+            return _exact_query_window_bboxes(page_words, qtokens)
+        boxes = _exact_query_window_bboxes(words, qtokens)
         if boxes or len(words) == len(page_words):
             return boxes
-        return _query_window_bboxes(page_words, qtokens, fuzzy=False)
+        return _exact_query_window_bboxes(page_words, qtokens)
 
     def _fuzzy_match_bboxes(self,
                             *,

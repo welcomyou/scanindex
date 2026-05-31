@@ -682,7 +682,8 @@ def relabel_dossier(store: ArchiveStore, dossier_id: int, *,
                     topic: str = "", note: str = "",
                     fonds_name: str = "", catalog_name: str = "") -> RelabelStats:
     """Update dossier metadata and, when any of the 4 identity codes changes,
-    rename every child PDF + update documents.file_name/file_path.
+    rename every child PDF and canonical OCR companion, then update
+    documents.file_name/file_path.
 
     This is intentionally a separate operation from update_dossier_metadata:
     changing codes changes the dossier's natural key and physical storage
@@ -737,33 +738,64 @@ def relabel_dossier(store: ArchiveStore, dossier_id: int, *,
         dossier_code=dossier_code,
     )
 
-    move_ops = []
+    move_ops: list[dict] = []
     if code_changed:
+        source_pdfs: set[Path] = set()
+        source_companions: set[Path] = set()
         for idx, doc in enumerate(docs, start=1):
             src = _abs_pdf_path(store, doc["file_path"] or "")
             if not src.exists() or not src.is_file():
                 raise FileNotFoundError(f"KhÃ´ng tÃ¬m tháº¥y PDF: {src}")
+            src = src.resolve()
+            if src in source_pdfs:
+                raise ValueError(f"Nhiá»u vÄƒn báº£n Ä‘ang dÃ¹ng chung má»™t PDF: {src}")
+            source_pdfs.add(src)
+            src_companion = resolve_companion(src)
+            if src_companion is not None:
+                src_companion = src_companion.resolve()
+                source_companions.add(src_companion)
             new_name = _canonical_doc_name(
                 ma_dinh_danh, fonds, catalog, dossier_code, idx
             )
-            dst = target_dir / new_name
-            if dst.exists() and dst.resolve() != src.resolve():
-                raise FileExistsError(f"File Ä‘Ã­ch Ä‘Ã£ tá»“n táº¡i: {dst}")
+            dst = (target_dir / new_name).resolve()
             rel = str(dst.relative_to(store.archive_path)).replace("\\", "/")
-            move_ops.append((doc["doc_id"], src, dst, new_name, rel))
+            move_ops.append({
+                "doc_id": doc["doc_id"],
+                "src": src,
+                "dst": dst,
+                "new_name": new_name,
+                "rel": rel,
+                "src_companion": src_companion,
+                "dst_companion": companion_for_pdf(dst),
+                "current_pdf": src,
+                "current_companion": src_companion,
+            })
+        for op in move_ops:
+            dst = op["dst"]
+            if dst.exists() and dst.resolve() not in source_pdfs:
+                raise FileExistsError(f"File Ä‘Ã­ch Ä‘Ã£ tá»“n táº¡i: {dst}")
+            dst_companion = op["dst_companion"]
+            if (dst_companion.exists()
+                    and dst_companion.resolve() not in source_companions):
+                raise FileExistsError(f"File JSON Ä‘Ã­ch Ä‘Ã£ tá»“n táº¡i: {dst_companion}")
 
     now = int(time.time())
-    moved: list[tuple[Path, Path]] = []
     try:
         conn.execute("BEGIN IMMEDIATE")
         if code_changed:
             target_dir.mkdir(parents=True, exist_ok=True)
-            for _doc_id, src, dst, _new_name, _rel in move_ops:
+            for op in move_ops:
+                src = op["src"]
+                dst = op["dst"]
                 if src.resolve() == dst.resolve():
                     continue
                 dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(src), str(dst))
-                moved.append((dst, src))
+                _move_path_with_retry(src, dst)
+                op["current_pdf"] = dst
+                src_companion = op["src_companion"]
+                if src_companion is not None and src_companion.exists():
+                    _move_path_with_retry(src_companion, op["dst_companion"])
+                    op["current_companion"] = op["dst_companion"]
 
         conn.execute(
             "UPDATE dossiers SET ma_dinh_danh = ?, fonds = ?, fonds_name = ?,"
@@ -785,11 +817,11 @@ def relabel_dossier(store: ArchiveStore, dossier_id: int, *,
                 now, dossier_id,
             ),
         )
-        for doc_id, _src, _dst, new_name, rel in move_ops:
+        for op in move_ops:
             conn.execute(
                 "UPDATE documents SET file_name = ?, file_path = ?,"
                 " updated_at = ? WHERE doc_id = ?",
-                (new_name, rel, now, doc_id),
+                (op["new_name"], op["rel"], now, op["doc_id"]),
             )
         conn.execute("COMMIT")
     except Exception:
@@ -797,19 +829,37 @@ def relabel_dossier(store: ArchiveStore, dossier_id: int, *,
             conn.execute("ROLLBACK")
         except Exception:
             pass
-        for dst, src in reversed(moved):
+        for op in reversed(move_ops):
+            src_companion = op.get("src_companion")
+            current_companion = op.get("current_companion")
             try:
-                if dst.exists() and not src.exists():
+                if (src_companion is not None and current_companion is not None
+                        and Path(current_companion).exists()
+                        and Path(current_companion) != src_companion):
+                    src_companion.parent.mkdir(parents=True, exist_ok=True)
+                    _move_path_with_retry(
+                        Path(current_companion), src_companion,
+                        attempts=4, delay=0.05,
+                    )
+            except Exception:
+                pass
+            current_pdf = op.get("current_pdf")
+            src = op["src"]
+            try:
+                if (current_pdf is not None and Path(current_pdf).exists()
+                        and Path(current_pdf) != src):
                     src.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.move(str(dst), str(src))
+                    _move_path_with_retry(
+                        Path(current_pdf), src, attempts=4, delay=0.05
+                    )
             except Exception:
                 pass
         raise
 
     if code_changed:
-        for _doc_id, _src, _dst, _new_name, _rel in move_ops:
+        for op in move_ops:
             try:
-                _cleanup_empty_pdf_parents(store, _src.parent)
+                _cleanup_empty_pdf_parents(store, op["src"].parent)
             except Exception:
                 pass
 

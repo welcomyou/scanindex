@@ -3835,7 +3835,8 @@ class RepositoryScreen(ScreenContent):
     def _on_edit_dossier(self, dossier: DossierRow) -> None:
         """Open the same DossierInfoDialog used in Bước 1, pre-filled with
         the row's identity. If the 4 identity codes change, the operation
-        also renames child PDFs and updates their stored file paths."""
+        also renames child PDFs, moves their OCR companions, and updates
+        the stored file paths."""
         from scanindex.core.digitization.session import IdentityCodes
         from scanindex.ui.dialogs.archive_session_dialog import DossierInfoDialog
         from scanindex.core.repository import admin
@@ -3877,7 +3878,8 @@ class RepositoryScreen(ScreenContent):
             ask = QMessageBox.question(
                 self,
                 "Đổi mã hồ sơ?",
-                "Thao tác này sẽ đổi tên toàn bộ PDF và chuyển thư mục lưu trữ.\n\n"
+                "Thao tác này sẽ đổi tên toàn bộ PDF, dữ liệu OCR đi kèm "
+                "và chuyển thư mục lưu trữ.\n\n"
                 f"{old_key}\n→ {new_key}\n\n"
                 f"Số văn bản sẽ đổi tên: {dossier.doc_count}\n\n"
                 "Tiếp tục?",
@@ -3911,7 +3913,7 @@ class RepositoryScreen(ScreenContent):
         if stats.code_changed:
             self.log_message.emit(
                 f"Đã đổi mã hồ sơ {stats.old_key} → {stats.new_key}; "
-                f"đổi tên {stats.renamed_docs} PDF.",
+                f"đổi tên {stats.renamed_docs} PDF và dữ liệu OCR đi kèm.",
                 "success",
             )
         else:

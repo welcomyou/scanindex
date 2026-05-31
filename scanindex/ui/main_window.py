@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
     QFileDialog, QMessageBox, QApplication, QProgressDialog, QLabel,
     QInputDialog,
 )
-from PySide6.QtCore import Qt, QTimer, Slot, QThread, Signal
+from PySide6.QtCore import QPoint, QSize, Qt, QTimer, Slot, QThread, Signal
 from PySide6.QtGui import QFont
 
 from scanindex.ui.theme import (
@@ -71,6 +71,8 @@ pdf_utils = None
 table_anchored_merger = None
 
 SCREEN_AI_WORKERS_PER_FILE = 4
+DEFAULT_WINDOW_SIZE = QSize(1200, 680)
+WINDOW_SCREEN_MARGIN = 8
 
 
 def per_file_pre_workers(parallel_files: int) -> int:
@@ -286,7 +288,8 @@ class MainWindow(QMainWindow):
         super().__init__()
         self._base_window_title = get_text("app_title")
         self.setWindowTitle(self._base_window_title)
-        self.resize(1200, 680)
+        self._initial_window_bounds_checked = False
+        self._resize_for_primary_screen()
 
         # --- Signals ---
         self.signals = AppSignals()
@@ -356,6 +359,70 @@ class MainWindow(QMainWindow):
         # zero heavy modules in memory.
         self.model_manager = ModelManager()
         self._register_model_groups(self.model_manager)
+
+    def _resize_for_primary_screen(self):
+        """Keep the first frame smaller than the desktop work area.
+
+        Qt uses logical pixels here. On laptop displays with DPI scaling, the
+        available logical height can be smaller than the old fixed 680px
+        startup height, which lets Windows place the title bar off-screen.
+        """
+        screen = QApplication.primaryScreen()
+        if screen is None:
+            self.resize(DEFAULT_WINDOW_SIZE)
+            return
+        available = screen.availableGeometry()
+        width = min(DEFAULT_WINDOW_SIZE.width(),
+                    max(1, available.width() - 2 * WINDOW_SCREEN_MARGIN))
+        height = min(DEFAULT_WINDOW_SIZE.height(),
+                     max(1, available.height() - 2 * WINDOW_SCREEN_MARGIN))
+        self.resize(width, height)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self._initial_window_bounds_checked:
+            return
+        self._initial_window_bounds_checked = True
+        # Native frame margins and the final monitor are reliable only after
+        # show(). Clamp once more so the title bar remains reachable.
+        QTimer.singleShot(0, self._ensure_initial_window_bounds)
+
+    def _ensure_initial_window_bounds(self):
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is None:
+            return
+
+        available = screen.availableGeometry().adjusted(
+            WINDOW_SCREEN_MARGIN,
+            WINDOW_SCREEN_MARGIN,
+            -WINDOW_SCREEN_MARGIN,
+            -WINDOW_SCREEN_MARGIN,
+        )
+        if available.width() <= 0 or available.height() <= 0:
+            available = screen.availableGeometry()
+
+        frame = self.frameGeometry()
+        frame_extra_width = max(0, frame.width() - self.width())
+        frame_extra_height = max(0, frame.height() - self.height())
+        max_client_size = QSize(
+            max(1, available.width() - frame_extra_width),
+            max(1, available.height() - frame_extra_height),
+        )
+        target_size = self.size().boundedTo(max_client_size)
+        if target_size != self.size():
+            self.resize(target_size)
+
+        frame = self.frameGeometry()
+        target_x = min(
+            max(frame.x(), available.left()),
+            max(available.left(), available.right() - frame.width() + 1),
+        )
+        target_y = min(
+            max(frame.y(), available.top()),
+            max(available.top(), available.bottom() - frame.height() + 1),
+        )
+        if target_x != frame.x() or target_y != frame.y():
+            self.move(self.pos() + QPoint(target_x - frame.x(), target_y - frame.y()))
 
     # ================================================================
     # UI CONSTRUCTION

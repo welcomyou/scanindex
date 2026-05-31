@@ -526,6 +526,88 @@ def _line_overlaps_layout_type(line: TextLine,
     return False
 
 
+def refine_figure_layout_regions(lines: List[TextLine],
+                                 layout_regions_by_page: Dict[int, List[dict]],
+                                 logger: Logger) -> None:
+    """Remove text-block false positives and trim figure boxes above body text."""
+    if not lines or not layout_regions_by_page:
+        return
+
+    lines_by_page: Dict[int, List[TextLine]] = {}
+    for line in lines:
+        lines_by_page.setdefault(line.page, []).append(line)
+
+    def paragraph_like(line: TextLine, bbox: Tuple[float, float, float, float]) -> bool:
+        text = _clean_extracted_text(line.text)
+        words = [part for part in text.split() if part]
+        if len(text) < 20 or len(words) < 4:
+            return False
+        lx0, _ly0, lx1, _ly1 = _line_bbox(line)
+        x0, _y0, x1, _y1 = bbox
+        overlap_w = max(0.0, min(lx1, x1) - max(lx0, x0))
+        return overlap_w >= min(max((x1 - x0) * 0.55, 80.0), x1 - x0)
+
+    def update_bottom(region: dict,
+                      bbox: Tuple[float, float, float, float],
+                      new_bottom: float) -> None:
+        x0, y0, x1, y1 = bbox
+        region["bbox_pdf"] = [round(x0, 2), round(y0, 2), round(x1, 2), round(new_bottom, 2)]
+        for key in ("bbox", "bbox_px"):
+            raw = region.get(key)
+            if not raw or len(raw) < 4 or y1 <= y0:
+                continue
+            values = [float(v) for v in raw[:4]]
+            values[3] = values[1] + (values[3] - values[1]) * ((new_bottom - y0) / (y1 - y0))
+            region[key] = [round(v, 1) for v in values]
+
+    dropped = 0
+    trimmed = 0
+    for page, regions in (layout_regions_by_page or {}).items():
+        page_lines = lines_by_page.get(page, [])
+        refined = []
+        for region in regions or []:
+            if _layout_region_kind(region) != "figure":
+                refined.append(region)
+                continue
+            bbox = _layout_region_bbox_pdf(region)
+            if not bbox:
+                refined.append(region)
+                continue
+            x0, y0, x1, y1 = bbox
+            figure_h = y1 - y0
+            text_lines = [
+                line for line in page_lines
+                if paragraph_like(line, bbox)
+                and (
+                    _bbox_overlap_ratio(_line_bbox(line), bbox) >= 0.18
+                    or _layout_center_inside(_line_bbox(line), bbox, pad=3.0)
+                )
+            ]
+            text_lines.sort(key=lambda line: (line.y, line.x))
+
+            if len(text_lines) >= 4:
+                text_span = max(line.y + line.height for line in text_lines) - min(line.y for line in text_lines)
+                text_chars = sum(len(_clean_extracted_text(line.text)) for line in text_lines)
+                if text_span >= max(36.0, figure_h * 0.18) and text_chars >= 120:
+                    dropped += 1
+                    continue
+
+            lower_text_lines = [
+                line for line in text_lines
+                if line.y >= y0 + figure_h * 0.62
+            ]
+            if lower_text_lines:
+                new_bottom = min(line.y for line in lower_text_lines) - 3.0
+                if y0 + figure_h * 0.35 <= new_bottom < y1 - 2.0:
+                    update_bottom(region, bbox, new_bottom)
+                    trimmed += 1
+            refined.append(region)
+        regions[:] = refined
+
+    if dropped or trimmed:
+        logger.log(f"Refined figure layout regions: dropped={dropped}, trimmed={trimmed}")
+
+
 def filter_figure_ocr_noise(lines: List[TextLine],
                             layout_regions_by_page: Dict[int, List[dict]],
                             logger: Logger) -> List[TextLine]:
@@ -10093,6 +10175,7 @@ def create_docx_from_pdf(
                 )
 
         if layout_regions_by_page:
+            refine_figure_layout_regions(pdf_lines, layout_regions_by_page, logger)
             prepare_layout_region_reading_orders(layout_regions_by_page, page_info, logger)
 
         # Step 1c: Match lines to layout regions (assigns semantic_type)

@@ -689,6 +689,8 @@ def _build_text_page_words(page, words_data, font_path, *, fallback_lines=None):
     a whole OCR line as one text run lets font metrics drift across the line,
     so late-line word bboxes no longer match the OCR boxes. Writing each word
     with a horizontal morph keeps the PDF text layer aligned with word bboxes.
+    ActualText preserves inter-word spacing even when adjacent bboxes are too
+    close for a PDF viewer to infer the space geometrically.
     """
     if not words_data:
         _build_text_page_lines(page, fallback_lines or [], font_path)
@@ -718,6 +720,16 @@ def _build_text_page_words(page, words_data, font_path, *, fallback_lines=None):
                 render_mode=3,
                 morph=(baseline, fitz.Matrix(hscale, 1.0)),
                 overlay=True,
+            )
+            content_xref = page.get_contents()[-1]
+            content = page.parent.xref_stream(content_xref)
+            actual_text = text + (" " if wd.get("has_space_after", True) else "")
+            actual_hex = ("FEFF" + actual_text.encode("utf-16-be").hex()).upper()
+            page.parent.update_stream(
+                content_xref,
+                f"/Span << /ActualText <{actual_hex}> >> BDC\n".encode("ascii")
+                + content
+                + b"\nEMC\n",
             )
         except Exception:
             continue
