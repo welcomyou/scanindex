@@ -36,15 +36,26 @@ python -m venv .venv_build
 pip install -r requirements.txt
 ```
 
-### Tải model (~1.9 GB) — có verify SHA256
+### Tải model (~2.1 GB) — có verify SHA256
 
 ```powershell
 python scripts\download_offline_models.py
 ```
 
-Script kéo từng repo HF về `models/`, sau đó **verify SHA256 từng file** theo bảng cứng `MODELS_CONFIG` hardcode trong [scripts/download_offline_models.py](scripts/download_offline_models.py). Mỗi repo cũng pin `revision=<commit_sha>` — nếu HF account bị hijack, attacker push commit mới cũng không ảnh hưởng. Hash mismatch → script raise `ModelIntegrityError` và dừng.
+Script kéo từng repo HF về `models/`, tải bootstrap ***REMOVED*** từ GitHub
+Release, sau đó **verify SHA256 từng file** theo bảng cứng trong
+[scripts/download_offline_models.py](scripts/download_offline_models.py). Mỗi
+repo HF cũng pin `revision=<commit_sha>`; bootstrap ***REMOVED*** pin URL asset,
+SHA256 archive và SHA256 từng file. Hash mismatch → script raise
+`ModelIntegrityError` và dừng.
 
-ScreenAI tải từ Google CDN qua [scanindex/core/ocr/screen_ai_downloader.py](scanindex/core/ocr/screen_ai_downloader.py) (Chrome signed CRX channel; license Google không cho re-host trên HF).
+ScreenAI tải từ Google CDN qua [scanindex/core/ocr/screen_ai_downloader.py](scanindex/core/ocr/screen_ai_downloader.py). Downloader kiểm tra URL HTTPS, SHA256 64 ký tự do Google updater XML công bố và chữ ký Authenticode của DLL Google.
+
+Kiểm tra manifest URL/hash mà không tải file:
+
+```powershell
+python scripts\download_offline_models.py --validate-config
+```
 
 Sau khi retrain + re-upload model nào đó, regen lại hash anchor:
 
@@ -113,12 +124,14 @@ Tổng hợp ở Collection [welcomyou/scanindex](https://huggingface.co/collect
 | [welcomyou/gmft-tatr-onnx](https://huggingface.co/welcomyou/gmft-tatr-onnx) | Bảng — TATR detection + structure | active |
 | [welcomyou/docling-tableformer-v1-onnx-stepcache](https://huggingface.co/welcomyou/docling-tableformer-v1-onnx-stepcache) | Bảng — Docling TableFormer (stepcache) | active |
 | [welcomyou/scanindex-models](https://huggingface.co/welcomyou/scanindex-models) | Bundle nhỏ: PaddleOCR orientation classifier | active |
+| [welcomyou/scanindex-models/uvdoc](https://huggingface.co/welcomyou/scanindex-models/tree/main/uvdoc) | UVDoc dewarp ONNX FP32 | active |
+| [ScanIndex ***REMOVED***](https://github.com/welcomyou/scanindex/releases/tag/***REMOVED***) | ***REMOVED*** EN↔VI bootstrap, pin SHA256 archive + từng file | active |
 | [welcomyou/e5-small-vn-archive-mix50](https://huggingface.co/welcomyou/e5-small-vn-archive-mix50) | Multilingual E5 embedder (semantic search) | **dormant** — code search đã chuyển sang Tantivy + SQLite, model giữ trên HF cho lần revive |
 | `BAAI/bge-reranker-v2-m3` (upstream) | Cross-encoder rerank cho semantic search | **dormant** — không wire trong UI hiện tại |
 
 Mọi model semantic vẫn còn trên HF + train-convert scripts ([train-convert/archive-embedder/](train-convert/archive-embedder/)) để dễ bật lại sau. Bộ "dormant" không nằm trong `MODELS_CONFIG` nên `download_offline_models.py` không tự kéo.
 
-Chrome ScreenAI OCR DLL nằm ngoài HF (license Google không cho re-host) — auto download từ Google CDN bởi [scanindex/core/ocr/screen_ai_downloader.py](scanindex/core/ocr/screen_ai_downloader.py), kèm Authenticode verify để chắc DLL ký bởi Google LLC.
+Chrome ScreenAI OCR DLL nằm ngoài HF — auto download từ Google CDN bởi [scanindex/core/ocr/screen_ai_downloader.py](scanindex/core/ocr/screen_ai_downloader.py), kèm SHA256 từ Google updater XML và Authenticode verify để chắc DLL ký bởi Google LLC.
 
 Upload model sau khi retrain:
 

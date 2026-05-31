@@ -92,6 +92,13 @@ REPOS = [
         "local_dir": "orientation",
         "description": "PaddleOCR PP-LCNet 4-way page-orientation classifier",
     },
+    {
+        "model_id": "uvdoc-paddleocr-onnx",
+        "repo_id":  "welcomyou/scanindex-models",
+        "type":     "huggingface",
+        "local_dir": "uvdoc",
+        "description": "UVDoc PaddleOCR document dewarp model (ONNX FP32)",
+    },
 ]
 
 
@@ -185,9 +192,11 @@ def build_models_config() -> list[dict]:
 def render_python(config: list[dict]) -> str:
     lines = ["MODELS_CONFIG = ["]
     for c in config:
+        source_url = f"https://huggingface.co/{c['repo_id']}/tree/{c['revision']}"
         lines.append("    {")
         lines.append(f'        "model_id":    {c["model_id"]!r},')
         lines.append(f'        "repo_id":     {c["repo_id"]!r},')
+        lines.append(f'        "source_url":  {source_url!r},')
         lines.append(f'        "type":        {c["type"]!r},')
         lines.append(f'        "sources":     {c["sources"]!r},')
         lines.append(f'        "revision":    {c["revision"]!r},')

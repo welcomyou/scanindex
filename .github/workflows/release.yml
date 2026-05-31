@@ -1,0 +1,76 @@
+name: Build Windows Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to build
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows-full:
+    runs-on: windows-latest
+    timeout-minutes: 180
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install downloader dependency
+        run: python -m pip install --upgrade huggingface_hub
+
+      - name: Validate pinned model sources
+        run: python scripts/download_offline_models.py --validate-config
+
+      - name: Download and verify offline models
+        run: python scripts/download_offline_models.py
+
+      - name: Build full portable app
+        shell: cmd
+        run: build_portable.bat full
+
+      - name: Package and test archive
+        shell: pwsh
+        run: |
+          $version = (Get-Content -LiteralPath VERSION -Raw).Trim()
+          $folder = "dist\ScanIndex-$version"
+          $archive = "dist\ScanIndex-$version.7z"
+          7z a -t7z -mx=7 -mmt=on -bb0 -bsp0 $archive "$folder\*"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          7z t -bb0 -bsp0 $archive
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash
+          "Archive: $archive" | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "SHA256: $hash" | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+      - name: Publish GitHub Release asset
+        shell: pwsh
+        run: |
+          $version = (Get-Content -LiteralPath VERSION -Raw).Trim()
+          $archive = "dist\ScanIndex-$version.7z"
+          gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY `
+              --title "ScanIndex $version" `
+              --notes "Full portable Windows release with verified offline models."
+          }
+          gh release upload $env:RELEASE_TAG $archive --clobber `
+            --repo $env:GITHUB_REPOSITORY

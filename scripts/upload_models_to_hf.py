@@ -395,6 +395,7 @@ def _bundle_readme(standalone: List["RepoSpec"]) -> str:
 Small companion repo for [ScanIndex](https://github.com/welcomyou/scanindex). Contains:
 
 - `orientation/PP-LCNet_x1_0_doc_ori.onnx` — PaddleOCR's 4-way page-orientation classifier (Apache-2.0; tiny, redistributed for offline-install convenience)
+- `uvdoc/uvdoc_fp32.onnx` — UVDoc document dewarp model exported to ONNX FP32 (Apache-2.0)
 - `manifest.json` — list of standalone model repos that complete the runtime
 
 The actual model weights live in the standalone repos below. Download all of them at once with `scripts/download_offline_models.py` in the GitHub repo.
@@ -450,7 +451,7 @@ STANDALONE: List[RepoSpec] = [
 ]
 
 BUNDLE_REPO = f"{USER}/scanindex-models"
-BUNDLE_SOURCES = ["orientation"]
+BUNDLE_SOURCES = ["orientation", "uvdoc"]
 
 
 # NOTE: Upstream models (microsoft/layoutlmv3-base, protonx-models/distilled-protonx-legal-tc, juliozhao/DocLayout-YOLO-DocStructBench,
@@ -663,6 +664,8 @@ def main() -> int:
     parser.add_argument("--skip-collection", action="store_true")
     parser.add_argument("--collection-only", action="store_true",
                         help="Only build/update the Collection (skip all uploads)")
+    parser.add_argument("--bundle-only", action="store_true",
+                        help="Only update the small scanindex-models bundle")
     parser.add_argument("--readmes-only", action="store_true",
                         help="Re-upload only README.md for each repo (skip model files)")
     args = parser.parse_args()
@@ -683,6 +686,9 @@ def main() -> int:
     if args.collection_only:
         _build_collection(args.dry_run, log)
         return 0
+
+    if args.bundle_only:
+        return 0 if _push_bundle(api, args.dry_run, log) else 1
 
     targets = STANDALONE
     if args.only:

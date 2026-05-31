@@ -13,6 +13,7 @@ import io
 import logging
 import os
 import platform
+import re
 import shutil
 import struct
 import sys
@@ -181,6 +182,12 @@ def check_update():
                 codebase = app.get("codebase", "")
                 sha256 = app.get("hash_sha256", "")
                 size = int(app.get("size", "0"))
+                if not codebase.startswith("https://"):
+                    logger.error("Google update XML did not return an HTTPS codebase")
+                    return None
+                if not re.fullmatch(r"[0-9a-f]{64}", sha256):
+                    logger.error("Google update XML returned an invalid SHA256 digest")
+                    return None
                 # Extract version from codebase URL
                 # URL format: ..._140.21/mfhmdacoffp..._140.21_win64_...crx3
                 version = app.get("version", "")
@@ -204,7 +211,7 @@ def check_update():
     return None
 
 
-def download_crx(dest_path, progress_callback=None):
+def download_crx(dest_path, progress_callback=None, source_url=None):
     """
     Download the ScreenAI CRX3 file.
 
@@ -215,7 +222,7 @@ def download_crx(dest_path, progress_callback=None):
     Returns:
         True if successful
     """
-    url = _build_url("redirect")
+    url = source_url or _build_url("redirect")
     logger.info(f"Downloading ScreenAI from Google CDN...")
 
     try:
@@ -528,7 +535,7 @@ def install_screen_ai(model_dir, status, progress_callback=None, log_callback=No
                 if int(pct) % 10 == 0:
                     log(f"Downloading: {pct:.0f}%", "debug")
 
-        if not download_crx(tmp_path, _progress):
+        if not download_crx(tmp_path, _progress, source_url=update_info["url"]):
             raise RuntimeError("Failed to download ScreenAI from Google CDN")
 
         # D — verify SHA256 announced by Google's update XML.
