@@ -267,7 +267,6 @@ def check_update():
                 # URL format: ..._140.21/mfhmdacoffp..._140.21_win64_...crx3
                 version = app.get("version", "")
                 if not version and codebase:
-                    import re
                     m = re.search(r'_(\d+\.\d+)_', codebase)
                     if m:
                         version = m.group(1)
