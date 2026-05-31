@@ -55,9 +55,15 @@ class ScreenAIIntegrityError(RuntimeError):
 # of the SHA256 check from Google's update XML — catches tampering of
 # the on-disk DLL after extraction (e.g. local malware modifying it).
 _GOOGLE_SIGNER_NEEDLES = ("Google LLC", "Google Inc")
+_AUTHENTICODE_UNAVAILABLE_NEEDLES = (
+    "CouldNotAutoloadMatchingModule",
+    "Get-AuthenticodeSignature' is not recognized",
+)
 
 
-def _verify_authenticode_google_signed(file_path: str) -> None:
+def _verify_authenticode_google_signed(
+    file_path: str, allow_unavailable: bool = False
+) -> None:
     """Verify `file_path` is Authenticode-signed by Google LLC.
 
     Windows-only. On other platforms this is a no-op (caller should rely
@@ -101,6 +107,14 @@ def _verify_authenticode_google_signed(file_path: str) -> None:
         ) from e
 
     if result.returncode != 0:
+        details = f"{result.stderr or ''}\n{result.stdout or ''}"
+        if allow_unavailable and any(
+            needle in details for needle in _AUTHENTICODE_UNAVAILABLE_NEEDLES
+        ):
+            logger.warning(
+                "Authenticode cmdlet unavailable; relying on verified CRX SHA256"
+            )
+            return
         raise ScreenAIIntegrityError(
             f"Authenticode signature invalid for {file_path}\n"
             f"  PowerShell stderr: {(result.stderr or '').strip()}\n"
@@ -650,7 +664,7 @@ def install_screen_ai(model_dir, status, progress_callback=None, log_callback=No
         # B — Authenticode verify the on-disk DLL is genuinely signed by
         # Google. Catches post-extraction tampering that the SHA256 check
         # above (D) cannot see.
-        _verify_authenticode_google_signed(lib_path)
+        _verify_authenticode_google_signed(lib_path, allow_unavailable=True)
 
         log(f"ScreenAI v{version} installed: {final_dir}", "success")
         return lib_path, final_dir, color_type
