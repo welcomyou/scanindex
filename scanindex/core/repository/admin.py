@@ -10,6 +10,7 @@ inside the Kho UI:
   - delete_dossiers_bulk    remove many dossiers
   - update_document_metadata edit the 14 KIE fields of a doc
   - update_dossier_metadata  edit dossier title / codes / retention / term
+  - reorder_dossier_documents reorder + canonically rename every child PDF
   - add_document            append a new file to an existing dossier
                               (caller supplies pre-extracted body chunks
                               + KIE fields; the orchestrator runs OCR/
@@ -25,6 +26,7 @@ import os
 import re
 import shutil
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Optional
@@ -38,6 +40,7 @@ from .importer import (
 from .indexer import HybridIndex
 from .store import ArchiveStore
 from .tokenizer import segment, to_no_diacritic
+from scanindex.core.canonical_io import companion_for_pdf, resolve_companion
 
 
 @dataclass
@@ -54,6 +57,12 @@ class RelabelStats:
     renamed_docs: int = 0
     old_key: str = ""
     new_key: str = ""
+    target_dir: str = ""
+
+
+@dataclass
+class ReorderStats:
+    renamed_docs: int = 0
     target_dir: str = ""
 
 
@@ -132,6 +141,81 @@ def _cleanup_empty_pdf_parents(store: ArchiveStore, start: Path) -> None:
         except OSError:
             break
         cur = cur.parent
+
+
+def _move_path_with_retry(src: Path, dst: Path, *,
+                          attempts: int = 16,
+                          delay: float = 0.15) -> None:
+    """Move a file after tolerating short-lived Windows reader locks."""
+    src = Path(src)
+    dst = Path(dst)
+    for attempt in range(max(1, int(attempts))):
+        try:
+            shutil.move(str(src), str(dst))
+            return
+        except OSError as exc:
+            is_transient_lock = (
+                isinstance(exc, PermissionError)
+                or getattr(exc, "winerror", None) in {5, 32, 33}
+            )
+            if not is_transient_lock:
+                raise
+            if attempt + 1 >= max(1, int(attempts)):
+                raise PermissionError(
+                    f"File đang được chương trình khác sử dụng: {src}. "
+                    "Hãy đóng cửa sổ đang mở hoặc khung xem trước Explorer "
+                    "rồi thử lại."
+                ) from exc
+            time.sleep(max(0.0, float(delay)))
+
+
+def _restore_staged_reorder_files(move_ops: list[dict]) -> None:
+    """Best-effort rollback for a partially completed two-phase rename."""
+    for op in move_ops:
+        current_pdf = op.get("current_pdf")
+        stage_pdf = op["stage_pdf"]
+        try:
+            if current_pdf and Path(current_pdf).exists() and Path(current_pdf) != stage_pdf:
+                stage_pdf.parent.mkdir(parents=True, exist_ok=True)
+                _move_path_with_retry(
+                    Path(current_pdf), stage_pdf, attempts=4, delay=0.05
+                )
+                op["current_pdf"] = stage_pdf
+        except OSError:
+            pass
+        current_companion = op.get("current_companion")
+        stage_companion = op["stage_companion"]
+        try:
+            if (current_companion and Path(current_companion).exists()
+                    and Path(current_companion) != stage_companion):
+                stage_companion.parent.mkdir(parents=True, exist_ok=True)
+                _move_path_with_retry(
+                    Path(current_companion), stage_companion,
+                    attempts=4, delay=0.05,
+                )
+                op["current_companion"] = stage_companion
+        except OSError:
+            pass
+
+    for op in move_ops:
+        stage_pdf = op["stage_pdf"]
+        src = op["src"]
+        try:
+            if stage_pdf.exists():
+                src.parent.mkdir(parents=True, exist_ok=True)
+                _move_path_with_retry(stage_pdf, src, attempts=4, delay=0.05)
+        except OSError:
+            pass
+        stage_companion = op["stage_companion"]
+        src_companion = op.get("src_companion")
+        try:
+            if src_companion is not None and stage_companion.exists():
+                src_companion.parent.mkdir(parents=True, exist_ok=True)
+                _move_path_with_retry(
+                    stage_companion, src_companion, attempts=4, delay=0.05
+                )
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------- delete
@@ -438,6 +522,154 @@ def update_dossier_metadata(store: ArchiveStore, dossier_id: int,
             (note or "").strip()[:1000] or None,
             int(time.time()), dossier_id,
         ),
+    )
+
+
+def reorder_dossier_documents(store: ArchiveStore, dossier_id: int,
+                              ordered_doc_ids: Iterable[str]) -> ReorderStats:
+    """Persist a dossier's document order by renaming every PDF canonically.
+
+    File names are the repository's stable ordering key. A two-phase move via
+    a temporary directory prevents swaps such as 001 <-> 002 from overwriting
+    either PDF. Canonical OCR companions move with their PDFs.
+    """
+    ordered_ids = [str(doc_id) for doc_id in ordered_doc_ids]
+    if len(ordered_ids) != len(set(ordered_ids)):
+        raise ValueError("Danh sách sắp xếp có văn bản bị trùng")
+
+    conn = store.connect()
+    dossier = conn.execute(
+        "SELECT ma_dinh_danh, fonds, catalog, dossier_code "
+        "FROM dossiers WHERE dossier_id = ?",
+        (dossier_id,),
+    ).fetchone()
+    if dossier is None:
+        raise KeyError(f"dossier_id not found: {dossier_id}")
+
+    docs = conn.execute(
+        "SELECT doc_id, file_name, file_path FROM documents "
+        "WHERE dossier_id = ? AND indexed_status != 'deleted' "
+        "ORDER BY file_name, created_at, doc_id",
+        (dossier_id,),
+    ).fetchall()
+    by_id = {str(doc["doc_id"]): doc for doc in docs}
+    if set(ordered_ids) != set(by_id):
+        raise ValueError("Danh sách sắp xếp không khớp các văn bản trong hồ sơ")
+    if not ordered_ids:
+        return ReorderStats()
+
+    ma_dinh_danh = _validate_code_part(
+        "mã định danh", dossier["ma_dinh_danh"]
+    )
+    fonds = _validate_code_part("mã phông", dossier["fonds"])
+    catalog = _validate_code_part("mục lục", dossier["catalog"])
+    dossier_code = _validate_code_part("số hồ sơ", dossier["dossier_code"])
+    target_dir = _dossier_pdf_dir(
+        store,
+        ma_dinh_danh=ma_dinh_danh,
+        fonds=fonds,
+        catalog=catalog,
+        dossier_code=dossier_code,
+    )
+    stage_dir = target_dir / f".reorder-{uuid.uuid4().hex}"
+
+    move_ops: list[dict] = []
+    source_pdfs: set[Path] = set()
+    source_companions: set[Path] = set()
+    for idx, doc_id in enumerate(ordered_ids, start=1):
+        doc = by_id[doc_id]
+        src = _abs_pdf_path(store, doc["file_path"] or "")
+        if not src.exists() or not src.is_file():
+            raise FileNotFoundError(f"Không tìm thấy PDF: {src}")
+        src = src.resolve()
+        if src in source_pdfs:
+            raise ValueError(f"Nhiều văn bản đang dùng chung một PDF: {src}")
+        source_pdfs.add(src)
+        src_companion = resolve_companion(src)
+        if src_companion is not None:
+            src_companion = src_companion.resolve()
+            source_companions.add(src_companion)
+
+        new_name = _canonical_doc_name(
+            ma_dinh_danh, fonds, catalog, dossier_code, idx
+        )
+        dst = (target_dir / new_name).resolve()
+        stage_pdf = stage_dir / f"{idx:06d}.pdf"
+        move_ops.append({
+            "doc_id": doc_id,
+            "old_name": doc["file_name"] or "",
+            "src": src,
+            "dst": dst,
+            "new_name": new_name,
+            "rel": str(dst.relative_to(store.archive_path)).replace("\\", "/"),
+            "src_companion": src_companion,
+            "dst_companion": companion_for_pdf(dst),
+            "stage_pdf": stage_pdf,
+            "stage_companion": companion_for_pdf(stage_pdf),
+            "current_pdf": src,
+            "current_companion": src_companion,
+        })
+
+    for op in move_ops:
+        dst = op["dst"]
+        if dst.exists() and dst.resolve() not in source_pdfs:
+            raise FileExistsError(f"File đích đã tồn tại: {dst}")
+        dst_companion = op["dst_companion"]
+        if (dst_companion.exists()
+                and dst_companion.resolve() not in source_companions):
+            raise FileExistsError(f"File JSON đích đã tồn tại: {dst_companion}")
+
+    now = int(time.time())
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        stage_dir.mkdir(parents=True, exist_ok=False)
+        for op in move_ops:
+            _move_path_with_retry(op["src"], op["stage_pdf"])
+            op["current_pdf"] = op["stage_pdf"]
+            src_companion = op["src_companion"]
+            if src_companion is not None and src_companion.exists():
+                _move_path_with_retry(src_companion, op["stage_companion"])
+                op["current_companion"] = op["stage_companion"]
+
+        for op in move_ops:
+            op["dst"].parent.mkdir(parents=True, exist_ok=True)
+            _move_path_with_retry(op["stage_pdf"], op["dst"])
+            op["current_pdf"] = op["dst"]
+            if op["stage_companion"].exists():
+                _move_path_with_retry(
+                    op["stage_companion"], op["dst_companion"]
+                )
+                op["current_companion"] = op["dst_companion"]
+            conn.execute(
+                "UPDATE documents SET file_name = ?, file_path = ?, "
+                "updated_at = ? WHERE doc_id = ?",
+                (op["new_name"], op["rel"], now, op["doc_id"]),
+            )
+        conn.execute("COMMIT")
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        _restore_staged_reorder_files(move_ops)
+        raise
+    finally:
+        try:
+            stage_dir.rmdir()
+        except OSError:
+            pass
+
+    for op in move_ops:
+        try:
+            _cleanup_empty_pdf_parents(store, op["src"].parent)
+        except Exception:
+            pass
+    return ReorderStats(
+        renamed_docs=sum(
+            op["old_name"] != op["new_name"] or op["src"] != op["dst"]
+            for op in move_ops
+        ),
+        target_dir=str(target_dir),
     )
 
 

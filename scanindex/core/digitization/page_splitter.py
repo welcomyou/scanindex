@@ -16,7 +16,7 @@ import types
 import unicodedata
 from importlib.machinery import ModuleSpec
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 DOC_START_FEATURES = [
@@ -844,7 +844,11 @@ def build_signer_features(
     return features, evidence
 
 
-def predict_doc_starts(canonical_json_path: str, threshold: float = DEFAULT_THRESHOLD) -> dict[str, Any]:
+def predict_doc_starts(
+    canonical_json_path: str,
+    threshold: float = DEFAULT_THRESHOLD,
+    progress_cb: Callable[[int, int], None] | None = None,
+) -> dict[str, Any]:
     model = load_model()
     if model is None:
         raise FileNotFoundError("doc_start LightGBM model not found")
@@ -856,6 +860,7 @@ def predict_doc_starts(canonical_json_path: str, threshold: float = DEFAULT_THRE
     pages = payload.get("pages") or []
     rows = []
     feature_rows = []
+    total_pages = len(pages)
     for page in pages:
         features, evidence = build_doc_start_features(page)
         page_index = int(page.get("page_index", len(rows)))
@@ -865,6 +870,11 @@ def predict_doc_starts(canonical_json_path: str, threshold: float = DEFAULT_THRE
             "evidence": evidence,
         })
         feature_rows.append([features[name] for name in DOC_START_FEATURES])
+        if progress_cb is not None:
+            try:
+                progress_cb(len(rows), total_pages)
+            except Exception:
+                pass
 
     if not rows:
         return {"threshold": threshold, "model_path": _MODEL_PATH, "pages": [], "start_pages": []}

@@ -31,9 +31,17 @@ def _patch_six_meta_path_importer():
 # Portable/offline setup must run before any torch/transformers import.
 try:
     from scanindex.infra import paths as portable_utils
-    portable_utils.setup_offline_mode()
 except Exception as exc:
-    print(f"[Portable] Warning: setup_offline_mode failed: {exc}")
+    print(f"[Portable] Warning: portable paths import failed: {exc}")
+else:
+    try:
+        portable_utils.ensure_runtime_config_files()
+    except Exception as exc:
+        print(f"[Portable] Warning: runtime config bootstrap failed: {exc}")
+    try:
+        portable_utils.setup_offline_mode()
+    except Exception as exc:
+        print(f"[Portable] Warning: setup_offline_mode failed: {exc}")
 
 # FORCE CPU ONLY — must be before any torch import
 os.environ["CUDA_VISIBLE_DEVICES"] = ""

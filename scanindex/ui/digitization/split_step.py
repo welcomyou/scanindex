@@ -56,6 +56,10 @@ _FONT = 12
 _FONT_SM = 11
 _RAD = 4
 _FLIST_W = 220
+_PROGRESS_OCR_END = 80
+_PROGRESS_ASSEMBLE_START = 82
+_PROGRESS_ASSEMBLE_END = 90
+_PROGRESS_SPLIT_END = 99
 
 
 class ArchiveStep1Split(QWidget):
@@ -65,7 +69,7 @@ class ArchiveStep1Split(QWidget):
     log_message = Signal(str)
     busy_changed = Signal(bool)
     _ocr_page_done = Signal(int, int, int)  # run_id, page_idx, done_count
-    _ocr_stage = Signal(int, str, str)  # run_id, status, title
+    _ocr_stage = Signal(int, str, str, int)  # run_id, status, title, total progress
     _ocr_finished = Signal(int, str, object, str)  # run_id, ocr_pdf_path, split_result, error
     _ocr_cancelled = Signal(int)  # run_id
 
@@ -673,7 +677,7 @@ class ArchiveStep1Split(QWidget):
         self._btn_next.setEnabled(False)
         self._seg_list.setEnabled(False)
         self._viewer.set_interaction_enabled(False)
-        self._ocr_progress.setRange(0, max(1, page_count))
+        self._ocr_progress.setRange(0, 100)
         self._ocr_progress.setValue(0)
         self._ocr_lbl_pages.setText(f"0/{page_count}")
         self._ocr_lbl_current.setText("-")
@@ -708,17 +712,21 @@ class ArchiveStep1Split(QWidget):
         if run_id != self._ocr_run_id or not self._ocr_busy:
             return
         total = max(1, self.session.source_page_count)
-        self._ocr_progress.setValue(min(done_count, total))
-        self._ocr_lbl_pages.setText(f"{min(done_count, total)}/{total}")
+        done = min(done_count, total)
+        progress_value = round((done / total) * _PROGRESS_OCR_END)
+        self._ocr_progress.setValue(min(_PROGRESS_OCR_END, progress_value))
+        self._ocr_lbl_pages.setText(f"{done}/{total}")
         self._ocr_lbl_current.setText(str(page_idx + 1))
         self._ocr_lbl_elapsed.setText(f"{time.monotonic() - self._ocr_started_at:.1f}s")
         self._viewer.scroll_to_page(page_idx)
         # Status line stays generic — page progress already shown by the
         # progress bar + "OCR  X/Y" + "Trang gần nhất" rows above.
 
-    def _on_ocr_stage(self, run_id: int, status: str, title: str):
+    def _on_ocr_stage(self, run_id: int, status: str, title: str, progress_value: int):
         if run_id != self._ocr_run_id or not self._ocr_busy:
             return
+        if progress_value >= 0:
+            self._ocr_progress.setValue(max(0, min(100, int(progress_value))))
         self._set_overlay_status(status, title=title or None)
 
     def _on_ocr_finished(self, run_id: int, ocr_pdf_path: str, split_result: object, error: str):
@@ -734,6 +742,12 @@ class ArchiveStep1Split(QWidget):
                 f"OCR/split failed: {error}",
             )
             return
+
+        self._ocr_progress.setValue(_PROGRESS_SPLIT_END)
+        self._set_overlay_status(
+            "Đang áp dụng gợi ý tách văn bản...",
+            title="Đang cập nhật giao diện",
+        )
 
         json_path = ""
         resolved_json = None
@@ -770,6 +784,7 @@ class ArchiveStep1Split(QWidget):
         self._build_page_secrecy_cache(json_path)
         self._refresh_segments()
         self._ocr_lbl_splits.setText(str(len(starts)))
+        self._ocr_progress.setValue(100)
         self._set_overlay_status("Đã OCR xong và tự động gợi ý tách văn bản.", title="Hoàn tất")
         self._update_status()
         self._hide_ocr_progress()
@@ -859,6 +874,7 @@ class ArchiveStep1Split(QWidget):
                     run_id,
                     "OCR xong. Đang dựng PDF OCR và phát hiện trang đầu...",
                     "Đang hoàn tất",
+                    _PROGRESS_ASSEMBLE_START,
                 )
                 if cancel.is_set() or run_id != self._ocr_run_id:
                     self._ocr_cancelled.emit(run_id)
@@ -897,6 +913,7 @@ class ArchiveStep1Split(QWidget):
                         run_id,
                         "Đang phát hiện trang đầu bằng LightGBM...",
                         "Đang tách văn bản",
+                        _PROGRESS_ASSEMBLE_END,
                     )
                     if warm_thread is not None and warm_thread.is_alive():
                         self.log_message.emit("[step1-splitter] waiting for LightGBM warmup...")
@@ -910,9 +927,36 @@ class ArchiveStep1Split(QWidget):
                     from scanindex.core.canonical_io import companion_for_pdf, resolve_companion
 
                     canonical_path = resolve_companion(ocr_pdf_path) or companion_for_pdf(ocr_pdf_path)
+                    last_split_progress = _PROGRESS_ASSEMBLE_END
+
+                    def on_split_progress(done_pages: int, total_pages: int):
+                        nonlocal last_split_progress
+                        if cancel.is_set() or run_id != self._ocr_run_id:
+                            return
+                        total_pages = max(1, int(total_pages or 0))
+                        done_pages = max(0, min(int(done_pages or 0), total_pages))
+                        progress_value = _PROGRESS_ASSEMBLE_END + round(
+                            (done_pages / total_pages)
+                            * (_PROGRESS_SPLIT_END - _PROGRESS_ASSEMBLE_END)
+                        )
+                        progress_value = max(
+                            _PROGRESS_ASSEMBLE_END,
+                            min(_PROGRESS_SPLIT_END, progress_value),
+                        )
+                        if progress_value == last_split_progress and done_pages != total_pages:
+                            return
+                        last_split_progress = progress_value
+                        self._ocr_stage.emit(
+                            run_id,
+                            f"Đang xác định trang đầu bằng LightGBM: {done_pages}/{total_pages} trang",
+                            "Đang tách văn bản",
+                            progress_value,
+                        )
+
                     split_result = archive_page_splitter.predict_doc_starts(
                         str(canonical_path),
                         threshold=0.50,
+                        progress_cb=on_split_progress,
                     )
                     self.log_message.emit(
                         "[step1-splitter] doc_start predicted "
@@ -952,7 +996,8 @@ class ArchiveStep1Split(QWidget):
         self._spinner_idx = (self._spinner_idx + 1) % len(self._spinner_chars)
         self._update_status()
         if (self.session.source_pdf
-                and self.session.all_pages_cached()):
+                and self.session.all_pages_cached()
+                and self._ocr_progress.value() <= _PROGRESS_OCR_END):
             self._set_overlay_status(
                 "OCR xong. Đang dựng PDF OCR và phát hiện trang đầu...",
                 title="Đang hoàn tất",

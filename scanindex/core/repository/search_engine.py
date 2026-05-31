@@ -11,6 +11,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
 
@@ -24,6 +25,10 @@ _log = logging.getLogger(__name__)
 
 _MIN_CHUNK_TEXT_LEN = 12
 _WORD_RE = re.compile(r"\w+", re.UNICODE)
+_CONNECTOR_TOKENS = frozenset({
+    "va", "voi", "ve", "cua", "cho", "trong", "tren", "duoi", "tai",
+    "tu", "den", "theo", "bang", "de", "la", "cac", "nhung", "mot",
+})
 
 
 @dataclass
@@ -107,6 +112,119 @@ def _dedupe_match_bboxes(boxes: List[List[float]]) -> List[List[float]]:
     return out
 
 
+def _bbox_from_word_record(word: dict) -> Optional[List[float]]:
+    box = word.get("bbox")
+    if isinstance(box, (list, tuple)) and len(box) >= 4:
+        try:
+            x0, y0, x1, y1 = (float(v) for v in box[:4])
+        except (TypeError, ValueError):
+            return None
+        if x1 > x0 and y1 > y0:
+            return [x0, y0, x1, y1]
+    try:
+        x = float(word.get("x", 0.0) or 0.0)
+        y = float(word.get("y", 0.0) or 0.0)
+        w = float(word.get("w", 0.0) or 0.0)
+        h = float(word.get("h", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return None
+    if w <= 0 or h <= 0:
+        return None
+    return [x, y, x + w, y + h]
+
+
+def _word_visual_key(item: dict) -> tuple:
+    bbox = item.get("bbox") or [0.0, 0.0, 0.0, 0.0]
+    try:
+        x0, y0, _x1, y1 = (float(v) for v in bbox[:4])
+    except (TypeError, ValueError):
+        x0 = y0 = y1 = 0.0
+    return (
+        int(item.get("line_index", 0) or 0),
+        int(item.get("order", 0) or 0),
+        (y0 + y1) / 2.0,
+        x0,
+    )
+
+
+def _query_token_count_for_word(
+    token: str,
+    qtokens: List[str],
+    pos: int,
+    *,
+    fuzzy: bool,
+) -> int:
+    if not token or pos >= len(qtokens):
+        return 0
+    first = qtokens[pos]
+    if (_fuzzy_token_match(first, token) if fuzzy else first == token):
+        return 1
+
+    joined = ""
+    max_parts = min(6, len(qtokens) - pos)
+    for count in range(1, max_parts + 1):
+        joined += qtokens[pos + count - 1]
+        if len(joined) > len(token) + (2 if fuzzy else 0):
+            break
+        if (_fuzzy_token_match(joined, token) if fuzzy else joined == token):
+            return count
+    return 0
+
+
+def _query_window_bboxes(
+    words: List[dict],
+    qtokens: List[str],
+    *,
+    fuzzy: bool = False,
+    max_gap: int = 0,
+    exact_qpos: int | None = None,
+) -> List[List[float]]:
+    if not qtokens or not words:
+        return []
+    boxes: List[List[float]] = []
+    for start in range(len(words)):
+        qpos = 0
+        wpos = start
+        gap = 0
+        matched_boxes: List[List[float]] = []
+        while qpos < len(qtokens) and wpos < len(words):
+            word = words[wpos]
+            consumed = _query_token_count_for_word(
+                str(word.get("token") or ""),
+                qtokens,
+                qpos,
+                fuzzy=fuzzy and qpos != exact_qpos,
+            )
+            if consumed <= 0:
+                if max_gap > 0 and matched_boxes and gap < max_gap:
+                    gap += 1
+                    wpos += 1
+                    continue
+                break
+            bbox = word.get("bbox") or []
+            if len(bbox) == 4:
+                matched_boxes.append([float(v) for v in bbox])
+            qpos += consumed
+            wpos += 1
+            gap = 0
+        if qpos >= len(qtokens) and matched_boxes:
+            boxes.append(_bbox_union(matched_boxes))
+    return _dedupe_match_bboxes(boxes)
+
+
+def _content_tokens(tokens: List[str]) -> List[str]:
+    kept = [
+        t for t in tokens
+        if t not in _CONNECTOR_TOKENS and (len(t) >= 2 or any(ch.isdigit() for ch in t))
+    ]
+    if kept:
+        return kept
+    return [
+        t for t in tokens
+        if len(t) >= 2 or any(ch.isdigit() for ch in t)
+    ]
+
+
 def _auto_fuzzy_max_edits(token: str) -> int:
     """Elasticsearch/Lucene-style AUTO fuzziness: 0 edits for <=2 chars,
     1 edit for 3..5 chars, 2 edits for >5 chars."""
@@ -118,6 +236,7 @@ def _auto_fuzzy_max_edits(token: str) -> int:
     return 2
 
 
+@lru_cache(maxsize=65536)
 def _edit_distance(a: str, b: str) -> int | None:
     try:
         from rapidfuzz.distance import DamerauLevenshtein
@@ -130,6 +249,7 @@ def _edit_distance(a: str, b: str) -> int | None:
             return None
 
 
+@lru_cache(maxsize=65536)
 def _fuzzy_token_match(a: str, b: str) -> bool:
     if not a or not b:
         return False
@@ -151,6 +271,91 @@ def _fuzzy_token_match(a: str, b: str) -> bool:
     return dist <= max_dist
 
 
+def _nearest_lexical_assignment(qtokens: List[str],
+                                window: List[str]) -> List[int]:
+    """Assign every query token to a distinct nearest lexical token."""
+    best_metric: tuple | None = None
+    best_assignment: List[int] = []
+
+    def visit(qpos: int,
+              used: set[int],
+              assigned: List[int],
+              edit_cost: int) -> None:
+        nonlocal best_metric, best_assignment
+        if best_metric is not None and edit_cost > best_metric[0]:
+            return
+        if qpos >= len(qtokens):
+            if not any(qtok == window[idx] for qtok, idx in zip(qtokens, assigned)):
+                return
+            ordered = sorted(assigned)
+            span_width = ordered[-1] - ordered[0] + 1
+            metric = (edit_cost, span_width, tuple(ordered))
+            if best_metric is None or metric < best_metric:
+                best_metric = metric
+                best_assignment = list(assigned)
+            return
+        qtok = qtokens[qpos]
+        for idx, token in enumerate(window):
+            if idx in used or not _fuzzy_token_match(qtok, token):
+                continue
+            dist = _edit_distance(qtok, token)
+            if dist is None:
+                continue
+            used.add(idx)
+            assigned.append(idx)
+            visit(qpos + 1, used, assigned, edit_cost + int(dist))
+            assigned.pop()
+            used.remove(idx)
+
+    visit(0, set(), [], 0)
+    return best_assignment
+
+
+def _fuzzy_span_token_ranges(tokens: List[str],
+                             qtokens: List[str]) -> List[tuple[int, int]]:
+    qtokens = _content_tokens(qtokens)
+    tokens = [
+        str(token or "")
+        for token in tokens
+        if str(token or "")
+    ]
+    if len(qtokens) < 2 or len(qtokens) >= 8 or len(tokens) < 2:
+        return []
+    if any(any(ch.isdigit() for ch in token) for token in qtokens):
+        return []
+
+    n = len(qtokens)
+    max_span = n + (n - 1)
+    ranges: List[tuple[int, int]] = []
+
+    for start in range(len(tokens)):
+        upper = min(len(tokens), start + max_span)
+        for end in range(start + n - 1, upper):
+            assigned = _nearest_lexical_assignment(qtokens, tokens[start:end + 1])
+            if not assigned:
+                continue
+            ranges.append((start + min(assigned), start + max(assigned)))
+    return sorted(set(ranges))
+
+
+def _fuzzy_span_word_bboxes(words: List[dict],
+                            qtokens: List[str]) -> List[List[float]]:
+    ranges = _fuzzy_span_token_ranges(
+        [str(word.get("token") or "") for word in words],
+        qtokens,
+    )
+    boxes: List[List[float]] = []
+    for start, end in ranges:
+        matched_boxes: List[List[float]] = []
+        for word in words[start:end + 1]:
+            bbox = word.get("bbox") or []
+            if len(bbox) == 4:
+                matched_boxes.append([float(v) for v in bbox])
+        if matched_boxes:
+            boxes.append(_bbox_union(matched_boxes))
+    return _dedupe_match_bboxes(boxes)
+
+
 def _fuzzy_frequency(text: str, query: str) -> int:
     qtokens = [
         t for t in _tokens(query)
@@ -168,13 +373,11 @@ def _fuzzy_frequency(text: str, query: str) -> int:
             return sum(1 for tt in ttokens if tt == qt)
         return sum(1 for tt in ttokens if _fuzzy_token_match(qt, tt))
 
-    n = len(qtokens)
-    hits = 0
-    for i in range(0, len(ttokens) - n + 1):
-        window = ttokens[i:i + n]
-        if all(_fuzzy_token_match(qt, tt) for qt, tt in zip(qtokens, window)):
-            hits += 1
-    return hits * n
+    ranges = _fuzzy_span_token_ranges(ttokens, qtokens)
+    if ranges:
+        return len(ranges) * len(_content_tokens(qtokens))
+
+    return 0
 
 
 def _filter_tokens(text: str) -> List[str]:
@@ -233,17 +436,7 @@ def _advanced_text_match(needle: Any, haystack: str, *, fuzzy: bool = True) -> b
         return any(_fuzzy_token_match(qtokens[0], t) for t in htokens)
     if len(qtokens) > 8 or len(htokens) < len(qtokens):
         return False
-    n = len(qtokens)
-    for i in range(0, len(htokens) - n + 1):
-        if all(_fuzzy_token_match(qt, ht) for qt, ht in zip(qtokens, htokens[i:i + n])):
-            return True
-    pos = 0
-    for ht in htokens:
-        if _fuzzy_token_match(qtokens[pos], ht):
-            pos += 1
-            if pos >= len(qtokens):
-                return True
-    return False
+    return bool(_fuzzy_span_token_ranges(htokens, qtokens))
 
 
 _ADVANCED_FILTER_FIELDS: dict[str, Tuple[str, ...]] = {
@@ -365,6 +558,25 @@ class SearchEngine:
             for cid, did, score in fuzzy_hits
             if did not in exact_doc_ids
         ]
+        span_fuzzy_hits = [
+            (cid, did, score)
+            for cid, did, score in self._span_fuzzy_hits(
+                query,
+                candidate_doc_ids,
+                chunk_type_filter=chunk_type_filter,
+                limit=C.TANTIVY_TOP_K,
+            )
+            if did not in exact_doc_ids
+        ]
+        doc_id_by_chunk = {
+            cid: did for cid, did, _score in fuzzy_hits + span_fuzzy_hits
+        }
+        fuzzy_hits = [
+            (cid, doc_id_by_chunk.get(cid, ""), score)
+            for cid, score in _dedupe_chunk_scores(
+                [(cid, score) for cid, _did, score in fuzzy_hits + span_fuzzy_hits]
+            )
+        ]
         fuzzy_results = self._build_results(
             [(cid, score) for cid, _did, score in fuzzy_hits],
             match_kind="fuzzy",
@@ -383,6 +595,44 @@ class SearchEngine:
             len(results),
         )
         return results
+
+    def _span_fuzzy_hits(self,
+                         query: str,
+                         candidate_doc_ids: Optional[List[str]],
+                         *,
+                         chunk_type_filter: str,
+                         limit: int) -> List[Tuple[int, str, float]]:
+        if len(_content_tokens(_tokens(query))) < 2:
+            return []
+        params: List[Any] = [chunk_type_filter]
+        where = [
+            "c.chunk_type = ?",
+            "d.indexed_status = 'indexed'",
+        ]
+        if candidate_doc_ids is not None:
+            if not candidate_doc_ids:
+                return []
+            ph = ",".join("?" * len(candidate_doc_ids))
+            where.append(f"c.doc_id IN ({ph})")
+            params.extend(candidate_doc_ids)
+        rows = self.store.connect().execute(
+            "SELECT c.chunk_id, c.doc_id, c.text_original "
+            "FROM chunks c "
+            "JOIN documents d ON c.doc_id = d.doc_id "
+            f"WHERE {' AND '.join(where)}",
+            params,
+        ).fetchall()
+        hits: List[Tuple[int, str, float]] = []
+        for row in rows:
+            text = str(row["text_original"] or "")
+            if len(text.strip()) < _MIN_CHUNK_TEXT_LEN:
+                continue
+            score = _fuzzy_frequency(text, query)
+            if score <= 0:
+                continue
+            hits.append((int(row["chunk_id"]), str(row["doc_id"]), float(score)))
+        hits.sort(key=lambda item: item[2], reverse=True)
+        return hits[:max(1, int(limit or 1))]
 
     def _scope_doc_ids(self, filters: dict) -> Optional[List[str]]:
         if not is_active(filters):
@@ -440,6 +690,87 @@ class SearchEngine:
         ).fetchall()
         return {int(r["chunk_id"]): dict(r) for r in rows}
 
+    def _page_word_items_from_companion(self, pdf_path: Path, page: int) -> List[dict]:
+        try:
+            from scanindex.core.canonical_io import load_canonical, resolve_companion
+            companion = resolve_companion(pdf_path)
+            if companion is None:
+                return []
+            data = load_canonical(companion)
+        except Exception:
+            return []
+
+        pages = data.get("pages") or []
+        if not isinstance(pages, list):
+            return []
+
+        page_idx = int(page) - 1
+        page_data = None
+        for fallback_idx, candidate in enumerate(pages):
+            if not isinstance(candidate, dict):
+                continue
+            try:
+                candidate_idx = int(candidate.get("page_index", fallback_idx))
+            except (TypeError, ValueError):
+                candidate_idx = fallback_idx
+            if candidate_idx == page_idx:
+                page_data = candidate
+                break
+        if page_data is None and 0 <= page_idx < len(pages):
+            candidate = pages[page_idx]
+            page_data = candidate if isinstance(candidate, dict) else None
+        if page_data is None:
+            return []
+
+        line_order_by_id = {}
+        for order, line in enumerate(page_data.get("lines") or []):
+            if not isinstance(line, dict):
+                continue
+            line_id = str(line.get("id") or line.get("line_id") or "")
+            if not line_id:
+                continue
+            try:
+                line_idx = int(line.get("order", line.get("line_index", order)) or 0)
+            except (TypeError, ValueError):
+                line_idx = order
+            line_order_by_id[line_id] = line_idx
+
+        items: List[dict] = []
+        for order, word in enumerate(page_data.get("words") or []):
+            if not isinstance(word, dict):
+                continue
+            text = str(word.get("text") or word.get("ocr_text") or "")
+            if not text.strip():
+                continue
+            bbox = _bbox_from_word_record(word)
+            if not bbox:
+                continue
+            line_id = str(word.get("line_id") or "")
+            try:
+                line_idx = int(
+                    word.get("line_index", line_order_by_id.get(line_id, 0)) or 0
+                )
+            except (TypeError, ValueError):
+                line_idx = int(line_order_by_id.get(line_id, 0) or 0)
+            raw_word_idx = word.get("word_index")
+            if raw_word_idx is None:
+                raw_word_idx = word.get("order")
+            if raw_word_idx is None:
+                raw_word_idx = order
+            try:
+                word_idx = int(raw_word_idx)
+            except (TypeError, ValueError):
+                word_idx = order
+            for token in _tokens(text):
+                items.append({
+                    "token": token,
+                    "bbox": bbox,
+                    "line_index": line_idx,
+                    "order": word_idx,
+                })
+        items.sort(key=_word_visual_key)
+        return items
+
     def _page_word_items(self, pdf_rel_path: str, page: int, cache: dict) -> List[dict]:
         if not pdf_rel_path or page <= 0:
             return []
@@ -447,6 +778,10 @@ class SearchEngine:
         if key in cache:
             return cache[key]
         pdf_path = (Path(self.store.archive_path) / pdf_rel_path).resolve()
+        items = self._page_word_items_from_companion(pdf_path, page)
+        if items:
+            cache[key] = items
+            return items
         items: List[dict] = []
         try:
             import fitz
@@ -470,8 +805,15 @@ class SearchEngine:
             if len(w) < 5:
                 continue
             bbox = [float(w[0]), float(w[1]), float(w[2]), float(w[3])]
+            block_idx = int(w[5]) if len(w) > 5 else 0
+            line_idx = int(w[6]) if len(w) > 6 else 0
             for tok in _tokens(str(w[4] or "")):
-                items.append({"token": tok, "bbox": bbox})
+                items.append({
+                    "token": tok,
+                    "bbox": bbox,
+                    "line_index": block_idx * 1000 + line_idx,
+                    "order": int(w[7]) if len(w) > 7 else 0,
+                })
         cache[key] = items
         return items
 
@@ -483,21 +825,22 @@ class SearchEngine:
                             chunk_bbox: List[float],
                             word_cache: dict) -> List[List[float]]:
         qtokens = _tokens(query)
-        if not qtokens or not chunk_bbox or len(chunk_bbox) != 4:
+        if not qtokens:
             return []
-        words = [
-            item for item in self._page_word_items(pdf_rel_path, page, word_cache)
-            if _bbox_intersects(item.get("bbox") or [], chunk_bbox)
-        ]
-        if len(words) < len(qtokens):
-            return []
-        n = len(qtokens)
-        boxes: List[List[float]] = []
-        for i in range(0, len(words) - n + 1):
-            if [w["token"] for w in words[i:i + n]] != qtokens:
-                continue
-            boxes.append(_bbox_union([w["bbox"] for w in words[i:i + n]]))
-        return _dedupe_match_bboxes(boxes)
+        page_words = self._page_word_items(pdf_rel_path, page, word_cache)
+        if chunk_bbox and len(chunk_bbox) == 4:
+            words = [
+                item for item in page_words
+                if _bbox_intersects(item.get("bbox") or [], chunk_bbox)
+            ]
+        else:
+            words = page_words
+        if not words:
+            return _query_window_bboxes(page_words, qtokens, fuzzy=False)
+        boxes = _query_window_bboxes(words, qtokens, fuzzy=False)
+        if boxes or len(words) == len(page_words):
+            return boxes
+        return _query_window_bboxes(page_words, qtokens, fuzzy=False)
 
     def _fuzzy_match_bboxes(self,
                             *,
@@ -506,26 +849,30 @@ class SearchEngine:
                             page: int,
                             chunk_bbox: List[float],
                             word_cache: dict) -> List[List[float]]:
+        raw_qtokens = _tokens(query)
         qtokens = [
-            t for t in _tokens(query)
-            if len(t) >= 3 or (len(t) >= 2 and any(ch.isdigit() for ch in t))
+            t for t in raw_qtokens
+            if len(t) >= 3
+            or (len(t) >= 2 and (len(raw_qtokens) > 1 or any(ch.isdigit() for ch in t)))
         ]
-        if not qtokens or len(qtokens) >= 8 or not chunk_bbox or len(chunk_bbox) != 4:
+        if not qtokens or len(qtokens) >= 8:
             return []
-        words = [
-            item for item in self._page_word_items(pdf_rel_path, page, word_cache)
-            if _bbox_intersects(item.get("bbox") or [], chunk_bbox)
-        ]
-        if len(words) < len(qtokens):
-            return []
-        n = len(qtokens)
-        boxes: List[List[float]] = []
-        for i in range(0, len(words) - n + 1):
-            window = words[i:i + n]
-            if not all(_fuzzy_token_match(qt, w["token"]) for qt, w in zip(qtokens, window)):
-                continue
-            boxes.append(_bbox_union([w["bbox"] for w in window]))
-        return _dedupe_match_bboxes(boxes)
+        page_words = self._page_word_items(pdf_rel_path, page, word_cache)
+        if chunk_bbox and len(chunk_bbox) == 4:
+            words = [
+                item for item in page_words
+                if _bbox_intersects(item.get("bbox") or [], chunk_bbox)
+            ]
+        else:
+            words = page_words
+        if not words:
+            return _fuzzy_span_word_bboxes(page_words, qtokens)
+        boxes = _fuzzy_span_word_bboxes(words, qtokens)
+        if boxes:
+            return boxes
+        if len(words) == len(page_words):
+            return boxes
+        return _fuzzy_span_word_bboxes(page_words, qtokens)
 
     def hydrate_match_bboxes(self,
                              results: List[SearchResult],
@@ -544,7 +891,7 @@ class SearchEngine:
                 continue
             if result.match_kind not in {"exact", "fuzzy"}:
                 continue
-            if not result.query or not result.file_path or not result.bbox:
+            if not result.query or not result.file_path:
                 continue
             if result.match_kind == "exact":
                 boxes = self._exact_match_bboxes(

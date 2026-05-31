@@ -750,6 +750,170 @@ def _resolve_box_for_page(writer, page_idx: int, box_tl: Tuple[float, float, flo
     return (min(xs), min(ys), max(xs), max(ys))
 
 
+def _rect_intersection_area(a: Tuple[float, float, float, float],
+                            b: Tuple[float, float, float, float]) -> float:
+    ix0 = max(float(a[0]), float(b[0]))
+    iy0 = max(float(a[1]), float(b[1]))
+    ix1 = min(float(a[2]), float(b[2]))
+    iy1 = min(float(a[3]), float(b[3]))
+    if ix1 <= ix0 or iy1 <= iy0:
+        return 0.0
+    return (ix1 - ix0) * (iy1 - iy0)
+
+
+def _clamp_signature_box_to_page(
+    box_tl: Tuple[float, float, float, float],
+    page_w: float,
+    page_h: float,
+    *,
+    margin: float = 6.0,
+) -> Tuple[float, float, float, float]:
+    left, top, width, height = [float(v) for v in box_tl]
+    max_w = max(1.0, page_w - 2 * margin)
+    max_h = max(1.0, page_h - 2 * margin)
+    width = max(1.0, min(width, max_w))
+    height = max(1.0, min(height, max_h))
+    left = max(margin, min(left, page_w - width - margin))
+    top = max(margin, min(top, page_h - height - margin))
+    return (left, top, width, height)
+
+
+def _page_text_rects_for_autoplace(page, page_w: float, page_h: float,
+                                   *, padding: float = 6.0
+                                   ) -> list[Tuple[float, float, float, float]]:
+    rects_by_line: dict[object, list[float]] = {}
+    fallback_index = 0
+    try:
+        words = page.get_text("words") or []
+    except Exception:
+        return []
+    for word in words:
+        if len(word) < 5 or not str(word[4] or "").strip():
+            continue
+        x0, y0, x1, y1 = [float(v) for v in word[:4]]
+        if x1 <= x0 or y1 <= y0:
+            continue
+        if len(word) >= 7:
+            key = (word[5], word[6])
+        else:
+            key = ("word", fallback_index)
+            fallback_index += 1
+        rect = rects_by_line.get(key)
+        if rect is None:
+            rects_by_line[key] = [x0, y0, x1, y1]
+        else:
+            rect[0] = min(rect[0], x0)
+            rect[1] = min(rect[1], y0)
+            rect[2] = max(rect[2], x1)
+            rect[3] = max(rect[3], y1)
+
+    return [
+        (
+            max(0.0, x0 - padding),
+            max(0.0, y0 - padding),
+            min(page_w, x1 + padding),
+            min(page_h, y1 + padding),
+        )
+        for x0, y0, x1, y1 in rects_by_line.values()
+    ]
+
+
+def _shrink_box_to_text_gap(
+    box_tl: Tuple[float, float, float, float],
+    text_rects: list[Tuple[float, float, float, float]],
+    *,
+    min_size: float = 1.0,
+) -> Tuple[float, float, float, float]:
+    """Keep the user's top-left anchor and shrink into the immediate gap.
+
+    The box is bounded by the nearest padded PDF text rectangle that intersects
+    it: text below clips the bottom edge, text to the right clips the right
+    edge. When a blocker is both below and to the right, keep the larger
+    remaining area. The signature renderer then scales image/text into the
+    resulting box.
+    """
+    left, top, width, height = [float(v) for v in box_tl]
+    right = left + max(min_size, width)
+    bottom = top + max(min_size, height)
+
+    for _ in range(min(24, len(text_rects) + 2)):
+        current = (left, top, right, bottom)
+        blockers = [r for r in text_rects if _rect_intersection_area(current, r) > 0.0]
+        if not blockers:
+            break
+
+        next_right = right
+        next_bottom = bottom
+        for rect in blockers:
+            can_clip_bottom = rect[1] > top + 0.01
+            can_clip_right = rect[0] > left + 0.01
+
+            if can_clip_bottom and can_clip_right:
+                area_if_bottom = max(0.0, right - left) * max(0.0, rect[1] - top)
+                area_if_right = max(0.0, rect[0] - left) * max(0.0, bottom - top)
+                if area_if_bottom >= area_if_right:
+                    next_bottom = min(next_bottom, rect[1])
+                else:
+                    next_right = min(next_right, rect[0])
+            elif can_clip_bottom:
+                next_bottom = min(next_bottom, rect[1])
+            elif can_clip_right:
+                next_right = min(next_right, rect[0])
+            else:
+                # The anchor itself is inside padded text; no positive-size
+                # anchored rectangle can fully avoid it.
+                next_right = min(next_right, left + min_size)
+                next_bottom = min(next_bottom, top + min_size)
+
+        new_right = max(left + min_size, next_right)
+        new_bottom = max(top + min_size, next_bottom)
+        if abs(new_right - right) < 0.01 and abs(new_bottom - bottom) < 0.01:
+            break
+        right, bottom = new_right, new_bottom
+
+    return (left, top, max(min_size, right - left), max(min_size, bottom - top))
+
+
+def find_text_clear_signature_box(
+    input_path: str,
+    page_idx: int,
+    sig_box: Tuple[float, float, float, float] = SIG_BOX_DEFAULT,
+) -> Tuple[float, float, float, float]:
+    """Shrink a top-left signature box into the immediate text-free gap.
+
+    The function relies on the PDF text/OCR layer. If the page has no
+    extractable words, it returns the requested box clamped to page bounds.
+    The top-left anchor is preserved; only width/height are reduced.
+    """
+    try:
+        import fitz
+    except Exception:
+        return sig_box
+
+    try:
+        with fitz.open(input_path) as doc:
+            if not (0 <= int(page_idx) < doc.page_count):
+                return sig_box
+            page = doc[int(page_idx)]
+            page_w = float(page.rect.width)
+            page_h = float(page.rect.height)
+            page_clamped = _clamp_signature_box_to_page(
+                sig_box, page_w, page_h, margin=0.0
+            )
+            text_rects = _page_text_rects_for_autoplace(page, page_w, page_h)
+            if not text_rects:
+                return page_clamped
+
+            left, top, width, height = page_clamped
+            own_rect = (left, top, left + width, top + height)
+            if not any(_rect_intersection_area(own_rect, r) > 0.0 for r in text_rects):
+                return page_clamped
+
+            return _shrink_box_to_text_gap(page_clamped, text_rects)
+    except Exception:
+        return sig_box
+
+
 # ── Custom Signer ─────────────────────────────────────────────────────────────
 
 class WinCSPSigner(_BaseSigner):
@@ -1077,6 +1241,7 @@ def sign_single_pdf(
     tsa_url: Optional[str] = None,
     stamp_image_path: Optional[str] = None,
     stamp_text_position: str = STAMP_TEXT_BELOW,
+    avoid_text_overlap: bool = False,
 ) -> None:
     """Sign one PDF file, writing to *output_path*."""
 
@@ -1093,6 +1258,8 @@ def sign_single_pdf(
 
     # Fixed-box auto-fit: the user fixes the box, we scale the
     # font down to make all 4 stamp lines fit inside.
+    if avoid_text_overlap:
+        sig_box = find_text_clear_signature_box(input_path, page, sig_box)
     box_w, box_h = sig_box[2], sig_box[3]
     fit_font_size = compute_fit_font_size(
         cert_info, box_w, box_h,
@@ -1168,6 +1335,7 @@ def batch_sign(
     tsa_url: Optional[str] = None,
     stamp_image_path: Optional[str] = None,
     stamp_text_position: str = STAMP_TEXT_BELOW,
+    avoid_text_overlap: bool = False,
 ) -> List[Tuple[str, bool, str]]:
     """
     Sign all PDFs in *input_paths*, writing results to *output_dir*.
@@ -1195,6 +1363,7 @@ def batch_sign(
                 tsa_url=tsa_url,
                 stamp_image_path=stamp_image_path,
                 stamp_text_position=stamp_text_position,
+                avoid_text_overlap=avoid_text_overlap,
             )
             entry = (src, True, "")
         except Exception as exc:

@@ -112,13 +112,14 @@ def _normalise_preprocess_record(page_index: int, raw: Optional[dict]) -> dict:
     branch = raw.get("branch") or "unknown"
     rotation = int(raw.get("rotation", raw.get("rotate_angle", 0)) or 0) % 360
     skew_angle = float(raw.get("skew_angle", 0.0) or 0.0)
-    rasterized = bool(raw.get("rasterized", branch in {"C", "D", "raster_deskew"}))
-    if branch in {"A", "B", "C", "D"}:
+    rasterized = bool(raw.get("rasterized", branch in {"C", "D", "E", "raster_deskew", "uvdoc_dewarp"}))
+    if branch in {"A", "B", "C", "D", "E"}:
         branch = {
             "A": "insert_pdf",
             "B": "set_rotation",
             "C": "raster_deskew",
             "D": "raster_deskew",
+            "E": "uvdoc_dewarp",
         }[branch]
     return {
         "page_index": int(page_index),

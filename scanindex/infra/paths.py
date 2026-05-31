@@ -1,7 +1,17 @@
 """Utility functions for portable executable mode with OFFLINE support"""
 import os
-import sys
+import shutil
 import stat
+import sys
+
+
+_RUNTIME_CONFIG_SEEDS = (
+    ("settings.ini", "settings.ini.example"),
+    ("ignored_words.txt", "ignored_words.txt.example"),
+    ("config/sign_settings.json", "config/sign_settings.json.example"),
+    ("config/sign_templates.json", "config/sign_templates.json.example"),
+)
+
 
 def ensure_writable(path):
     """
@@ -56,6 +66,61 @@ def get_resource_path(relative_path):
     if os.path.exists(bundle_path):
         return bundle_path
     return base_path
+
+
+def _copy_file_if_missing(source_path, target_path):
+    """Copy a sample file without overwriting a runtime file."""
+    os.makedirs(os.path.dirname(target_path), exist_ok=True)
+    created_target = False
+    try:
+        with open(source_path, "rb") as source:
+            try:
+                with open(target_path, "xb") as target:
+                    created_target = True
+                    shutil.copyfileobj(source, target)
+            except FileExistsError:
+                return False
+    except Exception:
+        if created_target and os.path.exists(target_path):
+            try:
+                os.remove(target_path)
+            except OSError:
+                pass
+        raise
+
+    try:
+        shutil.copystat(source_path, target_path)
+    except OSError:
+        pass
+    ensure_writable(target_path)
+    return True
+
+
+def ensure_runtime_config_files():
+    """
+    Seed portable runtime config from read-only samples on first launch only.
+
+    Release payloads intentionally ship ``*.example`` files instead of live
+    config so copying a newer portable build over an existing installation
+    preserves local settings, stamp templates, stamp images, and repository.
+    """
+    base_dir = get_base_dir()
+    created = []
+    for target_rel, sample_rel in _RUNTIME_CONFIG_SEEDS:
+        target_path = os.path.join(base_dir, target_rel)
+        if os.path.exists(target_path):
+            continue
+        sample_path = get_resource_path(sample_rel)
+        if not os.path.isfile(sample_path):
+            print(f"[Portable] Warning: Missing config sample {sample_rel}")
+            continue
+        if _copy_file_if_missing(sample_path, target_path):
+            created.append(target_path)
+            print(f"[Portable] Info: Created runtime config {target_rel}")
+
+    os.makedirs(os.path.join(base_dir, "config", "sign_stamp_images"), exist_ok=True)
+    return created
+
 
 def is_frozen():
     """Check if running as frozen executable"""

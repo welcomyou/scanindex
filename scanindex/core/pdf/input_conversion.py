@@ -47,9 +47,12 @@ def _frame_dpi(frame) -> tuple[float, float]:
         dpi_y = float(raw[1] if len(raw) > 1 else raw[0])
     except Exception:
         dpi_x = dpi_y = 300.0
-    if dpi_x <= 0:
+    # Camera/JPEG files commonly carry 72 or 96 DPI metadata even though the
+    # pixels are intended for OCR, not a 40-50 inch physical page. Use the scan
+    # fallback for such low metadata to keep downstream DOCX geometry sane.
+    if dpi_x <= 96:
         dpi_x = 300.0
-    if dpi_y <= 0:
+    if dpi_y <= 96:
         dpi_y = dpi_x
     return dpi_x, dpi_y
 

@@ -10548,10 +10548,37 @@ def create_docx_from_pdf(
         has_figures = any(e["type"] == "figure" for e in doc_elements)
         if has_figures:
             try:
-                # Prefer original input (higher quality than OCR overlay)
-                original_pdf = pdf_path.replace("_ocr.pdf", ".pdf")
-                doc_pdf = fitz.open(original_pdf if os.path.exists(original_pdf) else pdf_path)
-            except Exception:
+                docx_export_pipeline = ((companion_data or {}).get("pipeline") or {}).get("docx_export") or {}
+                manifest = [
+                    entry for entry in (docx_export_pipeline.get("page_source_manifest") or [])
+                    if isinstance(entry, dict)
+                ]
+                visual_path = docx_export_pipeline.get("visual_pdf_path")
+                visual_required = bool(docx_export_pipeline.get("coordinate_contract")) or any(
+                    ((entry.get("visual_source") or {}).get("pdf_path_role") == "preprocessed")
+                    or bool((entry.get("preprocess") or {}).get("rasterized"))
+                    or str((entry.get("preprocess") or {}).get("branch") or "") not in {"", "unknown", "digital_passthrough"}
+                    for entry in manifest
+                )
+
+                candidates = []
+                if visual_required:
+                    if visual_path and os.path.exists(visual_path):
+                        candidates.append(visual_path)
+                    candidates.append(pdf_path)
+                else:
+                    original_pdf = pdf_path.replace("_ocr.pdf", ".pdf")
+                    if original_pdf != pdf_path:
+                        candidates.append(original_pdf)
+                    if visual_path:
+                        candidates.append(visual_path)
+                    candidates.append(pdf_path)
+
+                figure_source_pdf = next((p for p in candidates if p and os.path.exists(p)), pdf_path)
+                doc_pdf = fitz.open(figure_source_pdf)
+                logger.log(f"Figure extraction source: {figure_source_pdf}")
+            except Exception as e:
+                logger.log(f"Figure source PDF open failed: {e}")
                 doc_pdf = None
 
         # Detect page orientations from PDF page dimensions

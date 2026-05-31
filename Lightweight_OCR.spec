@@ -1,9 +1,9 @@
 # -*- mode: python ; coding: utf-8 -*-
 """PyInstaller spec for the ScanIndex portable build.
 
-Runtime data that the application mutates or loads through get_base_dir()
-is copied by build_portable.bat next to the executable. This spec only bundles
-Python packages and read-only in-bundle assets needed at import time.
+Runtime data that the application loads through get_base_dir() is copied by
+build_portable.bat next to the executable. Mutable config is bundled only as
+read-only ``*.example`` samples and seeded on first launch when absent.
 """
 
 import os
@@ -41,7 +41,9 @@ def add_data(src, dest=None):
 add_data("assets", "assets")
 add_data("scanindex/core/repository/schema.sql", "scanindex/core/repository")
 add_data("settings.ini.example", ".")
-add_data("ignored_words.txt", ".")
+add_data("ignored_words.txt.example", ".")
+add_data("config/sign_settings.json.example", "config")
+add_data("config/sign_templates.json.example", "config")
 add_data("dictionaries", "dictionaries")
 # VERSION file is written by build_portable.bat (from `git describe`)
 # right before PyInstaller runs, so the bundled app reports the same

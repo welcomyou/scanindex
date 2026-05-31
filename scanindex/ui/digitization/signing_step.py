@@ -9,8 +9,8 @@ import uuid
 from dataclasses import dataclass
 from typing import Optional
 
-from PySide6.QtCore import QPoint, QSize, Qt, QThread, Signal
-from PySide6.QtGui import QColor, QBrush, QPainter, QPixmap, QPolygon
+from PySide6.QtCore import QPoint, QRectF, QSize, Qt, QThread, Signal
+from PySide6.QtGui import QColor, QBrush, QPainter, QPen, QPixmap, QPolygon
 from PySide6.QtWidgets import (
     QAbstractItemView, QButtonGroup, QCheckBox, QComboBox, QFileDialog, QFrame, QGridLayout, QHBoxLayout,
     QHeaderView, QLabel, QLineEdit, QInputDialog, QMessageBox, QPushButton,
@@ -111,6 +111,45 @@ class _NoWheelDoubleSpinBox(QDoubleSpinBox):
         event.ignore()
 
 
+class _ClearIconButton(QPushButton):
+    """Small centred X icon button, drawn instead of relying on font metrics."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(24, 24)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip("Xóa hình dấu")
+        self.setStyleSheet("QPushButton { background: transparent; border: none; }")
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        enabled = self.isEnabled()
+        hover = enabled and self.underMouse()
+
+        rect = QRectF(self.rect()).adjusted(2.0, 2.0, -2.0, -2.0)
+        if hover:
+            painter.setBrush(QBrush(QColor(COLOR_RED)))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawEllipse(rect)
+            icon = QColor("#ffffff")
+        else:
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            border = QColor(COLOR_BORDER_DEFAULT if enabled else COLOR_BORDER)
+            painter.setPen(QPen(border, 1.0))
+            painter.drawEllipse(rect)
+            icon = QColor(COLOR_RED if enabled else COLOR_TEXT_MUTED)
+
+        painter.setPen(QPen(icon, 2.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        cx = rect.center().x()
+        cy = rect.center().y()
+        r = 4.6
+        painter.drawLine(QPoint(int(round(cx - r)), int(round(cy - r))),
+                         QPoint(int(round(cx + r)), int(round(cy + r))))
+        painter.drawLine(QPoint(int(round(cx + r)), int(round(cy - r))),
+                         QPoint(int(round(cx - r)), int(round(cy + r))))
+
+
 def _page_count(path: str) -> int:
     try:
         from pypdf import PdfReader
@@ -163,6 +202,7 @@ class _SignWorker(QThread):
         stamp_text_position: str = STAMP_TEXT_BELOW,
         tsa_url: str = "",
         enable_pdfa: bool = False,
+        avoid_text_overlap: bool = True,
         parent=None,
     ):
         super().__init__(parent)
@@ -180,6 +220,7 @@ class _SignWorker(QThread):
         )
         self._tsa_url = str(tsa_url or "").strip()
         self._enable_pdfa = bool(enable_pdfa)
+        self._avoid_text_overlap = bool(avoid_text_overlap)
         self._cancelled = False
 
     def cancel(self):
@@ -228,6 +269,7 @@ class _SignWorker(QThread):
                         tsa_url=self._tsa_url,
                         stamp_image_path=self._stamp_image_path or None,
                         stamp_text_position=self._stamp_text_position,
+                        avoid_text_overlap=self._avoid_text_overlap,
                     )
                     result = {
                         "index": idx,
@@ -462,6 +504,20 @@ class ArchiveStep3Sign(QWidget):
         hint.setStyleSheet(f"color: {COLOR_TEXT_MUTED}; font-size: {_FONT_SM}px;")
         layout.addWidget(hint)
 
+        self.chk_avoid_text_overlap = QCheckBox("Tự tránh vùng có chữ khi đặt chữ ký")
+        self.chk_avoid_text_overlap.setChecked(True)
+        self.chk_avoid_text_overlap.setStyleSheet(
+            f"QCheckBox {{ color: {COLOR_TEXT}; font-size: {_FONT_SM}px; }}"
+        )
+        self.chk_avoid_text_overlap.setToolTip(
+            "Trước khi ký, phần mềm đọc text/OCR trên trang rồi thu nhỏ khung "
+            "chữ ký theo khoảng trống từ vị trí X/Y, có chừa khoảng hở "
+            "với text PDF. Nếu trang không có text layer hoặc không tìm được vùng "
+            "trống phù hợp thì dùng vị trí hiện tại."
+        )
+        self.chk_avoid_text_overlap.stateChanged.connect(lambda *_: self._save_settings())
+        layout.addWidget(self.chk_avoid_text_overlap)
+
         # PDF/A-2b conversion option (chuẩn lưu trữ dài hạn).
         # Convert TRƯỚC khi ký số: signature trong PDF/A-2 vẫn valid.
         # Cần Ghostscript đã cài (auto-detect).
@@ -568,23 +624,7 @@ class ArchiveStep3Sign(QWidget):
             f"font-size: 10px;"
         )
         stamp_row.addWidget(self.lbl_stamp_image_preview)
-        self._btn_stamp_image_clear = QPushButton("×")
-        self._btn_stamp_image_clear.setFixedSize(24, 24)
-        self._btn_stamp_image_clear.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._btn_stamp_image_clear.setToolTip("Xóa hình dấu")
-        self._btn_stamp_image_clear.setStyleSheet(f"""
-            QPushButton {{
-                background: transparent; border: none; border-radius: 12px;
-                color: {COLOR_RED}; font-size: 18px; font-weight: 700;
-                font-family: {FONT_UI};
-            }}
-            QPushButton:hover {{
-                background: {COLOR_RED}; color: #fff;
-            }}
-            QPushButton:disabled {{
-                color: {COLOR_TEXT_MUTED}; background: transparent;
-            }}
-        """)
+        self._btn_stamp_image_clear = _ClearIconButton()
         self._btn_stamp_image_clear.clicked.connect(self._clear_stamp_image)
         stamp_row.addWidget(self._btn_stamp_image_clear, alignment=Qt.AlignmentFlag.AlignTop)
         stamp_row.addStretch()
@@ -756,19 +796,28 @@ class ArchiveStep3Sign(QWidget):
             QRadioButton {{
                 background: {COLOR_BG}; color: {COLOR_TEXT}; font-size: {_FONT_SM}px;
                 font-family: {FONT_UI}; padding: 4px 8px; border-radius: {_RAD}px;
+                spacing: 6px;
             }}
             QRadioButton:checked {{
-                background: {COLOR_BG}; color: {COLOR_TEXT};
+                background: {COLOR_ELEVATED}; color: {COLOR_TEXT};
             }}
             QRadioButton::indicator {{
                 width: 14px; height: 14px; border-radius: 7px;
-                border: 1px solid {COLOR_TEXT_SECONDARY}; background: transparent;
+                border: 1px solid {COLOR_TEXT_SECONDARY}; background: {COLOR_BG};
             }}
             QRadioButton::indicator:checked {{
-                border: 1px solid #fff; background: #fff;
+                border: 1px solid {COLOR_ACCENT};
+                background: qradialgradient(
+                    cx: 0.5, cy: 0.5, radius: 0.58,
+                    fx: 0.5, fy: 0.5,
+                    stop: 0 {COLOR_ACCENT},
+                    stop: 0.42 {COLOR_ACCENT},
+                    stop: 0.45 {COLOR_BG},
+                    stop: 1 {COLOR_BG}
+                );
             }}
             QRadioButton::indicator:unchecked {{
-                background: transparent;
+                background: {COLOR_BG};
             }}
             QRadioButton:disabled {{
                 color: {COLOR_TEXT_MUTED};
@@ -1131,6 +1180,12 @@ class ArchiveStep3Sign(QWidget):
             # PDF/A toggle (chỉ load khi UI checkbox enabled — Ghostscript có sẵn)
             if hasattr(self, "chk_pdfa") and self.chk_pdfa.isEnabled():
                 self.chk_pdfa.setChecked(bool(data.get("convert_pdfa", False)))
+            if hasattr(self, "chk_avoid_text_overlap"):
+                self.chk_avoid_text_overlap.blockSignals(True)
+                self.chk_avoid_text_overlap.setChecked(
+                    bool(data.get("avoid_text_overlap", True))
+                )
+                self.chk_avoid_text_overlap.blockSignals(False)
             if hasattr(self, "chk_tsa"):
                 self.chk_tsa.blockSignals(True)
                 self.chk_tsa.setChecked(bool(data.get("tsa_enabled", True)))
@@ -1156,6 +1211,10 @@ class ArchiveStep3Sign(QWidget):
             "height": float(self.spin_h.value()),
             "template_name": self.combo_template.currentText().strip(),
             "convert_pdfa": bool(self.chk_pdfa.isChecked()) if hasattr(self, "chk_pdfa") else False,
+            "avoid_text_overlap": (
+                bool(self.chk_avoid_text_overlap.isChecked())
+                if hasattr(self, "chk_avoid_text_overlap") else True
+            ),
             "tsa_enabled": bool(self.chk_tsa.isChecked()) if hasattr(self, "chk_tsa") else True,
             "tsa_url": self.edit_tsa_url.text().strip() if hasattr(self, "edit_tsa_url") else DEFAULT_TSA_URL,
         }
@@ -1631,6 +1690,10 @@ class ArchiveStep3Sign(QWidget):
             stamp_text_position=stamp_text_position,
             tsa_url=tsa_url,
             enable_pdfa=bool(self.chk_pdfa.isChecked()) if hasattr(self, "chk_pdfa") else False,
+            avoid_text_overlap=(
+                bool(self.chk_avoid_text_overlap.isChecked())
+                if hasattr(self, "chk_avoid_text_overlap") else True
+            ),
             parent=self,
         )
         self._worker.progress.connect(self._on_sign_progress)
@@ -1694,7 +1757,7 @@ class ArchiveStep3Sign(QWidget):
             self._btn_stamp_image_choose, self._btn_stamp_image_clear,
             self.radio_text_below, self.radio_text_right,
             self.spin_page, self.spin_x, self.spin_y, self.spin_w, self.spin_h,
-            self.text_template, self.chk_tsa, self.edit_tsa_url,
+            self.text_template, self.chk_avoid_text_overlap, self.chk_tsa, self.edit_tsa_url,
         ]:
             widget.setEnabled(enabled)
         if enabled:

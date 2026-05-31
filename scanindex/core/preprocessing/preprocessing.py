@@ -771,7 +771,9 @@ def _get_uvdoc_session():
     )
 
 
-def _uvdoc_enabled() -> bool:
+def _uvdoc_enabled(config_value: Optional[bool] = None) -> bool:
+    if config_value is not None:
+        return bool(config_value)
     value = os.environ.get("OCRTOOL_UVDOC_DEWARP", "1").strip().lower()
     return value not in {"0", "false", "no", "off"}
 
@@ -813,8 +815,9 @@ def _should_uvdoc_dewarp(
     image: np.ndarray,
     has_dominant_image: bool,
     skew_angle: float = 0.0,
+    enabled: Optional[bool] = None,
 ) -> Tuple[bool, dict]:
-    enabled = _uvdoc_enabled()
+    enabled = _uvdoc_enabled(enabled)
     meta = {
         "enabled": enabled,
         "available": _get_uvdoc_session() is not None if enabled else False,
@@ -835,7 +838,7 @@ def _should_uvdoc_dewarp(
     quad = _largest_document_quad(image)
     if quad is None:
         if abs(float(skew_angle or 0.0)) > _DESKEW_KEEP_CANVAS_MAX_DEG:
-            meta["reason"] = "large_skew_camera_candidate"
+            meta["reason"] = "large_skew_camera_or_book_spread"
             return True, meta
         meta["reason"] = "no_page_quad"
         return False, meta
@@ -930,7 +933,8 @@ def _estimate_embedded_dpi(displayed_rect, pixel_w: int, pixel_h: int) -> Option
 
 def pre_process_pdf(input_path: str, output_path: str, update_callback=None,
                     debug_mode=False, max_workers: Optional[int] = None,
-                    return_metadata: bool = False):
+                    return_metadata: bool = False,
+                    uvdoc_enabled: Optional[bool] = None):
     """
     Smart Preprocessing (parallel):
     Phase 1 (serial): Extract/rasterize images from PDF (fitz not thread-safe)
@@ -1069,6 +1073,7 @@ def pre_process_pdf(input_path: str, output_path: str, update_callback=None,
                 test_img,
                 bool(pd.get("has_dominant_image")),
                 skew_angle,
+                enabled=uvdoc_enabled,
             )
 
             return {

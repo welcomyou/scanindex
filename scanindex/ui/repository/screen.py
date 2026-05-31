@@ -42,8 +42,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
-from PySide6.QtCore import Qt, Signal, QThread
-from PySide6.QtGui import QImage, QPainter, QPen, QColor, QPixmap
+from PySide6.QtCore import QEvent, QMimeData, Qt, Signal, QThread, QTimer
+from PySide6.QtGui import QCursor, QDrag, QImage, QPainter, QPen, QColor, QPixmap
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
     QComboBox, QFrame, QScrollArea, QSplitter,
@@ -73,7 +73,11 @@ from scanindex.core.repository.importer import (
     Importer, ImportProgress, KIE_COLUMNS, KIE_LABELS,
     extract_blocks_from_canonical,
 )
-from scanindex.core.repository.search_engine import SearchEngine, SearchResult
+from scanindex.core.repository.search_engine import (
+    SearchEngine,
+    SearchResult,
+    _fuzzy_span_token_ranges,
+)
 from scanindex.core.repository.repair import run_startup_repair
 from scanindex.core.repository.tokenizer import to_no_diacritic
 
@@ -641,40 +645,9 @@ def _query_match_spans(text: str, query: str, *, fuzzy: bool = False) -> list[tu
                 ):
                     spans.append((start, end))
         elif n < 8:
-            for i in range(0, len(word_spans) - n + 1):
-                window = word_spans[i:i + n]
-                if all(
-                    _display_fuzzy_token_match(
-                        qt,
-                        tok,
-                        allow_short_fuzzy=allow_short_fuzzy,
-                    )
-                    for qt, (_, _, tok) in zip(qtokens, window)
-                ):
-                    spans.append((window[0][0], window[-1][1]))
-            if not spans:
-                matched_by_query = {
-                    qt: any(
-                        _display_fuzzy_token_match(
-                            qt,
-                            token,
-                            allow_short_fuzzy=allow_short_fuzzy,
-                        )
-                        for _, _, token in word_spans
-                    )
-                    for qt in qtokens
-                }
-                if all(matched_by_query.values()):
-                    for start, end, token in word_spans:
-                        if any(
-                            _display_fuzzy_token_match(
-                                qt,
-                                token,
-                                allow_short_fuzzy=allow_short_fuzzy,
-                            )
-                            for qt in qtokens
-                        ):
-                            spans.append((start, end))
+            tokens = [token for _, _, token in word_spans]
+            for start_idx, end_idx in _fuzzy_span_token_ranges(tokens, qtokens):
+                spans.append((word_spans[start_idx][0], word_spans[end_idx][1]))
     if not spans:
         return []
 
@@ -912,6 +885,22 @@ def _format_repo_stats(dossier_count: int,
     )
 
 
+def _reordered_doc_ids(doc_ids: List[str], dragged_doc_id: str,
+                       target_doc_id: str, insert_after: bool) -> List[str]:
+    """Return a reordered copy for one card drop, preserving every doc id."""
+    out = list(doc_ids)
+    if dragged_doc_id == target_doc_id:
+        return out
+    if dragged_doc_id not in out or target_doc_id not in out:
+        raise ValueError("Không tìm thấy văn bản cần sắp xếp")
+    out.remove(dragged_doc_id)
+    target_index = out.index(target_doc_id)
+    if insert_after:
+        target_index += 1
+    out.insert(target_index, dragged_doc_id)
+    return out
+
+
 class _DateFilterInput(QWidget):
     """Line edit plus calendar button for dd/mm/yyyy metadata filters."""
 
@@ -1068,6 +1057,9 @@ _CARD_QSS = (
     f"QFrame#Card:hover {{ border-color: {COLOR_ACCENT}; }}"
     f"QFrame#Card[active=\"true\"] {{ background: {COLOR_ELEVATED}; "
     f"  border-color: {COLOR_ACCENT}; }}"
+    f"QFrame#Card[dropTarget=\"true\"] {{ background: {COLOR_ELEVATED}; "
+    f"  border: 2px solid {COLOR_GREEN}; }}"
+    f"QFrame#Card[dragReady=\"true\"] {{ border-color: {COLOR_GREEN}; }}"
     f"QFrame#Card QLabel {{ background: transparent; border: none; }}"
 )
 
@@ -1190,12 +1182,100 @@ class _DossierCard(QFrame):
         super().mousePressEvent(e)
 
 
+_FILE_REORDER_MIME = "application/x-scanindex-repository-doc-id"
+
+
+class _RepositoryListScrollArea(QScrollArea):
+    """List scroll area that remains usable during a long-press file drag."""
+
+    _EDGE_SCROLL_MARGIN = 56
+    _EDGE_SCROLL_STEP = 28
+    _EDGE_SCROLL_INTERVAL_MS = 45
+    _WHEEL_SCROLL_STEP = 72
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._reorder_drag_active = False
+        self._edge_scroll_timer = QTimer(self)
+        self._edge_scroll_timer.setInterval(self._EDGE_SCROLL_INTERVAL_MS)
+        self._edge_scroll_timer.timeout.connect(self._scroll_for_drag_edge)
+
+    def begin_reorder_drag(self) -> None:
+        if self._reorder_drag_active:
+            return
+        self._reorder_drag_active = True
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
+        self._edge_scroll_timer.start()
+
+    def end_reorder_drag(self) -> None:
+        if not self._reorder_drag_active:
+            return
+        self._reorder_drag_active = False
+        self._edge_scroll_timer.stop()
+        app = QApplication.instance()
+        if app is not None:
+            app.removeEventFilter(self)
+
+    @classmethod
+    def _edge_scroll_direction(cls, y: int, height: int) -> int:
+        if y < 0 or y >= height:
+            return 0
+        margin = min(cls._EDGE_SCROLL_MARGIN, max(1, height // 2))
+        if y < margin:
+            return -1
+        if y >= height - margin:
+            return 1
+        return 0
+
+    def _cursor_in_viewport(self) -> Optional[object]:
+        point = self.viewport().mapFromGlobal(QCursor.pos())
+        return point if self.viewport().rect().contains(point) else None
+
+    def _apply_drag_wheel_delta(self, delta_y: int) -> bool:
+        if not delta_y:
+            return False
+        direction = -1 if delta_y > 0 else 1
+        bar = self.verticalScrollBar()
+        bar.setValue(bar.value() + direction * self._WHEEL_SCROLL_STEP)
+        return True
+
+    def _scroll_for_drag_edge(self) -> None:
+        if not self._reorder_drag_active:
+            return
+        point = self._cursor_in_viewport()
+        if point is None:
+            return
+        direction = self._edge_scroll_direction(
+            point.y(), self.viewport().height()
+        )
+        if not direction:
+            return
+        bar = self.verticalScrollBar()
+        bar.setValue(bar.value() + direction * self._EDGE_SCROLL_STEP)
+
+    def eventFilter(self, watched, event):
+        if (self._reorder_drag_active
+                and event.type() == QEvent.Type.Wheel
+                and self._cursor_in_viewport() is not None
+                and self._apply_drag_wheel_delta(event.angleDelta().y())):
+            event.accept()
+            return True
+        return super().eventFilter(watched, event)
+
+
 class _FileCard(QFrame):
     """Browse-mode card for one file inside a dossier. Has a checkbox at
     the top-left for multi-select bulk delete, and a body click area that
-    emits `clicked(doc_id)` to open the file."""
+    emits `clicked(doc_id)` to open the file. Holding the body briefly arms
+    native drag/drop reorder within the current dossier."""
     clicked = Signal(str)
     selection_changed = Signal(str, bool)   # (doc_id, checked)
+    reorder_requested = Signal(str, str, bool)  # dragged, target, insert_after
+
+    _REORDER_MIME = _FILE_REORDER_MIME
+    _LONG_PRESS_MS = 450
 
     def __init__(self, file: FileRow, parent=None):
         super().__init__(parent)
@@ -1203,6 +1283,15 @@ class _FileCard(QFrame):
         self.setObjectName("Card")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setStyleSheet(_CARD_QSS)
+        self.setAcceptDrops(True)
+        self.setToolTip("Giữ chuột rồi kéo để sắp xếp thứ tự văn bản")
+        self._press_pos = None
+        self._drag_ready = False
+        self._drag_started = False
+        self._active_reorder_scroll = None
+        self._long_press_timer = QTimer(self)
+        self._long_press_timer.setSingleShot(True)
+        self._long_press_timer.timeout.connect(self._arm_drag)
         h = QHBoxLayout(self)
         h.setContentsMargins(SP[3], SP[2], SP[3], SP[2])
         h.setSpacing(SP[2])
@@ -1224,6 +1313,7 @@ class _FileCard(QFrame):
         title_text = file.subject or file.file_name or "(không tiêu đề)"
         title = QLabel(title_text)
         title.setWordWrap(True)
+        title.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         title.setStyleSheet(f"color: {COLOR_TEXT}; font: 600 13px '{FONT_UI}';")
         v.addWidget(title)
 
@@ -1231,12 +1321,14 @@ class _FileCard(QFrame):
         if meta_text:
             meta = QLabel(meta_text)
             meta.setWordWrap(True)
+            meta.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
             meta.setStyleSheet(f"color: {COLOR_TEXT_SECONDARY}; font: 11px '{FONT_UI}';")
             v.addWidget(meta)
 
         if file.file_name:
             fn = QLabel(f"📄 {file.file_name}")
             fn.setWordWrap(True)
+            fn.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
             fn.setStyleSheet(
                 f"color: {COLOR_GREEN}; font: 600 11px '{FONT_UI}';"
             )
@@ -1251,17 +1343,128 @@ class _FileCard(QFrame):
     def set_active(self, active: bool) -> None:
         _set_card_active(self, active)
 
+    def _set_drag_property(self, name: str, value: bool) -> None:
+        self.setProperty(name, "true" if value else "false")
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self.update()
+
+    def _reset_press_state(self) -> None:
+        self._long_press_timer.stop()
+        if self._active_reorder_scroll is not None:
+            self._active_reorder_scroll.end_reorder_drag()
+            self._active_reorder_scroll = None
+        self._press_pos = None
+        self._drag_ready = False
+        self._set_drag_property("dragReady", False)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def _arm_drag(self) -> None:
+        if self._press_pos is None:
+            return
+        self._drag_ready = True
+        self._active_reorder_scroll = self._find_reorder_scroll_area()
+        if self._active_reorder_scroll is not None:
+            self._active_reorder_scroll.begin_reorder_drag()
+        self._set_drag_property("dragReady", True)
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+
+    def _find_reorder_scroll_area(self) -> Optional[_RepositoryListScrollArea]:
+        widget = self.parentWidget()
+        while widget is not None:
+            if isinstance(widget, _RepositoryListScrollArea):
+                return widget
+            widget = widget.parentWidget()
+        return None
+
+    def _start_drag(self) -> None:
+        self._drag_started = True
+        mime = QMimeData()
+        mime.setData(self._REORDER_MIME, self.file.doc_id.encode("utf-8"))
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+        self.setCursor(Qt.CursorShape.ClosedHandCursor)
+        drag.exec(Qt.DropAction.MoveAction)
+        self._reset_press_state()
+
+    def _dragged_doc_id(self, e) -> str:
+        if not e.mimeData().hasFormat(self._REORDER_MIME):
+            return ""
+        return bytes(e.mimeData().data(self._REORDER_MIME)).decode(
+            "utf-8", errors="ignore"
+        )
+
+    def _set_drop_target(self, active: bool) -> None:
+        self._set_drag_property("dropTarget", active)
+
     def mousePressEvent(self, e):
-        # Body click → open file. Clicking the checkbox itself routes
-        # through QCheckBox; we only filter that out of the card click.
         if e.button() == Qt.MouseButton.LeftButton:
             child = self.childAt(e.position().toPoint())
             from PySide6.QtWidgets import QCheckBox
             if isinstance(child, QCheckBox):
                 super().mousePressEvent(e)
                 return
-            self.clicked.emit(self.file.doc_id)
+            self._press_pos = e.position().toPoint()
+            self._drag_started = False
+            self._long_press_timer.start(self._LONG_PRESS_MS)
+            e.accept()
+            return
         super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        if (self._press_pos is not None
+                and e.buttons() & Qt.MouseButton.LeftButton):
+            distance = (
+                e.position().toPoint() - self._press_pos
+            ).manhattanLength()
+            if self._drag_ready and distance >= QApplication.startDragDistance():
+                self._start_drag()
+                e.accept()
+                return
+            if not self._drag_ready and distance >= QApplication.startDragDistance():
+                self._reset_press_state()
+        super().mouseMoveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton and self._press_pos is not None:
+            should_click = not self._drag_started
+            self._reset_press_state()
+            if should_click:
+                self.clicked.emit(self.file.doc_id)
+            e.accept()
+            return
+        super().mouseReleaseEvent(e)
+
+    def dragEnterEvent(self, e):
+        dragged_doc_id = self._dragged_doc_id(e)
+        if dragged_doc_id and dragged_doc_id != self.file.doc_id:
+            self._set_drop_target(True)
+            e.acceptProposedAction()
+            return
+        e.ignore()
+
+    def dragMoveEvent(self, e):
+        dragged_doc_id = self._dragged_doc_id(e)
+        if dragged_doc_id and dragged_doc_id != self.file.doc_id:
+            e.acceptProposedAction()
+            return
+        e.ignore()
+
+    def dragLeaveEvent(self, e):
+        self._set_drop_target(False)
+        super().dragLeaveEvent(e)
+
+    def dropEvent(self, e):
+        self._set_drop_target(False)
+        dragged_doc_id = self._dragged_doc_id(e)
+        if not dragged_doc_id or dragged_doc_id == self.file.doc_id:
+            e.ignore()
+            return
+        insert_after = e.position().y() >= self.height() / 2
+        self.reorder_requested.emit(
+            dragged_doc_id, self.file.doc_id, insert_after
+        )
+        e.acceptProposedAction()
 
 
 class _SearchHitCard(QFrame):
@@ -2392,7 +2595,7 @@ class RepositoryScreen(ScreenContent):
         v.setSpacing(SP[1])
 
         # Scrollable card area
-        self._list_scroll = QScrollArea()
+        self._list_scroll = _RepositoryListScrollArea()
         self._list_scroll.setWidgetResizable(True)
         self._list_scroll.setStyleSheet(
             f"QScrollArea {{ background: {COLOR_BG}; border: none; }}"
@@ -2932,6 +3135,7 @@ class RepositoryScreen(ScreenContent):
             card = _FileCard(f)
             card.clicked.connect(lambda _did, ff=f: self._show_file(ff))
             card.selection_changed.connect(self._on_file_selection_changed)
+            card.reorder_requested.connect(self._on_file_reorder_requested)
             self._file_cards_by_id[f.doc_id] = card
             self._doc_cards_by_id[f.doc_id] = card
             self._add_card(card)
@@ -3084,6 +3288,9 @@ class RepositoryScreen(ScreenContent):
         ).fetchall()
         docs: list[dict] = []
         skipped = 0
+        # `file_name` is the persisted dossier order key. Reorder renames the
+        # stored PDFs first, so both ZIP members and Excel rows below follow
+        # the same new sequence.
         for r in rows:
             pdf_path = (self._archive_path / (r["file_path"] or "")).resolve()
             if not pdf_path.is_file():
@@ -3176,18 +3383,57 @@ class RepositoryScreen(ScreenContent):
                 head = self._first_jumpable_result(chunk_hits)
                 is_meta = (getattr(head, "chunk_type", "body") == "metadata")
                 match_boxes = getattr(head, "match_bboxes", None) or None
-                bbox = None if (is_meta or match_boxes) else (head.bbox or None)
+                all_match_boxes = self._match_page_boxes(chunk_hits)
+                is_text_match = self._is_text_search_result(head)
+                bbox = (
+                    None
+                    if (is_meta or match_boxes or is_text_match)
+                    else (head.bbox or None)
+                )
                 if bbox and len(bbox) == 4 and all(v == 0 for v in bbox):
                     bbox = None
                 self._pdf_pane.show_pdf(pdf_abs, page=head.page or 1,
                                          bbox=bbox,
                                          bboxes=match_boxes,
-                                         highlight_style="highlight" if match_boxes else "box")
+                                         highlight_style="highlight"
+                                         if (all_match_boxes or match_boxes)
+                                         else "box",
+                                         page_bboxes=all_match_boxes)
                 self._right_panel.set_active_chunk(head.chunk_id or 0)
             else:
                 self._pdf_pane.show_pdf(pdf_abs, page=1, bbox=None)
         else:
             self._pdf_pane.clear()
+
+    @staticmethod
+    def _is_text_search_result(result: SearchResult) -> bool:
+        if (getattr(result, "chunk_type", "body") or "body") == "metadata":
+            return False
+        return (
+            (getattr(result, "match_kind", "") or "") in {"exact", "fuzzy"}
+            and bool(str(getattr(result, "query", "") or "").strip())
+        )
+
+    @staticmethod
+    def _match_page_boxes(chunks: List[SearchResult]) -> list[tuple[int, list[float]]]:
+        out: list[tuple[int, list[float]]] = []
+        seen_by_page: dict[int, list[list[float]]] = {}
+        for chunk in chunks or []:
+            if (getattr(chunk, "chunk_type", "body") or "body") == "metadata":
+                continue
+            page = int(getattr(chunk, "page", 0) or 0)
+            if page <= 0:
+                continue
+            seen = seen_by_page.setdefault(page, [])
+            for bb in getattr(chunk, "match_bboxes", None) or []:
+                if not bb or len(bb) != 4:
+                    continue
+                clean = [float(v) for v in bb]
+                if any(_is_same_match_bbox(clean, old) for old in seen):
+                    continue
+                seen.append(clean)
+                out.append((page - 1, clean))
+        return out
 
     @staticmethod
     def _first_jumpable_result(chunks: List[SearchResult]) -> SearchResult:
@@ -3419,7 +3665,7 @@ class RepositoryScreen(ScreenContent):
             full.dossier_title = hit.file_row.dossier_title
         chunk_hits = [] if hit.match_kind == "filter" else hit.chunks
         if chunk_hits and self._engine is not None:
-            self._engine.hydrate_match_bboxes(chunk_hits, limit=48)
+            self._engine.hydrate_match_bboxes(chunk_hits, limit=max(48, len(chunk_hits)))
         self._show_file(full, chunk_hits=chunk_hits or None)
 
     def _on_snippet_clicked(self, result: SearchResult):
@@ -3432,18 +3678,38 @@ class RepositoryScreen(ScreenContent):
         self._right_panel.set_active_chunk(result.chunk_id or 0)
         pdf_abs = (self._archive_path / self._current_file.file_path).resolve()
         is_meta = (getattr(result, "chunk_type", "body") == "metadata")
+        file_chunks = self._current_search_chunks_for_file()
         if (not is_meta
                 and self._engine is not None
                 and not getattr(result, "match_bboxes", None)):
             self._engine.hydrate_match_bboxes([result], limit=1)
+        if self._engine is not None and file_chunks:
+            self._engine.hydrate_match_bboxes(file_chunks, limit=max(96, len(file_chunks)))
         match_boxes = None if is_meta else (getattr(result, "match_bboxes", None) or None)
-        bbox = None if (is_meta or match_boxes) else (result.bbox or None)
+        all_match_boxes = [] if is_meta else self._match_page_boxes(file_chunks)
+        is_text_match = self._is_text_search_result(result)
+        bbox = (
+            None
+            if (is_meta or match_boxes or is_text_match)
+            else (result.bbox or None)
+        )
         # Real bboxes carry non-zero width/height; sanity-check just in case.
         if bbox and len(bbox) == 4 and all(v == 0 for v in bbox):
             bbox = None
         self._pdf_pane.show_pdf(pdf_abs, page=1 if is_meta else (result.page or 1),
                                  bbox=bbox, bboxes=match_boxes,
-                                 highlight_style="highlight" if match_boxes else "box")
+                                 highlight_style="highlight"
+                                 if (all_match_boxes or match_boxes)
+                                 else "box",
+                                 page_bboxes=all_match_boxes)
+
+    def _current_search_chunks_for_file(self) -> list[SearchResult]:
+        if not self._current_file:
+            return []
+        hit = self._hits_by_doc.get(self._current_file.doc_id)
+        if hit is None:
+            return []
+        return list(hit.chunks or [])
 
     # ------ External-open helpers ------
 
@@ -3696,6 +3962,55 @@ class RepositoryScreen(ScreenContent):
         self._show_dossier_list()
 
     # ------ CRUD: file multi-select + bulk delete + add ------
+
+    def _on_file_reorder_requested(self, dragged_doc_id: str,
+                                   target_doc_id: str,
+                                   insert_after: bool) -> None:
+        if (self._mode != self._MODE_FILES
+                or self._current_dossier is None
+                or self._store is None):
+            return
+        dossier = self._current_dossier
+        files = self._fetch_files_for_dossier(dossier.dossier_id)
+        current_ids = [file.doc_id for file in files]
+        try:
+            ordered_ids = _reordered_doc_ids(
+                current_ids, dragged_doc_id, target_doc_id, insert_after
+            )
+        except ValueError as e:
+            QMessageBox.warning(self, "Sắp xếp văn bản", str(e))
+            return
+        if ordered_ids == current_ids:
+            return
+
+        active_doc_id = self._active_doc_id
+        try:
+            from scanindex.core.repository import admin
+            self._pdf_pane.release_file_handles(timeout=5.0)
+            stats = admin.reorder_dossier_documents(
+                self._store, dossier.dossier_id, ordered_ids
+            )
+        except Exception as e:
+            if active_doc_id:
+                current = self._fetch_file_by_doc_id(active_doc_id)
+                if current is not None:
+                    self._show_file(current)
+            QMessageBox.critical(
+                self, "Sắp xếp văn bản",
+                f"Không sắp xếp lại được văn bản:\n{e}",
+            )
+            return
+
+        self.log_message.emit(
+            f"Đã sắp xếp lại {len(ordered_ids)} văn bản; "
+            f"đổi tên {stats.renamed_docs} PDF theo số thứ tự.",
+            "success",
+        )
+        self._show_files_in_dossier(dossier)
+        if active_doc_id:
+            updated = self._fetch_file_by_doc_id(active_doc_id)
+            if updated is not None:
+                self._show_file(updated)
 
     def _on_file_selection_changed(self, doc_id: str, checked: bool) -> None:
         if checked:

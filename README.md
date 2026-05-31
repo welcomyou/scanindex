@@ -64,6 +64,17 @@ python ocr_app.py
 build_portable.bat
 ```
 
+### Portable updates
+
+The dist payload contains config samples only. To update an existing portable
+installation, close the app and copy the new dist contents over the old folder.
+Existing `settings.ini`, `config/sign_settings.json`,
+`config/sign_templates.json`, `config/sign_stamp_images/`, `ignored_words.txt`,
+and `repository/` are preserved. On first launch, missing runtime config files
+are created from their `.example` samples.
+For GitHub Releases, upload a ZIP made from the generated
+`dist/ScanIndex-<version>/` folder only, not from the source tree or an old dist.
+
 Output ở `dist/ScanIndex-<version>/` (auto-derived từ `git describe`). Spec: [Lightweight_OCR.spec](Lightweight_OCR.spec).
 
 Auto-versioning đi theo git tag SemVer (xem [scanindex/infra/version.py](scanindex/infra/version.py)):
@@ -120,8 +131,12 @@ python scripts\upload_models_to_hf.py --dry-run  # xem trước
 
 ## Settings
 
-Copy `settings.ini.example` → `settings.ini` để chỉnh runtime config (ngôn ngữ,
-correction model, số worker, v.v.). `settings.ini` được gitignored.
+`settings.ini` is created automatically from `settings.ini.example` on first
+launch if it does not exist. Existing runtime config is never overwritten by
+an update.
+
+Edit `settings.ini` để chỉnh runtime config (ngôn ngữ, correction model, số
+worker, v.v.). `settings.ini` được gitignored.
 
 ## Phụ thuộc chính
 

@@ -83,6 +83,7 @@ def per_file_pre_workers(parallel_files: int) -> int:
 def _run_preprocess_and_ocr(input_path, output_path, num_pages, parallel_files,
                              update_callback, debug_mode, wait_per_page,
                              comparison_interval, source_document_path,
+                             uvdoc_enabled=True,
                              ocr_log_callback=None):
     """Shared helper: preprocess (with thread cap + rotation metadata) then OCR.
 
@@ -102,6 +103,7 @@ def _run_preprocess_and_ocr(input_path, output_path, num_pages, parallel_files,
         debug_mode=debug_mode,
         max_workers=pre_workers,
         return_metadata=True,
+        uvdoc_enabled=uvdoc_enabled,
     )
 
     if isinstance(pre_result, tuple) and len(pre_result) == 3:
@@ -149,7 +151,8 @@ def _source_page_count(source_path: str) -> int:
 
 def _run_source_to_ocr_pdf(input_path, output_path, num_pages, parallel_files,
                            update_callback, debug_mode, wait_per_page,
-                           comparison_interval, ocr_log_callback=None):
+                           comparison_interval, uvdoc_enabled=True,
+                           ocr_log_callback=None):
     """Normalize supported inputs to PDF, then run the existing OCR pipeline."""
     if is_image_path(input_path):
         with tempfile.TemporaryDirectory(prefix="ocrtool_image_pdf_") as temp_dir:
@@ -166,6 +169,7 @@ def _run_source_to_ocr_pdf(input_path, output_path, num_pages, parallel_files,
                 wait_per_page=wait_per_page,
                 comparison_interval=comparison_interval,
                 source_document_path=temp_pdf,
+                uvdoc_enabled=uvdoc_enabled,
                 ocr_log_callback=ocr_log_callback,
             )
 
@@ -179,6 +183,7 @@ def _run_source_to_ocr_pdf(input_path, output_path, num_pages, parallel_files,
         wait_per_page=wait_per_page,
         comparison_interval=comparison_interval,
         source_document_path=input_path,
+        uvdoc_enabled=uvdoc_enabled,
         ocr_log_callback=ocr_log_callback,
     )
 
@@ -960,6 +965,7 @@ class MainWindow(QMainWindow):
             "model": "", "gpu": "CPU", "verbose": True,
             "correct": True, "export": True,
             "translate_vi": False,
+            "uvdoc_dewarp": True,
             "show_log_panel": True,
             "kie_mode": None,
             "doc_types": doc_type_defaults,
@@ -995,6 +1001,7 @@ class MainWindow(QMainWindow):
                     # setting ignored so stale settings.ini cannot disable it.
                     self._saved["export"] = True
                     self._saved["translate_vi"] = self.config["OCR"].getboolean("TranslateVietnamese", False)
+                    self._saved["uvdoc_dewarp"] = self.config["OCR"].getboolean("UvdocDewarpEnabled", True)
                     self._saved["verbose"] = self.config["OCR"].getboolean("VerboseLog", True)
                     self._saved["show_log_panel"] = self.config["OCR"].getboolean("ShowLogPanel", True)
 
@@ -1047,6 +1054,7 @@ class MainWindow(QMainWindow):
                 self.log(get_text("msg_settings_loaded", settings_path))
             except Exception as e:
                 self.log(f"Failed to load settings: {e}", LOG_ERROR)
+        os.environ["OCRTOOL_UVDOC_DEWARP"] = "1" if bool(self._saved.get("uvdoc_dewarp", True)) else "0"
 
     def _apply_settings_to_ui(self):
         s = self._saved
@@ -1071,6 +1079,7 @@ class MainWindow(QMainWindow):
             catalogs=s.get("catalogs"),
             theme=s.get("theme", ACTIVE_THEME),
             translate_vi=s.get("translate_vi", False),
+            uvdoc_dewarp=s.get("uvdoc_dewarp", True),
         )
 
         # Sync the visible PDF→Word toolbar checkbox with the persisted value.
@@ -1114,11 +1123,14 @@ class MainWindow(QMainWindow):
             "CorrectEnabled": str(bool(vals.get("correct", True))),
             "ExportEnabled": "True",
             "TranslateVietnamese": str(bool(vals.get("translate_vi", False))),
+            "UvdocDewarpEnabled": str(bool(vals.get("uvdoc_dewarp", True))),
             "VerboseLog": str(vals["verbose"]),
             "ShowLogPanel": str(vals["show_log_panel"]),
         }
         self._saved["correct"] = bool(vals.get("correct", True))
         self._saved["translate_vi"] = bool(vals.get("translate_vi", False))
+        self._saved["uvdoc_dewarp"] = bool(vals.get("uvdoc_dewarp", True))
+        os.environ["OCRTOOL_UVDOC_DEWARP"] = "1" if self._saved["uvdoc_dewarp"] else "0"
         self.config["Correction"] = {
             "Model": vals["model"],
             "Acceleration": "CPU",
@@ -2563,6 +2575,7 @@ class MainWindow(QMainWindow):
             "do_metadata": False,
             "do_export": True,
             "force_rerun": False,
+            "uvdoc_dewarp": bool(vals.get("uvdoc_dewarp", True)),
         }
 
         pipeline_items = []
@@ -2690,6 +2703,7 @@ class MainWindow(QMainWindow):
                     debug_mode=self.settings_tab.chk_verbose.isChecked(),
                     wait_per_page=cfg_wait_page,
                     comparison_interval=cfg_wait_int,
+                    uvdoc_enabled=bool(vals.get("uvdoc_dewarp", True)),
                 )
 
             future = self.ocr_executor.submit(_ocr_work)
@@ -2990,6 +3004,7 @@ class ProcessingPipeline:
             debug_mode=self.app.settings_tab.chk_verbose.isChecked(),
             wait_per_page=self.config["wait_page"],
             comparison_interval=self.config["wait_int"],
+            uvdoc_enabled=bool(self.config.get("uvdoc_dewarp", True)),
             ocr_log_callback=_log_cb,
         )
         dt = time.time() - t0

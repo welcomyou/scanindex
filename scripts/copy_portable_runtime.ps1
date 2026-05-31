@@ -194,16 +194,18 @@ function Copy-LightgbmSplitter {
 
 New-Item -ItemType Directory -Path $DistRoot -Force | Out-Null
 
-Copy-FileIfExists "settings.ini" "settings.ini" "settings.ini"
+# Ship samples only so overlay updates preserve the user's runtime config.
 Copy-FileIfExists "settings.ini.example" "settings.ini.example" "settings.ini.example"
-Copy-FileIfExists "ignored_words.txt" "ignored_words.txt" "ignored words"
+Copy-FileIfExists "ignored_words.txt.example" "ignored_words.txt.example" "ignored words sample"
+Copy-FileIfExists "config\sign_settings.json.example" "config\sign_settings.json.example" "signature settings sample"
+Copy-FileIfExists "config\sign_templates.json.example" "config\sign_templates.json.example" "signature templates sample"
 
 Copy-DirIfExists "assets" "assets" "assets"
-Copy-DirIfExists "config" "config" "sign/config files"
 Copy-DirIfExists "dictionaries" "dictionaries" "dictionaries"
 
 Copy-ScreenAiRuntime
 Copy-DirIfExists "models\orientation" "models\orientation" "orientation ONNX"
+Copy-DirIfExists "models\uvdoc" "models\uvdoc" "UVDoc dewarp ONNX"
 Copy-DirIfExists "models\gmft_onnx" "models\gmft_onnx" "GMFT table ONNX"
 Copy-DirIfExists "models\docling_tableformer_v1_stepcache_onnx" "models\docling_tableformer_v1_stepcache_onnx" "Docling TableFormer v1 step-cache ONNX"
 Copy-DirIfExists "models\doclayout_yolo_onnx_dynamic" "models\doclayout_yolo_onnx_dynamic" "DocLayout-YOLO dynamic ONNX"

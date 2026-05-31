@@ -5,6 +5,7 @@ PDF Viewer Widget — Continuous-scroll viewer with:
 - All pages stacked vertically, smooth scroll
 """
 import re
+import time
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QScrollArea, QLabel,
@@ -123,7 +124,7 @@ class _ContinuousPageWidget(QWidget):
         self._zone = None  # (page_idx, x, y, w, h)
         self._zone_color = QColor(COLOR_ACCENT)
         self._overlays: list[tuple] = []
-        self._search_highlight = None  # (page_idx, [(x, y, w, h), ...], style)
+        self._search_highlight = None  # [(page_idx, [(x, y, w, h), ...], style)]
         # Fuzzy match overlays — drawn in a distinct color, clickable
         self._fuzzy_overlays: list[dict] = []
         self._text_selection_enabled = False
@@ -161,7 +162,20 @@ class _ContinuousPageWidget(QWidget):
         self.update()
 
     def set_search_highlight(self, page_idx, rects, style="box"):
-        self._search_highlight = (page_idx, list(rects or []), style or "box")
+        self.set_search_highlights([(page_idx, list(rects or []), style or "box")])
+        self.update()
+
+    def set_search_highlights(self, highlights):
+        cleaned = []
+        for item in highlights or []:
+            try:
+                page_idx, rects, style = item
+            except (TypeError, ValueError):
+                continue
+            page_rects = [r for r in (rects or []) if r and len(r) >= 4]
+            if page_rects:
+                cleaned.append((int(page_idx), page_rects, style or "box"))
+        self._search_highlight = cleaned or None
         self.update()
 
     def clear_search_highlight(self):
@@ -377,8 +391,9 @@ class _ContinuousPageWidget(QWidget):
         # highlighter-style fill; semantic/body chunk matches keep the
         # broader box.
         if self._search_highlight:
-            pi, rects, style = self._search_highlight
-            if 0 <= pi < len(self._page_y_offsets):
+            for pi, rects, style in self._search_highlight:
+                if not (0 <= pi < len(self._page_y_offsets)):
+                    continue
                 y_off = self._page_y_offsets[pi]
                 pm = self._page_pixmaps[pi]
                 x_off = (widget_w - pm.width()) // 2
@@ -552,6 +567,8 @@ class PdfViewerWidget(QWidget):
         self._fit_mode = True
         self._file_label_text = ""
         self._render_gen = 0
+        self._render_threads_lock = threading.Lock()
+        self._active_render_threads = set()
         self._current_search_highlight = None
         self._pending_view_scroll = None
         self._text_selection_available = bool(text_selection_available)
@@ -764,7 +781,8 @@ class PdfViewerWidget(QWidget):
         target_y = page_y + int((float(bbox_pdf[1]) - rect_y0) * y_scale) - 96
         self._scroll.verticalScrollBar().setValue(max(0, target_y))
 
-    def show_pdf(self, pdf_path, page=1, bbox=None, bboxes=None, highlight_style="box"):
+    def show_pdf(self, pdf_path, page=1, bbox=None, bboxes=None,
+                 highlight_style="box", page_bboxes=None):
         """Repository-compatible API: load a PDF, jump to page, and draw
         exact lexical highlights or broader semantic/chunk boxes."""
         path = str(pdf_path)
@@ -774,11 +792,17 @@ class PdfViewerWidget(QWidget):
         if not boxes and bbox and len(bbox) >= 4:
             boxes = [bbox]
         page_idx = max(0, int(page or 1) - 1)
-        if boxes:
+        page_boxes = self._normalize_page_bboxes(page_bboxes)
+        if page_boxes:
+            self.highlight_page_regions(page_boxes, highlight_style)
+        elif boxes:
             self.highlight_regions(page_idx, boxes, highlight_style)
         else:
             self.clear_highlight()
-        focus_bbox = boxes[0] if boxes else None
+        focus_bbox = boxes[0] if boxes else next(
+            (bb for pi, bb in page_boxes if pi == page_idx),
+            page_boxes[0][1] if page_boxes else None,
+        )
         if not self._raw_pixmaps or self._pages_widget.page_count() == 0:
             self._pending_view_scroll = (page_idx, focus_bbox)
             return
@@ -809,6 +833,39 @@ class PdfViewerWidget(QWidget):
         self._current_search_highlight = (int(page_idx), boxes, style or "box")
         self._reapply_search_highlight()
 
+    def highlight_page_regions(self, page_bboxes, style="box"):
+        grouped: dict[int, list[list[float]]] = {}
+        for page_idx, bbox in self._normalize_page_bboxes(page_bboxes):
+            grouped.setdefault(int(page_idx), []).append(list(bbox[:4]))
+        self._current_search_highlight = [
+            (page_idx, boxes, style or "box")
+            for page_idx, boxes in sorted(grouped.items())
+            if boxes
+        ]
+        self._reapply_search_highlight()
+
+    @staticmethod
+    def _normalize_page_bboxes(page_bboxes):
+        out = []
+        for item in page_bboxes or []:
+            page = None
+            bbox = None
+            if isinstance(item, dict):
+                page = item.get("page_idx", item.get("page"))
+                bbox = item.get("bbox")
+            else:
+                try:
+                    page, bbox = item
+                except (TypeError, ValueError):
+                    continue
+            if bbox and len(bbox) >= 4:
+                try:
+                    page_idx = int(page)
+                except (TypeError, ValueError):
+                    continue
+                out.append((page_idx, [float(v) for v in bbox[:4]]))
+        return out
+
     def _apply_pending_view_scroll(self):
         pending = self._pending_view_scroll
         if not pending or not self._raw_pixmaps:
@@ -828,13 +885,34 @@ class PdfViewerWidget(QWidget):
         if not self._current_search_highlight or not self._raw_pixmaps:
             self._pages_widget.clear_search_highlight()
             return
-        page_idx, boxes, style = self._current_search_highlight
-        rects = []
-        for box in boxes:
-            rects.append(self._pdf_bbox_to_view_rect(page_idx, box))
-        self._pages_widget.set_search_highlight(page_idx, rects, style)
+        current = self._current_search_highlight
+        if isinstance(current, tuple) and len(current) == 3:
+            entries = [current]
+        else:
+            entries = list(current or [])
+        highlights = []
+        for page_idx, boxes, style in entries:
+            rects = []
+            for box in boxes:
+                rect = self._pdf_bbox_to_view_rect(page_idx, box)
+                rects.append(self._pad_search_highlight_rect(page_idx, rect, style))
+            if rects:
+                highlights.append((page_idx, rects, style))
+        self._pages_widget.set_search_highlights(highlights)
 
     # ── KIE field overlays (multiple bboxes, one per field) ─────────
+
+    def _pad_search_highlight_rect(self, page_idx: int, rect, style: str):
+        if (style or "") != "highlight" or not rect:
+            return rect
+        x, y, w, h = (float(v) for v in rect[:4])
+        pad_y = max(2.5, min(8.0, h * 0.35))
+        new_y = max(0.0, y - pad_y)
+        new_h = h + (y - new_y) + pad_y
+        if 0 <= page_idx < len(self._raw_pixmaps):
+            page_h = float(self._raw_pixmaps[page_idx].height())
+            new_h = min(new_h, max(1.0, page_h - new_y))
+        return x, new_y, w, max(1.0, new_h)
 
     def set_field_overlays(self, fields):
         """Display KIE field bboxes on the rendered pages.
@@ -927,6 +1005,24 @@ class PdfViewerWidget(QWidget):
         self._update_nav_state()
         self._update_zoom_label()
         self._lbl_page.setText("")
+
+    def release_file_handles(self, timeout: float = 5.0) -> bool:
+        """Close the active PDF and wait briefly for background renders.
+
+        Windows prevents repository rename operations while either the main
+        viewer or an asynchronous render worker still has the PDF open.
+        """
+        self.clear()
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while True:
+            with self._render_threads_lock:
+                threads = list(self._active_render_threads)
+            if not threads:
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            threads[0].join(min(0.05, remaining))
 
     def update_texts(self):
         if self._doc is None:
@@ -1190,18 +1286,90 @@ class PdfViewerWidget(QWidget):
                 wx, wy, ww, wh = self._pdf_bbox_to_view_rect(page_idx, word["bbox"])
                 if page_selection.intersects(QRectF(wx, wy, ww, wh)):
                     selected.append(word)
-        selected.sort(
-            key=lambda w: (
-                w["page_idx"], w["block"], w["line"], w["word"],
-                w["bbox"][1], w["bbox"][0], w["order"],
-            )
-        )
-        return selected
+        return self._visual_order_words(selected)
 
     @staticmethod
     def _clipboard_word_text(text: str) -> str:
         text = str(text or "").replace("\xa0", " ").strip()
         return "-" if text == "\xad" else text.replace("\xad", "-")
+
+    @staticmethod
+    def _word_bbox(word: dict) -> list[float]:
+        bbox = word.get("bbox") or [0.0, 0.0, 0.0, 0.0]
+        try:
+            return [float(v) for v in bbox[:4]]
+        except (TypeError, ValueError):
+            return [0.0, 0.0, 0.0, 0.0]
+
+    @staticmethod
+    def _word_center_y(word: dict) -> float:
+        bbox = PdfViewerWidget._word_bbox(word)
+        return (bbox[1] + bbox[3]) / 2.0
+
+    @staticmethod
+    def _word_height(word: dict) -> float:
+        bbox = PdfViewerWidget._word_bbox(word)
+        return max(1.0, bbox[3] - bbox[1])
+
+    @staticmethod
+    def _word_left(word: dict) -> float:
+        return PdfViewerWidget._word_bbox(word)[0]
+
+    @staticmethod
+    def _visual_line_groups(words: list[dict]) -> list[list[dict]]:
+        if not words:
+            return []
+        ordered = sorted(
+            words,
+            key=lambda w: (
+                int(w.get("page_idx", 0)),
+                PdfViewerWidget._word_center_y(w),
+                PdfViewerWidget._word_left(w),
+                int(w.get("block", 0)),
+                int(w.get("line", 0)),
+                int(w.get("word", 0)),
+                int(w.get("order", 0)),
+            ),
+        )
+        groups: list[dict] = []
+        for word in ordered:
+            page_idx = int(word.get("page_idx", 0))
+            center_y = PdfViewerWidget._word_center_y(word)
+            height = PdfViewerWidget._word_height(word)
+            if groups and groups[-1]["page_idx"] == page_idx:
+                prev = groups[-1]
+                tol = max(3.0, max(prev["height"], height) * 0.70)
+                if abs(center_y - prev["center_y"]) <= tol:
+                    count = len(prev["words"])
+                    prev["center_y"] = (prev["center_y"] * count + center_y) / (count + 1)
+                    prev["height"] = max(prev["height"], height)
+                    prev["words"].append(word)
+                    continue
+            groups.append({
+                "page_idx": page_idx,
+                "center_y": center_y,
+                "height": height,
+                "words": [word],
+            })
+        return [
+            sorted(
+                group["words"],
+                key=lambda w: (
+                    PdfViewerWidget._word_left(w),
+                    int(w.get("word", 0)),
+                    int(w.get("order", 0)),
+                ),
+            )
+            for group in groups
+        ]
+
+    @staticmethod
+    def _visual_order_words(words: list[dict]) -> list[dict]:
+        return [
+            word
+            for group in PdfViewerWidget._visual_line_groups(words)
+            for word in group
+        ]
 
     @staticmethod
     def _clipboard_text_from_line_words(words: list[dict]) -> str:
@@ -1224,19 +1392,17 @@ class PdfViewerWidget(QWidget):
         if not words:
             return []
         lines: list[dict] = []
-        current_key = None
-        current_words: list[dict] = []
 
-        def flush():
-            if not current_words:
-                return
-            text = PdfViewerWidget._clipboard_text_from_line_words(current_words)
-            boxes = [w.get("bbox") or [0, 0, 0, 0] for w in current_words]
+        for line_words in PdfViewerWidget._visual_line_groups(words):
+            if not line_words:
+                continue
+            text = PdfViewerWidget._clipboard_text_from_line_words(line_words)
+            boxes = [PdfViewerWidget._word_bbox(w) for w in line_words]
             x0 = min(float(b[0]) for b in boxes)
             y0 = min(float(b[1]) for b in boxes)
             x1 = max(float(b[2]) for b in boxes)
             y1 = max(float(b[3]) for b in boxes)
-            first = current_words[0]
+            first = line_words[0]
             lines.append({
                 "page_idx": int(first.get("page_idx", 0)),
                 "block": int(first.get("block", 0)),
@@ -1247,22 +1413,6 @@ class PdfViewerWidget(QWidget):
                 "bbox": [x0, y0, x1, y1],
                 "height": max(1.0, y1 - y0),
             })
-
-        for word in words:
-            key = (
-                int(word.get("page_idx", 0)),
-                int(word.get("block", 0)),
-                str(word.get("paragraph", word.get("block", 0))),
-                int(word.get("line", 0)),
-            )
-            if current_key is None:
-                current_key = key
-            if key != current_key:
-                flush()
-                current_key = key
-                current_words = []
-            current_words.append(word)
-        flush()
         return [line for line in lines if line.get("text")]
 
     @staticmethod
@@ -1453,8 +1603,14 @@ class PdfViewerWidget(QWidget):
                 signal.emit((images, gen, is_base))
             except Exception:
                 pass
+            finally:
+                with self._render_threads_lock:
+                    self._active_render_threads.discard(threading.current_thread())
 
-        threading.Thread(target=_worker, daemon=True).start()
+        worker = threading.Thread(target=_worker, daemon=True)
+        with self._render_threads_lock:
+            self._active_render_threads.add(worker)
+        worker.start()
 
     def _on_pages_rendered(self, data):
         images, gen, is_base = data

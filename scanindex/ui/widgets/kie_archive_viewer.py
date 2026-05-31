@@ -1504,20 +1504,77 @@ class KieArchiveViewer(QWidget):
         if new_zoom is None:
             return
 
-        # Translate viewport pos to inner-content coords pre-zoom
+        anchor = self._zoom_anchor_at_viewport_pos(viewport_pos)
+        self._set_zoom(new_zoom)
+        self._restore_zoom_anchor(anchor, viewport_pos)
+
+    def _zoom_anchor_at_viewport_pos(self, viewport_pos: QPoint):
+        """Return page-local cursor position before zoom.
+
+        The pages are horizontally centred and separated by fixed layout
+        spacing, so scaling the raw scrollbar values is not stable enough.
+        Anchoring to a concrete page widget keeps the same document point under
+        the mouse even when page x/y positions shift after relayout.
+        """
+        if not self._page_widgets:
+            return None
+        inner_pos = self._inner.mapFrom(self._scroll.viewport(), viewport_pos)
+        best = None
+        best_dist = None
+        for pw in self._page_widgets:
+            rect = pw.geometry()
+            if rect.contains(inner_pos):
+                local_x = inner_pos.x() - rect.x()
+                local_y = inner_pos.y() - rect.y()
+                return (
+                    pw.page_index,
+                    local_x / max(1, rect.width()),
+                    local_y / max(1, rect.height()),
+                )
+            # If the cursor is in the left/right margin next to a page, treat
+            # that page as the anchor; this is the common Step 2 layout.
+            if rect.top() <= inner_pos.y() <= rect.bottom():
+                local_x = max(0, min(rect.width(), inner_pos.x() - rect.x()))
+                local_y = inner_pos.y() - rect.y()
+                return (
+                    pw.page_index,
+                    local_x / max(1, rect.width()),
+                    local_y / max(1, rect.height()),
+                )
+            center_y = rect.y() + rect.height() / 2.0
+            dist = abs(inner_pos.y() - center_y)
+            if best is None or dist < best_dist:
+                best = pw
+                best_dist = dist
+        if best is None:
+            return None
+        rect = best.geometry()
+        local_x = max(0, min(rect.width(), inner_pos.x() - rect.x()))
+        local_y = max(0, min(rect.height(), inner_pos.y() - rect.y()))
+        return (
+            best.page_index,
+            local_x / max(1, rect.width()),
+            local_y / max(1, rect.height()),
+        )
+
+    def _restore_zoom_anchor(self, anchor, viewport_pos: QPoint):
+        if anchor is None:
+            return
+        page_idx, frac_x, frac_y = anchor
+        if not (0 <= page_idx < len(self._page_widgets)):
+            return
+        try:
+            self._inner_layout.activate()
+            self._inner.updateGeometry()
+        except Exception:
+            pass
+        pw = self._page_widgets[page_idx]
+        target_x = pw.x() + int(round(max(0.0, min(1.0, frac_x)) * pw.width()))
+        target_y = pw.y() + int(round(max(0.0, min(1.0, frac_y)) * pw.height()))
         hbar = self._scroll.horizontalScrollBar()
         vbar = self._scroll.verticalScrollBar()
-        content_x = hbar.value() + viewport_pos.x()
-        content_y = vbar.value() + viewport_pos.y()
-        ratio = new_zoom / old_zoom
-
-        self._set_zoom(new_zoom)
-
-        # Re-anchor: keep the world point under the cursor at the same screen pos
-        new_x = int(content_x * ratio - viewport_pos.x())
-        new_y = int(content_y * ratio - viewport_pos.y())
-        hbar.setValue(max(0, new_x))
-        vbar.setValue(max(0, new_y))
+        hbar.setValue(max(0, target_x - viewport_pos.x()))
+        vbar.setValue(max(0, target_y - viewport_pos.y()))
 
     # ---- edit mode -------------------------------------------------
 
