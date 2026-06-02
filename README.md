@@ -26,6 +26,33 @@ Các màn hình UI chính:
 - **Phát hiện file mật** — quét folder, OCR trang đầu, nhận dạng dấu MẬT/TỐI MẬT/TUYỆT MẬT
 - **Công cụ hỗ trợ** — utilities khác
 
+## Lưu ý bản quyền: Google ScreenAI và ***REMOVED***
+
+ScanIndex hiện dựa vào hai runtime component thuộc hệ sinh thái Google/Chrome:
+
+- **Chrome ScreenAI** — DLL/runtime OCR tải từ Google CDN hoặc copy từ thư mục
+  Chrome local, dùng để OCR offline.
+- **Google/Chrome ***REMOVED***** — runtime + language pack EN↔VI dùng cho tính
+  năng dịch DOCX offline.
+
+Các component này **không thuộc sở hữu của dự án ScanIndex** và không được cấp
+license bởi README này. Google, Chrome, ScreenAI, ***REMOVED*** và các binary/model
+liên quan thuộc quyền sở hữu/điều khoản của Google LLC hoặc các bên cấp phép
+tương ứng. Cơ chế tải/copy trong repo chỉ kiểm tra nguồn gốc và tính toàn vẹn
+file; việc verify SHA256 hoặc Authenticode **không tạo thêm quyền sử dụng, phân
+phối hoặc thương mại hóa** các component đó.
+
+Dự án này được dùng cho **quy trình số hóa tài liệu nội bộ, không thương mại**.
+Không dùng bản portable/release chứa ScreenAI hoặc ***REMOVED*** để bán lại, cung
+cấp dịch vụ thương mại, SaaS, hoặc phân phối như một sản phẩm công khai khi chưa
+có đánh giá pháp lý và quyền sử dụng/phân phối phù hợp từ Google hoặc chủ sở hữu
+liên quan. Nếu cần triển khai thương mại, hãy thay thế các component Google/Chrome
+bằng engine có license rõ ràng cho mục đích đó, hoặc xin quyền sử dụng riêng.
+
+Người vận hành cần tự bảo đảm việc sử dụng phù hợp với
+[Google Terms of Service](https://policies.google.com/terms) và
+[Google Chrome and ChromeOS Additional Terms of Service](https://www.google.com/chrome/terms/).
+
 ## Cài đặt từ source
 
 ```powershell
@@ -46,10 +73,13 @@ Script kéo từng repo HF về `models/`, tải bootstrap ***REMOVED*** từ Gi
 Release, sau đó **verify SHA256 từng file** theo bảng cứng trong
 [scripts/download_offline_models.py](scripts/download_offline_models.py). Mỗi
 repo HF cũng pin `revision=<commit_sha>`; bootstrap ***REMOVED*** pin URL asset,
-SHA256 archive và SHA256 từng file. Hash mismatch → script raise
-`ModelIntegrityError` và dừng.
+SHA256 archive và SHA256 từng file. ***REMOVED*** là component Google/Chrome; phần
+verify này chỉ xác nhận đúng artifact đã pin, không phải giấy phép phân phối hay
+thương mại hóa. Hash mismatch → script raise `ModelIntegrityError` và dừng.
 
 ScreenAI tải từ Google CDN qua [scanindex/core/ocr/screen_ai_downloader.py](scanindex/core/ocr/screen_ai_downloader.py). Downloader kiểm tra host Google + URL HTTPS, SHA256 64 ký tự do Google updater XML công bố hoặc fallback Google CDN được pin cứng, và chữ ký Authenticode của DLL Google.
+Đây cũng chỉ là kiểm tra provenance/tamper-resistance; quyền sử dụng ScreenAI vẫn
+phụ thuộc điều khoản Google/Chrome.
 
 Kiểm tra manifest URL/hash mà không tải file:
 
@@ -158,5 +188,16 @@ DocLayout-YOLO · GMFT · OpenCV · LightGBM · tantivy · pyHanko · pywin32
 
 ## License
 
-Code: TBD. Model weights: xem từng subdir trong
-[welcomyou/scanindex-models](https://huggingface.co/welcomyou/scanindex-models#licenses).
+Code: TBD; hiện chưa công bố open-source/commercial license cho việc dùng lại bên
+ngoài. Mặc định repo và bản portable/release được dùng cho **nội bộ, không thương
+mại**.
+
+Model weights của ScanIndex: xem từng subdir/repo tương ứng trong
+[welcomyou/scanindex-models](https://huggingface.co/welcomyou/scanindex-models#licenses)
+và các repo Hugging Face được liệt kê ở trên; một số model upstream/base có thể
+có giới hạn non-commercial riêng.
+
+Google/Chrome ScreenAI và Google/Chrome ***REMOVED***: không nằm trong license của
+ScanIndex. Mọi quyền, nhãn hiệu, binary/runtime/model và điều khoản sử dụng thuộc
+Google LLC hoặc chủ sở hữu tương ứng. README này không cấp quyền phân phối,
+thương mại hóa, sublicensing, hoặc sử dụng ngoài phạm vi nội bộ/không thương mại.
