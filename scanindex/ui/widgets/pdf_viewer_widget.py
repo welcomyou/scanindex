@@ -119,7 +119,8 @@ class _ContinuousPageWidget(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._page_pixmaps = []
+        self._page_pixmaps = {}
+        self._page_sizes = []
         self._page_y_offsets = []
         self._zone = None  # (page_idx, x, y, w, h)
         self._zone_color = QColor(COLOR_ACCENT)
@@ -135,15 +136,39 @@ class _ContinuousPageWidget(QWidget):
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
     def set_pages(self, pixmaps):
-        self._page_pixmaps = pixmaps
+        self._page_sizes = [pm.size() for pm in pixmaps]
+        self._page_pixmaps = {i: pm for i, pm in enumerate(pixmaps)}
         self._zone = None
         self._overlays = []
         self._text_selection_rects = []
         self._recalc_offsets()
         self.update()
 
+    def set_page_sizes(self, sizes):
+        self._page_sizes = [QSize(s) for s in (sizes or [])]
+        self._page_pixmaps = {}
+        self._zone = None
+        self._overlays = []
+        self._text_selection_rects = []
+        self._recalc_offsets()
+        self.update()
+
+    def set_page_pixmap(self, page_idx: int, pixmap: QPixmap):
+        if 0 <= page_idx < len(self._page_sizes):
+            self._page_pixmaps[int(page_idx)] = pixmap
+            self.update(self._page_rect(page_idx))
+
+    def release_page_pixmap(self, page_idx: int):
+        if int(page_idx) in self._page_pixmaps:
+            self._page_pixmaps.pop(int(page_idx), None)
+            self.update(self._page_rect(page_idx))
+
+    def rendered_page_indices(self):
+        return set(self._page_pixmaps.keys())
+
     def clear_pages(self):
-        self._page_pixmaps = []
+        self._page_pixmaps = {}
+        self._page_sizes = []
         self._page_y_offsets = []
         self._zone = None
         self._overlays = []
@@ -246,8 +271,8 @@ class _ContinuousPageWidget(QWidget):
                 if not (0 <= ov["page_idx"] < len(self._page_y_offsets)):
                     continue
                 y_off = self._page_y_offsets[ov["page_idx"]]
-                pm = self._page_pixmaps[ov["page_idx"]]
-                x_off = (self.width() - pm.width()) // 2
+                size = self.page_size(ov["page_idx"])
+                x_off = (self.width() - size.width()) // 2
                 rx = int(x_off + ov["x"])
                 ry = int(y_off + ov["y"])
                 rw = int(ov["w"])
@@ -295,33 +320,51 @@ class _ContinuousPageWidget(QWidget):
         return 0
 
     def page_count(self):
-        return len(self._page_pixmaps)
+        return len(self._page_sizes)
+
+    def page_size(self, page_idx):
+        if 0 <= int(page_idx) < len(self._page_sizes):
+            return self._page_sizes[int(page_idx)]
+        return QSize(0, 0)
+
+    def _page_rect(self, page_idx):
+        if not (0 <= int(page_idx) < len(self._page_y_offsets)):
+            return QRect()
+        size = self.page_size(page_idx)
+        x_off = (self.width() - size.width()) // 2
+        return QRect(x_off, self._page_y_offsets[int(page_idx)], size.width(), size.height())
 
     def _recalc_offsets(self):
         self._page_y_offsets = []
         y = 0
         max_w = 0
-        for pm in self._page_pixmaps:
+        for size in self._page_sizes:
             self._page_y_offsets.append(y)
-            y += pm.height() + _PAGE_GAP
-            max_w = max(max_w, pm.width())
-        total_h = y - _PAGE_GAP if self._page_pixmaps else 0
+            y += size.height() + _PAGE_GAP
+            max_w = max(max_w, size.width())
+        total_h = y - _PAGE_GAP if self._page_sizes else 0
         self.setFixedSize(max(max_w, 1), max(total_h, 1))
 
     def paintEvent(self, event):
-        if not self._page_pixmaps:
+        if not self._page_sizes:
             return
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         visible = event.rect()
         widget_w = self.width()
 
-        for i, pm in enumerate(self._page_pixmaps):
+        for i, size in enumerate(self._page_sizes):
             y_off = self._page_y_offsets[i]
-            if y_off + pm.height() < visible.top() or y_off > visible.bottom():
+            if y_off + size.height() < visible.top() or y_off > visible.bottom():
                 continue
-            x_off = (widget_w - pm.width()) // 2
-            painter.drawPixmap(x_off, y_off, pm)
+            x_off = (widget_w - size.width()) // 2
+            pm = self._page_pixmaps.get(i)
+            if pm is not None:
+                painter.drawPixmap(x_off, y_off, pm)
+            else:
+                painter.fillRect(QRect(x_off, y_off, size.width(), size.height()), QColor("#ffffff"))
+                painter.setPen(QPen(QColor(COLOR_BORDER_DEFAULT), 1))
+                painter.drawRect(QRect(x_off, y_off, size.width(), size.height()))
 
         # Persistent overlays (KIE field bboxes)
         for overlay in self._overlays:
@@ -332,8 +375,8 @@ class _ContinuousPageWidget(QWidget):
             if not (0 <= pi < len(self._page_y_offsets)):
                 continue
             y_off = self._page_y_offsets[pi]
-            pm = self._page_pixmaps[pi]
-            x_off = (widget_w - pm.width()) // 2
+            size = self.page_size(pi)
+            x_off = (widget_w - size.width()) // 2
             rx, ry = int(x_off + zx), int(y_off + zy)
             rw, rh = int(zw), int(zh)
             color = QColor(color_hex) if color_hex else QColor(COLOR_ACCENT)
@@ -364,8 +407,8 @@ class _ContinuousPageWidget(QWidget):
             if not (0 <= pi < len(self._page_y_offsets)):
                 continue
             y_off = self._page_y_offsets[pi]
-            pm = self._page_pixmaps[pi]
-            x_off = (widget_w - pm.width()) // 2
+            size = self.page_size(pi)
+            x_off = (widget_w - size.width()) // 2
             rx = int(x_off + ov["x"])
             ry = int(y_off + ov["y"])
             rw = int(ov["w"])
@@ -395,8 +438,8 @@ class _ContinuousPageWidget(QWidget):
                 if not (0 <= pi < len(self._page_y_offsets)):
                     continue
                 y_off = self._page_y_offsets[pi]
-                pm = self._page_pixmaps[pi]
-                x_off = (widget_w - pm.width()) // 2
+                size = self.page_size(pi)
+                x_off = (widget_w - size.width()) // 2
                 color = QColor("#f59e0b" if style == "highlight" else COLOR_RED)
                 for zx, zy, zw, zh in rects:
                     rx, ry = int(x_off + zx), int(y_off + zy)
@@ -424,8 +467,8 @@ class _ContinuousPageWidget(QWidget):
             pi, zx, zy, zw, zh = self._zone
             if 0 <= pi < len(self._page_y_offsets):
                 y_off = self._page_y_offsets[pi]
-                pm = self._page_pixmaps[pi]
-                x_off = (widget_w - pm.width()) // 2
+                size = self.page_size(pi)
+                x_off = (widget_w - size.width()) // 2
                 rx, ry = int(x_off + zx), int(y_off + zy)
                 rw, rh = int(zw), int(zh)
                 fill = QColor(self._zone_color)
@@ -448,8 +491,8 @@ class _ContinuousPageWidget(QWidget):
                 if not (0 <= pi < len(self._page_y_offsets)):
                     continue
                 y_off = self._page_y_offsets[pi]
-                pm = self._page_pixmaps[pi]
-                x_off = (widget_w - pm.width()) // 2
+                size = self.page_size(pi)
+                x_off = (widget_w - size.width()) // 2
                 rx, ry = int(x_off + zx), int(y_off + zy)
                 rw, rh = max(1, int(zw)), max(1, int(zh))
                 rect = QRect(rx, ry, rw, rh)
@@ -554,6 +597,7 @@ class PdfViewerWidget(QWidget):
 
     RENDER_DPI = 150
     ZOOM_STEPS = [0.25, 0.33, 0.5, 0.67, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0]
+    RENDER_CACHE_MAX_PAGES = 18
 
     def __init__(self, parent=None, *, fit_on_load=True,
                  text_selection_available=False):
@@ -561,7 +605,12 @@ class PdfViewerWidget(QWidget):
         self._doc = None
         self._page_count = 0
         self._pdf_path = None
-        self._raw_pixmaps = []
+        self._raw_pixmaps = {}
+        self._page_point_sizes = []
+        self._render_queue = []
+        self._render_queued = set()
+        self._render_active = False
+        self._render_active_gen = None
         self._zoom = 1.0
         self._fit_on_load = bool(fit_on_load)
         self._fit_mode = True
@@ -581,6 +630,10 @@ class PdfViewerWidget(QWidget):
         self._hires_timer.setSingleShot(True)
         self._hires_timer.setInterval(300)
         self._hires_timer.timeout.connect(self._start_hires_render)
+        self._scroll_timer = QTimer(self)
+        self._scroll_timer.setSingleShot(True)
+        self._scroll_timer.setInterval(60)
+        self._scroll_timer.timeout.connect(self._scroll_debounce_fire)
         self._setup_ui()
         self._copy_shortcut = QShortcut(QKeySequence.StandardKey.Copy, self)
         self._copy_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
@@ -731,7 +784,7 @@ class PdfViewerWidget(QWidget):
         if self._hint_label.isVisible():
             sw, sh = self._scroll.width(), self._scroll.height()
             self._hint_label.setGeometry(0, sh // 3, sw, 60)
-        if self._fit_mode and self._raw_pixmaps:
+        if self._fit_mode and self._page_point_sizes:
             self._rebuild_scaled_pages()
 
     # ------ Public API ------
@@ -739,7 +792,13 @@ class PdfViewerWidget(QWidget):
     def load_pdf(self, pdf_path):
         self._close_doc()
         self._hires_timer.stop()
-        self._raw_pixmaps = []
+        self._scroll_timer.stop()
+        self._raw_pixmaps = {}
+        self._page_point_sizes = []
+        self._render_queue = []
+        self._render_queued = set()
+        self._render_active = False
+        self._render_active_gen = None
         self._pages_widget.clear_pages()
         self._current_search_highlight = None
         self._pending_view_scroll = None
@@ -751,10 +810,18 @@ class PdfViewerWidget(QWidget):
             self._doc = fitz.open(pdf_path)
             self._pdf_path = pdf_path
             self._page_count = len(self._doc)
+            self._page_point_sizes = [
+                (
+                    max(1.0, float(self._doc[i].rect.width)),
+                    max(1.0, float(self._doc[i].rect.height)),
+                )
+                for i in range(self._page_count)
+            ]
             self._fit_mode = self._fit_on_load
             self._hint_label.setVisible(False)
             self._render_gen += 1
-            self._bg_render(self.RENDER_DPI, self._render_gen, is_base=True)
+            self._rebuild_scaled_pages(reset_generation=False)
+            QTimer.singleShot(0, self._enqueue_viewport_pages)
             self._update_nav_state()
         except Exception as e:
             self._hint_label.setText(str(e))
@@ -803,7 +870,7 @@ class PdfViewerWidget(QWidget):
             (bb for pi, bb in page_boxes if pi == page_idx),
             page_boxes[0][1] if page_boxes else None,
         )
-        if not self._raw_pixmaps or self._pages_widget.page_count() == 0:
+        if self._pages_widget.page_count() == 0:
             self._pending_view_scroll = (page_idx, focus_bbox)
             return
         self._pending_view_scroll = None
@@ -868,7 +935,7 @@ class PdfViewerWidget(QWidget):
 
     def _apply_pending_view_scroll(self):
         pending = self._pending_view_scroll
-        if not pending or not self._raw_pixmaps:
+        if not pending or self._pages_widget.page_count() == 0:
             return
         self._pending_view_scroll = None
         page_idx, focus_bbox = pending
@@ -882,7 +949,7 @@ class PdfViewerWidget(QWidget):
         QTimer.singleShot(0, _scroll)
 
     def _reapply_search_highlight(self):
-        if not self._current_search_highlight or not self._raw_pixmaps:
+        if not self._current_search_highlight or self._pages_widget.page_count() == 0:
             self._pages_widget.clear_search_highlight()
             return
         current = self._current_search_highlight
@@ -909,8 +976,8 @@ class PdfViewerWidget(QWidget):
         pad_y = max(2.5, min(8.0, h * 0.35))
         new_y = max(0.0, y - pad_y)
         new_h = h + (y - new_y) + pad_y
-        if 0 <= page_idx < len(self._raw_pixmaps):
-            page_h = float(self._raw_pixmaps[page_idx].height())
+        if 0 <= page_idx < self._pages_widget.page_count():
+            page_h = float(self._pages_widget.page_size(page_idx).height())
             new_h = min(new_h, max(1.0, page_h - new_y))
         return x, new_y, w, max(1.0, new_h)
 
@@ -994,8 +1061,14 @@ class PdfViewerWidget(QWidget):
     def clear(self):
         self._render_gen += 1
         self._hires_timer.stop()
+        self._scroll_timer.stop()
         self._close_doc()
-        self._raw_pixmaps = []
+        self._raw_pixmaps = {}
+        self._page_point_sizes = []
+        self._render_queue = []
+        self._render_queued = set()
+        self._render_active = False
+        self._render_active_gen = None
         self._current_field_overlays = []
         self._selection_words_by_page = None
         self._clear_text_selection()
@@ -1066,16 +1139,15 @@ class PdfViewerWidget(QWidget):
         fallback = self._current_pdf_to_view_scale()
         try:
             page = self._doc[int(page_idx)] if self._doc is not None else None
-            pixmaps = getattr(self._pages_widget, "_page_pixmaps", [])
-            pm = pixmaps[int(page_idx)] if 0 <= int(page_idx) < len(pixmaps) else None
+            size = self._pages_widget.page_size(int(page_idx))
             rect = page.rect if page is not None else None
-            if pm is None or rect is None:
+            if size.isEmpty() or rect is None:
                 return fallback, fallback, 0.0, 0.0
             rect_w = max(1.0, float(rect.width))
             rect_h = max(1.0, float(rect.height))
             return (
-                float(pm.width()) / rect_w,
-                float(pm.height()) / rect_h,
+                float(size.width()) / rect_w,
+                float(size.height()) / rect_h,
                 float(rect.x0),
                 float(rect.y0),
             )
@@ -1272,10 +1344,11 @@ class PdfViewerWidget(QWidget):
         widget_w = float(self._pages_widget.width())
         words_by_page = self._ensure_selection_words_loaded()
         selected: list[dict] = []
-        for page_idx, pm in enumerate(getattr(self._pages_widget, "_page_pixmaps", [])):
-            page_x0 = (widget_w - float(pm.width())) / 2.0
+        for page_idx in range(self._pages_widget.page_count()):
+            size = self._pages_widget.page_size(page_idx)
+            page_x0 = (widget_w - float(size.width())) / 2.0
             page_y0 = float(self._pages_widget.page_y_offset(page_idx))
-            page_rect = QRectF(page_x0, page_y0, float(pm.width()), float(pm.height()))
+            page_rect = QRectF(page_x0, page_y0, float(size.width()), float(size.height()))
             if not selection_rect.intersects(page_rect):
                 continue
             page_selection = selection_rect.intersected(page_rect).translated(
@@ -1464,7 +1537,7 @@ class PdfViewerWidget(QWidget):
 
     def _on_zoom_at_pos(self, direction, viewport_pos):
         """Zoom in/out anchored at the cursor position in the viewport."""
-        if not self._raw_pixmaps:
+        if not self._page_point_sizes:
             return
 
         old_zoom = self._zoom
@@ -1529,25 +1602,35 @@ class PdfViewerWidget(QWidget):
         self._zoom = z
         self._rebuild_scaled_pages()
 
-    def _rebuild_scaled_pages(self):
-        if not self._raw_pixmaps:
+    def _display_page_sizes(self):
+        scale = self._current_pdf_to_view_scale()
+        return [
+            QSize(
+                max(1, int(round(width * scale))),
+                max(1, int(round(height * scale))),
+            )
+            for width, height in self._page_point_sizes
+        ]
+
+    def _rebuild_scaled_pages(self, *, reset_generation=True):
+        if not self._page_point_sizes:
             return
         if self._fit_mode:
             avail_w = self._scroll.viewport().width() - 12
             if avail_w <= 0:
                 avail_w = 600
-            max_raw_w = max(pm.width() for pm in self._raw_pixmaps)
+            max_raw_w = max(
+                width * (self.RENDER_DPI / 72.0)
+                for width, _height in self._page_point_sizes
+            )
             self._zoom = avail_w / max_raw_w if max_raw_w > 0 else 1.0
 
-        scaled = []
-        for pm in self._raw_pixmaps:
-            w = int(pm.width() * self._zoom)
-            h = int(pm.height() * self._zoom)
-            scaled.append(pm.scaled(
-                w, h, Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation))
-        self._pages_widget.set_pages(scaled)
-        # Re-apply overlays after the page swap (set_pages clears them)
+        if reset_generation:
+            self._render_gen += 1
+        self._raw_pixmaps = {}
+        self._render_queue = []
+        self._render_queued = set()
+        self._pages_widget.set_page_sizes(self._display_page_sizes())
         if getattr(self, "_current_field_overlays", None):
             self.set_field_overlays(self._current_field_overlays)
         self._reapply_search_highlight()
@@ -1555,12 +1638,8 @@ class PdfViewerWidget(QWidget):
             self._reapply_fuzzy_matches()
         self._reapply_text_selection()
         self._update_zoom_label()
-
-        # Schedule hi-res re-render if zoomed beyond base resolution
-        if self._zoom > 1.05 and self._pdf_path:
-            self._hires_timer.start()
-        else:
-            self._hires_timer.stop()
+        self._hires_timer.stop()
+        QTimer.singleShot(0, self._enqueue_viewport_pages)
 
     def _update_zoom_label(self):
         self._lbl_zoom.setText(f"{int(self._zoom * 100)}%")
@@ -1568,41 +1647,104 @@ class PdfViewerWidget(QWidget):
     # ------ Scroll tracking ------
 
     def _on_scroll(self, value):
-        if not self._raw_pixmaps:
+        if self._pages_widget.page_count() == 0:
             return
         for i in range(self._pages_widget.page_count() - 1, -1, -1):
             if value >= self._pages_widget.page_y_offset(i) - 20:
                 self._lbl_page.setText(f"{i + 1} / {self._page_count}")
-                return
+                break
+        self._scroll_timer.start()
+
+    def _scroll_debounce_fire(self):
+        self._enqueue_viewport_pages()
+        self._evict_far_pixmaps()
 
     # ------ Internal ------
 
     def _close_doc(self):
         if self._doc:
             self._doc.close()
-            self._doc = None
-            self._page_count = 0
-            self._pdf_path = None
+        self._doc = None
+        self._page_count = 0
+        self._pdf_path = None
+        self._page_point_sizes = []
 
-    def _bg_render(self, dpi, gen, is_base=False):
-        """Render all pages at *dpi* in a background thread."""
+    def _visible_page_indices(self, margin_pages=1):
+        count = self._pages_widget.page_count()
+        if count <= 0:
+            return []
+        top = self._scroll.verticalScrollBar().value()
+        bottom = top + max(1, self._scroll.viewport().height())
+        visible = []
+        for i in range(count):
+            y = self._pages_widget.page_y_offset(i)
+            h = self._pages_widget.page_size(i).height()
+            if y + h < top:
+                continue
+            if y > bottom:
+                if visible:
+                    break
+                continue
+            visible.append(i)
+        if not visible:
+            current = self._current_page_index()
+            visible = [current] if current is not None else [0]
+        start = max(0, min(visible) - margin_pages)
+        end = min(count, max(visible) + margin_pages + 1)
+        return list(range(start, end))
+
+    def _current_page_index(self):
+        count = self._pages_widget.page_count()
+        if count <= 0:
+            return None
+        value = self._scroll.verticalScrollBar().value()
+        current = 0
+        for i in range(count):
+            if value >= self._pages_widget.page_y_offset(i) - 20:
+                current = i
+            else:
+                break
+        return current
+
+    def _enqueue_viewport_pages(self):
+        if not self._pdf_path or self._pages_widget.page_count() == 0:
+            return
+        rendered = self._pages_widget.rendered_page_indices()
+        for page_idx in self._visible_page_indices(margin_pages=2):
+            if page_idx in rendered or page_idx in self._render_queued:
+                continue
+            self._render_queue.append(page_idx)
+            self._render_queued.add(page_idx)
+        self._drain_render_queue()
+
+    def _drain_render_queue(self):
+        if self._render_active or not self._render_queue or not self._pdf_path:
+            return
+        page_idx = self._render_queue.pop(0)
+        self._render_queued.discard(page_idx)
+        self._render_active = True
         path = self._pdf_path
+        gen = self._render_gen
+        self._render_active_gen = gen
+        dpi = max(24.0, float(self.RENDER_DPI) * float(self._zoom or 1.0))
         signal = self._pages_rendered
 
         def _worker():
             try:
                 import fitz
-                doc = fitz.open(path)
-                mat = fitz.Matrix(dpi / 72.0, dpi / 72.0)
-                images = []
-                for i in range(len(doc)):
-                    pix = doc[i].get_pixmap(matrix=mat, alpha=False, annots=True)
-                    images.append(QImage(pix.samples, pix.width, pix.height,
-                                         pix.stride, QImage.Format.Format_RGB888).copy())
-                doc.close()
-                signal.emit((images, gen, is_base))
-            except Exception:
-                pass
+                with fitz.open(path) as doc:
+                    if not (0 <= page_idx < len(doc)):
+                        signal.emit(("error", page_idx, "page out of range", gen))
+                        return
+                    mat = fitz.Matrix(dpi / 72.0, dpi / 72.0)
+                    pix = doc[page_idx].get_pixmap(matrix=mat, alpha=False, annots=True)
+                    image = QImage(
+                        pix.samples, pix.width, pix.height,
+                        pix.stride, QImage.Format.Format_RGB888,
+                    ).copy()
+                signal.emit(("page", page_idx, image, gen))
+            except Exception as e:
+                signal.emit(("error", page_idx, str(e), gen))
             finally:
                 with self._render_threads_lock:
                     self._active_render_threads.discard(threading.current_thread())
@@ -1613,31 +1755,49 @@ class PdfViewerWidget(QWidget):
         worker.start()
 
     def _on_pages_rendered(self, data):
-        images, gen, is_base = data
-        if gen != self._render_gen:
+        if not isinstance(data, tuple) or len(data) < 4:
             return
-        pixmaps = [QPixmap.fromImage(img) for img in images]
-        if is_base:
-            self._raw_pixmaps = pixmaps
-            self._rebuild_scaled_pages()
+        kind, page_idx, payload, gen = data
+        if gen == self._render_active_gen:
+            self._render_active = False
+            self._render_active_gen = None
+        if gen != self._render_gen:
+            self._drain_render_queue()
+            return
+        if kind == "page":
+            pixmap = QPixmap.fromImage(payload)
+            target_size = self._pages_widget.page_size(int(page_idx))
+            if not target_size.isEmpty() and pixmap.size() != target_size:
+                pixmap = pixmap.scaled(
+                    target_size,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            self._raw_pixmaps[int(page_idx)] = pixmap
+            self._pages_widget.set_page_pixmap(int(page_idx), pixmap)
             self._apply_pending_view_scroll()
-        else:
-            # Hi-res: pixmaps already at correct display size
-            self._pages_widget.set_pages(pixmaps)
-            if getattr(self, "_current_field_overlays", None):
-                self.set_field_overlays(self._current_field_overlays)
-            self._reapply_search_highlight()
-            if getattr(self, "_current_fuzzy_matches", None):
-                self._reapply_fuzzy_matches()
-            self._reapply_text_selection()
-            self._apply_pending_view_scroll()
+            self._evict_far_pixmaps()
+        self._drain_render_queue()
+
+    def _evict_far_pixmaps(self):
+        rendered = self._pages_widget.rendered_page_indices()
+        if len(rendered) <= self.RENDER_CACHE_MAX_PAGES:
+            return
+        current = self._current_page_index()
+        if current is None:
+            current = 0
+        keep = set(self._visible_page_indices(margin_pages=2))
+        ordered = sorted(rendered, key=lambda idx: (idx in keep, -abs(idx - current)))
+        while len(rendered) > self.RENDER_CACHE_MAX_PAGES and ordered:
+            idx = ordered.pop(0)
+            if idx in keep and len(rendered) <= len(keep):
+                break
+            rendered.discard(idx)
+            self._raw_pixmaps.pop(idx, None)
+            self._pages_widget.release_page_pixmap(idx)
 
     def _start_hires_render(self):
-        if not self._pdf_path or self._zoom <= 1.05:
-            return
-        effective_dpi = self.RENDER_DPI * self._zoom
-        self._render_gen += 1
-        self._bg_render(effective_dpi, self._render_gen, is_base=False)
+        self._enqueue_viewport_pages()
 
     def _update_nav_state(self):
         has = self._doc is not None

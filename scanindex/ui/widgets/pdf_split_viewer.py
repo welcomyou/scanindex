@@ -39,6 +39,7 @@ _MAX_DISPLAY_SCALE = 2.5
 _DEFAULT_DISPLAY_SCALE = 0.85  # so the page fits typical screens at start
 _ZOOM_STEP = 1.15
 _GUTTER_HEIGHT = 22
+_RENDER_CACHE_MAX_PAGES = 18
 
 # Fat scroll bars — about 2x default Qt size so they're easy to grab.
 _SCROLLBAR_PX = 22
@@ -150,11 +151,17 @@ class PdfSplitViewer(QWidget):
         super().__init__(parent)
         self._doc: Optional[fitz.Document] = None
         self._page_labels: list[_PageLabel] = []
-        # Pixmaps rendered ONCE from PyMuPDF at _BASE_RENDER_SCALE; zoom
-        # operates on these via Qt's smooth pixmap scaler (no re-render).
-        self._base_pixmaps: list[QPixmap] = []
+        # Materialize high-quality pixmaps only around the viewport. This keeps
+        # long PDFs from pinning one rendered image per page in memory.
+        self._base_pixmaps: dict[int, QPixmap] = {}
+        self._page_sizes: list[tuple[float, float]] = []
         self._display_scale = _DEFAULT_DISPLAY_SCALE
         self._gutters: list[_CutGutter] = []
+        self._render_queue: deque[int] = deque()
+        self._render_queued: set[int] = set()
+        self._render_active = False
+        self._render_gen = 0
+        self._scroll_debounce_pending = False
         # History of cut-toggle actions for undo/redo: each entry is page_idx
         # of the toggled cut + the resulting state (True=on after toggle).
         self._undo: deque[tuple[int, bool]] = deque(maxlen=200)
@@ -187,6 +194,7 @@ class PdfSplitViewer(QWidget):
             f"QScrollBar::add-page, QScrollBar::sub-page {{ background: none; }}"
         )
         self._scroll.zoom_requested.connect(self._on_zoom)
+        self._scroll.verticalScrollBar().valueChanged.connect(self._on_scroll)
 
         self._inner = QWidget()
         self._inner.setStyleSheet(f"background: {COLOR_BG};")
@@ -212,8 +220,8 @@ class PdfSplitViewer(QWidget):
     # ── public API ──────────────────────────────────────────────────
 
     def load_pdf(self, path: str) -> int:
-        """Open the PDF, render every page once, build cut gutters between
-        them. Returns the page count (0 on failure)."""
+        """Open the PDF, build page placeholders and cut gutters, then render
+        visible pages lazily. Returns the page count (0 on failure)."""
         self.clear()
         try:
             self._doc = fitz.open(path)
@@ -224,12 +232,14 @@ class PdfSplitViewer(QWidget):
         n = len(self._doc)
         # Hide empty-state placeholder
         self._empty_label.setVisible(False)
+        self._render_gen += 1
+        my_gen = self._render_gen
 
         for i in range(n):
+            page = self._doc[i]
+            self._page_sizes.append((float(page.rect.width), float(page.rect.height)))
             page_w = _PageLabel(i)
-            base_pm = self._render_base_pixmap(i)
-            self._base_pixmaps.append(base_pm)
-            self._apply_display_scale(page_w, base_pm)
+            self._set_placeholder_size(i, page_w)
             self._page_labels.append(page_w)
             # Insert before the trailing stretch
             self._stack.insertWidget(self._stack.count() - 1, page_w,
@@ -241,9 +251,14 @@ class PdfSplitViewer(QWidget):
                 self._stack.insertWidget(self._stack.count() - 1, gutter)
 
         self.page_count_changed.emit(n)
+        QTimer.singleShot(0, lambda: self._enqueue_viewport_pages(my_gen))
         return n
 
     def clear(self):
+        self._render_gen += 1
+        self._render_queue.clear()
+        self._render_queued.clear()
+        self._render_active = False
         # Drop everything except the trailing stretch
         for w in self._page_labels:
             w.setParent(None); w.deleteLater()
@@ -252,6 +267,7 @@ class PdfSplitViewer(QWidget):
         self._page_labels.clear()
         self._gutters.clear()
         self._base_pixmaps.clear()
+        self._page_sizes.clear()
         self._undo.clear()
         self._redo.clear()
         if self._doc is not None:
@@ -321,25 +337,14 @@ class PdfSplitViewer(QWidget):
         if abs(new - old) < 1e-3:
             return
         self._display_scale = new
-        # On long PDFs (134+ pages) calling QPixmap.scaled on every page per
-        # tick was 150-200ms and caused the visible stutter. Strategy:
-        #   1. Scale pages currently in (or near) the viewport synchronously
-        #      so the user sees instant feedback at the cursor.
-        #   2. Defer the rest to the next event-loop tick, processed in small
-        #      batches so the GUI thread stays responsive.
-        visible = self._visible_page_indices()
-        for i in visible:
-            if 0 <= i < len(self._page_labels):
-                self._apply_display_scale(
-                    self._page_labels[i], self._base_pixmaps[i]
-                )
-        if len(visible) < len(self._page_labels):
-            self._zoom_pending = [
-                i for i in range(len(self._page_labels)) if i not in set(visible)
-            ]
-            QTimer.singleShot(0, self._drain_zoom_pending)
-        else:
-            self._zoom_pending = []
+        for i, label in enumerate(self._page_labels):
+            base_pm = self._base_pixmaps.get(i)
+            if base_pm is not None:
+                self._apply_display_scale(label, base_pm)
+            else:
+                self._set_placeholder_size(i, label)
+        self._evict_far_pixmaps()
+        self._enqueue_viewport_pages(self._render_gen)
 
     def _drain_zoom_pending(self):
         """Rescale up to N off-screen pages per event-loop tick. Reschedules
@@ -350,9 +355,11 @@ class PdfSplitViewer(QWidget):
         self._zoom_pending = self._zoom_pending[8:]
         for i in batch:
             if 0 <= i < len(self._page_labels):
-                self._apply_display_scale(
-                    self._page_labels[i], self._base_pixmaps[i]
-                )
+                base_pm = self._base_pixmaps.get(i)
+                if base_pm is not None:
+                    self._apply_display_scale(self._page_labels[i], base_pm)
+                else:
+                    self._set_placeholder_size(i, self._page_labels[i])
         if self._zoom_pending:
             QTimer.singleShot(0, self._drain_zoom_pending)
 
@@ -413,6 +420,89 @@ class PdfSplitViewer(QWidget):
         return best
 
     # ── internals ───────────────────────────────────────────────────
+
+    def _on_scroll(self, _value: int):
+        if self._scroll_debounce_pending:
+            return
+        self._scroll_debounce_pending = True
+        my_gen = self._render_gen
+        QTimer.singleShot(50, lambda: self._scroll_debounce_fire(my_gen))
+
+    def _scroll_debounce_fire(self, my_gen: int):
+        self._scroll_debounce_pending = False
+        if my_gen != self._render_gen:
+            return
+        self._enqueue_viewport_pages(my_gen)
+        self._evict_far_pixmaps()
+
+    def _enqueue_viewport_pages(self, my_gen: int):
+        if my_gen != self._render_gen:
+            return
+        added = 0
+        for idx in self._visible_page_indices():
+            if idx in self._base_pixmaps or idx in self._render_queued:
+                continue
+            self._render_queue.append(idx)
+            self._render_queued.add(idx)
+            added += 1
+        if added and not self._render_active:
+            QTimer.singleShot(0, lambda: self._drain_render_queue(my_gen))
+
+    def _drain_render_queue(self, my_gen: int):
+        if my_gen != self._render_gen:
+            return
+        if not self._render_queue:
+            self._render_active = False
+            return
+        self._render_active = True
+        page_idx = self._render_queue.popleft()
+        try:
+            self._fill_page_pixmap(page_idx)
+        finally:
+            self._render_queued.discard(page_idx)
+            self._render_active = False
+        if self._render_queue:
+            QTimer.singleShot(0, lambda: self._drain_render_queue(my_gen))
+
+    def _fill_page_pixmap(self, page_idx: int):
+        if self._doc is None or not (0 <= page_idx < len(self._page_labels)):
+            return
+        base_pm = self._base_pixmaps.get(page_idx)
+        if base_pm is None:
+            base_pm = self._render_base_pixmap(page_idx)
+            self._base_pixmaps[page_idx] = base_pm
+        self._apply_display_scale(self._page_labels[page_idx], base_pm)
+        self._evict_far_pixmaps()
+
+    def _set_placeholder_size(self, page_idx: int, label: _PageLabel):
+        if 0 <= page_idx < len(self._page_sizes):
+            page_w, page_h = self._page_sizes[page_idx]
+        else:
+            page_w = page_h = 1.0
+        target_w = max(1, int(round(page_w * self._display_scale)))
+        target_h = max(1, int(round(page_h * self._display_scale)))
+        label.setFixedSize(QSize(target_w, target_h))
+
+    def _evict_far_pixmaps(self):
+        if len(self._base_pixmaps) <= _RENDER_CACHE_MAX_PAGES:
+            return
+        keep = set(self._visible_page_indices())
+        current = self._current_page_index()
+        if current is not None:
+            keep.update(range(max(0, current - 2), min(len(self._page_labels), current + 3)))
+        candidates = [idx for idx in self._base_pixmaps if idx not in keep]
+        if not candidates:
+            candidates = list(self._base_pixmaps)
+        candidates.sort(
+            key=lambda idx: abs((current if current is not None else 0) - idx),
+            reverse=True,
+        )
+        while len(self._base_pixmaps) > _RENDER_CACHE_MAX_PAGES and candidates:
+            idx = candidates.pop(0)
+            self._base_pixmaps.pop(idx, None)
+            if 0 <= idx < len(self._page_labels):
+                self._page_labels[idx].clear()
+                self._set_placeholder_size(idx, self._page_labels[idx])
 
     def _render_base_pixmap(self, page_idx: int) -> QPixmap:
         """Rasterise one PDF page at the high-quality base scale, used as

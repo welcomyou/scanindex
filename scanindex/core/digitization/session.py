@@ -13,6 +13,8 @@ source PDF so on-disk temp folders never collide between runs.
 from __future__ import annotations
 
 import os
+import io
+import json
 import secrets
 import shutil
 import threading
@@ -157,8 +159,11 @@ class ArchiveSession:
         # Always implicitly contains 0 and source_page_count as bounds.
         self.cut_points: set[int] = set()
 
-        # OCR cache populated by Step 1 background runner: page_idx -> page_dict
+        # OCR cache populated by Step 1 background runner. Heavy page payloads
+        # are spilled to temp so long source PDFs don't keep every OCR result
+        # resident in RAM.
         self.ocr_cache: dict[int, dict] = {}
+        self._ocr_cache_paths: dict[int, str] = {}
         self._cache_lock = threading.Lock()
 
         # Step 1 → Step 2 handoff: segments after physical split (paths absolute)
@@ -222,6 +227,7 @@ class ArchiveSession:
         self.cut_points = set()
         with self._cache_lock:
             self.ocr_cache = {}
+            self._ocr_cache_paths = {}
         self.segments = []
         self.step1_ocr_pdf_path = None
         self.step1_ocr_json_path = None
@@ -260,16 +266,94 @@ class ArchiveSession:
     # ── OCR cache ───────────────────────────────────────────────────
 
     def cache_page(self, page_idx: int, page_result: dict) -> None:
+        page_idx = int(page_idx)
+        cache_dir = os.path.join(self.temp_dir(), "_ocr_page_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        dest = os.path.join(cache_dir, f"page_{page_idx:06d}.json.zst")
+        tmp = dest + ".tmp"
+        try:
+            import zstandard as zstd
+            encoder = json.JSONEncoder(ensure_ascii=False)
+            with open(tmp, "wb") as fh:
+                with zstd.ZstdCompressor(level=3).stream_writer(fh) as writer:
+                    for chunk in encoder.iterencode(page_result or {}):
+                        writer.write(chunk.encode("utf-8"))
+            os.replace(tmp, dest)
+        except Exception:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
+            raise
         with self._cache_lock:
-            self.ocr_cache[page_idx] = page_result
+            self.ocr_cache.pop(page_idx, None)
+            self._ocr_cache_paths[page_idx] = dest
 
     def get_cached_page(self, page_idx: int) -> Optional[dict]:
+        page_idx = int(page_idx)
         with self._cache_lock:
-            return self.ocr_cache.get(page_idx)
+            cached = self.ocr_cache.get(page_idx)
+            path = self._ocr_cache_paths.get(page_idx)
+        if cached is not None:
+            return cached
+        if not path or not os.path.exists(path):
+            return None
+        try:
+            import zstandard as zstd
+            with open(path, "rb") as fh:
+                with zstd.ZstdDecompressor().stream_reader(fh) as reader:
+                    with io.TextIOWrapper(reader, encoding="utf-8") as text:
+                        return json.load(text)
+        except Exception:
+            return None
+
+    def has_cached_page(self, page_idx: int) -> bool:
+        page_idx = int(page_idx)
+        with self._cache_lock:
+            return page_idx in self.ocr_cache or page_idx in self._ocr_cache_paths
 
     def cached_page_count(self) -> int:
         with self._cache_lock:
-            return len(self.ocr_cache)
+            return len(set(self.ocr_cache) | set(self._ocr_cache_paths))
 
     def all_pages_cached(self) -> bool:
         return self.cached_page_count() >= self.source_page_count > 0
+
+    def clear_ocr_cache(self) -> None:
+        paths = []
+        with self._cache_lock:
+            paths = list(self._ocr_cache_paths.values())
+            self.ocr_cache = {}
+            self._ocr_cache_paths = {}
+        for path in paths:
+            try:
+                if path and os.path.exists(path):
+                    os.remove(path)
+            except OSError:
+                pass
+
+    def cache_slice(self, source_pages) -> "_OcrCacheSlice":
+        return _OcrCacheSlice(self, list(source_pages or []))
+
+
+class _OcrCacheSlice:
+    """Lazy local-page -> source-page OCR cache view for Step 1 handoff."""
+
+    def __init__(self, session: ArchiveSession, source_pages: list[int]):
+        self._session = session
+        self._source_pages = [int(p) for p in source_pages]
+
+    def __bool__(self) -> bool:
+        return any(self._session.has_cached_page(p) for p in self._source_pages)
+
+    def __len__(self) -> int:
+        return len(self._source_pages)
+
+    def get(self, page_idx: int, default=None):
+        try:
+            source_idx = self._source_pages[int(page_idx)]
+        except (IndexError, TypeError, ValueError):
+            return default
+        cached = self._session.get_cached_page(source_idx)
+        return default if cached is None else cached

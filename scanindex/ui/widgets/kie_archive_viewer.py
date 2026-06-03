@@ -304,6 +304,16 @@ class _PdfPageWidget(QLabel):
         self.setPixmap(display_pm)
         self.setFixedSize(display_pm.size())
 
+    def release_pixmaps(self):
+        """Drop rendered images while preserving geometry and OCR hit data."""
+        target_w = max(1, int(round(self.pdf_width * self.render_scale)))
+        target_h = max(1, int(round(self.pdf_height * self.render_scale)))
+        self._source_pixmap = None
+        self.base_pixmap = None
+        self._overlaid_pixmap = None
+        self.clear()
+        self.setFixedSize(target_w, target_h)
+
     def set_word_rects(self, words: list[tuple[str, list[float]]]):
         self.word_rects = list(words)
         self._repaint()
@@ -723,7 +733,7 @@ class KieArchiveViewer(QWidget):
         # to a file we've already opened reuses cached pixmaps so the file
         # appears instantly instead of blocking on fitz re-render.
         self._pixmap_cache: dict[tuple, QPixmap] = {}
-        self._pixmap_cache_max = 200  # cap to avoid unbounded growth
+        self._pixmap_cache_max = 24  # cap to avoid unbounded growth
 
         # Lazy viewport rendering state — page widgets start as empty
         # placeholders sized to the PDF page; pixmaps are filled in only
@@ -897,6 +907,7 @@ class KieArchiveViewer(QWidget):
 
     def load_pdf(self, pdf_path: str):
         self._close_doc()
+        self._pixmap_cache.clear()
         # Wipe undo/redo when switching files — stacks are scoped per active
         # field and the per-file canonical changes underneath us.
         self._undo_stack.clear()
@@ -935,6 +946,9 @@ class KieArchiveViewer(QWidget):
         self._close_doc()
         self._canonical = None
         self._canonical_path = None
+        self._pixmap_cache.clear()
+        self._render_queue.clear()
+        self._render_queued.clear()
         self._active_field_id = None
         self._dirty = False
         self._last_dirty_resolution = None
@@ -1071,6 +1085,8 @@ class KieArchiveViewer(QWidget):
             return
         newly_queued = 0
         for idx in self._viewport_page_indices():
+            if 0 <= idx < len(self._page_widgets) and self._page_widgets[idx].base_pixmap is not None:
+                continue
             if idx in self._render_queued:
                 continue
             self._render_queue.append(idx)
@@ -1092,6 +1108,8 @@ class KieArchiveViewer(QWidget):
             self._fill_page_pixmap(page_idx)
         except Exception:
             pass
+        finally:
+            self._render_queued.discard(page_idx)
         self._render_active = False
         if self._render_queue:
             QTimer.singleShot(0, lambda: self._drain_render_queue(my_gen))
@@ -1136,6 +1154,7 @@ class KieArchiveViewer(QWidget):
         self._apply_word_data_to_single_page(page_idx)
         # Re-apply highlights now that the pixmap is in place
         self._refresh_active_field_highlight()
+        self._evict_far_page_pixmaps()
 
     def _apply_word_data_to_single_page(self, page_idx: int):
         """Re-apply the canonical's word data to ONE page (used after lazy
@@ -1197,6 +1216,7 @@ class KieArchiveViewer(QWidget):
         if my_gen != self._render_gen:
             return
         self._enqueue_viewport_pages(my_gen)
+        self._evict_far_page_pixmaps()
 
     def _cache_pixmap(self, key: tuple, pm: QPixmap):
         """Store pixmap with simple LRU-ish eviction (drop oldest entries
@@ -1205,6 +1225,39 @@ class KieArchiveViewer(QWidget):
             for k in list(self._pixmap_cache.keys())[:20]:
                 self._pixmap_cache.pop(k, None)
         self._pixmap_cache[key] = pm
+
+    def _evict_far_page_pixmaps(self):
+        """Release rendered page images outside the viewport buffer."""
+        if not self._page_widgets:
+            return
+        keep = set(self._viewport_page_indices())
+        current = self._current_page_index()
+        if current is not None:
+            keep.update(range(max(0, current - 2), min(len(self._page_widgets), current + 3)))
+        for idx, pw in enumerate(self._page_widgets):
+            if idx in keep:
+                continue
+            if pw.base_pixmap is not None or getattr(pw, "_source_pixmap", None) is not None:
+                pw.release_pixmaps()
+
+    def _current_page_index(self) -> Optional[int]:
+        if not self._page_widgets:
+            return None
+        viewport_top = self._scroll.verticalScrollBar().value()
+        viewport_mid = viewport_top + self._scroll.viewport().height() // 2
+        for i, widget in enumerate(self._page_widgets):
+            top = widget.y()
+            bottom = top + widget.height()
+            if top <= viewport_mid <= bottom:
+                return i
+        return min(
+            range(len(self._page_widgets)),
+            key=lambda i: abs(
+                self._page_widgets[i].y()
+                + self._page_widgets[i].height() // 2
+                - viewport_mid
+            ),
+        )
 
     def _apply_word_data_to_pages(self):
         if not self._canonical or not self._page_widgets:
@@ -1486,10 +1539,8 @@ class KieArchiveViewer(QWidget):
         # Pixmaps not yet loaded (placeholders) need to be re-queued so they
         # render at the current display scale from the high-res source cache.
         self._render_queue.clear()
-        self._render_queued = {
-            pw.page_index for pw in self._page_widgets
-            if pw.base_pixmap is not None
-        }
+        self._render_queued.clear()
+        self._evict_far_page_pixmaps()
         QTimer.singleShot(0, lambda: self._enqueue_viewport_pages(self._render_gen))
 
     def _on_zoom_wheel(self, direction: int, viewport_pos: QPoint):

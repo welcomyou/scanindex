@@ -204,7 +204,7 @@ class FileSpec:
     file_id: str = ""
     source_document_path: Optional[str] = None
     source_page_indices: Optional[list[int]] = None
-    pre_ocr_cache: dict = field(default_factory=dict)  # page_idx -> page_dict
+    pre_ocr_cache: object = field(default_factory=dict)  # page_idx -> page_dict mapping
     selected_pages: Optional[list[int]] = None
     from_step1: bool = False
 
@@ -290,7 +290,7 @@ class ArchiveRunner:
         self._done_event = threading.Event()
         # file_id -> {page_idx: page_dict} pre-OCR cache supplied by caller.
         # Looked up by `ocr_submit` to avoid re-OCRing pages Step 1 already did.
-        self._pre_ocr_cache: dict[str, dict[int, dict]] = {}
+        self._pre_ocr_cache: dict[str, object] = {}
         self._tasks_completed: list[FileTask] = []
 
         os.makedirs(self.output_dir, exist_ok=True)
@@ -451,7 +451,7 @@ class ArchiveRunner:
             with self._results_lock:
                 self.results[file_id] = ArchiveResult(file_name=file_id)
             if spec.pre_ocr_cache:
-                self._pre_ocr_cache[file_id] = dict(spec.pre_ocr_cache)
+                self._pre_ocr_cache[file_id] = spec.pre_ocr_cache
 
         # Map input_path -> file_id so the OCR adapter can look up the cache
         # (BatchPipeline only hands us `input_path` + `page_idx` per submit).
@@ -562,6 +562,7 @@ class ArchiveRunner:
         dt = time.time() - t0
 
         self._tasks_completed = list(tasks)
+        self._pre_ocr_cache.clear()
 
         if self.write_excel_on_done:
             try:

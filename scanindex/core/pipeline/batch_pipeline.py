@@ -80,6 +80,12 @@ class FileTask:
     t_correction_done: float = 0.0
     t_kie_done: float = 0.0
 
+    def release_heavy_payloads(self) -> None:
+        """Drop transient per-page payloads after output files are written."""
+        self.page_results.clear()
+        self.raw_text = None
+        self.corrected_text = None
+
 
 # Event types emitted to caller
 EVENT_FILE_QUEUED = "file_queued"
@@ -122,7 +128,8 @@ class BatchPipeline:
                  on_event: Optional[Callable[[str, FileTask, Any], None]] = None,
                  log_cb: Optional[Callable[[str], None]] = None,
                  page_timeout: float = 120.0,
-                 in_flight_drain_timeout: float = 30.0):
+                 in_flight_drain_timeout: float = 30.0,
+                 max_in_flight_pages: Optional[int] = None):
         self._ocr_submit = ocr_submit
         self._run_correction = run_correction
         self._run_kie = run_kie
@@ -130,6 +137,12 @@ class BatchPipeline:
         self._log = log_cb or (lambda m: None)
         self._page_timeout = page_timeout
         self._in_flight_drain_timeout = in_flight_drain_timeout
+        if max_in_flight_pages is None:
+            try:
+                max_in_flight_pages = int(os.environ.get("OCRTOOL_MAX_IN_FLIGHT_PAGES", "16"))
+            except (TypeError, ValueError):
+                max_in_flight_pages = 16
+        self._max_in_flight_pages = max(1, int(max_in_flight_pages))
 
         # Synchronisation primitives
         self.feeder_can_run = threading.Event()
@@ -252,6 +265,7 @@ class BatchPipeline:
 
             # Submit each page; respect pause flag between submissions
             for page_idx in range(task.num_pages):
+                self._wait_for_in_flight_slot()
                 while not self.feeder_can_run.is_set():
                     if self.cancel_event.is_set():
                         return
@@ -270,6 +284,17 @@ class BatchPipeline:
                     self._in_flight.append((task, page_idx, ar))
 
             next_idx += 1
+
+    def _wait_for_in_flight_slot(self) -> None:
+        """Backpressure OCR submissions so long PDFs don't enqueue every page."""
+        while not self.cancel_event.is_set():
+            if not self.feeder_can_run.is_set():
+                self.feeder_can_run.wait(timeout=0.5)
+                continue
+            with self._in_flight_lock:
+                if len(self._in_flight) < self._max_in_flight_pages:
+                    return
+            time.sleep(0.05)
 
     # ── internal: collector ─────────────────────────────────────────
 
@@ -451,6 +476,7 @@ class BatchPipeline:
             task.t_kie_done = time.time()
             self._on_event(EVENT_KIE_DONE, task, time.time() - t0)
             self._on_event(EVENT_FILE_COMPLETE, task, None)
+            task.release_heavy_payloads()
         except BaseException as e:
             tb = traceback.format_exc()
             task.error = f"kie failed: {e}"

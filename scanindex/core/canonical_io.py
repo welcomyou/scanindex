@@ -27,6 +27,7 @@ Compression: on by default at zstd level 3. Real-world OCR JSON shrinks to
 """
 from __future__ import annotations
 
+import io
 import json
 import os
 from pathlib import Path
@@ -167,12 +168,35 @@ def load_canonical(path: PathLike) -> dict:
     explicitly passed for developer migration/debugging, but `resolve_companion`
     never selects it implicitly.
     """
-    raw = Path(path).read_bytes()
-    is_zst = str(path).endswith(ZST_SUFFIX) or raw[:4] == _ZSTD_MAGIC
-    if is_zst:
+    p = Path(path)
+    with p.open("rb") as fh:
+        head = fh.read(4)
+        fh.seek(0)
+        is_zst = str(path).endswith(ZST_SUFFIX) or head == _ZSTD_MAGIC
+        if is_zst:
+            import zstandard as zstd
+            with zstd.ZstdDecompressor().stream_reader(fh) as reader:
+                with io.TextIOWrapper(reader, encoding="utf-8") as text:
+                    return json.load(text)
+        with io.TextIOWrapper(fh, encoding="utf-8") as text:
+            return json.load(text)
+
+
+def _stream_json_to_binary_writer(data: dict, writer) -> None:
+    encoder = json.JSONEncoder(ensure_ascii=False)
+    for chunk in encoder.iterencode(data):
+        writer.write(chunk.encode("utf-8"))
+
+
+def _write_canonical_payload(tmp: Path, data: dict, *, compress: bool, level: int) -> None:
+    if compress:
         import zstandard as zstd
-        raw = zstd.ZstdDecompressor().decompress(raw)
-    return json.loads(raw)
+        with tmp.open("wb") as fh:
+            with zstd.ZstdCompressor(level=level).stream_writer(fh) as writer:
+                _stream_json_to_binary_writer(data, writer)
+        return
+    with tmp.open("w", encoding="utf-8") as fh:
+        json.dump(data, fh, ensure_ascii=False)
 
 
 def save_canonical(
@@ -230,12 +254,14 @@ def save_canonical(
         else:
             dest = Path(s)
 
-    payload = json.dumps(data, ensure_ascii=False).encode("utf-8")
-    if compress:
-        import zstandard as zstd
-        payload = zstd.ZstdCompressor(level=level).compress(payload)
-
     tmp = Path(str(dest) + ".tmp")
-    tmp.write_bytes(payload)
-    os.replace(tmp, dest)
+    try:
+        _write_canonical_payload(tmp, data, compress=compress, level=level)
+        os.replace(tmp, dest)
+    except Exception:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
     return dest

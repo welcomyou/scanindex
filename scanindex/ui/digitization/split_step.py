@@ -837,26 +837,65 @@ class ArchiveStep1Split(QWidget):
                 )
                 warm_thread.start()
 
-                ar_list = []
-                for pi in range(page_count):
-                    if cancel.is_set() or run_id != self._ocr_run_id:
-                        self._ocr_cancelled.emit(run_id)
-                        return
-                    try:
-                        ar = direct_ocr_engine.submit_page(path, pi)
-                        ar_list.append((pi, ar))
-                    except Exception as e:
-                        self.log_message.emit(f"[step1-ocr] submit failed: {e}")
-                        self._ocr_finished.emit(run_id, "", {}, str(e))
-                        return
-
                 done = 0
-                for pi, ar in ar_list:
+                try:
+                    max_in_flight = int(
+                        os.environ.get("OCRTOOL_STEP1_MAX_IN_FLIGHT_PAGES")
+                        or os.environ.get("OCRTOOL_MAX_IN_FLIGHT_PAGES")
+                        or "16"
+                    )
+                except (TypeError, ValueError):
+                    max_in_flight = 16
+                max_in_flight = max(1, min(page_count, max_in_flight))
+                pending = []
+                next_page = 0
+
+                def submit_until_full():
+                    nonlocal next_page
+                    while next_page < page_count and len(pending) < max_in_flight:
+                        if cancel.is_set() or run_id != self._ocr_run_id:
+                            return
+                        pi = next_page
+                        next_page += 1
+                        try:
+                            pending.append((
+                                pi,
+                                direct_ocr_engine.submit_page(path, pi),
+                                time.monotonic(),
+                            ))
+                        except Exception as e:
+                            self.log_message.emit(f"[step1-ocr] submit failed: {e}")
+                            raise
+
+                self.log_message.emit(
+                    f"[step1-ocr] bounded queue: max {max_in_flight} page(s) in flight"
+                )
+                try:
+                    submit_until_full()
+                except Exception as e:
+                    self._ocr_finished.emit(run_id, "", {}, str(e))
+                    return
+
+                while pending:
                     if cancel.is_set() or run_id != self._ocr_run_id:
                         self._ocr_cancelled.emit(run_id)
                         return
+                    picked = None
+                    now = time.monotonic()
+                    for idx, (pi, ar, submitted_at) in enumerate(pending):
+                        ready_fn = getattr(ar, "ready", None)
+                        ready = bool(ready_fn()) if callable(ready_fn) else idx == 0
+                        timed_out = now - submitted_at >= 180.0
+                        if ready or timed_out:
+                            picked = idx
+                            break
+                    if picked is None:
+                        time.sleep(0.05)
+                        continue
+
+                    pi, ar, _submitted_at = pending.pop(picked)
                     try:
-                        _, page_result = ar.get(timeout=180)
+                        _, page_result = ar.get(timeout=0.1)
                     except Exception as e:
                         page_result = None
                         self.log_message.emit(f"[step1-ocr] page {pi}: {e}")
@@ -865,6 +904,11 @@ class ArchiveStep1Split(QWidget):
                             session.cache_page(pi, page_result)
                     done += 1
                     self._ocr_page_done.emit(run_id, pi, done)
+                    try:
+                        submit_until_full()
+                    except Exception as e:
+                        self._ocr_finished.emit(run_id, "", {}, str(e))
+                        return
 
                 if cancel.is_set() or run_id != self._ocr_run_id:
                     self._ocr_cancelled.emit(run_id)
@@ -881,12 +925,7 @@ class ArchiveStep1Split(QWidget):
                     return
                 os.makedirs(run_temp_dir, exist_ok=True)
                 ocr_pdf_path = os.path.join(run_temp_dir, "_step1_source_ocr.pdf")
-                page_results = {
-                    pi: cached
-                    for pi in range(page_count)
-                    for cached in [session.get_cached_page(pi)]
-                    if cached is not None
-                }
+                page_results = session.cache_slice(range(page_count))
                 assemble_t0 = time.monotonic()
                 ok, msg = direct_ocr_engine.assemble_pdf_from_page_results(
                     path,

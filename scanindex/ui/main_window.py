@@ -2049,6 +2049,10 @@ class MainWindow(QMainWindow):
                         self.signals.status_updated.emit("archive", i, doc["status"])
                     break
             if evt == EVENT_PIPELINE_DONE:
+                try:
+                    self.archive_tab.session.clear_ocr_cache()
+                except Exception:
+                    pass
                 self.is_processing = False
                 self.signals.processing_finished.emit()
 
@@ -2128,11 +2132,7 @@ class MainWindow(QMainWindow):
                 source_pages = list(seg.page_indices())
             if not source_pages:
                 continue
-            page_cache = {}
-            for local_idx, src_idx in enumerate(source_pages):
-                cached = session.get_cached_page(src_idx)
-                if cached is not None:
-                    page_cache[local_idx] = cached
+            page_cache = session.cache_slice(source_pages)
             specs.append(FileSpec(
                 input_path=doc["pdf_path"],
                 file_id=os.path.basename(doc["pdf_path"]),

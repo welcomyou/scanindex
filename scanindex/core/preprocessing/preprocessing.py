@@ -992,10 +992,29 @@ def pre_process_pdf(input_path: str, output_path: str, update_callback=None,
         total_pages = len(src_doc)
 
         # =================================================================
-        # PHASE 1 (serial): per-page native-DPI metadata + analysis preview
+        # PHASE 1+2: render small preview batches, analyze, then release them.
+        # Keeping every 200-DPI RGB preview in memory made RAM grow linearly
+        # with long PDFs. The metadata result is tiny, so only the previews are
+        # bounded.
         # =================================================================
-        page_data_list = []
-        for i in range(total_pages):
+        import concurrent.futures
+
+        if max_workers is None:
+            n_workers = max(2, (os.cpu_count() or 4) - 1)
+        else:
+            n_workers = max(1, int(max_workers))
+        n_workers = max(1, min(total_pages or 1, n_workers))
+        classifier_threads = max(
+            1,
+            min(
+                _ORIENTATION_CLASSIFIER_THREADS,
+                max(1, (os.cpu_count() or _ORIENTATION_CLASSIFIER_THREADS) // n_workers),
+            ),
+        )
+        if update_callback:
+            update_callback(f"Analyzing orientation ({n_workers} threads)...", "debug")
+
+        def render_analysis_page(i: int):
             page = src_doc[i]
             if update_callback:
                 update_callback(f"Extracting Page {i+1}/{total_pages}...", "debug")
@@ -1019,32 +1038,12 @@ def pre_process_pdf(input_path: str, output_path: str, update_callback=None,
                 arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w)
                 analysis_img = cv2.cvtColor(arr, cv2.COLOR_GRAY2BGR)
 
-            page_data_list.append({
+            return {
                 "index": i,
                 "analysis_img": analysis_img,
                 "estimated_dpi": estimated_dpi,
                 "has_dominant_image": dominant is not None,
-            })
-
-        # =================================================================
-        # PHASE 2 (parallel): orientation + deskew detection on previews
-        # =================================================================
-        import concurrent.futures
-
-        if max_workers is None:
-            n_workers = max(2, (os.cpu_count() or 4) - 1)
-        else:
-            n_workers = max(1, int(max_workers))
-        n_workers = max(1, min(total_pages or 1, n_workers))
-        classifier_threads = max(
-            1,
-            min(
-                _ORIENTATION_CLASSIFIER_THREADS,
-                max(1, (os.cpu_count() or _ORIENTATION_CLASSIFIER_THREADS) // n_workers),
-            ),
-        )
-        if update_callback:
-            update_callback(f"Analyzing orientation ({n_workers} threads)...", "debug")
+            }
 
         def analyze_page(pd):
             """Detect cardinal rotation + fine skew on the preview image. Thread-safe."""
@@ -1087,8 +1086,18 @@ def pre_process_pdf(input_path: str, output_path: str, update_callback=None,
                 "has_dominant_image": pd["has_dominant_image"],
             }
 
+        results = []
+        preview_batch_size = max(1, min(total_pages or 1, n_workers * 2))
         with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as executor:
-            results = list(executor.map(analyze_page, page_data_list))
+            preview_batch = []
+            for i in range(total_pages):
+                preview_batch.append(render_analysis_page(i))
+                if len(preview_batch) >= preview_batch_size:
+                    results.extend(executor.map(analyze_page, preview_batch))
+                    preview_batch.clear()
+            if preview_batch:
+                results.extend(executor.map(analyze_page, preview_batch))
+                preview_batch.clear()
         results.sort(key=lambda r: r["index"])
 
         # =================================================================

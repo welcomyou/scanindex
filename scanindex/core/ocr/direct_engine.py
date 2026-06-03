@@ -1710,6 +1710,74 @@ def _empty_page_ocr_result():
     }
 
 
+def _collect_page_ocr_bounded(input_path, page_indices, total_pages, log,
+                              page_timeout: float = 120.0):
+    """Collect page OCR through a bounded apply_async queue."""
+    import time
+
+    pool = _get_pool()
+    page_indices = [
+        int(idx) for idx in sorted({int(idx) for idx in page_indices})
+        if 0 <= int(idx) < total_pages
+    ]
+    if not page_indices:
+        return {}, 0
+
+    max_in_flight = min(
+        len(page_indices),
+        _env_int("OCRTOOL_MAX_IN_FLIGHT_PAGES", 16),
+    )
+    pending = []
+    next_pos = 0
+    results = {}
+
+    def submit_until_full():
+        nonlocal next_pos
+        while next_pos < len(page_indices) and len(pending) < max_in_flight:
+            page_idx = page_indices[next_pos]
+            next_pos += 1
+            pending.append((
+                page_idx,
+                pool.apply_async(_worker_ocr_single, (input_path, page_idx)),
+                time.monotonic(),
+            ))
+
+    submit_until_full()
+    while pending:
+        picked = None
+        now = time.monotonic()
+        for idx, (page_idx, ar, submitted_at) in enumerate(pending):
+            ready_fn = getattr(ar, "ready", None)
+            ready = bool(ready_fn()) if callable(ready_fn) else idx == 0
+            timed_out = (
+                page_timeout is not None
+                and now - submitted_at >= float(page_timeout)
+            )
+            if ready or timed_out:
+                picked = idx
+                break
+        if picked is None:
+            time.sleep(0.02)
+            continue
+
+        page_idx, ar, _submitted_at = pending.pop(picked)
+        try:
+            _, page_result = ar.get(timeout=0.1)
+        except Exception as e:
+            log(f"  Page {page_idx + 1}/{total_pages}: OCR error: {e}", "error")
+            page_result = None
+        if page_result is not None:
+            results[page_idx] = page_result
+            n_lines = len(page_result["lines_data"])
+            log(f"  Page {page_idx + 1}/{total_pages}: {n_lines} lines detected", "debug")
+        else:
+            log(f"  Page {page_idx + 1}/{total_pages}: OCR failed", "error")
+            results[page_idx] = _empty_page_ocr_result()
+        submit_until_full()
+
+    return results, max_in_flight
+
+
 def _process_selected_pages_serial(input_path, doc_in, page_indices, total_pages, log):
     """Serial OCR for a selected page subset used by page-wise DOCX export."""
     from PIL import Image
@@ -1759,34 +1827,19 @@ def _process_selected_pages_parallel(input_path, page_indices, total_pages, log,
     """Submit only OCR-required pages to the shared page-level pool."""
     import time
 
-    pool = _get_pool()
     t0 = time.perf_counter()
-    results = {}
     page_indices = sorted({int(idx) for idx in page_indices if 0 <= int(idx) < total_pages})
 
     try:
-        async_results = [
-            (page_idx, pool.apply_async(_worker_ocr_single, (input_path, page_idx)))
-            for page_idx in page_indices
-        ]
-        for page_idx, ar in async_results:
-            try:
-                _, page_result = ar.get(timeout=page_timeout)
-            except Exception as e:
-                log(f"  Page {page_idx + 1}/{total_pages}: OCR error: {e}", "error")
-                page_result = None
-            if page_result is not None:
-                results[page_idx] = page_result
-                n_lines = len(page_result["lines_data"])
-                log(f"  Page {page_idx + 1}/{total_pages}: {n_lines} lines detected", "debug")
-            else:
-                log(f"  Page {page_idx + 1}/{total_pages}: OCR failed", "error")
-                results[page_idx] = _empty_page_ocr_result()
+        results, max_in_flight = _collect_page_ocr_bounded(
+            input_path, page_indices, total_pages, log, page_timeout
+        )
 
         dt = time.perf_counter() - t0
         log(
             f"Parallel OCR completed: {len(page_indices)} selected page(s) in {dt:.1f}s "
-            f"({_NUM_PAGE_WORKERS} workers, {dt/max(len(page_indices),1):.2f}s/page avg)",
+            f"({_NUM_PAGE_WORKERS} workers, max {max_in_flight} queued, "
+            f"{dt/max(len(page_indices),1):.2f}s/page avg)",
             "info",
         )
         return results
@@ -1803,45 +1856,20 @@ def _process_selected_pages_parallel(input_path, page_indices, total_pages, log,
 
 def _process_pages_parallel(input_path, total_pages, log,
                               page_timeout: float = 120.0):
-    """Submit each page to the page-level pool concurrently and collect results.
-
-    The pool has `_NUM_PAGE_WORKERS` worker processes (1 DLL each). All pages
-    of the input file are submitted as individual `apply_async` tasks; the
-    pool load-balances them across workers. Pages from concurrent files share
-    the same pool, so true page-level parallelism is preserved across files."""
+    """Submit pages to the page-level pool with bounded in-flight work."""
     import time
 
-    pool = _get_pool()
     t0 = time.perf_counter()
-    results = {}
 
     try:
-        async_results = [
-            (page_idx, pool.apply_async(_worker_ocr_single, (input_path, page_idx)))
-            for page_idx in range(total_pages)
-        ]
-        for page_idx, ar in async_results:
-            try:
-                _, page_result = ar.get(timeout=page_timeout)
-            except Exception as e:
-                log(f"  Page {page_idx + 1}/{total_pages}: OCR error: {e}", "error")
-                page_result = None
-            if page_result is not None:
-                results[page_idx] = page_result
-                n_lines = len(page_result["lines_data"])
-                log(f"  Page {page_idx + 1}/{total_pages}: {n_lines} lines detected", "debug")
-            else:
-                log(f"  Page {page_idx + 1}/{total_pages}: OCR failed", "error")
-                results[page_idx] = {
-                    "lines_data": [],
-                    "words_data": [],
-                    "render_width": 0,
-                    "render_height": 0,
-                }
+        results, max_in_flight = _collect_page_ocr_bounded(
+            input_path, range(total_pages), total_pages, log, page_timeout
+        )
 
         dt = time.perf_counter() - t0
         log(f"Parallel OCR completed: {total_pages} pages in {dt:.1f}s "
-            f"({_NUM_PAGE_WORKERS} workers, {dt/max(total_pages,1):.2f}s/page avg)",
+            f"({_NUM_PAGE_WORKERS} workers, max {max_in_flight} queued, "
+            f"{dt/max(total_pages,1):.2f}s/page avg)",
             "info")
         return results
 
