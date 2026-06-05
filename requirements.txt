@@ -28,7 +28,10 @@ tzlocal>=5.0
 
 opencv-contrib-python-headless>=4.9.0,<4.10
 opencv-python-headless>=4.9.0,<4.10
-numpy>=1.26.0,<2.4
+# OpenCV 4.9 Windows wheels use the NumPy 1.x C ABI. GitHub Actions was
+# resolving NumPy 2.x, which made frozen workers fail with:
+# "numpy.core.multiarray failed to import".
+numpy>=1.26.0,<2.0
 onnxruntime>=1.20.0
 docling-core>=2.75.0,<3
 docling-ibm-models>=3.13.2,<4

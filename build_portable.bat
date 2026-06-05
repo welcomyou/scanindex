@@ -71,6 +71,11 @@ if "%MODE%"=="1" (
     if errorlevel 1 goto :fail
 
     echo.
+    echo [FULL] Verifying native dependency imports...
+    python -c "import numpy, cv2, onnxruntime; print('numpy=' + numpy.__version__); print('cv2=' + cv2.__version__); print('onnxruntime=' + onnxruntime.__version__)"
+    if errorlevel 1 goto :fail
+
+    echo.
     echo [FULL] Checking offline runtime assets...
     call :check_dir "models\screen_ai" "ScreenAI models"
     call :check_dir "models\orientation" "Orientation ONNX"
