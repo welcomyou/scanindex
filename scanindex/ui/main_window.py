@@ -92,7 +92,9 @@ def _run_preprocess_and_ocr(input_path, output_path, num_pages, parallel_files,
     Returns (res, msg). Caller is responsible for cleaning up the preprocessed file."""
     try:
         from scanindex.core.preprocessing import preprocessing
-    except ImportError:
+    except ModuleNotFoundError as exc:
+        if exc.name not in {"scanindex.core.preprocessing", "scanindex.core.preprocessing.preprocessing"}:
+            raise
         sys.path.append(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "src"))
         import preprocessing
 

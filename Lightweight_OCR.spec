@@ -56,6 +56,7 @@ add_data("VERSION", ".")
 # wrappers were removed, so only the entry point stays bare.
 hiddenimports += [
     "ocr_app",
+    "preprocessing",
 
     # ScanIndex packages
     "scanindex",

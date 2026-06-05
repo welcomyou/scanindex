@@ -195,6 +195,7 @@ def _analyze_combined_layout_regions(page, page_idx, page_w, page_h, analyzers, 
 # --- Worker process state (1 ScreenAI instance per worker process) ---
 _worker_ocr = None       # the worker's ScreenAIOCR instance
 _worker_dll_path = None  # loaded DLL path, kept for diagnostics
+_worker_init_error = None
 
 
 def _worker_init(dll_path, model_dir):
@@ -202,17 +203,32 @@ def _worker_init(dll_path, model_dir):
 
     The DLL must stay next to its ScreenAI model/runtime files so Windows can
     resolve native dependencies from the same directory in frozen builds."""
-    global _worker_ocr, _worker_dll_path
+    global _worker_ocr, _worker_dll_path, _worker_init_error
 
-    ocr = ScreenAIOCR(dll_path=dll_path, model_dir=model_dir)
-    ocr.initialize()
-    _worker_ocr = ocr
-    _worker_dll_path = dll_path
+    try:
+        from scanindex.infra.mp_safety import ensure_valid_stdio
+        ensure_valid_stdio()
+        ocr = ScreenAIOCR(dll_path=dll_path, model_dir=model_dir)
+        ocr.initialize()
+        _worker_ocr = ocr
+        _worker_dll_path = dll_path
+        _worker_init_error = None
+    except Exception as exc:
+        _worker_ocr = None
+        _worker_dll_path = dll_path
+        _worker_init_error = f"{type(exc).__name__}: {exc}"
+        logger.exception("ScreenAI worker initialization failed")
 
 
 def _worker_ocr_single(input_path, page_idx, render_annots=True):
     """OCR a single page using this worker's DLL instance."""
     try:
+        if _worker_ocr is None:
+            return (page_idx, {
+                "worker_init_failed": True,
+                "error": _worker_init_error or "ScreenAI worker is not initialized",
+            })
+
         import fitz
         from PIL import Image
 
@@ -231,8 +247,6 @@ def _worker_ocr_single(input_path, page_idx, render_annots=True):
         scale_x = page_w / render_w
         scale_y = page_h / render_h
 
-        if _worker_ocr is None:
-            return (page_idx, None)
         result = _worker_ocr.perform_ocr(img)
         ocr_lines = result.get("lines", [])
 
@@ -247,9 +261,8 @@ def _worker_ocr_single(input_path, page_idx, render_annots=True):
             "render_height": render_h,
         })
 
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
+    except Exception:
+        logger.exception("ScreenAI worker OCR failed")
         return (page_idx, None)
 
 
@@ -355,6 +368,9 @@ def ocr_one_page(input_path: str, page_idx: int, timeout: float = 120.0,
     ar = submit_page(input_path, page_idx, render_annots=render_annots)
     try:
         _, result = ar.get(timeout=timeout)
+        if isinstance(result, dict) and result.get("worker_init_failed"):
+            shutdown_pool()
+            return None
         return result
     except Exception:
         return None
@@ -1766,6 +1782,9 @@ def _collect_page_ocr_bounded(input_path, page_indices, total_pages, log,
         except Exception as e:
             log(f"  Page {page_idx + 1}/{total_pages}: OCR error: {e}", "error")
             page_result = None
+        if isinstance(page_result, dict) and page_result.get("worker_init_failed"):
+            detail = page_result.get("error") or "ScreenAI worker initialization failed"
+            raise RuntimeError(str(detail))
         if page_result is not None:
             results[page_idx] = page_result
             n_lines = len(page_result["lines_data"])
@@ -1846,6 +1865,7 @@ def _process_selected_pages_parallel(input_path, page_indices, total_pages, log,
 
     except Exception as e:
         log(f"Parallel OCR failed, falling back to serial: {e}", "error")
+        shutdown_pool()
         import fitz
         doc_in = fitz.open(input_path)
         try:
@@ -1875,6 +1895,7 @@ def _process_pages_parallel(input_path, total_pages, log,
 
     except Exception as e:
         log(f"Parallel OCR failed, falling back to serial: {e}", "error")
+        shutdown_pool()
         import fitz
         doc_in = fitz.open(input_path)
         result = _process_pages_serial(input_path, doc_in, total_pages, log)

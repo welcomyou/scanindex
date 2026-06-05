@@ -6,10 +6,12 @@ import sys
 import multiprocessing
 
 from scanindex.infra.mp_safety import (
+    ensure_valid_stdio,
     patch_multiprocessing_spawn_sys_path,
     sanitize_current_sys_path,
 )
 
+ensure_valid_stdio()
 sanitize_current_sys_path()
 patch_multiprocessing_spawn_sys_path()
 

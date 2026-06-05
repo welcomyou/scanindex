@@ -404,6 +404,30 @@ def get_installed_version(model_dir):
     return versions[0]
 
 
+def _missing_required_ocr_files(version_dir):
+    """Return required OCR model files missing from a ScreenAI version dir."""
+    required = ["gocr_mobile_chrome_multiscript_2024_q4_engine.binarypb"]
+    file_list_path = os.path.join(version_dir, "files_list_ocr.txt")
+    if not os.path.exists(file_list_path):
+        required.append("files_list_ocr.txt")
+    else:
+        try:
+            with open(file_list_path, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    item = line.strip()
+                    if item and item not in required:
+                        required.append(item)
+        except OSError:
+            required.append("files_list_ocr.txt")
+
+    missing = []
+    for rel_path in required:
+        full_path = os.path.join(version_dir, rel_path.replace("/", os.sep))
+        if not os.path.exists(full_path):
+            missing.append(rel_path)
+    return missing
+
+
 def _get_chrome_screen_ai_base_path():
     """Get the expected Chrome ScreenAI path for the current platform."""
     if sys.platform == "win32":
@@ -482,15 +506,25 @@ def check_screen_ai(model_dir):
     color_type = PLATFORM_COLOR_TYPE.get(sys.platform, 6)
 
     # --- Step 1: Check local model_dir ---
+    local_missing_note = ""
     ver, ver_path = get_installed_version(model_dir)
     if ver and ver_path:
-        lib_path = os.path.join(ver_path, lib_name)
-        return ScreenAIStatus(
-            ScreenAIStatus.FOUND_LOCAL,
-            lib_path=lib_path, model_path=ver_path,
-            color_type=color_type, version=ver,
-            message=f"ScreenAI v{ver} found locally"
+        missing = _missing_required_ocr_files(ver_path)
+        if not missing:
+            lib_path = os.path.join(ver_path, lib_name)
+            return ScreenAIStatus(
+                ScreenAIStatus.FOUND_LOCAL,
+                lib_path=lib_path, model_path=ver_path,
+                color_type=color_type, version=ver,
+                message=f"ScreenAI v{ver} found locally"
+            )
+        preview = ", ".join(missing[:5])
+        suffix = "..." if len(missing) > 5 else ""
+        local_missing_note = (
+            f"\nLocal ScreenAI v{ver} at {ver_path} is incomplete: "
+            f"missing {len(missing)} required OCR file(s): {preview}{suffix}"
         )
+        logger.warning(local_missing_note.strip())
 
     # --- Step 2: Check Chrome installation ---
     chrome_ver, chrome_path = find_chrome_screen_ai()
@@ -511,7 +545,7 @@ def check_screen_ai(model_dir):
         version = update_info.get("version", "unknown")
         size = update_info.get("size", 0)
         size_mb = size / (1024 * 1024)
-        return ScreenAIStatus(
+        status = ScreenAIStatus(
             ScreenAIStatus.NEED_DOWNLOAD,
             color_type=color_type, version=version,
             download_size=size,
@@ -522,7 +556,10 @@ def check_screen_ai(model_dir):
             )
         )
 
-    return ScreenAIStatus(
+        status.message += local_missing_note
+        return status
+
+    status = ScreenAIStatus(
         ScreenAIStatus.UNAVAILABLE,
         message=(
             f"Không tìm thấy thư viện OCR đi kèm, "
@@ -530,6 +567,8 @@ def check_screen_ai(model_dir):
             f"Không thể kết nối Google để tải. Kiểm tra kết nối mạng hoặc cài Google Chrome."
         )
     )
+    status.message += local_missing_note
+    return status
 
 
 def install_screen_ai(model_dir, status, progress_callback=None, log_callback=None):

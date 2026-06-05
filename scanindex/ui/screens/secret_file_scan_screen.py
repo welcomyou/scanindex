@@ -1369,6 +1369,9 @@ class SecretFileScanScreen(ScreenContent):
             except Exception as exc:
                 failures += 1
                 self.log_message.emit(f"[{rel}] Lỗi: {exc}", "err")
+            finally:
+                if os.path.isdir(file_work):
+                    shutil.rmtree(file_work, ignore_errors=True)
             self._progress_changed.emit(idx, max(1, total))
 
         self._scan_finished.emit(

@@ -14,6 +14,28 @@ from contextlib import contextmanager
 
 _PATCH_LOCK = threading.Lock()
 _PATCHED = False
+_DEVNULL_STREAMS = []
+
+
+def ensure_valid_stdio() -> None:
+    """Give windowed/frozen child processes writable stdio handles.
+
+    PyInstaller windowed apps can run with ``sys.stderr``/``sys.stdout`` set
+    to ``None``. If a multiprocessing child then hits an exception during
+    bootstrap, Python's traceback printer tries to call ``.write()`` on None
+    and masks the real error.
+    """
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name, None)
+        if stream is not None and hasattr(stream, "write"):
+            continue
+        try:
+            replacement = open(os.devnull, "w", encoding="utf-8", buffering=1)
+        except Exception:
+            continue
+        setattr(sys, name, replacement)
+        setattr(sys, f"__{name}__", replacement)
+        _DEVNULL_STREAMS.append(replacement)
 
 
 def _is_cv2_loader_path(path: str) -> bool:
