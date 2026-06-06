@@ -65,6 +65,10 @@ if "%MODE%"=="1" (
     echo [FULL] Installing dependencies...
     python -m pip install --upgrade pip
     if errorlevel 1 goto :fail
+    echo.
+    echo [FULL] Removing conflicting OpenCV GUI wheels...
+    pip uninstall -y opencv-python opencv-contrib-python
+    if errorlevel 1 goto :fail
     pip install -r requirements.txt
     if errorlevel 1 goto :fail
     pip install pyinstaller
@@ -72,7 +76,9 @@ if "%MODE%"=="1" (
 
     echo.
     echo [FULL] Verifying native dependency imports...
-    python -c "import numpy, cv2, onnxruntime; print('numpy=' + numpy.__version__); print('cv2=' + cv2.__version__); print('onnxruntime=' + onnxruntime.__version__)"
+    python -c "import importlib.metadata as md; import numpy, cv2, onnxruntime, ctranslate2, PIL; print('numpy=' + numpy.__version__); print('cv2=' + cv2.__version__); print('onnxruntime=' + onnxruntime.__version__); print('ctranslate2=' + ctranslate2.__version__); print('Pillow=' + PIL.__version__); print('docling-core=' + md.version('docling-core'))"
+    if errorlevel 1 goto :fail
+    pip check
     if errorlevel 1 goto :fail
 
     echo.

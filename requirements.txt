@@ -1,41 +1,41 @@
-PySide6>=6.6.0
-pypdf>=6.6.0
-selenium>=4.39.0
-webdriver-manager>=4.0.2
-huggingface_hub>=0.34.0,<1.0
-ctranslate2>=4.6.0
-transformers>=4.40.0,<5
-sentencepiece
-configparser
-zstandard>=0.22
+# Release pins intentionally match the local 1.1.2 build environment that was
+# verified to run the PDF-to-DOCX OCR pipeline. Broad ranges made GitHub
+# Actions resolve newer native wheels than local builds.
+PySide6==6.10.2
+pypdf==6.6.0
+selenium==4.40.0
+webdriver-manager==4.0.2
+huggingface_hub==0.36.2
+ctranslate2==4.6.3
+transformers==4.57.6
+sentencepiece==0.2.1
+configparser==7.2.0
+zstandard==0.25.0
 
-PyMuPDF>=1.24.0
-pdf2docx>=0.5.13
-pikepdf>=10.0.0
-python-docx>=1.1.0
-rapidfuzz>=3.5.0
-pandas
-joblib
-lightgbm
-scikit-learn
-openpyxl
-pyhanko[opentype]>=0.20.0
-pyhanko-certvalidator>=0.26.0
-cryptography>=41.0.0
-asn1crypto>=1.5.1
-Pillow>=10.0.0
-tzlocal>=5.0
+PyMuPDF==1.26.7
+pdf2docx==0.5.13
+pikepdf==10.2.0
+python-docx==1.2.0
+rapidfuzz==3.14.3
+pandas==2.3.3
+joblib==1.5.3
+lightgbm==4.6.0
+scikit-learn==1.8.0
+openpyxl==3.1.5
+pyhanko[opentype]==0.34.1
+pyhanko-certvalidator==0.30.2
+cryptography==46.0.7
+asn1crypto==1.5.1
+Pillow==12.1.0
+tzlocal==5.3.1
 
-opencv-contrib-python-headless>=4.9.0,<4.10
-opencv-python-headless>=4.9.0,<4.10
-# OpenCV 4.9 Windows wheels use the NumPy 1.x C ABI. GitHub Actions was
-# resolving NumPy 2.x, which made frozen workers fail with:
-# "numpy.core.multiarray failed to import".
-numpy>=1.26.0,<2.0
-onnxruntime>=1.20.0
-docling-core>=2.75.0,<3
-docling-ibm-models>=3.13.2,<4
+opencv-contrib-python-headless==4.9.0.80
+opencv-python-headless==4.9.0.80
+numpy==1.26.4
+onnxruntime==1.24.4
+docling-core==2.75.0
+docling-ibm-models==3.13.2
 
 # Kho luu tru: Tantivy lexical/fuzzy search
-tantivy>=0.22
-underthesea>=6.0
+tantivy==0.26.0
+underthesea==9.4.0
