@@ -13,11 +13,13 @@ ported from the original `ArchiveTab` essentially unchanged."""
 import os
 import json
 import re
+import threading
+import time
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QComboBox,
+    QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QComboBox,
     QLabel, QLineEdit, QTextEdit, QPushButton,
     QListWidget, QListWidgetItem, QScrollArea, QFrame,
-    QMessageBox, QSizePolicy, QSplitter,
+    QMessageBox, QSizePolicy, QSplitter, QProgressBar,
 )
 from PySide6.QtCore import Qt, QTimer, Signal, QDate
 from PySide6.QtGui import QBrush, QColor, QTextOption
@@ -168,23 +170,32 @@ from scanindex.core.kie.text_normalize import (  # noqa: E402
 )
 
 
-def _load_annotation(json_path):
+def _load_canonical_document(json_path):
     from scanindex.core.canonical_io import load_canonical, resolve_companion
     resolved = resolve_companion(json_path) if json_path else None
     if resolved is None:
-        return None
+        return None, None
     try:
         doc = load_canonical(resolved)
         ann = doc.get("annotations") or None
         if ann and "field_instances" in ann:
             try:
                 from scanindex.core.kie.postprocess import apply_layoutlmv3_schema_postprocess
-                ann = apply_layoutlmv3_schema_postprocess(doc, ann)
+                doc["annotations"] = apply_layoutlmv3_schema_postprocess(doc, ann)
             except Exception:
                 pass
-            return ann
+        return doc, str(resolved)
     except Exception:
+        return None, str(resolved)
+
+
+def _load_annotation(json_path):
+    doc, _resolved = _load_canonical_document(json_path)
+    if not isinstance(doc, dict):
         return None
+    ann = doc.get("annotations") or None
+    if ann and "field_instances" in ann:
+        return ann
     return None
 
 
@@ -399,6 +410,7 @@ class ArchiveStep2Kie(QWidget):
     stop_clicked = Signal()
     field_label_clicked = Signal(str)
     log_message = Signal(str)
+    _canonical_ready = Signal(int, int, str, object)
 
     def __init__(self, icons=None, parent=None):
         super().__init__(parent)
@@ -411,6 +423,12 @@ class ArchiveStep2Kie(QWidget):
         self._review_mode = False
         self._source_mode = "folder"   # "folder" | "step1"
         self._is_processing = False
+        self._preprocess_busy = False
+        self._preprocess_started_at = 0.0
+        self._preprocess_total = 0
+        self._preprocess_done = 0
+        self._canonical_cache: dict[str, tuple[float, dict]] = {}
+        self._canonical_request_gen = 0
         # Tracks whether the section-1 form has user edits the
         # operator hasn't saved into doc["metadata"] yet. Switching
         # rows while dirty triggers a Save / Discard / Cancel prompt.
@@ -430,6 +448,7 @@ class ArchiveStep2Kie(QWidget):
         self._save_notice_timer.setSingleShot(True)
         self._save_notice_timer.setInterval(1000)
         self._save_notice_timer.timeout.connect(self._hide_saved_notice)
+        self._canonical_ready.connect(self._on_canonical_ready)
         self._setup_ui()
 
     # ── ui construction ────────────────────────────────────────────
@@ -490,6 +509,7 @@ class ArchiveStep2Kie(QWidget):
         body.setStretchFactor(2, 0)
         body.setSizes([_FLIST_W, 9999, _META_W])
         root.addWidget(body, 1)
+        self._build_preprocess_overlay()
 
         self._spinner_chars = ["⠋", "⠙", "⠹", "⠸",
                                 "⠼", "⠴", "⠦", "⠧",
@@ -499,6 +519,113 @@ class ArchiveStep2Kie(QWidget):
         self._spinner_timer.setInterval(80)
         self._spinner_timer.timeout.connect(self._tick_spinner)
         self._spinner_timer.start()
+
+    def _build_preprocess_overlay(self):
+        self._preprocess_overlay = QFrame(self)
+        self._preprocess_overlay.setObjectName("archiveStep2PreprocessOverlay")
+        self._preprocess_overlay.setGeometry(self.rect())
+        self._preprocess_overlay.setStyleSheet(f"""
+            QFrame#archiveStep2PreprocessOverlay {{
+                background: rgba(20, 20, 20, 205);
+                border: none;
+            }}
+        """)
+        layout = QVBoxLayout(self._preprocess_overlay)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addStretch(1)
+
+        card = QFrame()
+        card.setFixedWidth(520)
+        card.setStyleSheet(f"""
+            QFrame {{
+                background: {COLOR_SURFACE};
+                border: 1px solid {COLOR_BORDER_DEFAULT};
+                border-radius: 6px;
+            }}
+        """)
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(16, 14, 16, 14)
+        card_layout.setSpacing(10)
+
+        self._preprocess_overlay_title = QLabel("Đang preprocess bước 2")
+        self._preprocess_overlay_title.setStyleSheet(
+            f"color: {COLOR_TEXT}; font-size: 14px; font-weight: 700; "
+            f"font-family: {FONT_UI}; border: none;"
+        )
+        card_layout.addWidget(self._preprocess_overlay_title)
+
+        self._preprocess_progress = QProgressBar()
+        self._preprocess_progress.setRange(0, 100)
+        self._preprocess_progress.setValue(0)
+        card_layout.addWidget(self._preprocess_progress)
+
+        grid = QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(5)
+        self._preprocess_lbl_files = self._make_overlay_value("0/0")
+        self._preprocess_lbl_current = self._make_overlay_value("-")
+        self._preprocess_lbl_elapsed = self._make_overlay_value("0.0s")
+        self._preprocess_lbl_stage = self._make_overlay_value("Preprocess")
+        grid.addWidget(self._make_overlay_key("Preprocess"), 0, 0)
+        grid.addWidget(self._preprocess_lbl_files, 0, 1)
+        grid.addWidget(self._make_overlay_key("File hiện tại"), 1, 0)
+        grid.addWidget(self._preprocess_lbl_current, 1, 1)
+        grid.addWidget(self._make_overlay_key("Thời gian"), 2, 0)
+        grid.addWidget(self._preprocess_lbl_elapsed, 2, 1)
+        grid.addWidget(self._make_overlay_key("Giai đoạn"), 3, 0)
+        grid.addWidget(self._preprocess_lbl_stage, 3, 1)
+        card_layout.addLayout(grid)
+
+        self._preprocess_overlay_status = QLabel("Đang chuẩn bị preprocess...")
+        self._preprocess_overlay_status.setWordWrap(True)
+        self._preprocess_overlay_status.setStyleSheet(
+            f"color: {COLOR_TEXT_SECONDARY}; font-size: {_FONT_SM}px; "
+            f"font-family: {FONT_UI}; border: none;"
+        )
+        card_layout.addWidget(self._preprocess_overlay_status)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        self._btn_cancel_preprocess = QPushButton("Hủy")
+        self._btn_cancel_preprocess.setFixedHeight(_H)
+        self._btn_cancel_preprocess.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_cancel_preprocess.setStyleSheet(
+            f"QPushButton {{ background: {COLOR_RED}; border: none; "
+            f"border-radius: {_RAD}px; color: white; font-size: {_FONT}px; "
+            f"font-family: {FONT_UI}; font-weight: 600; padding: 0 18px; }} "
+            f"QPushButton:hover {{ background: {COLOR_RED_HOVER}; }}"
+        )
+        self._btn_cancel_preprocess.clicked.connect(self.stop_clicked.emit)
+        buttons.addWidget(self._btn_cancel_preprocess)
+        card_layout.addLayout(buttons)
+
+        row = QHBoxLayout()
+        row.addStretch(1)
+        row.addWidget(card)
+        row.addStretch(1)
+        layout.addLayout(row)
+        layout.addStretch(2)
+
+        self._preprocess_overlay.hide()
+
+    def _make_overlay_key(self, text: str) -> QLabel:
+        label = QLabel(text)
+        label.setStyleSheet(
+            f"color: {COLOR_TEXT_MUTED}; font-size: {_FONT_SM}px; "
+            f"font-family: {FONT_UI}; border: none;"
+        )
+        return label
+
+    def _make_overlay_value(self, text: str) -> QLabel:
+        label = QLabel(text)
+        label.setWordWrap(True)
+        label.setStyleSheet(
+            f"color: {COLOR_TEXT}; font-size: {_FONT_SM}px; "
+            f"font-family: {FONT_UI}; font-weight: 600; border: none;"
+        )
+        return label
 
     def _build_toolbar(self, parent_layout):
         bar = QFrame()
@@ -1002,10 +1129,20 @@ class ArchiveStep2Kie(QWidget):
         if self._current_doc_idx < len(self._documents) - 1:
             self.doc_list.setCurrentRow(self._current_doc_idx + 1)
 
+    def _update_doc_counter(self):
+        total = len(self._documents)
+        idx = self._current_doc_idx
+        if total <= 0:
+            self._lbl_count.setText("")
+        elif 0 <= idx < total:
+            self._lbl_count.setText(f"{idx + 1} / {total}")
+        else:
+            self._lbl_count.setText(f"0 / {total}")
+
     def _update_file_nav(self):
         total = len(self._documents)
         idx = self._current_doc_idx
-        self.pdf_viewer.set_file_label(idx, total)
+        self._update_doc_counter()
         self.pdf_viewer.set_file_nav_enabled(idx > 0, idx < total - 1)
 
     # ── public API ──────────────────────────────────────────────────
@@ -1027,6 +1164,8 @@ class ArchiveStep2Kie(QWidget):
         self.btn_process.setVisible((not is_running) and self._source_mode != "step1")
         self.btn_stop.setVisible(is_running)
         self._btn_browse_in.setEnabled(not is_running)
+        if not is_running:
+            self.hide_preprocess_progress()
 
     def reset(self):
         """Wipe every piece of Step 2 state for the "↻ Bắt đầu lại" flow:
@@ -1043,16 +1182,87 @@ class ArchiveStep2Kie(QWidget):
         self._form_dirty = False
         self._hide_saved_notice()
         self._fuzzy_active_field = None
-        self.pdf_viewer.set_file_label(-1, 0)
         self.pdf_viewer.set_file_nav_enabled(False, False)
 
     def set_progress(self, current, total):
         return  # progress reflected per-row
 
+    def show_preprocess_progress(self, total: int):
+        try:
+            total = max(0, int(total or 0))
+        except Exception:
+            total = 0
+        self._preprocess_busy = True
+        self._preprocess_started_at = time.monotonic()
+        self._preprocess_total = total
+        self._preprocess_done = 0
+        self._preprocess_progress.setRange(0, 100)
+        self._preprocess_progress.setValue(0)
+        self._preprocess_lbl_files.setText(f"0/{total}")
+        self._preprocess_lbl_current.setText("-")
+        self._preprocess_lbl_elapsed.setText("0.0s")
+        self._preprocess_lbl_stage.setText("Preprocess")
+        self._preprocess_overlay_title.setText("Đang preprocess bước 2")
+        self._preprocess_overlay_status.setText(
+            "Đang tiền xử lý PDF trước OCR/KIE..."
+        )
+        self._preprocess_overlay.setGeometry(self.rect())
+        self._preprocess_overlay.raise_()
+        self._preprocess_overlay.show()
+
+    def update_preprocess_progress(
+        self,
+        done: int | None = None,
+        total: int | None = None,
+        current_file: str | None = None,
+        status: str | None = None,
+    ):
+        if not self._preprocess_busy:
+            self.show_preprocess_progress(total or len(self._documents))
+        if total is not None:
+            try:
+                self._preprocess_total = max(0, int(total or 0))
+            except Exception:
+                pass
+        if done is not None:
+            try:
+                self._preprocess_done = max(0, int(done or 0))
+            except Exception:
+                pass
+        if self._preprocess_total:
+            self._preprocess_done = min(self._preprocess_done, self._preprocess_total)
+            self._preprocess_progress.setValue(
+                round((self._preprocess_done / self._preprocess_total) * 100)
+            )
+        else:
+            self._preprocess_progress.setValue(0)
+        self._preprocess_lbl_files.setText(
+            f"{self._preprocess_done}/{self._preprocess_total}"
+        )
+        self._preprocess_lbl_elapsed.setText(
+            f"{time.monotonic() - self._preprocess_started_at:.1f}s"
+        )
+        if current_file is not None:
+            base = os.path.basename(str(current_file)) or "-"
+            self._preprocess_lbl_current.setText(base)
+            self._preprocess_lbl_current.setToolTip(str(current_file))
+        if status:
+            self._preprocess_overlay_status.setText(str(status))
+        self._preprocess_overlay.setGeometry(self.rect())
+        self._preprocess_overlay.raise_()
+        self._preprocess_overlay.show()
+
+    def hide_preprocess_progress(self):
+        self._preprocess_busy = False
+        overlay = getattr(self, "_preprocess_overlay", None)
+        if overlay is not None:
+            overlay.hide()
+
     def set_documents(self, documents, default_status: str = "Pending"):
         """Populate the list. With `default_status='OCR...'` (used when
         coming from Step 1) every row starts active — load spinner shown
         until the pipeline marks it Done."""
+        self.hide_preprocess_progress()
         self._documents = documents
         self.doc_list.blockSignals(True)
         self.doc_list.clear()
@@ -1071,13 +1281,13 @@ class ArchiveStep2Kie(QWidget):
             doc.setdefault("status", default_status)
             self._apply_row_state(item, doc)
         self.doc_list.blockSignals(False)
-        self._lbl_count.setText(str(len(documents)))
         self._current_doc_idx = -1
+        self._update_doc_counter()
         target_row = -1
         for i, d in enumerate(documents):
             if self._is_preview_ready(d):
                 target_row = i; break
-        if target_row >= 0:
+        if target_row >= 0 and not self._is_processing:
             self.doc_list.setCurrentRow(target_row)
         if not self._review_mode and documents:
             self._flist_panel.setVisible(True)
@@ -1092,7 +1302,11 @@ class ArchiveStep2Kie(QWidget):
         item = self.doc_list.item(idx)
         if item is not None:
             self._apply_row_state(item, self._documents[idx])
-        if self._current_doc_idx < 0 and self._is_preview_ready(self._documents[idx]):
+        if (
+            not self._is_processing
+            and self._current_doc_idx < 0
+            and self._is_preview_ready(self._documents[idx])
+        ):
             self.doc_list.setCurrentRow(idx)
 
     def _apply_row_state(self, item: QListWidgetItem, doc: dict):
@@ -1305,6 +1519,9 @@ class ArchiveStep2Kie(QWidget):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        overlay = getattr(self, "_preprocess_overlay", None)
+        if overlay is not None:
+            overlay.setGeometry(self.rect())
         self._resize_fields_soon()
 
     # ── selection / metadata (port of original ArchiveTab) ─────────
@@ -1512,20 +1729,118 @@ class ArchiveStep2Kie(QWidget):
             f"json_path={json_path!r} "
             f"json_exists={resolved_json is not None}"
         )
-        annotation = _load_annotation(str(resolved_json or json_path)) if json_path else None
-        if annotation:
+        pdf_candidate = None
+        for candidate in [doc.get("output_path"), doc.get("ocr_path"), doc.get("pdf_path")]:
+            if candidate and os.path.exists(candidate):
+                pdf_candidate = candidate
+                break
+        if pdf_candidate:
+            self.pdf_viewer.load_pdf(pdf_candidate)
+            QTimer.singleShot(120, lambda r=row: self._prefetch_adjacent_pdfs(r))
+        else:
+            self.pdf_viewer.clear()
+
+        selected_json = str(resolved_json or json_path) if json_path else ""
+        if selected_json:
+            self._request_canonical_for_selection(row, selected_json)
+        else:
+            self.pdf_viewer.clear_field_overlays()
+            QTimer.singleShot(30, lambda r=row: self._apply_doc_metadata(r, None, ""))
+
+    def _prefetch_adjacent_pdfs(self, row: int):
+        if row != self._current_doc_idx:
+            return
+        for offset in (1, -1, 2, -2):
+            idx = row + offset
+            if not (0 <= idx < len(self._documents)):
+                continue
+            doc = self._documents[idx]
+            if not self._is_preview_ready(doc):
+                continue
+            for candidate in [doc.get("output_path"), doc.get("ocr_path"), doc.get("pdf_path")]:
+                if candidate and os.path.exists(candidate):
+                    try:
+                        self.pdf_viewer.prefetch_pdf_first_page(candidate)
+                    except Exception:
+                        pass
+                    break
+
+    def _request_canonical_for_selection(self, row: int, json_path: str):
+        self._canonical_request_gen += 1
+        gen = self._canonical_request_gen
+        try:
+            mtime = os.path.getmtime(json_path)
+        except OSError:
+            mtime = -1.0
+        cached = self._canonical_cache.get(json_path)
+        if cached is not None and cached[0] == mtime:
+            canonical = cached[1]
+            QTimer.singleShot(
+                30,
+                lambda r=row, g=gen, p=json_path, c=canonical:
+                    self._on_canonical_ready(r, g, p, c),
+            )
+            return
+
+        doc = self._documents[row] if 0 <= row < len(self._documents) else {}
+        cached_doc = doc.get("_canonical_cache") if isinstance(doc, dict) else None
+        cached_path = doc.get("_canonical_cache_path") if isinstance(doc, dict) else None
+        if isinstance(cached_doc, dict) and cached_path == json_path:
+            QTimer.singleShot(
+                30,
+                lambda r=row, g=gen, p=json_path, c=cached_doc:
+                    self._on_canonical_ready(r, g, p, c),
+            )
+            return
+
+        def _worker():
+            canonical, resolved = _load_canonical_document(json_path)
+            self._canonical_ready.emit(row, gen, str(resolved or json_path), canonical)
+
+        threading.Thread(
+            target=_worker,
+            daemon=True,
+            name=f"step2-canonical-load-{row}",
+        ).start()
+
+    def _on_canonical_ready(self, row: int, gen: int, json_path: str, canonical):
+        if gen != self._canonical_request_gen or row != self._current_doc_idx:
+            return
+        if isinstance(canonical, dict):
+            try:
+                mtime = os.path.getmtime(json_path)
+            except OSError:
+                mtime = -1.0
+            self._canonical_cache[json_path] = (mtime, canonical)
+            while len(self._canonical_cache) > 8:
+                self._canonical_cache.pop(next(iter(self._canonical_cache)))
+            try:
+                self.pdf_viewer.load_canonical_data(json_path, canonical)
+            except AttributeError:
+                self.pdf_viewer.load_canonical(json_path)
+        else:
+            self.pdf_viewer.clear_field_overlays()
+        self._apply_doc_metadata(row, canonical, json_path)
+
+    def _apply_doc_metadata(self, row: int, canonical, json_path: str):
+        if row != self._current_doc_idx or not (0 <= row < len(self._documents)):
+            return
+        doc = self._documents[row]
+        annotation = doc.get("annotation") if isinstance(doc, dict) else None
+        if not annotation and isinstance(canonical, dict):
+            annotation = canonical.get("annotations") or None
+        if annotation and "field_instances" in annotation:
             doc["annotation"] = annotation
+            if isinstance(canonical, dict):
+                doc["_canonical_cache"] = canonical
+                doc["_canonical_cache_path"] = json_path
             # Derive form metadata from the annotation only when the
             # doc doesn't already carry user-edited values. Re-running
             # the projection on every selection clobbers anything the
-            # operator typed (e.g. a manually-entered date for a doc
-            # whose OCR garbled the PLACE_DATE token), which would
-            # silently revert their work between row clicks.
+            # operator typed between row clicks.
             existing_meta = doc.get("metadata") or {}
             derived = _annotation_to_metadata_form(annotation)
             if existing_meta:
-                # Merge: user's existing non-empty values win, derived
-                # values fill the rest.
                 merged = dict(derived)
                 for k, v in existing_meta.items():
                     if isinstance(v, str) and v.strip():
@@ -1546,21 +1861,11 @@ class ArchiveStep2Kie(QWidget):
             )
 
         meta = doc.get("metadata", {})
-        for key, _, multiline in _FIELDS:
+        for key, _, _multiline in _FIELDS:
             val = meta.get(key, "") or ""
             self._set_field_value(key, val, block_signals=True)
         self._refresh_raw_kie_panel(doc.get("annotation"))
         self._resize_fields_soon()
-
-        for candidate in [doc.get("output_path"), doc.get("ocr_path"), doc.get("pdf_path")]:
-            if candidate and os.path.exists(candidate):
-                self.pdf_viewer.load_pdf(candidate)
-                if json_path:
-                    self.pdf_viewer.load_canonical(json_path)
-                else:
-                    self.pdf_viewer.clear_field_overlays()
-                return
-        self.pdf_viewer.clear()
 
     def _on_viewer_dirty_changed(self, dirty: bool):
         idx = self._current_doc_idx

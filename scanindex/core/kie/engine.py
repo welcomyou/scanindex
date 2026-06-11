@@ -183,7 +183,7 @@ def warmup_layoutlmv3(log_cb: Optional[Callable[[str], None]] = None) -> bool:
             sess_opts = ort.SessionOptions()
             # EXTENDED keeps the graph portable across CPUs while avoiding the
             # oversubscription that ORT defaults can trigger on hybrid cores.
-            default_threads = max(1, (os.cpu_count() or 4) // 2)
+            default_threads = min(2, max(1, (os.cpu_count() or 4) // 2))
             try:
                 threads = int(os.environ.get("LAYOUTLMV3_ONNX_THREADS", default_threads))
             except (TypeError, ValueError):
@@ -253,7 +253,7 @@ def warmup_layoutlmv3_visual(log_cb: Optional[Callable[[str], None]] = None) -> 
 
             log_cb(f"Loading LayoutLMv3 visual ONNX int8 ({os.path.basename(onnx_path)})...")
             sess_opts = ort.SessionOptions()
-            default_threads = max(1, min(10, (os.cpu_count() or 4) // 2))
+            default_threads = min(2, max(1, (os.cpu_count() or 4) // 2))
             raw_threads = (
                 os.environ.get("LAYOUTLMV3_VISUAL_ONNX_THREADS")
                 or os.environ.get("LAYOUTLMV3_ONNX_THREADS")
@@ -306,50 +306,95 @@ def warmup_layoutlmv3_visual(log_cb: Optional[Callable[[str], None]] = None) -> 
             return False
 
 
-def _bio_tags_to_field_instances(tags_per_word: list[str], words_per_page: list[list[dict]],
-                                   page_index_offset: int = 0) -> list[dict]:
+def _bio_tags_to_field_instances(
+    tags_per_word: list[list[str]],
+    words_per_page: list[list[dict]],
+    confidence_per_word: list[list[float]] | None = None,
+    margin_per_word: list[list[float]] | None = None,
+    page_index_offset: int = 0,
+    filter_details: list[dict] | None = None,
+) -> list[dict]:
     """Group consecutive B-/I- tags into field instances per page."""
     instances: list[dict] = []
     field_counter = 0
     for page_idx, (word_tags, page_words) in enumerate(zip(tags_per_word, words_per_page)):
+        page_conf = confidence_per_word[page_idx] if confidence_per_word and page_idx < len(confidence_per_word) else []
+        page_margin = margin_per_word[page_idx] if margin_per_word and page_idx < len(margin_per_word) else []
         current_label: str | None = None
         current_words: list[dict] = []
-        for tag, w in zip(word_tags, page_words):
+        current_conf: list[float] = []
+        current_margin: list[float] = []
+
+        def flush_current() -> None:
+            nonlocal current_label, current_words, current_conf, current_margin, field_counter
+            if current_label and current_words:
+                field_counter += 1
+                instance = _build_instance(
+                    field_counter,
+                    current_label,
+                    page_idx + page_index_offset,
+                    current_words,
+                    current_conf,
+                    current_margin,
+                )
+                reject_reason = _layoutlmv3_reject_instance_reason(instance)
+                if reject_reason:
+                    if filter_details is not None:
+                        filter_details.append(
+                            {
+                                "label": instance.get("label"),
+                                "page_index": instance.get("page_index"),
+                                "action": "drop_low_confidence_runtime_span",
+                                "reason": reject_reason,
+                                "confidence": instance.get("confidence"),
+                                "confidence_margin": instance.get("confidence_margin"),
+                                "text": instance.get("text"),
+                            }
+                        )
+                else:
+                    instances.append(instance)
+            current_label = None
+            current_words = []
+            current_conf = []
+            current_margin = []
+
+        for word_idx, (tag, w) in enumerate(zip(word_tags, page_words)):
+            conf = float(page_conf[word_idx]) if word_idx < len(page_conf) else 0.0
+            margin = float(page_margin[word_idx]) if word_idx < len(page_margin) else 0.0
             if tag == "O" or not tag:
-                if current_label and current_words:
-                    field_counter += 1
-                    instances.append(_build_instance(field_counter, current_label,
-                                                     page_idx + page_index_offset, current_words))
-                current_label = None
-                current_words = []
+                flush_current()
                 continue
             if tag.startswith("B-"):
-                if current_label and current_words:
-                    field_counter += 1
-                    instances.append(_build_instance(field_counter, current_label,
-                                                     page_idx + page_index_offset, current_words))
+                flush_current()
                 current_label = tag[2:]
                 current_words = [w]
+                current_conf = [conf]
+                current_margin = [margin]
             elif tag.startswith("I-"):
                 lbl = tag[2:]
                 if current_label == lbl:
                     current_words.append(w)
+                    current_conf.append(conf)
+                    current_margin.append(margin)
                 else:
                     # Treat orphan I- as B-
-                    if current_label and current_words:
-                        field_counter += 1
-                        instances.append(_build_instance(field_counter, current_label,
-                                                         page_idx + page_index_offset, current_words))
+                    flush_current()
                     current_label = lbl
                     current_words = [w]
-        if current_label and current_words:
-            field_counter += 1
-            instances.append(_build_instance(field_counter, current_label,
-                                             page_idx + page_index_offset, current_words))
+                    current_conf = [conf]
+                    current_margin = [margin]
+        flush_current()
     return instances
 
 
-def _build_instance(field_idx: int, label: str, page_index: int, words: list[dict]) -> dict:
+def _build_instance(
+    field_idx: int,
+    label: str,
+    page_index: int,
+    words: list[dict],
+    confidences: list[float] | None = None,
+    margins: list[float] | None = None,
+) -> dict:
     words = _ordered_words_for_reading(words)
     word_ids = [w.get("id") or w.get("word_id") for w in words]
     line_ids = []
@@ -365,7 +410,7 @@ def _build_instance(field_idx: int, label: str, page_index: int, words: list[dic
         line_ids.append(line_id)
     bbox = _merge_bboxes([_word_bbox(w) for w in words])
     text = _text_from_ordered_words(words)
-    return {
+    instance = {
         "field_id": f"f{field_idx}",
         "label": label,
         "page_index": page_index,
@@ -374,6 +419,59 @@ def _build_instance(field_idx: int, label: str, page_index: int, words: list[dic
         "bbox": bbox,
         "text": text,
     }
+    clean_conf = [float(v) for v in (confidences or [])]
+    clean_margin = [float(v) for v in (margins or [])]
+    if clean_conf:
+        instance["confidence"] = sum(clean_conf) / len(clean_conf)
+    if clean_margin:
+        instance["confidence_margin"] = sum(clean_margin) / len(clean_margin)
+    return instance
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _config_float(cfg: dict, key: str, default: float) -> float:
+    try:
+        return float(cfg.get(key, default))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _layoutlmv3_doc_subject_thresholds() -> tuple[float, float]:
+    cfg = _llmv3.cfg or {}
+    min_conf = _env_float(
+        "LAYOUTLMV3_DOC_SUBJECT_MIN_CONFIDENCE",
+        _config_float(cfg, "doc_subject_min_confidence", 0.50),
+    )
+    min_margin = _env_float(
+        "LAYOUTLMV3_DOC_SUBJECT_MIN_MARGIN",
+        _config_float(cfg, "doc_subject_min_margin", 0.10),
+    )
+    return min_conf, min_margin
+
+
+def _layoutlmv3_reject_instance_reason(instance: dict) -> str | None:
+    if instance.get("label") != "DOC_SUBJECT":
+        return None
+    min_conf, min_margin = _layoutlmv3_doc_subject_thresholds()
+    confidence = instance.get("confidence")
+    margin = instance.get("confidence_margin")
+    try:
+        if confidence is not None and float(confidence) < min_conf:
+            return f"confidence_below_{min_conf:.2f}"
+    except (TypeError, ValueError):
+        pass
+    try:
+        if margin is not None and float(margin) < min_margin:
+            return f"margin_below_{min_margin:.2f}"
+    except (TypeError, ValueError):
+        pass
+    return None
 
 
 def _line_number_from_id(line_id: object) -> int | None:
@@ -479,27 +577,49 @@ def _run_layoutlmv3(canonical_json_path: str,
     pages = canonical.get("pages", [])
     page_filter = _resolve_selected_pages(canonical, selected_pages)
     tags_per_page: list[list[str]] = []
+    confidence_per_page: list[list[float]] = []
+    margin_per_page: list[list[float]] = []
     words_per_page: list[list[dict]] = []
+    empty_selected_pages: list[int] = []
 
     for pi, page in enumerate(pages):
         words = page.get("words") or []
         words_per_page.append(words)
         if pi not in page_filter:
             tags_per_page.append(["O"] * len(words))
+            confidence_per_page.append([0.0] * len(words))
+            margin_per_page.append([0.0] * len(words))
             continue
         if not words:
-            raise RuntimeError(f"LayoutLMv3 selected page {pi} has no OCR words.")
+            empty_selected_pages.append(pi)
+            tags_per_page.append([])
+            confidence_per_page.append([])
+            margin_per_page.append([])
+            continue
         line_lookup = {}
         for ln in page.get("lines") or []:
             lid = ln.get("id") or ln.get("line_id")
             if lid:
                 line_lookup[str(lid)] = ln
-        tags = _layoutlmv3_predict_page(page, words, line_lookup)
+        tags, confidences, margins = _layoutlmv3_predict_page(page, words, line_lookup)
         if len(tags) != len(words):
             tags = (tags + ["O"] * len(words))[:len(words)]
+        if len(confidences) != len(words):
+            confidences = (confidences + [0.0] * len(words))[:len(words)]
+        if len(margins) != len(words):
+            margins = (margins + [0.0] * len(words))[:len(words)]
         tags_per_page.append(tags)
+        confidence_per_page.append(confidences)
+        margin_per_page.append(margins)
 
-    instances = _bio_tags_to_field_instances(tags_per_page, words_per_page)
+    runtime_filter_details: list[dict] = []
+    instances = _bio_tags_to_field_instances(
+        tags_per_page,
+        words_per_page,
+        confidence_per_word=confidence_per_page,
+        margin_per_word=margin_per_page,
+        filter_details=runtime_filter_details,
+    )
     payload = {
         "schema": "kie_vi_official_v3",
         "source": "layoutlmv3",
@@ -507,13 +627,22 @@ def _run_layoutlmv3(canonical_json_path: str,
         "field_instances": instances,
         "relations": [],
     }
+    postprocess_details: dict[str, object] = {}
+    if runtime_filter_details:
+        postprocess_details["layoutlmv3_runtime_thresholds"] = runtime_filter_details
+    if empty_selected_pages:
+        postprocess_details["layoutlmv3_empty_selected_pages"] = empty_selected_pages
+    if postprocess_details:
+        payload["postprocess"] = postprocess_details
     from scanindex.core.kie.postprocess import apply_layoutlmv3_schema_postprocess
     return apply_layoutlmv3_schema_postprocess(canonical, payload)
 
 
 def _layoutlmv3_predict_page(page: dict, words: list[dict],
-                              line_lookup: dict | None = None) -> list[str]:
-    """Run LayoutLMv3 token classification on one page; return per-word BIO tag.
+                              line_lookup: dict | None = None) -> tuple[list[str], list[float], list[float]]:
+    """Run LayoutLMv3 token classification on one page.
+
+    Returns per-word BIO tags, field confidence, and field margin.
 
     The fontgray-trained variant requires `token_type_ids` (style emphasis
     flag per token, 0 or 1, derived from page-relative font_size, fg_gray,
@@ -567,10 +696,9 @@ def _layoutlmv3_predict_page(page: dict, words: list[dict],
     expected_inputs = {ip.name for ip in session.get_inputs()}
     n_chunks = encoding["input_ids"].shape[0]
 
-    # Per-word vote tracking: pick the FIRST non-O tag seen for a word across
-    # chunks (training code uses similar "first-seen" logic).
-    per_word_tag: list[str] = ["O"] * len(words)
-    word_seen: set[int] = set()
+    # Match the train/evaluate decoder: collect probabilities from every
+    # subtoken/chunk hit for a word, then average before taking argmax.
+    per_word_probs: list[list[np.ndarray]] = [[] for _ in words]
 
     for chunk_idx in range(n_chunks):
         word_ids = encoding.word_ids(batch_index=chunk_idx)
@@ -590,19 +718,55 @@ def _layoutlmv3_predict_page(page: dict, words: list[dict],
             feeds["token_type_ids"] = token_type_ids
 
         outputs = session.run(None, feeds)
-        pred_ids = outputs[0][0].argmax(axis=-1).tolist()
+        logits = np.asarray(outputs[0][0], dtype="float32")
+        logits = logits - np.max(logits, axis=-1, keepdims=True)
+        probs = np.exp(logits)
+        probs = probs / np.clip(np.sum(probs, axis=-1, keepdims=True), 1e-12, None)
 
-        # First non-O wins per word across chunks; if all O, last write keeps O
         for tok_idx, w_idx in enumerate(word_ids):
             if w_idx is None:
                 continue
-            if w_idx in word_seen and per_word_tag[w_idx] != "O":
-                continue  # already have a meaningful tag for this word
-            label_idx = pred_ids[tok_idx]
-            if 0 <= label_idx < len(label_list) and 0 <= w_idx < len(per_word_tag):
-                per_word_tag[w_idx] = label_list[label_idx]
-                word_seen.add(w_idx)
-    return per_word_tag
+            if 0 <= w_idx < len(per_word_probs):
+                per_word_probs[w_idx].append(probs[tok_idx])
+
+    per_word_tag: list[str] = []
+    per_word_confidence: list[float] = []
+    per_word_margin: list[float] = []
+    for parts in per_word_probs:
+        if not parts or not label_list:
+            per_word_tag.append("O")
+            per_word_confidence.append(0.0)
+            per_word_margin.append(0.0)
+            continue
+
+        mean_prob = np.mean(np.stack(parts, axis=0), axis=0)
+        pred_id = int(np.argmax(mean_prob))
+        label = label_list[pred_id] if 0 <= pred_id < len(label_list) else "O"
+        field_probs = _layoutlmv3_field_probabilities(mean_prob, label_list)
+        field = _field_from_bio_label(label)
+        field_conf = float(field_probs.get(field, float(mean_prob[pred_id])))
+        other_best = max((value for key, value in field_probs.items() if key != field), default=0.0)
+
+        per_word_tag.append(label)
+        per_word_confidence.append(field_conf)
+        per_word_margin.append(field_conf - float(other_best))
+    return per_word_tag, per_word_confidence, per_word_margin
+
+
+def _field_from_bio_label(label: str) -> str:
+    if label.startswith(("B-", "I-")):
+        return label[2:]
+    return "O"
+
+
+def _layoutlmv3_field_probabilities(probs, label_list: list[str]) -> dict[str, float]:
+    field_probs: dict[str, float] = {}
+    for idx, label in enumerate(label_list):
+        if idx >= len(probs):
+            break
+        field = _field_from_bio_label(str(label))
+        field_probs[field] = field_probs.get(field, 0.0) + float(probs[idx])
+    return field_probs
 
 
 def _word_style_type_ids(words: list[dict], line_lookup: dict) -> list[int]:

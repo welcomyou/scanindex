@@ -196,6 +196,10 @@ class ArchiveContainer(QWidget):
     def set_documents(self, docs, default_status="Pending"):
         self._step2.set_documents(docs, default_status=default_status)
     def update_doc_status(self, i, s): self._step2.update_doc_status(i, s)
+    def show_preprocess_progress(self, total): self._step2.show_preprocess_progress(total)
+    def update_preprocess_progress(self, done=None, total=None, current_file=None, status=None):
+        self._step2.update_preprocess_progress(done, total, current_file, status)
+    def hide_preprocess_progress(self): self._step2.hide_preprocess_progress()
     def get_documents(self): return self._step2.get_documents()
     def refresh_current_doc(self): self._step2.refresh_current_doc()
     def update_texts(self):

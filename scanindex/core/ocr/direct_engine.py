@@ -92,7 +92,7 @@ _init_lock = threading.Lock()
 # Page-level pool: N processes, each loads ONE ScreenAI DLL. Pool size
 # = number of OCR pages that can run concurrently across the whole app
 # (regardless of how many input files are being processed).
-_NUM_PAGE_WORKERS = _env_int("DIRECT_OCR_NUM_PAGE_WORKERS", 4)
+_NUM_PAGE_WORKERS = _env_int("DIRECT_OCR_NUM_PAGE_WORKERS", 2)
 # Legacy env vars kept for backwards compat — they map to the new model:
 #   total_workers = NUM_PROCESSES * NUM_DLL_PER_PROCESS
 _LEGACY_NUM_PROCESSES = os.environ.get("DIRECT_OCR_NUM_PROCESSES")
@@ -1672,6 +1672,47 @@ def assemble_pdf_from_page_results(input_path, output_path, all_page_results,
         import traceback
         traceback.print_exc()
         return False, str(e)
+
+
+def assemble_pdf_from_page_results_payload(payload_path: str):
+    """Worker-process entry point for Step 2 assembly.
+
+    The assembly path can spend minutes in PyMuPDF/text-layer operations and
+    may hold the GIL long enough to starve Qt if it runs in the GUI process.
+    Passing only a pickle path keeps ProcessPool argument pickling small.
+    """
+    import pickle
+    import time
+
+    t0 = time.perf_counter()
+    try:
+        with open(payload_path, "rb") as fh:
+            payload = pickle.load(fh)
+        ok, msg = assemble_pdf_from_page_results(
+            payload["input_path"],
+            payload["output_path"],
+            payload["page_results"],
+            source_document_path=payload.get("source_document_path"),
+            source_page_indices=payload.get("source_page_indices"),
+            preprocess_rotations=payload.get("preprocess_rotations"),
+            update_callback=None,
+            canonical_profile=payload.get("canonical_profile"),
+            include_layout_analysis=bool(payload.get("include_layout_analysis", True)),
+        )
+        return {
+            "ok": bool(ok),
+            "msg": msg,
+            "elapsed_s": time.perf_counter() - t0,
+            "output_path": payload.get("output_path"),
+        }
+    except BaseException as exc:
+        import traceback
+        return {
+            "ok": False,
+            "msg": f"{exc}\n{traceback.format_exc()}",
+            "elapsed_s": time.perf_counter() - t0,
+            "output_path": "",
+        }
 
 
 def _process_pages_serial(input_path, doc_in, total_pages, log):

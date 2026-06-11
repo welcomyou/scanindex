@@ -205,7 +205,6 @@ Copy-DirIfExists "dictionaries" "dictionaries" "dictionaries"
 
 Copy-ScreenAiRuntime
 Copy-DirIfExists "models\orientation" "models\orientation" "orientation ONNX"
-Copy-DirIfExists "models\uvdoc" "models\uvdoc" "UVDoc dewarp ONNX"
 Copy-DirIfExists "models\gmft_onnx" "models\gmft_onnx" "GMFT table ONNX"
 Copy-DirIfExists "models\docling_tableformer_v1_stepcache_onnx" "models\docling_tableformer_v1_stepcache_onnx" "Docling TableFormer v1 step-cache ONNX"
 Copy-DirIfExists "models\doclayout_yolo_onnx_dynamic" "models\doclayout_yolo_onnx_dynamic" "DocLayout-YOLO dynamic ONNX"

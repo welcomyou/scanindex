@@ -17,10 +17,13 @@ from __future__ import annotations
 
 import json
 import os
+import pickle
 import shutil
 import threading
 import time
 import traceback
+import tempfile
+import concurrent.futures
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
@@ -32,6 +35,9 @@ from scanindex.core.pipeline.batch_pipeline import (
     EVENT_KIE_START, EVENT_KIE_DONE, EVENT_FILE_FAILED, EVENT_PAGE_DONE,
     EVENT_FILE_QUEUED,
 )
+
+EVENT_FILE_PREPROCESS_START = "file_preprocess_start"
+EVENT_FILE_PREPROCESS_DONE = "file_preprocess_done"
 
 
 @dataclass
@@ -245,6 +251,17 @@ def _same_path(left: str | None, right: str | None) -> bool:
     return os.path.normcase(os.path.abspath(left)) == os.path.normcase(os.path.abspath(right))
 
 
+def _bounded_env_int(name: str, default: int, min_value: int = 1, max_value: int | None = None) -> int:
+    try:
+        value = int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        value = int(default)
+    value = max(min_value, value)
+    if max_value is not None:
+        value = min(max_value, value)
+    return value
+
+
 def _is_step1_handoff(spec: FileSpec) -> bool:
     if getattr(spec, "from_step1", False):
         return True
@@ -288,6 +305,7 @@ class ArchiveRunner:
         self._results_lock = threading.Lock()
         self._pipeline: Optional[BatchPipeline] = None
         self._done_event = threading.Event()
+        self._assemble_executor: concurrent.futures.ProcessPoolExecutor | None = None
         # file_id -> {page_idx: page_dict} pre-OCR cache supplied by caller.
         # Looked up by `ocr_submit` to avoid re-OCRing pages Step 1 already did.
         self._pre_ocr_cache: dict[str, object] = {}
@@ -316,13 +334,114 @@ class ArchiveRunner:
     def cancel(self) -> None:
         if self._pipeline is not None:
             self._pipeline.cancel()
+        self._shutdown_assemble_executor(wait=False)
 
     # ── workers ─────────────────────────────────────────────────────
+
+    def _get_assemble_executor(self) -> concurrent.futures.ProcessPoolExecutor:
+        if self._assemble_executor is not None:
+            return self._assemble_executor
+        from scanindex.infra.mp_safety import (
+            patch_multiprocessing_spawn_sys_path,
+            sanitized_sys_path_for_spawn,
+        )
+
+        patch_multiprocessing_spawn_sys_path()
+        with sanitized_sys_path_for_spawn():
+            self._assemble_executor = concurrent.futures.ProcessPoolExecutor(
+                max_workers=1,
+            )
+        return self._assemble_executor
+
+    def _shutdown_assemble_executor(self, *, wait: bool) -> None:
+        executor = self._assemble_executor
+        self._assemble_executor = None
+        if executor is None:
+            return
+        try:
+            executor.shutdown(wait=wait, cancel_futures=True)
+        except Exception:
+            pass
+
+    def _assemble_pdf_from_page_results_isolated(self, task: FileTask) -> tuple[bool, str | None]:
+        """Run PDF/text-layer assembly in a child process to keep Qt responsive."""
+        if (
+            os.environ.get("OCRTOOL_STEP2_ASSEMBLE_PROCESS", "1").strip().lower() in {"0", "false", "no", "off"}
+            or not os.path.exists(task.input_path)
+        ):
+            return direct_ocr_engine.assemble_pdf_from_page_results(
+                task.input_path, task.output_pdf_path,
+                task.page_results,
+                source_document_path=task.source_document_path or task.input_path,
+                source_page_indices=getattr(task, "source_page_indices", None),
+                preprocess_rotations=getattr(task, "preprocess_rotations", None),
+                update_callback=lambda m, lvl="info": self.log(m),
+                canonical_profile="layoutlmv3_runtime",
+                include_layout_analysis=False,
+            )
+
+        payload = {
+            "input_path": task.input_path,
+            "output_path": task.output_pdf_path,
+            "page_results": task.page_results,
+            "source_document_path": task.source_document_path or task.input_path,
+            "source_page_indices": getattr(task, "source_page_indices", None),
+            "preprocess_rotations": getattr(task, "preprocess_rotations", None),
+            "canonical_profile": "layoutlmv3_runtime",
+            "include_layout_analysis": False,
+        }
+        fd, payload_path = tempfile.mkstemp(
+            prefix=f"scanindex_assemble_{os.path.splitext(task.file_id)[0][:24]}_",
+            suffix=".pkl",
+            dir=self.output_dir,
+        )
+        os.close(fd)
+        try:
+            t0 = time.perf_counter()
+            with open(payload_path, "wb") as fh:
+                pickle.dump(payload, fh, protocol=pickle.HIGHEST_PROTOCOL)
+            pickle_dt = time.perf_counter() - t0
+            if pickle_dt >= 1.0:
+                self.log(f"[{task.file_id}] assemble payload serialized in {pickle_dt:.1f}s")
+            try:
+                future = self._get_assemble_executor().submit(
+                    direct_ocr_engine.assemble_pdf_from_page_results_payload,
+                    payload_path,
+                )
+                result = future.result()
+            except BaseException as exc:
+                self.log(
+                    f"[{task.file_id}] isolated assemble failed ({exc}); "
+                    "falling back to in-process assemble"
+                )
+                return direct_ocr_engine.assemble_pdf_from_page_results(
+                    task.input_path, task.output_pdf_path,
+                    task.page_results,
+                    source_document_path=task.source_document_path or task.input_path,
+                    source_page_indices=getattr(task, "source_page_indices", None),
+                    preprocess_rotations=getattr(task, "preprocess_rotations", None),
+                    update_callback=lambda m, lvl="info": self.log(m),
+                    canonical_profile="layoutlmv3_runtime",
+                    include_layout_analysis=False,
+                )
+            ok = bool(result.get("ok"))
+            msg = result.get("msg")
+            if ok:
+                elapsed = float(result.get("elapsed_s") or 0.0)
+                self.log(f"Assembled (cached OCR): {task.output_pdf_path} ({elapsed:.1f}s, isolated)")
+                return True, None
+            return False, str(msg or "isolated assembly failed")
+        finally:
+            try:
+                os.remove(payload_path)
+            except OSError:
+                pass
 
     def _run(self) -> None:
         try:
             self._run_inner()
         finally:
+            self._shutdown_assemble_executor(wait=False)
             self._done_event.set()
             self.on_event("pipeline_done", {})
 
@@ -333,6 +452,14 @@ class ArchiveRunner:
                 if f.lower().endswith(".pdf"):
                     pdfs.append(os.path.join(root, f))
         return pdfs
+
+    def _emit_file_event(self, evt: str, file_id: str, **payload) -> None:
+        data = {"file_id": file_id}
+        data.update(payload)
+        try:
+            self.on_event(evt, data)
+        except Exception:
+            pass
 
     def _run_inner(self) -> None:
         from scanindex.core.pdf.utils import create_corrected_pdf
@@ -410,14 +537,24 @@ class ArchiveRunner:
             else:
                 pre_pdf = _unique_preprocessed_pdf_path(self.output_dir, stem)
                 self.log(f"[{file_id}] Preprocess geometry before OCR...")
-                pre_result = preprocessing.pre_process_pdf(
-                    original_input_path,
-                    pre_pdf,
-                    update_callback=lambda m, lvl="info", fid=file_id: self.log(f"[{fid}] {m}"),
-                    debug_mode=False,
-                    max_workers=max(1, min(4, os.cpu_count() or 4)),
-                    return_metadata=True,
+                self._emit_file_event(EVENT_FILE_PREPROCESS_START, file_id)
+                preprocess_workers = _bounded_env_int(
+                    "OCRTOOL_STEP2_PREPROCESS_WORKERS",
+                    2,
+                    min_value=1,
+                    max_value=max(1, os.cpu_count() or 2),
                 )
+                try:
+                    pre_result = preprocessing.pre_process_pdf(
+                        original_input_path,
+                        pre_pdf,
+                        update_callback=lambda m, lvl="info", fid=file_id: self.log(f"[{fid}] {m}"),
+                        debug_mode=False,
+                        max_workers=preprocess_workers,
+                        return_metadata=True,
+                    )
+                finally:
+                    self._emit_file_event(EVENT_FILE_PREPROCESS_DONE, file_id)
                 if isinstance(pre_result, tuple) and len(pre_result) == 3:
                     pre_ok, pre_msg, pre_meta = pre_result
                 else:
@@ -498,8 +635,13 @@ class ArchiveRunner:
             return correction_engine.correct_text(raw) if raw.strip() else raw
 
         def run_kie(task: FileTask) -> dict:
-            # Assemble the OCR PDF + canonical JSON BEFORE running KIE
+            # Persist the complete in-memory OCR results before KIE. This is
+            # assembly only; KIE must never trigger a full-document OCR pass.
             try:
+                self.log(
+                    f"[{task.file_id}] KIE input: saving completed OCR results "
+                    f"to {task.output_json_path}"
+                )
                 self._assemble_outputs(task)
             except Exception as e:
                 self.log(f"[{task.file_id}] assemble failed: {e}")
@@ -550,6 +692,11 @@ class ArchiveRunner:
             run_kie=run_kie,
             on_event=on_pipeline_event,
             log_cb=self.log,
+            max_in_flight_pages=_bounded_env_int(
+                "OCRTOOL_STEP2_MAX_IN_FLIGHT_PAGES",
+                4,
+                min_value=1,
+            ),
         )
         for task in tasks:
             self._pipeline.add_file(task)
@@ -579,11 +726,10 @@ class ArchiveRunner:
     def _assemble_outputs(self, task: FileTask) -> None:
         """Build `_ocr.pdf` + canonical JSON for this file.
 
-        When every page is already in `task.page_results`, assemble directly
-        from that OCR layer. If page results are missing for non-digital files,
-        run the normal OCR+assemble path. Digital files must not use the
-        native-only path here because page 0 needs native+OCR merging and later
-        signer pages need the visual OCR layer."""
+        This method runs immediately before KIE and therefore only assembles
+        the complete OCR page cache produced by the pipeline. It must not
+        silently run OCR again when a page result is missing.
+        """
         have_all_pages = (
             task.num_pages > 0
             and len(task.page_results) >= task.num_pages
@@ -601,33 +747,20 @@ class ArchiveRunner:
         if failed_pages:
             pages = ", ".join(str(i + 1) for i in failed_pages)
             raise RuntimeError(f"OCR page result missing/failed for page(s): {pages}")
-        if task.is_digital and not have_all_pages:
-            raise RuntimeError("digital PDF requires complete page OCR results for native/OCR layer merge")
-        if have_all_pages:
-            ok, msg = direct_ocr_engine.assemble_pdf_from_page_results(
-                task.input_path, task.output_pdf_path,
-                task.page_results,
-                source_document_path=task.source_document_path or task.input_path,
-                source_page_indices=getattr(task, "source_page_indices", None),
-                preprocess_rotations=getattr(task, "preprocess_rotations", None),
-                update_callback=lambda m, lvl="info": self.log(m),
-                canonical_profile="layoutlmv3_runtime",
-                include_layout_analysis=False,
+        if not have_all_pages:
+            missing_pages = [
+                str(i + 1) for i in range(max(0, int(task.num_pages or 0)))
+                if i not in task.page_results
+            ]
+            missing = ", ".join(missing_pages) or "unknown"
+            raise RuntimeError(
+                "complete OCR page cache required before KIE; "
+                f"missing page(s): {missing}. Full-document OCR retry is disabled."
             )
-        else:
-            ok, msg = direct_ocr_engine.process_pdf(
-                task.input_path, task.output_pdf_path,
-                num_pages=task.num_pages,
-                update_callback=lambda m, lvl="info": self.log(m),
-                wait_per_page=1.0, comparison_interval=1.0,
-                source_document_path=task.source_document_path or task.input_path,
-                allow_page_parallel=True,
-                preprocess_rotations=getattr(task, "preprocess_rotations", None),
-                canonical_profile="layoutlmv3_runtime",
-                include_layout_analysis=False,
-            )
+
+        ok, msg = self._assemble_pdf_from_page_results_isolated(task)
         if not ok:
-            raise RuntimeError(f"process_pdf failed: {msg}")
+            raise RuntimeError(f"OCR result assembly failed: {msg}")
         if task.is_digital and task.num_pages > 0:
             try:
                 # Keep the visible output as the original digital PDF, but feed
@@ -719,8 +852,8 @@ class ArchiveRunner:
             return False
 
         self.log(
-            f"[{task.file_id}] KIE clean signer page: OCR page "
-            f"{signer_page + 1} with annots=False"
+            f"[{task.file_id}] KIE clean signer page only: OCR page "
+            f"{signer_page + 1} with annots=False; full-document OCR is reused"
         )
         clean_result = direct_ocr_engine.ocr_one_page(
             task.input_path,

@@ -154,7 +154,6 @@ Tổng hợp ở Collection [welcomyou/scanindex](https://huggingface.co/collect
 | [welcomyou/gmft-tatr-onnx](https://huggingface.co/welcomyou/gmft-tatr-onnx) | Bảng — TATR detection + structure | active |
 | [welcomyou/docling-tableformer-v1-onnx-stepcache](https://huggingface.co/welcomyou/docling-tableformer-v1-onnx-stepcache) | Bảng — Docling TableFormer (stepcache) | active |
 | [welcomyou/scanindex-models](https://huggingface.co/welcomyou/scanindex-models) | Bundle nhỏ: PaddleOCR orientation classifier | active |
-| [welcomyou/scanindex-models/uvdoc](https://huggingface.co/welcomyou/scanindex-models/tree/main/uvdoc) | UVDoc dewarp ONNX FP32 | active |
 | [ScanIndex ***REMOVED***](https://github.com/welcomyou/scanindex/releases/tag/***REMOVED***) | ***REMOVED*** EN↔VI bootstrap, pin SHA256 archive + từng file | active |
 | [welcomyou/e5-small-vn-archive-mix50](https://huggingface.co/welcomyou/e5-small-vn-archive-mix50) | Multilingual E5 embedder (semantic search) | **dormant** — code search đã chuyển sang Tantivy + SQLite, model giữ trên HF cho lần revive |
 | `BAAI/bge-reranker-v2-m3` (upstream) | Cross-encoder rerank cho semantic search | **dormant** — không wire trong UI hiện tại |

@@ -140,10 +140,6 @@ class SettingsTab(QWidget):
 
         card.content_layout().addLayout(form)
 
-        self.chk_uvdoc_dewarp = QCheckBox("UVDoc - chinh meo/cong anh chup")
-        self.chk_uvdoc_dewarp.setChecked(True)
-        card.content_layout().addWidget(self.chk_uvdoc_dewarp)
-
         # Hint box
         hint_frame = QFrame()
         hint_frame.setProperty("cssClass", "hint-box")
@@ -536,8 +532,7 @@ class SettingsTab(QWidget):
                    doc_types: list[str] | None = None,
                    catalogs: dict | None = None,
                    theme: str = "dark",
-                   translate_vi: bool = False,
-                   uvdoc_dewarp: bool = True):
+                   translate_vi: bool = False):
         self._wait_page_value = wait_page
         self._compare_value = compare_int
         self.entry_concurrency.setText(concurrency)
@@ -549,7 +544,6 @@ class SettingsTab(QWidget):
         self.combo_model.blockSignals(False)
         self.chk_correct_enabled.setChecked(bool(correct))
         self.chk_translate_vi.setChecked(bool(translate_vi))
-        self.chk_uvdoc_dewarp.setChecked(bool(uvdoc_dewarp))
         self.chk_verbose.setChecked(verbose)
         self.chk_show_log_panel.setChecked(show_log_panel)
         # Map config key → display index
@@ -584,7 +578,6 @@ class SettingsTab(QWidget):
             "model": self.combo_model.currentText(),
             "correct": self.chk_correct_enabled.isChecked(),
             "translate_vi": self.chk_translate_vi.isChecked(),
-            "uvdoc_dewarp": self.chk_uvdoc_dewarp.isChecked(),
             "verbose": self.chk_verbose.isChecked(),
             "show_log_panel": self.chk_show_log_panel.isChecked(),
             "kie_mode": kie_mode,
@@ -606,7 +599,6 @@ class SettingsTab(QWidget):
         self.btn_save.setText(translations.get_text("btn_save_settings"))
         self.chk_correct_enabled.setText(translations.get_text("chk_correct_enabled"))
         self.chk_translate_vi.setText(translations.get_text("chk_translate_vi"))
-        self.chk_uvdoc_dewarp.setText("UVDoc - chinh meo/cong anh chup")
         self.chk_show_log_panel.setText(translations.get_text("chk_show_log_panel"))
         self.chk_verbose.setText(translations.get_text("chk_verbose_log"))
         self.lbl_desc.setText(translations.get_text("lbl_settings_desc"))

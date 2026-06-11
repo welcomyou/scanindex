@@ -85,7 +85,6 @@ def per_file_pre_workers(parallel_files: int) -> int:
 def _run_preprocess_and_ocr(input_path, output_path, num_pages, parallel_files,
                              update_callback, debug_mode, wait_per_page,
                              comparison_interval, source_document_path,
-                             uvdoc_enabled=True,
                              ocr_log_callback=None):
     """Shared helper: preprocess (with thread cap + rotation metadata) then OCR.
 
@@ -107,7 +106,6 @@ def _run_preprocess_and_ocr(input_path, output_path, num_pages, parallel_files,
         debug_mode=debug_mode,
         max_workers=pre_workers,
         return_metadata=True,
-        uvdoc_enabled=uvdoc_enabled,
     )
 
     if isinstance(pre_result, tuple) and len(pre_result) == 3:
@@ -155,7 +153,7 @@ def _source_page_count(source_path: str) -> int:
 
 def _run_source_to_ocr_pdf(input_path, output_path, num_pages, parallel_files,
                            update_callback, debug_mode, wait_per_page,
-                           comparison_interval, uvdoc_enabled=True,
+                           comparison_interval,
                            ocr_log_callback=None):
     """Normalize supported inputs to PDF, then run the existing OCR pipeline."""
     if is_image_path(input_path):
@@ -173,7 +171,6 @@ def _run_source_to_ocr_pdf(input_path, output_path, num_pages, parallel_files,
                 wait_per_page=wait_per_page,
                 comparison_interval=comparison_interval,
                 source_document_path=temp_pdf,
-                uvdoc_enabled=uvdoc_enabled,
                 ocr_log_callback=ocr_log_callback,
             )
 
@@ -187,7 +184,6 @@ def _run_source_to_ocr_pdf(input_path, output_path, num_pages, parallel_files,
         wait_per_page=wait_per_page,
         comparison_interval=comparison_interval,
         source_document_path=input_path,
-        uvdoc_enabled=uvdoc_enabled,
         ocr_log_callback=ocr_log_callback,
     )
 
@@ -312,6 +308,8 @@ class MainWindow(QMainWindow):
         self.spinner_chars = ["\u280b", "\u2819", "\u2839", "\u2838", "\u283c", "\u2834",
                               "\u2826", "\u2827", "\u2807", "\u280f"]
         self.spinner_idx = 0
+        self._ui_watchdog_last_tick = time.perf_counter()
+        self._ui_watchdog_last_report = 0.0
 
         # Parallel OCR at file level. Each file uses ~4 internal ScreenAI workers.
         self.max_parallel_ocr_files = max(1, (os.cpu_count() or 4) // SCREEN_AI_WORKERS_PER_FILE)
@@ -354,6 +352,7 @@ class MainWindow(QMainWindow):
         self._spinner_timer.setInterval(80)
         self._spinner_timer.timeout.connect(self._animate_status)
         self._spinner_timer.start()
+        self._start_ui_watchdog()
 
         # --- Register model loaders (no eager load — lazy per-screen) ---
         # ModelManager tracks which groups are loaded; loaders fire on first
@@ -1034,7 +1033,6 @@ class MainWindow(QMainWindow):
             "model": "", "gpu": "CPU", "verbose": True,
             "correct": True, "export": True,
             "translate_vi": False,
-            "uvdoc_dewarp": True,
             "show_log_panel": True,
             "kie_mode": None,
             "doc_types": doc_type_defaults,
@@ -1070,7 +1068,6 @@ class MainWindow(QMainWindow):
                     # setting ignored so stale settings.ini cannot disable it.
                     self._saved["export"] = True
                     self._saved["translate_vi"] = self.config["OCR"].getboolean("TranslateVietnamese", False)
-                    self._saved["uvdoc_dewarp"] = self.config["OCR"].getboolean("UvdocDewarpEnabled", True)
                     self._saved["verbose"] = self.config["OCR"].getboolean("VerboseLog", True)
                     self._saved["show_log_panel"] = self.config["OCR"].getboolean("ShowLogPanel", True)
 
@@ -1123,8 +1120,6 @@ class MainWindow(QMainWindow):
                 self.log(get_text("msg_settings_loaded", settings_path))
             except Exception as e:
                 self.log(f"Failed to load settings: {e}", LOG_ERROR)
-        os.environ["OCRTOOL_UVDOC_DEWARP"] = "1" if bool(self._saved.get("uvdoc_dewarp", True)) else "0"
-
     def _apply_settings_to_ui(self):
         s = self._saved
         model_name = s["model"]
@@ -1148,7 +1143,6 @@ class MainWindow(QMainWindow):
             catalogs=s.get("catalogs"),
             theme=s.get("theme", ACTIVE_THEME),
             translate_vi=s.get("translate_vi", False),
-            uvdoc_dewarp=s.get("uvdoc_dewarp", True),
         )
 
         # Sync the visible PDF→Word toolbar checkbox with the persisted value.
@@ -1192,14 +1186,11 @@ class MainWindow(QMainWindow):
             "CorrectEnabled": str(bool(vals.get("correct", True))),
             "ExportEnabled": "True",
             "TranslateVietnamese": str(bool(vals.get("translate_vi", False))),
-            "UvdocDewarpEnabled": str(bool(vals.get("uvdoc_dewarp", True))),
             "VerboseLog": str(vals["verbose"]),
             "ShowLogPanel": str(vals["show_log_panel"]),
         }
         self._saved["correct"] = bool(vals.get("correct", True))
         self._saved["translate_vi"] = bool(vals.get("translate_vi", False))
-        self._saved["uvdoc_dewarp"] = bool(vals.get("uvdoc_dewarp", True))
-        os.environ["OCRTOOL_UVDOC_DEWARP"] = "1" if self._saved["uvdoc_dewarp"] else "0"
         self.config["Correction"] = {
             "Model": vals["model"],
             "Acceleration": "CPU",
@@ -1357,6 +1348,38 @@ class MainWindow(QMainWindow):
     def _on_log_message(self, msg, level):
         if hasattr(self, 'log_panel'):
             self.log_panel.append_log(msg, level)
+
+    def _start_ui_watchdog(self):
+        self._ui_watchdog_timer = QTimer(self)
+        self._ui_watchdog_timer.setInterval(250)
+        self._ui_watchdog_timer.timeout.connect(self._tick_ui_watchdog)
+        self._ui_watchdog_timer.start()
+
+    def _tick_ui_watchdog(self):
+        now = time.perf_counter()
+        elapsed_ms = (now - self._ui_watchdog_last_tick) * 1000.0
+        self._ui_watchdog_last_tick = now
+        if elapsed_ms < 850.0:
+            return
+        if now - self._ui_watchdog_last_report < 4.0:
+            return
+        self._ui_watchdog_last_report = now
+        docs = getattr(self, "_arc_documents", []) or []
+        active = []
+        for doc in docs:
+            status = str(doc.get("status") or "")
+            if status and status not in ("Pending", "Done", "Failed", "Corrected", "OCR Done"):
+                active.append(status)
+        summary = ", ".join(active[:6])
+        if len(active) > 6:
+            summary += f", +{len(active) - 6}"
+        if not summary:
+            summary = "none"
+        self.log(
+            f"[UI] event loop stall {elapsed_ms:.0f} ms "
+            f"(processing={self.is_processing}, archive_active={summary})",
+            LOG_DEBUG,
+        )
 
     # ================================================================
     # MODEL INIT
@@ -1641,6 +1664,26 @@ class MainWindow(QMainWindow):
         if list_type == "archive":
             docs = getattr(self, '_arc_documents', [])
             # Special keys driven from the worker thread:
+            if key == "_preprocess_progress":
+                try:
+                    data = json.loads(value or "{}")
+                except Exception:
+                    data = {}
+                action = data.get("action")
+                if action == "show":
+                    self.archive_tab.show_preprocess_progress(
+                        data.get("total", len(docs))
+                    )
+                elif action == "update":
+                    self.archive_tab.update_preprocess_progress(
+                        done=data.get("done"),
+                        total=data.get("total"),
+                        current_file=data.get("current_file"),
+                        status=data.get("status"),
+                    )
+                elif action == "hide":
+                    self.archive_tab.hide_preprocess_progress()
+                return
             if key == "_progress":
                 try:
                     cur, total = (int(p) for p in (value or "0/1").split("/"))
@@ -1658,6 +1701,22 @@ class MainWindow(QMainWindow):
                                 self.archive_tab)
                 cur = getattr(step2, "_current_doc_idx", -1)
                 if cur == idx:
+                    doc = docs[idx] if 0 <= idx < len(docs) else {}
+                    viewer = getattr(step2, "pdf_viewer", None)
+                    current_pdf = os.path.abspath(getattr(viewer, "_pdf_path", "") or "")
+                    desired_pdf = ""
+                    for candidate in (doc.get("output_path"), doc.get("ocr_path"), doc.get("pdf_path")):
+                        if candidate and os.path.exists(candidate):
+                            desired_pdf = os.path.abspath(candidate)
+                            break
+                    current_json = getattr(viewer, "_canonical_path", None) if viewer is not None else None
+                    desired_json = doc.get("json_path") or ""
+                    if (
+                        desired_pdf
+                        and current_pdf == desired_pdf
+                        and (not desired_json or current_json)
+                    ):
+                        return
                     self.archive_tab.refresh_current_doc()
                 return
             if 0 <= idx < len(docs):
@@ -1665,6 +1724,26 @@ class MainWindow(QMainWindow):
             return
         if 0 <= idx < len(self.dnd_files):
             self.dnd_files[idx][key] = value
+
+    def _arc_emit_preprocess_progress(
+        self,
+        action: str,
+        done=None,
+        total=None,
+        current_file=None,
+        status=None,
+    ):
+        payload = {
+            "action": action,
+            "done": done,
+            "total": total,
+            "current_file": current_file,
+            "status": status,
+        }
+        self.signals.cache_updated.emit(
+            "archive", 0, "_preprocess_progress",
+            json.dumps(payload, ensure_ascii=False),
+        )
 
     def update_file_cache(self, idx, key, value, list_type="dnd"):
         self.signals.cache_updated.emit(list_type, idx, key, str(value) if value else "")
@@ -1964,17 +2043,23 @@ class MainWindow(QMainWindow):
                 step2._current_doc_idx = -1
             except Exception:
                 pass
+        self.is_processing = True
         self.archive_tab.set_processing_state(True)
         self.archive_tab.set_progress(0, len(self._arc_documents))
+        self.archive_tab.show_preprocess_progress(len(self._arc_documents))
+        if self._arc_documents:
+            self._arc_documents[0]["status"] = "Preparing..."
+            self.archive_tab.update_doc_status(0, "Preparing...")
 
         # Resolve KIE mode from settings
         kie_mode = self._normalize_kie_mode_setting(self._saved.get("kie_mode"))
         self._saved["kie_mode"] = kie_mode
-        self.is_processing = True
 
-        from scanindex.core.digitization.runner import ArchiveRunner
+        from scanindex.core.digitization.runner import (
+            ArchiveRunner, EVENT_FILE_PREPROCESS_START, EVENT_FILE_PREPROCESS_DONE,
+        )
         from scanindex.core.pipeline.batch_pipeline import (
-            EVENT_PAGE_DONE, EVENT_FILE_OCR_DONE,
+            EVENT_FILE_QUEUED, EVENT_PAGE_DONE, EVENT_FILE_OCR_DONE,
             EVENT_CORRECTION_START, EVENT_CORRECTION_DONE,
             EVENT_KIE_START, EVENT_KIE_DONE,
             EVENT_FILE_COMPLETE, EVENT_FILE_FAILED, EVENT_PIPELINE_DONE,
@@ -1982,6 +2067,8 @@ class MainWindow(QMainWindow):
 
         # Counter for completed files (drives progress bar)
         self._arc_completed_count = 0
+        self._arc_preprocess_done_count = 0
+        self._arc_preprocess_done_files = set()
 
         # State machine: a row only animates while work is *actually* running
         # on it. Between stages (e.g. OCR done but correction queue is busy
@@ -1991,11 +2078,53 @@ class MainWindow(QMainWindow):
         def on_event(evt, payload):
             file_id = payload.get("file_id") if isinstance(payload, dict) else None
             if file_id is not None:
+                total_preprocess = len(self._arc_documents)
+                if evt == EVENT_FILE_PREPROCESS_START:
+                    self._arc_emit_preprocess_progress(
+                        "update",
+                        done=getattr(self, "_arc_preprocess_done_count", 0),
+                        total=total_preprocess,
+                        current_file=file_id,
+                        status="Đang tiền xử lý PDF trước OCR/KIE...",
+                    )
+                elif evt == EVENT_FILE_PREPROCESS_DONE:
+                    done_files = getattr(self, "_arc_preprocess_done_files", set())
+                    if file_id not in done_files:
+                        done_files.add(file_id)
+                        self._arc_preprocess_done_files = done_files
+                        self._arc_preprocess_done_count = min(
+                            total_preprocess,
+                            getattr(self, "_arc_preprocess_done_count", 0) + 1,
+                        )
+                    done_count = getattr(self, "_arc_preprocess_done_count", 0)
+                    status = (
+                        "Preprocess xong. Đang chuyển sang OCR/KIE..."
+                        if done_count >= total_preprocess
+                        else "Đã preprocess xong, chuẩn bị file tiếp theo..."
+                    )
+                    self._arc_emit_preprocess_progress(
+                        "update",
+                        done=done_count,
+                        total=total_preprocess,
+                        current_file=file_id,
+                        status=status,
+                    )
+                elif evt == EVENT_FILE_QUEUED:
+                    self._arc_emit_preprocess_progress("hide")
                 for i, doc in enumerate(self._arc_documents):
                     if os.path.basename(doc["path"]) != file_id:
                         continue
                     changed = False
-                    if evt == EVENT_PAGE_DONE:
+                    if evt == EVENT_FILE_PREPROCESS_START:
+                        doc["status"] = "Preprocess..."
+                        changed = True
+                    elif evt == EVENT_FILE_PREPROCESS_DONE:
+                        doc["status"] = "Pending"
+                        changed = True
+                    elif evt == EVENT_FILE_QUEUED:
+                        doc["status"] = "OCR..."
+                        changed = True
+                    elif evt == EVENT_PAGE_DONE:
                         # First completed page = at least one of this file's
                         # pages was actually running on a worker. Light up the
                         # row. Subsequent PAGE_DONE events are no-ops here.
@@ -2027,6 +2156,9 @@ class MainWindow(QMainWindow):
                             doc["selected_pages"] = getattr(task, "selected_pages", None)
                             doc["signature_page"] = getattr(task, "signature_page", None)
                             doc["page_selection"] = getattr(task, "page_selection", {})
+                            ann = getattr(task, "kie_annotation", None)
+                            if ann:
+                                doc["annotation"] = ann
                         # Brief lull before FILE_COMPLETE — gray
                         doc["status"] = "Pending"
                         changed = True
@@ -2051,6 +2183,7 @@ class MainWindow(QMainWindow):
                         self.signals.status_updated.emit("archive", i, doc["status"])
                     break
             if evt == EVENT_PIPELINE_DONE:
+                self._arc_emit_preprocess_progress("hide")
                 try:
                     self.archive_tab.session.clear_ocr_cache()
                 except Exception:
@@ -2077,7 +2210,7 @@ class MainWindow(QMainWindow):
         the runner. Cancels any in-flight previous run first."""
         from scanindex.core.digitization.runner import ArchiveRunner, FileSpec
         from scanindex.core.pipeline.batch_pipeline import (
-            EVENT_PAGE_DONE, EVENT_FILE_OCR_DONE,
+            EVENT_FILE_QUEUED, EVENT_PAGE_DONE, EVENT_FILE_OCR_DONE,
             EVENT_CORRECTION_START, EVENT_CORRECTION_DONE,
             EVENT_KIE_START, EVENT_KIE_DONE,
             EVENT_FILE_COMPLETE, EVENT_FILE_FAILED, EVENT_PIPELINE_DONE,
@@ -2152,7 +2285,10 @@ class MainWindow(QMainWindow):
                     if os.path.basename(doc["path"]) != file_id:
                         continue
                     changed = False
-                    if evt == EVENT_PAGE_DONE:
+                    if evt == EVENT_FILE_QUEUED:
+                        doc["status"] = "OCR..."
+                        changed = True
+                    elif evt == EVENT_PAGE_DONE:
                         pd = doc.get("_pages_done", 0) + 1
                         doc["_pages_done"] = pd
                         if pd == 1 and doc.get("status") == "Pending":
@@ -2179,6 +2315,8 @@ class MainWindow(QMainWindow):
                             # not visible / not on first split page),
                             # promote KIE's signal so the row goes red.
                             ann = getattr(task, "kie_annotation", None) or {}
+                            if ann:
+                                doc["annotation"] = ann
                             for f in ann.get("field_instances", []) or []:
                                 if (f.get("label") == "SECRECY_MARK"
                                         and (f.get("text") or "").strip()):
@@ -2605,6 +2743,12 @@ class MainWindow(QMainWindow):
             self.log("Stopping requested... waiting for current processes to finish.", LOG_ERROR)
             if self.pipeline:
                 self.pipeline.stop()
+            runner = getattr(self, "_archive_runner", None)
+            if runner is not None:
+                try:
+                    runner.cancel()
+                except Exception:
+                    pass
             self.stop_event.set()
 
     @Slot()
@@ -2644,7 +2788,6 @@ class MainWindow(QMainWindow):
             "do_metadata": False,
             "do_export": True,
             "force_rerun": False,
-            "uvdoc_dewarp": bool(vals.get("uvdoc_dewarp", True)),
         }
 
         pipeline_items = []
@@ -2772,7 +2915,6 @@ class MainWindow(QMainWindow):
                     debug_mode=self.settings_tab.chk_verbose.isChecked(),
                     wait_per_page=cfg_wait_page,
                     comparison_interval=cfg_wait_int,
-                    uvdoc_enabled=bool(vals.get("uvdoc_dewarp", True)),
                 )
 
             future = self.ocr_executor.submit(_ocr_work)
@@ -3073,7 +3215,6 @@ class ProcessingPipeline:
             debug_mode=self.app.settings_tab.chk_verbose.isChecked(),
             wait_per_page=self.config["wait_page"],
             comparison_interval=self.config["wait_int"],
-            uvdoc_enabled=bool(self.config.get("uvdoc_dewarp", True)),
             ocr_log_callback=_log_cb,
         )
         dt = time.time() - t0

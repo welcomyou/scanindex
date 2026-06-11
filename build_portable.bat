@@ -85,7 +85,6 @@ if "%MODE%"=="1" (
     echo [FULL] Checking offline runtime assets...
     call :check_dir "models\screen_ai" "ScreenAI models"
     call :check_dir "models\orientation" "Orientation ONNX"
-    call :check_dir "models\uvdoc" "UVDoc dewarp ONNX"
     call :check_dir "models\doclayout_yolo_onnx_dynamic" "DocLayout-YOLO dynamic ONNX"
     call :check_dir "models\doclayout_yolo_doclaynet_onnx_dynamic" "DocLayout-YOLO DocLayNet auxiliary ONNX"
     call :check_dir "models\lightgbm_splitter" "Archive page splitter"

@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 from typing import Optional
 
 import fitz
@@ -707,6 +708,8 @@ class KieArchiveViewer(QWidget):
     field_clicked = Signal(str)              # field_id (when user clicks a word in non-edit mode)
     fuzzy_match_picked = Signal(str, list)    # text, bbox_pdf
     dirty_changed = Signal(bool)
+    _prefetch_ready = Signal(str, float, int, int, object)
+    _page_rendered = Signal(object)
 
     RENDER_DPI = 150
     # Match Step 1's strategy: keep a high-quality base raster and scale the
@@ -734,6 +737,7 @@ class KieArchiveViewer(QWidget):
         # appears instantly instead of blocking on fitz re-render.
         self._pixmap_cache: dict[tuple, QPixmap] = {}
         self._pixmap_cache_max = 24  # cap to avoid unbounded growth
+        self._prefetch_submitted: set[tuple] = set()
 
         # Lazy viewport rendering state — page widgets start as empty
         # placeholders sized to the PDF page; pixmaps are filled in only
@@ -743,7 +747,14 @@ class KieArchiveViewer(QWidget):
         self._render_queued: set = set()       # page indices in queue or rendered
         self._render_active = False             # single-slot render guard
         self._render_gen = 0                    # bump on file load to invalidate
+        self._render_threads_lock = threading.Lock()
+        self._active_render_threads: set[threading.Thread] = set()
         self._scroll_debounce_pending = False
+        self._page_offsets: list[int] = []
+        self._render_tick_delay_ms = 35
+        self._overlay_bboxes_by_page: dict[int, list] = {}
+        self._overlay_selected_words_by_page: dict[int, list] = {}
+        self._overlay_icons_by_page: dict[int, list] = {}
 
         # Undo/redo stacks — store (field_id, word_ids, line_ids, text) snapshots
         # of the active field's word selection. Cleared on file load / field swap.
@@ -752,6 +763,8 @@ class KieArchiveViewer(QWidget):
         self._UNDO_LIMIT = 50
 
         self._build_ui()
+        self._prefetch_ready.connect(self._on_prefetch_ready)
+        self._page_rendered.connect(self._on_page_rendered)
         # Wire Ctrl+Z / Ctrl+Y shortcuts on the viewer
         QShortcut(QKeySequence("Ctrl+Z"), self, self._undo)
         QShortcut(QKeySequence("Ctrl+Y"), self, self._redo)
@@ -774,17 +787,11 @@ class KieArchiveViewer(QWidget):
         h.setContentsMargins(6, 0, 6, 0)
         h.setSpacing(4)
 
-        self._btn_prev = self._mini_btn("◀")
-        self._btn_prev.clicked.connect(self.prev_file_requested.emit)
-        h.addWidget(self._btn_prev)
-        self._lbl_file = QLabel("")
-        self._lbl_file.setStyleSheet(f"color: {COLOR_TEXT_MUTED}; font-size: 11px;")
-        self._lbl_file.setMinimumWidth(80)
-        self._lbl_file.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        h.addWidget(self._lbl_file)
-        self._btn_next = self._mini_btn("▶")
-        self._btn_next.clicked.connect(self.next_file_requested.emit)
-        h.addWidget(self._btn_next)
+        self._lbl_page = QLabel("")
+        self._lbl_page.setStyleSheet(f"color: {COLOR_TEXT_MUTED}; font-size: 11px;")
+        self._lbl_page.setMinimumWidth(80)
+        self._lbl_page.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        h.addWidget(self._lbl_page)
 
         h.addSpacing(8)
         self._btn_zoom_out = self._mini_btn("−")
@@ -907,7 +914,14 @@ class KieArchiveViewer(QWidget):
 
     def load_pdf(self, pdf_path: str):
         self._close_doc()
-        self._pixmap_cache.clear()
+        self._scroll_to_first_page()
+        self._canonical = None
+        self._canonical_path = None
+        self._active_field_id = None
+        self._last_dirty_resolution = None
+        self._overlay_bboxes_by_page = {}
+        self._overlay_selected_words_by_page = {}
+        self._overlay_icons_by_page = {}
         # Wipe undo/redo when switching files — stacks are scoped per active
         # field and the per-file canonical changes underneath us.
         self._undo_stack.clear()
@@ -942,16 +956,31 @@ class KieArchiveViewer(QWidget):
                 self._canonical = None
         self._apply_word_data_to_pages()
 
+    def load_canonical_data(self, canonical_json_path: str, canonical: dict):
+        """Attach a canonical document that was already loaded by the caller.
+
+        Step 2 uses this fast path after parsing the `.json.zst` off the UI
+        thread, so row selection can show the first PDF page immediately.
+        """
+        self._canonical_path = canonical_json_path
+        self._canonical = canonical if isinstance(canonical, dict) else None
+        self._last_dirty_resolution = None
+        self._apply_word_data_to_pages()
+
     def clear(self):
         self._close_doc()
         self._canonical = None
         self._canonical_path = None
         self._pixmap_cache.clear()
+        self._prefetch_submitted.clear()
         self._render_queue.clear()
         self._render_queued.clear()
         self._active_field_id = None
         self._dirty = False
         self._last_dirty_resolution = None
+        self._overlay_bboxes_by_page = {}
+        self._overlay_selected_words_by_page = {}
+        self._overlay_icons_by_page = {}
         self.dirty_changed.emit(False)
         self._btn_save.setEnabled(False)
         self._clear_pages()
@@ -976,6 +1005,8 @@ class KieArchiveViewer(QWidget):
                 w.setParent(None)
                 w.deleteLater()
         self._page_widgets = []
+        self._page_offsets = []
+        self._update_page_label()
 
     def _show_message(self, text: str):
         self._clear_pages()
@@ -983,6 +1014,69 @@ class KieArchiveViewer(QWidget):
         lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lbl.setStyleSheet(f"color: {COLOR_TEXT_MUTED}; padding: 40px;")
         self._inner_layout.insertWidget(0, lbl)
+
+    def prefetch_pdf_first_page(self, pdf_path: str, page_idx: int = 0, rotation: int = 0):
+        """Warm the first-page pixmap cache for a likely next file.
+
+        This mirrors the standalone KIE viewer's adjacent-file prefetch: fitz
+        rendering runs in a daemon thread, then the UI thread stores the
+        resulting QPixmap in the normal cache.
+        """
+        if not pdf_path or not os.path.exists(pdf_path):
+            return
+        source_scale = self.SOURCE_RENDER_SCALE
+        rotation = int(rotation or 0) % 360
+        cache_key = (pdf_path, round(source_scale, 4), int(page_idx), rotation)
+        if cache_key in self._pixmap_cache or cache_key in self._prefetch_submitted:
+            return
+        self._prefetch_submitted.add(cache_key)
+
+        def _worker():
+            try:
+                doc = fitz.open(pdf_path)
+                if 0 <= page_idx < doc.page_count:
+                    page = doc[int(page_idx)]
+                    mat = fitz.Matrix(source_scale, source_scale)
+                    pix = page.get_pixmap(matrix=mat, annots=True)
+                    img = QImage(
+                        pix.samples, pix.width, pix.height, pix.stride,
+                        QImage.Format.Format_RGB888,
+                    ).copy()
+                    self._prefetch_ready.emit(
+                        pdf_path, float(source_scale), int(page_idx), rotation, img
+                    )
+                doc.close()
+            except Exception:
+                self._prefetch_ready.emit(
+                    pdf_path, float(source_scale), int(page_idx), rotation, None
+                )
+
+        threading.Thread(
+            target=_worker,
+            daemon=True,
+            name=f"step2-pdf-prefetch-{os.path.basename(pdf_path)[-24:]}",
+        ).start()
+
+    def _on_prefetch_ready(
+        self,
+        pdf_path: str,
+        source_scale: float,
+        page_idx: int,
+        rotation: int,
+        image,
+    ):
+        cache_key = (pdf_path, round(float(source_scale), 4), int(page_idx), int(rotation) % 360)
+        try:
+            if image is not None:
+                pm = QPixmap.fromImage(image)
+                if rotation:
+                    pm = pm.transformed(
+                        QTransform().rotate(rotation),
+                        Qt.TransformationMode.SmoothTransformation,
+                    )
+                self._cache_pixmap(cache_key, pm)
+        finally:
+            self._prefetch_submitted.discard(cache_key)
 
     def _render_pages(self):
         """Lay out PLACEHOLDER widgets for every page in the document, sized
@@ -994,7 +1088,6 @@ class KieArchiveViewer(QWidget):
         ~5s (render every page) into ~50ms (compute placeholder sizes)."""
         if not self._doc:
             return
-        self._clear_pages()
         # New render generation invalidates any in-flight tick from the
         # previously-loaded file
         self._render_gen += 1
@@ -1004,47 +1097,66 @@ class KieArchiveViewer(QWidget):
 
         my_gen = self._render_gen
         scale = self.RENDER_DPI / 72.0 * self._zoom
+        priority_idx = 0
 
-        for pi in range(self._doc.page_count):
-            page = self._doc[pi]
-            page_w_pts = page.rect.width
-            page_h_pts = page.rect.height
-            # If preprocessing rotated the source image 90/270° before OCR,
-            # the OCR bbox frame is also rotated — swap w/h here so the
-            # placeholder reserves the right slot AND _bbox_to_rect operates
-            # in the rotated frame.
-            rotation = self._get_page_rotation(pi)
-            if rotation in (90, 270):
-                page_w_pts, page_h_pts = page_h_pts, page_w_pts
-            ph_w = int(round(page_w_pts * scale))
-            ph_h = int(round(page_h_pts * scale))
+        self._inner.setUpdatesEnabled(False)
+        try:
+            self._clear_pages()
+            margins = self._inner_layout.contentsMargins()
+            spacing = max(0, self._inner_layout.spacing())
+            next_top = int(margins.top())
+            for pi in range(self._doc.page_count):
+                page = self._doc[pi]
+                page_w_pts = page.rect.width
+                page_h_pts = page.rect.height
+                # If preprocessing rotated the source image 90/270° before OCR,
+                # the OCR bbox frame is also rotated — swap w/h here so the
+                # placeholder reserves the right slot AND _bbox_to_rect operates
+                # in the rotated frame.
+                rotation = self._get_page_rotation(pi)
+                if rotation in (90, 270):
+                    page_w_pts, page_h_pts = page_h_pts, page_w_pts
+                ph_w = int(round(page_w_pts * scale))
+                ph_h = int(round(page_h_pts * scale))
+                self._page_offsets.append(next_top)
+                next_top += ph_h + spacing
 
-            pw = _PdfPageWidget(pi, parent=self._inner)
-            pw.set_pan_scroll_area(self._scroll)
-            pw.setFixedSize(ph_w, ph_h)
-            # Placeholder visual — pale background so user knows space is reserved
-            pw.setStyleSheet(
-                f"background: {COLOR_SURFACE};"
-                f" border: 1px solid {COLOR_BORDER};"
-            )
-            # Important: still record pdf dims + scale so _bbox_to_rect works
-            # before the pixmap arrives (no overlays drawn until pixmap loaded
-            # but the storage is correct).
-            pw.pdf_width = page_w_pts
-            pw.pdf_height = page_h_pts
-            pw.render_scale = scale
-            pw.applied_rotation = rotation
-            pw.bbox_origin_bottom_left = self._page_uses_bottom_left_coords(pi)
+                pw = _PdfPageWidget(pi, parent=self._inner)
+                pw.set_pan_scroll_area(self._scroll)
+                pw.setFixedSize(ph_w, ph_h)
+                # Placeholder visual — pale background so user knows space is reserved
+                pw.setStyleSheet(
+                    f"background: {COLOR_SURFACE};"
+                    f" border: 1px solid {COLOR_BORDER};"
+                )
+                # Important: still record pdf dims + scale so _bbox_to_rect works
+                # before the pixmap arrives (no overlays drawn until pixmap loaded
+                # but the storage is correct).
+                pw.pdf_width = page_w_pts
+                pw.pdf_height = page_h_pts
+                pw.render_scale = scale
+                pw.applied_rotation = rotation
+                pw.bbox_origin_bottom_left = self._page_uses_bottom_left_coords(pi)
 
-            pw.set_edit_mode(self._edit_mode)
-            pw.word_selection_changed.connect(self._on_word_selection_changed)
-            pw.bbox_clicked_non_edit.connect(self._on_bbox_clicked_non_edit)
-            pw.bbox_right_clicked.connect(self._on_bbox_right_clicked)
-            pw.page_right_clicked.connect(self._on_page_right_clicked)
-            pw.empty_clicked.connect(self._on_empty_clicked)
-            pw.fuzzy_clicked.connect(self._on_fuzzy_clicked)
-            self._inner_layout.insertWidget(pi, pw, 0, Qt.AlignmentFlag.AlignHCenter)
-            self._page_widgets.append(pw)
+                pw.set_edit_mode(self._edit_mode)
+                pw.word_selection_changed.connect(self._on_word_selection_changed)
+                pw.bbox_clicked_non_edit.connect(self._on_bbox_clicked_non_edit)
+                pw.bbox_right_clicked.connect(self._on_bbox_right_clicked)
+                pw.page_right_clicked.connect(self._on_page_right_clicked)
+                pw.empty_clicked.connect(self._on_empty_clicked)
+                pw.fuzzy_clicked.connect(self._on_fuzzy_clicked)
+                self._inner_layout.insertWidget(pi, pw, 0, Qt.AlignmentFlag.AlignHCenter)
+                self._page_widgets.append(pw)
+
+            # Prefer an already-prefetched page, but do not render via fitz on
+            # the GUI thread. A cache miss is queued below and materialised by
+            # a worker, keeping row-click navigation responsive.
+            if self._page_widgets:
+                if not self._try_fill_page_from_cache(priority_idx, evict_far=False):
+                    self._render_queue.appendleft(priority_idx)
+                    self._render_queued.add(priority_idx)
+        finally:
+            self._inner.setUpdatesEnabled(True)
 
         # Hook scroll observer once. Connecting twice would fire twice per
         # scroll tick, but disconnecting on a never-connected signal raises
@@ -1053,13 +1165,18 @@ class KieArchiveViewer(QWidget):
             self._scroll.verticalScrollBar().valueChanged.connect(self._on_scroll)
             self._scroll_observer_wired = True
 
+        self._scroll_to_first_page()
+
         # Apply ownership/word_rects so click hit-testing works even on
         # placeholder pages — overlays draw once the pixmap is filled.
         self._apply_word_data_to_pages()
 
         # Defer the first viewport enqueue so the layout is realised by Qt
         # before we measure widget y-positions.
+        if self._render_queue and not self._render_active:
+            QTimer.singleShot(0, lambda: self._drain_render_queue(my_gen))
         QTimer.singleShot(0, lambda: self._enqueue_viewport_pages(my_gen))
+        QTimer.singleShot(0, self._scroll_to_first_page)
 
     def _viewport_page_indices(self) -> list[int]:
         """Indices of pages whose y-range overlaps viewport (+1 viewport
@@ -1072,12 +1189,29 @@ class KieArchiveViewer(QWidget):
         top = scroll_y - buffer
         bot = scroll_y + vp_h + buffer
         hits = []
-        for pw in self._page_widgets:
-            y = pw.y()
+        for idx, pw in enumerate(self._page_widgets):
+            y = self._page_top(idx)
             h = pw.height()
             if y + h >= top and y <= bot:
                 hits.append(pw.page_index)
         return hits
+
+    def _page_top(self, page_idx: int) -> int:
+        if 0 <= page_idx < len(self._page_offsets):
+            return int(self._page_offsets[page_idx])
+        if 0 <= page_idx < len(self._page_widgets):
+            return int(self._page_widgets[page_idx].y())
+        return 0
+
+    def _recompute_page_offsets(self):
+        margins = self._inner_layout.contentsMargins()
+        spacing = max(0, self._inner_layout.spacing())
+        y = int(margins.top())
+        offsets: list[int] = []
+        for pw in self._page_widgets:
+            offsets.append(y)
+            y += int(pw.height()) + spacing
+        self._page_offsets = offsets
 
     def _enqueue_viewport_pages(self, my_gen: int):
         """Add visible pages (+ buffer) to the render queue if not already."""
@@ -1099,31 +1233,33 @@ class KieArchiveViewer(QWidget):
         """Render one queued page per tick, then re-schedule until empty."""
         if my_gen != self._render_gen:
             return
+        if self._render_active:
+            return
         if not self._render_queue:
             self._render_active = False
             return
         self._render_active = True
         page_idx = self._render_queue.popleft()
-        try:
-            self._fill_page_pixmap(page_idx)
-        except Exception:
-            pass
-        finally:
+        if self._try_fill_page_from_cache(page_idx):
             self._render_queued.discard(page_idx)
-        self._render_active = False
-        if self._render_queue:
-            QTimer.singleShot(0, lambda: self._drain_render_queue(my_gen))
+            self._render_active = False
+            if self._render_queue:
+                QTimer.singleShot(
+                    self._render_tick_delay_ms,
+                    lambda: self._drain_render_queue(my_gen),
+                )
+            return
+        self._submit_page_render(page_idx, my_gen)
 
-    def _fill_page_pixmap(self, page_idx: int):
-        """Materialise the actual pixmap for a placeholder page widget.
-        Hits the pixmap cache when possible; otherwise calls fitz."""
+    def _try_fill_page_from_cache(self, page_idx: int, *, evict_far: bool = True) -> bool:
+        """Materialise a placeholder from cache without touching fitz."""
         if not self._doc:
-            return
+            return False
         if not (0 <= page_idx < len(self._page_widgets)):
-            return
+            return False
         pw = self._page_widgets[page_idx]
         if pw.base_pixmap is not None:
-            return  # already rendered
+            return True  # already rendered
         page = self._doc[page_idx]
         display_scale = self.RENDER_DPI / 72.0 * self._zoom
         source_scale = max(self.SOURCE_RENDER_SCALE, display_scale)
@@ -1133,28 +1269,149 @@ class KieArchiveViewer(QWidget):
         cache_key = (self._pdf_path, round(source_scale, 4), page_idx, rotation)
         pm = self._pixmap_cache.get(cache_key)
         if pm is None:
-            mat = fitz.Matrix(source_scale, source_scale)
-            pix = page.get_pixmap(matrix=mat, annots=True)
-            img = QImage(pix.samples, pix.width, pix.height, pix.stride,
-                          QImage.Format.Format_RGB888)
-            pm = QPixmap.fromImage(img.copy())
-            if rotation:
-                pm = pm.transformed(
-                    QTransform().rotate(rotation),
-                    Qt.TransformationMode.SmoothTransformation,
-                )
-            self._cache_pixmap(cache_key, pm)
+            return False
+        self._apply_page_pixmap(page_idx, pm, source_scale, evict_far=evict_far)
+        return True
+
+    def _apply_page_pixmap(
+        self,
+        page_idx: int,
+        pm: QPixmap,
+        source_scale: float,
+        *,
+        evict_far: bool = True,
+    ):
+        """Install a rendered pixmap on one page widget on the GUI thread."""
+        if not self._doc or not (0 <= page_idx < len(self._page_widgets)):
+            return
+        page = self._doc[page_idx]
+        pw = self._page_widgets[page_idx]
         # PDF dims for the page-widget are the rotated frame (so overlays
         # and hit testing project against the right axes).
         w_pts, h_pts = page.rect.width, page.rect.height
+        rotation = self._get_page_rotation(page_idx)
         if rotation in (90, 270):
             w_pts, h_pts = h_pts, w_pts
+        display_scale = self.RENDER_DPI / 72.0 * self._zoom
         pw.set_page(pm, w_pts, h_pts, display_scale, source_scale=source_scale)
         # set_page wipes word_rects/ownership; re-apply this page's data
         self._apply_word_data_to_single_page(page_idx)
         # Re-apply highlights now that the pixmap is in place
-        self._refresh_active_field_highlight()
-        self._evict_far_page_pixmaps()
+        self._apply_overlay_payload_to_page(page_idx)
+        if evict_far:
+            self._evict_far_page_pixmaps()
+
+    def _submit_page_render(self, page_idx: int, my_gen: int):
+        """Render one page in a worker thread, then apply it in the UI thread."""
+        pdf_path = self._pdf_path or ""
+        if not pdf_path or not os.path.exists(pdf_path):
+            self._render_active = False
+            self._render_queued.discard(page_idx)
+            if self._render_queue:
+                QTimer.singleShot(
+                    self._render_tick_delay_ms,
+                    lambda: self._drain_render_queue(my_gen),
+                )
+            return
+        if not self._doc or not (0 <= page_idx < len(self._page_widgets)):
+            self._render_active = False
+            self._render_queued.discard(page_idx)
+            if self._render_queue:
+                QTimer.singleShot(
+                    self._render_tick_delay_ms,
+                    lambda: self._drain_render_queue(my_gen),
+                )
+            return
+        display_scale = self.RENDER_DPI / 72.0 * self._zoom
+        source_scale = max(self.SOURCE_RENDER_SCALE, display_scale)
+        rotation = self._get_page_rotation(page_idx)
+        signal = self._page_rendered
+
+        def _worker():
+            try:
+                doc = fitz.open(pdf_path)
+                try:
+                    if not (0 <= page_idx < doc.page_count):
+                        signal.emit({
+                            "kind": "error",
+                            "gen": my_gen,
+                            "pdf_path": pdf_path,
+                            "page_idx": page_idx,
+                            "error": "page out of range",
+                        })
+                        return
+                    page = doc[int(page_idx)]
+                    mat = fitz.Matrix(source_scale, source_scale)
+                    pix = page.get_pixmap(matrix=mat, annots=True, alpha=False)
+                    img = QImage(
+                        pix.samples, pix.width, pix.height, pix.stride,
+                        QImage.Format.Format_RGB888,
+                    ).copy()
+                    signal.emit({
+                        "kind": "page",
+                        "gen": my_gen,
+                        "pdf_path": pdf_path,
+                        "page_idx": page_idx,
+                        "source_scale": source_scale,
+                        "rotation": rotation,
+                        "image": img,
+                    })
+                finally:
+                    doc.close()
+            except Exception as exc:
+                signal.emit({
+                    "kind": "error",
+                    "gen": my_gen,
+                    "pdf_path": pdf_path,
+                    "page_idx": page_idx,
+                    "error": str(exc),
+                })
+            finally:
+                with self._render_threads_lock:
+                    self._active_render_threads.discard(threading.current_thread())
+
+        worker = threading.Thread(
+            target=_worker,
+            daemon=True,
+            name=f"step2-pdf-render-{os.path.basename(pdf_path)[-18:]}-{page_idx}",
+        )
+        with self._render_threads_lock:
+            self._active_render_threads.add(worker)
+        worker.start()
+
+    def _on_page_rendered(self, payload):
+        if not isinstance(payload, dict):
+            return
+        gen = int(payload.get("gen") or -1)
+        page_idx = int(payload.get("page_idx") or 0)
+        if gen != self._render_gen or payload.get("pdf_path") != self._pdf_path:
+            return
+        self._render_active = False
+        try:
+            if payload.get("kind") == "page" and payload.get("image") is not None:
+                source_scale = float(payload.get("source_scale") or self.SOURCE_RENDER_SCALE)
+                rotation = int(payload.get("rotation") or 0) % 360
+                cache_key = (
+                    self._pdf_path,
+                    round(source_scale, 4),
+                    page_idx,
+                    rotation,
+                )
+                pm = QPixmap.fromImage(payload["image"])
+                if rotation:
+                    pm = pm.transformed(
+                        QTransform().rotate(rotation),
+                        Qt.TransformationMode.SmoothTransformation,
+                    )
+                self._cache_pixmap(cache_key, pm)
+                self._apply_page_pixmap(page_idx, pm, source_scale)
+        finally:
+            self._render_queued.discard(page_idx)
+        if self._render_queue:
+            QTimer.singleShot(
+                self._render_tick_delay_ms,
+                lambda: self._drain_render_queue(gen),
+            )
 
     def _apply_word_data_to_single_page(self, page_idx: int):
         """Re-apply the canonical's word data to ONE page (used after lazy
@@ -1205,6 +1462,7 @@ class KieArchiveViewer(QWidget):
         pw.line_to_words = line_to_words
     def _on_scroll(self, _value: int):
         """Coalesce rapid scroll events; queue any newly-visible pages."""
+        self._update_page_label()
         if self._scroll_debounce_pending:
             return
         self._scroll_debounce_pending = True
@@ -1246,14 +1504,14 @@ class KieArchiveViewer(QWidget):
         viewport_top = self._scroll.verticalScrollBar().value()
         viewport_mid = viewport_top + self._scroll.viewport().height() // 2
         for i, widget in enumerate(self._page_widgets):
-            top = widget.y()
+            top = self._page_top(i)
             bottom = top + widget.height()
             if top <= viewport_mid <= bottom:
                 return i
         return min(
             range(len(self._page_widgets)),
             key=lambda i: abs(
-                self._page_widgets[i].y()
+                self._page_top(i)
                 + self._page_widgets[i].height() // 2
                 - viewport_mid
             ),
@@ -1426,13 +1684,22 @@ class KieArchiveViewer(QWidget):
             pi = int(active_field.get("page_index", 0))
             per_page_selected[pi] = list(active_field.get("word_ids") or [])
 
-        for pi, pw in enumerate(self._page_widgets):
-            pw.set_selected_field(
-                label=None,
-                highlight_bboxes=per_page.get(pi, []),
-                selected_word_ids=per_page_selected.get(pi, []),
-                field_icons=per_page_icons.get(pi, []),
-            )
+        self._overlay_bboxes_by_page = per_page
+        self._overlay_selected_words_by_page = per_page_selected
+        self._overlay_icons_by_page = per_page_icons
+        for pi in range(len(self._page_widgets)):
+            self._apply_overlay_payload_to_page(pi)
+
+    def _apply_overlay_payload_to_page(self, page_idx: int):
+        if not (0 <= page_idx < len(self._page_widgets)):
+            return
+        pw = self._page_widgets[page_idx]
+        pw.set_selected_field(
+            label=None,
+            highlight_bboxes=self._overlay_bboxes_by_page.get(page_idx, []),
+            selected_word_ids=self._overlay_selected_words_by_page.get(page_idx, []),
+            field_icons=self._overlay_icons_by_page.get(page_idx, []),
+        )
 
     # ---- legacy compat (for non-edit display path) -----------------
 
@@ -1443,6 +1710,9 @@ class KieArchiveViewer(QWidget):
         self._refresh_active_field_highlight()
 
     def clear_field_overlays(self):
+        self._overlay_bboxes_by_page = {}
+        self._overlay_selected_words_by_page = {}
+        self._overlay_icons_by_page = {}
         for pw in self._page_widgets:
             pw.set_selected_field(None, [], [])
 
@@ -1478,7 +1748,7 @@ class KieArchiveViewer(QWidget):
             return
         pw = self._page_widgets[page_idx]
         # Position of the page widget within the inner content
-        page_top = pw.y()
+        page_top = self._page_top(page_idx)
         # Convert PDF-points bbox y-mid to pixel space using current render scale
         scale = self.RENDER_DPI / 72.0 * self._zoom
         if bbox and len(bbox) >= 4:
@@ -1491,18 +1761,42 @@ class KieArchiveViewer(QWidget):
         viewport_h = self._scroll.viewport().height()
         scroll_to = max(0, target_y - viewport_h // 2)
         self._scroll.verticalScrollBar().setValue(scroll_to)
+        self._update_page_label(page_idx)
         # Also flash a transient zone marker on that bbox
         # (the persistent overlay already paints field bboxes when active)
 
     def clear_highlight(self):
         pass
 
+    def _scroll_to_first_page(self):
+        if not hasattr(self, "_scroll"):
+            return
+        self._scroll.horizontalScrollBar().setValue(0)
+        self._scroll.verticalScrollBar().setValue(0)
+        self._update_page_label(0)
+
+    def _update_page_label(self, current_idx: Optional[int] = None):
+        total = int(self._doc.page_count) if self._doc is not None else len(self._page_widgets)
+        if total <= 0:
+            self._lbl_page.setText("")
+            return
+        if current_idx is None:
+            current_idx = self._current_page_index()
+        if current_idx is None:
+            current_idx = 0
+        try:
+            idx = int(current_idx)
+        except (TypeError, ValueError):
+            idx = 0
+        idx = max(0, min(idx, total - 1))
+        self._lbl_page.setText(f"{idx + 1} / {total}")
+
     def set_file_label(self, current_idx: int, total: int):
-        self._lbl_file.setText(f"{current_idx + 1} / {total}" if total else "")
+        """Kept for older callers; Step 2 now shows page position here."""
+        self._update_page_label()
 
     def set_file_nav_enabled(self, can_prev: bool, can_next: bool):
-        self._btn_prev.setEnabled(can_prev)
-        self._btn_next.setEnabled(can_next)
+        pass
 
     def update_texts(self):
         pass
@@ -1536,12 +1830,14 @@ class KieArchiveViewer(QWidget):
                 pw._repaint()
             except Exception:
                 pw.update()
+        self._recompute_page_offsets()
         # Pixmaps not yet loaded (placeholders) need to be re-queued so they
         # render at the current display scale from the high-res source cache.
         self._render_queue.clear()
         self._render_queued.clear()
         self._evict_far_page_pixmaps()
         QTimer.singleShot(0, lambda: self._enqueue_viewport_pages(self._render_gen))
+        QTimer.singleShot(0, self._update_page_label)
 
     def _on_zoom_wheel(self, direction: int, viewport_pos: QPoint):
         """Ctrl+wheel zoom anchored at the cursor. Re-renders pages and
@@ -1621,11 +1917,12 @@ class KieArchiveViewer(QWidget):
             pass
         pw = self._page_widgets[page_idx]
         target_x = pw.x() + int(round(max(0.0, min(1.0, frac_x)) * pw.width()))
-        target_y = pw.y() + int(round(max(0.0, min(1.0, frac_y)) * pw.height()))
+        target_y = self._page_top(page_idx) + int(round(max(0.0, min(1.0, frac_y)) * pw.height()))
         hbar = self._scroll.horizontalScrollBar()
         vbar = self._scroll.verticalScrollBar()
         hbar.setValue(max(0, target_x - viewport_pos.x()))
         vbar.setValue(max(0, target_y - viewport_pos.y()))
+        self._update_page_label(page_idx)
 
     # ---- edit mode -------------------------------------------------
 

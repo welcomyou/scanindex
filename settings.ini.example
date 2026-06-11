@@ -18,9 +18,6 @@ exportenabled = True
 ; sau khi tạo {name}.docx. Dùng Google ***REMOVED*** shim trong models/translate/
 ; (~96MB asset, beam=4 default). Thêm 2-30s/file tùy độ dài.
 translatevietnamese = False
-; UvdocDewarpEnabled: True de chinh meo/cong anh chup bang UVDoc ONNX khi preprocess scan/anh.
-; Tat neu file scan phang bi model lam bien dang.
-uvdocdewarpenabled = True
 verboselog = False
 showlogpanel = True
 

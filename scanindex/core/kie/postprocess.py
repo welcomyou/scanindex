@@ -48,7 +48,7 @@ _RE_STANDALONE_DOC_TITLE = re.compile(
 )
 _RE_SIGNER_ROLE_MARKER = re.compile(r"\b(?:tm\.?|t/m|kt\.?|k/t)\b", re.IGNORECASE)
 _RE_ORG_NAME_START = re.compile(
-    r"\b(?:tieu\s+ban|van\s+phong|chi\s+bo|bch|so\s+(?:noi|tu|giao|y|xay|tai|ke|lao|cong|van|nong|du|thong|khoa)|ban\s+(?!chi\s+dao|thuong\s+vu)|dang\s+uy|hoi\s+dong|uy\s+ban)\b",
+    r"\b(?:tieu\s+ban|van\s+phong|chi\s+bo|bch|so\s+(?:noi|tu|giao|y|xay|tai|ke|lao|cong|van|nong|du|thong|khoa)|ban\s+chi\s+dao|ban\s+(?!thuong\s+vu)|dang\s+uy|hoi\s+dong|uy\s+ban)\b",
     re.IGNORECASE,
 )
 _RE_SUPERIOR_HINT = re.compile(
@@ -351,6 +351,74 @@ def _issue_org_header_candidate(
     return superior_lines, org_lines, {"right_bound_x": right_bound_x}
 
 
+def _issue_org_header_candidate_from_predictions(
+    page: dict[str, Any],
+    annotation: dict[str, Any],
+    page_index: int,
+    current_name: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]] | None:
+    """Split the left header at the first predicted ISSUE_ORG_NAME line.
+
+    Once the model has marked a line as the issuing organization, every
+    following contiguous header line must belong to ISSUE_ORG_NAME, not
+    ISSUE_ORG_SUPERIOR. This removes mixed blue/pink org headers without
+    changing the final metadata concatenation rule.
+    """
+    right_bound_x = _right_header_bound_x(page, annotation, page_index)
+    if right_bound_x is None:
+        page_w = max(float(page.get("width") or page.get("page_width") or page.get("render_width") or 1.0), 1.0)
+        right_bound_x = page_w * 0.62
+    lines = _header_candidate_lines(page, right_bound_x)
+    if not lines:
+        return None
+    _words, words_by_id = _page_word_maps(page)
+    existing_name_lines = set().union(
+        *[_line_ids_for_instance(inst, words_by_id) for inst in current_name]
+    ) if current_name else set()
+    existing_name_words = {
+        str(word_id)
+        for inst in current_name
+        for word_id in (inst.get("word_ids") or [])
+    }
+
+    split_idx = None
+    for idx, line in enumerate(lines):
+        line_words = {str(word_id) for word_id in (line.get("word_ids") or [])}
+        if line["line_id"] in existing_name_lines or (line_words & existing_name_words):
+            split_idx = idx
+            break
+
+    if split_idx is None:
+        for idx, line in enumerate(lines):
+            if idx > 0 and _RE_ORG_NAME_START.search(line["norm"]):
+                split_idx = idx
+                break
+    if split_idx is None:
+        return None
+
+    superior_lines = lines[:split_idx]
+    if len(superior_lines) > _MAX_SUPERIOR_LINES:
+        return None
+
+    org_lines: list[dict[str, Any]] = []
+    previous = None
+    for line in lines[split_idx:]:
+        if len(org_lines) >= _MAX_ORG_NAME_LINES:
+            break
+        if _is_header_stop_norm(line["norm"]):
+            break
+        if previous is not None and _has_large_header_gap(previous, line):
+            break
+        org_lines.append(line)
+        previous = line
+    if not org_lines:
+        return None
+    return superior_lines, org_lines, {
+        "right_bound_x": right_bound_x,
+        "split_source": "first_issue_org_name_line",
+    }
+
+
 def _line_ids_for_instance(inst: dict[str, Any], words_by_id: dict[str, dict[str, Any]]) -> set[str]:
     out = {str(line_id) for line_id in (inst.get("line_ids") or []) if line_id is not None}
     if out:
@@ -610,6 +678,9 @@ def _merge_instance_group(
     conf = _confidence(group)
     if conf is not None:
         merged["confidence"] = conf
+    conf_margin = _confidence_margin(group)
+    if conf_margin is not None:
+        merged["confidence_margin"] = conf_margin
     if len(group) > 1:
         merged["schema_merged"] = True
         merged["merged_field_ids"] = [inst.get("field_id") for inst in group if inst.get("field_id") is not None]
@@ -917,11 +988,18 @@ def _needs_issue_org_repair(
     if (
         existing_sup_lines == candidate_sup_lines
         and existing_name_lines == candidate_name_lines
-        and _word_coverage(existing_sup_words, candidate_sup_words) >= 0.98
-        and _word_coverage(existing_name_words, candidate_name_words) >= 0.98
+        and (
+            existing_sup_words == candidate_sup_words
+            or _word_coverage(existing_sup_words, candidate_sup_words) >= 0.98
+        )
+        and (
+            existing_name_words == candidate_name_words
+            or _word_coverage(existing_name_words, candidate_name_words) >= 0.98
+        )
     ):
         return False, []
-    if _line_coverage(existing_issue_lines, candidate_lines) < 0.80:
+    superior_crosses_name_boundary = bool(existing_sup_lines & candidate_name_lines)
+    if _line_coverage(existing_issue_lines, candidate_lines) < 0.80 and not superior_crosses_name_boundary:
         return False, []
 
     reasons: list[str] = []
@@ -935,7 +1013,7 @@ def _needs_issue_org_repair(
         reasons.append("issue_org_spans_overlap")
     if existing_name_lines & candidate_sup_lines:
         reasons.append("org_name_contains_superior_lines")
-    if existing_sup_lines & candidate_name_lines:
+    if superior_crosses_name_boundary:
         reasons.append("superior_contains_org_name_lines")
     if existing_sup_lines == candidate_sup_lines and _word_coverage(existing_sup_words, candidate_sup_words) < 0.98:
         reasons.append("superior_line_not_full")
@@ -948,16 +1026,24 @@ def _needs_issue_org_repair(
     return bool(reasons), reasons
 
 
-def _confidence(instances: list[dict[str, Any]]) -> float | None:
+def _numeric_average(instances: list[dict[str, Any]], key: str) -> float | None:
     values = []
     for inst in instances:
-        value = inst.get("confidence")
+        value = inst.get(key)
         if value is not None:
             try:
                 values.append(float(value))
             except (TypeError, ValueError):
                 pass
     return sum(values) / len(values) if values else None
+
+
+def _confidence(instances: list[dict[str, Any]]) -> float | None:
+    return _numeric_average(instances, "confidence")
+
+
+def _confidence_margin(instances: list[dict[str, Any]]) -> float | None:
+    return _numeric_average(instances, "confidence_margin")
 
 
 def _instance_from_lines(
@@ -982,6 +1068,9 @@ def _instance_from_lines(
     conf = _confidence(existing)
     if conf is not None:
         payload["confidence"] = conf
+    conf_margin = _confidence_margin(existing)
+    if conf_margin is not None:
+        payload["confidence_margin"] = conf_margin
     return payload
 
 
@@ -1313,6 +1402,125 @@ def apply_doc_subject_line_block_constraints(canonical: dict[str, Any], annotati
     return out
 
 
+def _doc_subject_locked_words_and_lines(
+    instances: list[dict[str, Any]],
+    words_by_id: dict[str, dict[str, Any]],
+    page_index: int,
+) -> tuple[set[str], set[str]]:
+    locked_words: set[str] = set()
+    locked_lines: set[str] = set()
+    for inst in instances:
+        if _instance_page_index(inst) != page_index:
+            continue
+        if inst.get("label") == "DOC_SUBJECT":
+            continue
+        for word_id in inst.get("word_ids") or []:
+            word_id = str(word_id)
+            locked_words.add(word_id)
+            word = words_by_id.get(word_id)
+            if word is not None and word.get("line_id") is not None:
+                locked_lines.add(str(word.get("line_id")))
+        locked_lines.update(_line_ids_for_instance(inst, words_by_id))
+    return locked_words, locked_lines
+
+
+def apply_doc_subject_non_overlap_constraints(canonical: dict[str, Any], annotation: dict[str, Any]) -> dict[str, Any]:
+    """Keep page-0 DOC_SUBJECT disjoint from already-decoded page-0 fields."""
+    pages = canonical.get("pages") or []
+    instances = annotation.get("field_instances") or []
+    if not pages or not instances:
+        return annotation
+
+    pages_by_index = {int(page.get("page_index", idx)): page for idx, page in enumerate(pages)}
+    page = pages_by_index.get(_PRIMARY_METADATA_PAGE)
+    if page is None:
+        return annotation
+
+    _words, words_by_id = _page_word_maps(page)
+    locked_words, locked_lines = _doc_subject_locked_words_and_lines(
+        instances,
+        words_by_id,
+        _PRIMARY_METADATA_PAGE,
+    )
+    if not locked_words and not locked_lines:
+        return annotation
+
+    changed = False
+    final_instances: list[dict[str, Any]] = []
+    details: list[dict[str, Any]] = []
+    for inst in instances:
+        if inst.get("label") != "DOC_SUBJECT" or _instance_page_index(inst) != _PRIMARY_METADATA_PAGE:
+            final_instances.append(inst)
+            continue
+
+        word_ids = [str(word_id) for word_id in (inst.get("word_ids") or [])]
+        if not word_ids:
+            line_ids = {str(line_id) for line_id in (inst.get("line_ids") or []) if line_id is not None}
+            if line_ids & locked_lines:
+                changed = True
+                details.append(
+                    {
+                        "label": "DOC_SUBJECT",
+                        "page_index": _PRIMARY_METADATA_PAGE,
+                        "action": "drop_line_overlap_with_first_page_fields",
+                        "old_text": inst.get("text"),
+                    }
+                )
+                continue
+            final_instances.append(inst)
+            continue
+
+        kept_word_ids: list[str] = []
+        removed_word_ids: list[str] = []
+        for word_id in word_ids:
+            word = words_by_id.get(word_id)
+            line_id = str(word.get("line_id")) if word is not None and word.get("line_id") is not None else None
+            if word_id in locked_words or (line_id is not None and line_id in locked_lines):
+                removed_word_ids.append(word_id)
+            else:
+                kept_word_ids.append(word_id)
+
+        if not removed_word_ids:
+            final_instances.append(inst)
+            continue
+
+        changed = True
+        rebuilt = _rebuild_instance_from_word_ids(inst, kept_word_ids, page, words_by_id)
+        if rebuilt is None:
+            details.append(
+                {
+                    "label": "DOC_SUBJECT",
+                    "page_index": _PRIMARY_METADATA_PAGE,
+                    "action": "drop_overlap_with_first_page_fields",
+                    "old_text": inst.get("text"),
+                    "removed_words": len(removed_word_ids),
+                }
+            )
+            continue
+
+        details.append(
+            {
+                "label": "DOC_SUBJECT",
+                "page_index": _PRIMARY_METADATA_PAGE,
+                "action": "trim_overlap_with_first_page_fields",
+                "old_text": inst.get("text"),
+                "new_text": rebuilt.get("text"),
+                "removed_words": len(removed_word_ids),
+            }
+        )
+        final_instances.append(rebuilt)
+
+    if not changed:
+        return annotation
+
+    out = deepcopy(annotation)
+    out["field_instances"] = _sort_field_instances(final_instances)
+    post = dict(out.get("postprocess") or {})
+    post["doc_subject_non_overlap_constraints"] = details
+    out["postprocess"] = post
+    return out
+
+
 def _line_block_text(lines: list[dict[str, Any]]) -> str:
     return " ".join(str(line.get("text") or "").strip() for line in lines if str(line.get("text") or "").strip()).strip()
 
@@ -1634,7 +1842,10 @@ def apply_issue_org_header_constraints(canonical: dict[str, Any], annotation: di
         current_name = _instances_by_label(out, "ISSUE_ORG_NAME", page_index)
         if not current_sup and not current_name:
             continue
-        candidate = _issue_org_header_candidate(page, out, page_index)
+        candidate = (
+            _issue_org_header_candidate_from_predictions(page, out, page_index, current_name)
+            or _issue_org_header_candidate(page, out, page_index)
+        )
         if candidate is None:
             continue
         superior_lines, org_lines, detail = candidate
@@ -1668,24 +1879,30 @@ def apply_issue_org_header_constraints(canonical: dict[str, Any], annotation: di
         if not need_repair:
             continue
 
-        repaired_sup = _instance_from_lines("ISSUE_ORG_SUPERIOR", superior_lines, words_by_id, page_index, current_sup)
+        repaired_sup = (
+            _instance_from_lines("ISSUE_ORG_SUPERIOR", superior_lines, words_by_id, page_index, current_sup)
+            if superior_lines else None
+        )
         repaired_name = _instance_from_lines("ISSUE_ORG_NAME", org_lines, words_by_id, page_index, current_name)
         kept = [
             inst
             for inst in out.get("field_instances", [])
             if not (int(inst.get("page_index") or 0) == page_index and inst.get("label") in _ISSUE_ORG_FIELDS)
         ]
-        kept.extend([repaired_sup, repaired_name])
+        if repaired_sup is not None:
+            kept.append(repaired_sup)
+        kept.append(repaired_name)
         out["field_instances"] = kept
         details.append(
             {
                 "page_index": page_index,
-                "reason": "issue_org_right_bound_constraint",
+                "reason": "issue_org_vertical_boundary_constraint",
                 "reasons": reasons,
                 "right_bound_x": detail.get("right_bound_x"),
+                "split_source": detail.get("split_source"),
                 "old_issue_org_superior": existing_sup_text,
                 "old_issue_org_name": existing_name_text,
-                "new_issue_org_superior": repaired_sup["text"],
+                "new_issue_org_superior": repaired_sup["text"] if repaired_sup is not None else "",
                 "new_issue_org_name": repaired_name["text"],
             }
         )
@@ -1820,8 +2037,10 @@ def apply_layoutlmv3_schema_postprocess(canonical: dict[str, Any], annotation: d
     out = apply_single_line_block_constraints(canonical, out)
     out = apply_issue_org_header_constraints(canonical, out)
     out = apply_schema_cardinality_constraints(canonical, out)
+    out = _ensure_doc_number_symbol(canonical, out)
     out = apply_doc_subject_line_block_constraints(canonical, out)
     out = apply_signer_fragment_constraints(canonical, out)
+    out = apply_doc_subject_non_overlap_constraints(canonical, out)
     out = _normalize_field_instances_reading_order(canonical, out)
     out = apply_doc_subject_text_format(out)
     out = _ensure_doc_number_symbol(canonical, out)

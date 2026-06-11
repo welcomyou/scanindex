@@ -40,6 +40,8 @@ SIGNER_FEATURES = [
 
 DEFAULT_THRESHOLD = 0.50
 DEFAULT_SIGNER_THRESHOLD = 0.39
+MIN_SIGNER_ROLE_EVIDENCE = 0.35
+MIN_SIGNER_NAME_EVIDENCE = 0.50
 
 _MODEL_LOCK = threading.Lock()
 _MODEL = None
@@ -58,6 +60,13 @@ _RE_PLACE_DATE_STRICT = re.compile(
 _RE_NOI_NHAN = re.compile(r"\bnoi\s*nhan\b", re.IGNORECASE)
 _RE_SIGNER_PREFIX = re.compile(r"\b(?:t/?m|k/?t|t/?l|tuq|q\.)\b", re.IGNORECASE)
 _RE_DIGIT = re.compile(r"\d")
+_RE_SIGNER_TEMPLATE_PLACEHOLDER = re.compile(
+    r"\bten\s+co\s+quan\s*,?\s*don\s+vi\b"
+    r"|\bthu\s+truong\s+co\s+quan\s*/\s*don\s+vi\b"
+    r"|\bthu\s+truong\s+co\s+quan\s*,\s*don\s+vi\b"
+    r"|\bky\s*(?:ten|,)\b.*\b(?:dau|dong\s+dau|ghi\s+ro\s+ho\s+ten)\b",
+    re.IGNORECASE,
+)
 
 _ORG_KEYWORDS = (
     "dang uy",
@@ -844,6 +853,27 @@ def build_signer_features(
     return features, evidence
 
 
+def signer_candidate_exclusion_reason(page: dict[str, Any], features: dict[str, float]) -> str | None:
+    lines = page_lines(page)
+    if not (page.get("words") or []) or not lines:
+        return "empty_ocr_page"
+    page_norm = norm_text("\n".join(line.get("text") or "" for line in lines))
+    if _RE_SIGNER_TEMPLATE_PLACEHOLDER.search(page_norm):
+        return "signer_template_placeholder"
+    if (
+        float(features.get("signer_role_score", 0.0)) >= MIN_SIGNER_ROLE_EVIDENCE
+        or float(features.get("signer_name_score", 0.0)) >= MIN_SIGNER_NAME_EVIDENCE
+        or float(features.get("has_tm_kt_tl_tuq_regex", 0.0)) > 0.0
+    ):
+        return None
+    if (
+        float(features.get("recipients_score", 0.0)) > 0.0
+        or float(features.get("has_noi_nhan_regex", 0.0)) > 0.0
+    ):
+        return "recipient_only_no_signer_evidence"
+    return "no_signer_evidence"
+
+
 def predict_doc_starts(
     canonical_json_path: str,
     threshold: float = DEFAULT_THRESHOLD,
@@ -927,6 +957,7 @@ def predict_signer_page(
             "page_index": page_index,
             "features": features,
             "evidence": evidence,
+            "exclude_signer_reason": signer_candidate_exclusion_reason(page, features),
         })
 
     if not rows:
@@ -941,26 +972,38 @@ def predict_signer_page(
     feature_rows = [[row["features"][name] for name in SIGNER_FEATURES] for row in rows]
     scores = model.predict_proba(feature_rows)[:, 1]
 
-    best_idx = max(range(len(rows)), key=lambda i: float(scores[i]))
-    signer_page = int(rows[best_idx]["page_index"])
+    eligible_indices = [
+        idx
+        for idx, row in enumerate(rows)
+        if not row.get("exclude_signer_reason")
+    ]
+    best_idx = (
+        max(eligible_indices, key=lambda i: float(scores[i]))
+        if eligible_indices else None
+    )
+    signer_page = int(rows[best_idx]["page_index"]) if best_idx is not None else None
     predictions = []
     for row, score in zip(rows, scores):
         page_index = int(row["page_index"])
-        predictions.append({
+        item = {
             "page_index": page_index,
             "score": round(float(score), 6),
-            "is_signer_page": page_index == signer_page,
+            "is_signer_page": signer_page is not None and page_index == signer_page,
             "passes_threshold": bool(float(score) >= threshold),
+            "eligible_for_signer_page": not bool(row.get("exclude_signer_reason")),
             "features": row["features"],
             "evidence": row["evidence"],
-        })
+        }
+        if row.get("exclude_signer_reason"):
+            item["exclude_signer_reason"] = row["exclude_signer_reason"]
+        predictions.append(item)
 
-    selected_pages = sorted({0, signer_page})
+    selected_pages = sorted({0, signer_page}) if signer_page is not None else ([0] if rows else [])
     return {
         "threshold": float(threshold),
         "model_path": _SIGNER_MODEL_PATH,
         "pages": predictions,
         "signer_page": signer_page,
-        "signer_score": round(float(scores[best_idx]), 6),
+        "signer_score": round(float(scores[best_idx]), 6) if best_idx is not None else None,
         "selected_pages": selected_pages,
     }

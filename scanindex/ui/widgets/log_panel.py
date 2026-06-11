@@ -4,7 +4,7 @@ LogPanel — Activity log display with colored text per level.
 import time
 from PySide6.QtWidgets import QTextEdit, QWidget, QVBoxLayout, QHBoxLayout, QLabel
 from PySide6.QtGui import QTextCharFormat, QColor, QFont, QTextCursor
-from PySide6.QtCore import Qt, Slot
+from PySide6.QtCore import Qt, Slot, QTimer
 
 from scanindex.ui.theme import (
     COLOR_PANEL, COLOR_TEXT, COLOR_TEXT_SECONDARY, COLOR_GREEN, COLOR_RED,
@@ -20,8 +20,13 @@ class LogPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._verbose = True
+        self._pending_logs: list[tuple[str, str]] = []
         self._setup_ui()
         self._setup_formats()
+        self._flush_timer = QTimer(self)
+        self._flush_timer.setSingleShot(True)
+        self._flush_timer.setInterval(80)
+        self._flush_timer.timeout.connect(self._flush_pending_logs)
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
@@ -54,6 +59,7 @@ class LogPanel(QWidget):
         self.text_edit.setObjectName("logPanel")
         self.text_edit.setReadOnly(True)
         self.text_edit.setFont(QFont(FONT_MONO, 10))
+        self.text_edit.document().setMaximumBlockCount(2000)
         layout.addWidget(self.text_edit)
 
     def _setup_formats(self):
@@ -86,10 +92,25 @@ class LogPanel(QWidget):
             return
 
         ts = time.strftime("[%H:%M:%S] ")
-        fmt = self._formats.get(level, self._formats[LOG_INFO])
+        self._pending_logs.append((ts + msg + "\n", level))
+        if not self._flush_timer.isActive():
+            self._flush_timer.start()
 
+    def _flush_pending_logs(self):
+        if not self._pending_logs:
+            return
+        batch = self._pending_logs[:200]
+        del self._pending_logs[:200]
         cursor = self.text_edit.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
-        cursor.insertText(ts + msg + "\n", fmt)
-        self.text_edit.setTextCursor(cursor)
+        self.text_edit.setUpdatesEnabled(False)
+        try:
+            for text, level in batch:
+                fmt = self._formats.get(level, self._formats[LOG_INFO])
+                cursor.insertText(text, fmt)
+            self.text_edit.setTextCursor(cursor)
+        finally:
+            self.text_edit.setUpdatesEnabled(True)
         self.text_edit.ensureCursorVisible()
+        if self._pending_logs:
+            self._flush_timer.start(0)

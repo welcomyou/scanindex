@@ -395,7 +395,6 @@ def _bundle_readme(standalone: List["RepoSpec"]) -> str:
 Small companion repo for [ScanIndex](https://github.com/welcomyou/scanindex). Contains:
 
 - `orientation/PP-LCNet_x1_0_doc_ori.onnx` — PaddleOCR's 4-way page-orientation classifier (Apache-2.0; tiny, redistributed for offline-install convenience)
-- `uvdoc/uvdoc_fp32.onnx` — UVDoc document dewarp model exported to ONNX FP32 (Apache-2.0)
 - `manifest.json` — list of standalone model repos that complete the runtime
 
 The actual model weights live in the standalone repos below. Download all of them at once with `scripts/download_offline_models.py` in the GitHub repo.
@@ -451,7 +450,7 @@ STANDALONE: List[RepoSpec] = [
 ]
 
 BUNDLE_REPO = f"{USER}/scanindex-models"
-BUNDLE_SOURCES = ["orientation", "uvdoc"]
+BUNDLE_SOURCES = ["orientation"]
 
 
 # NOTE: Upstream models (microsoft/layoutlmv3-base, protonx-models/distilled-protonx-legal-tc, juliozhao/DocLayout-YOLO-DocStructBench,

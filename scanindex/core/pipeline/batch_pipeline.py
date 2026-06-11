@@ -129,7 +129,8 @@ class BatchPipeline:
                  log_cb: Optional[Callable[[str], None]] = None,
                  page_timeout: float = 120.0,
                  in_flight_drain_timeout: float = 30.0,
-                 max_in_flight_pages: Optional[int] = None):
+                 max_in_flight_pages: Optional[int] = None,
+                 pause_ocr_during_kie: bool = True):
         self._ocr_submit = ocr_submit
         self._run_correction = run_correction
         self._run_kie = run_kie
@@ -137,6 +138,7 @@ class BatchPipeline:
         self._log = log_cb or (lambda m: None)
         self._page_timeout = page_timeout
         self._in_flight_drain_timeout = in_flight_drain_timeout
+        self._pause_ocr_during_kie = bool(pause_ocr_during_kie)
         if max_in_flight_pages is None:
             try:
                 max_in_flight_pages = int(os.environ.get("OCRTOOL_MAX_IN_FLIGHT_PAGES", "16"))
@@ -470,6 +472,9 @@ class BatchPipeline:
         except Exception:
             traceback.print_exc()
         t0 = time.time()
+        if self._pause_ocr_during_kie:
+            self.feeder_can_run.clear()
+            self._wait_in_flight_drain(self._in_flight_drain_timeout)
         try:
             if self._run_kie is not None:
                 task.kie_annotation = self._run_kie(task)
@@ -485,3 +490,6 @@ class BatchPipeline:
                 self._on_event(EVENT_FILE_FAILED, task, str(e))
             except Exception:
                 traceback.print_exc()
+        finally:
+            if self._pause_ocr_during_kie:
+                self.feeder_can_run.set()

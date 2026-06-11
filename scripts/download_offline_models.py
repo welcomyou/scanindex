@@ -167,18 +167,6 @@ MODELS_CONFIG = [
             'orientation/PP-LCNet_x1_0_doc_ori.onnx': '76dc02d407066728872318a19263e3aeb31c19908b37b2e439343e14b3d5c4cf',
         },
     },
-    {
-        "model_id":    'uvdoc-paddleocr-onnx',
-        "repo_id":     'welcomyou/scanindex-models',
-        "source_url":  'https://huggingface.co/welcomyou/scanindex-models/tree/8d2082f9d8921dac1e1c36ddf0ee60240ddee7f5',
-        "type":        'huggingface',
-        "sources":     ['uvdoc'],
-        "revision":    '8d2082f9d8921dac1e1c36ddf0ee60240ddee7f5',
-        "description": 'UVDoc PaddleOCR document dewarp model (ONNX FP32)',
-        "integrity_files": {
-            'uvdoc/uvdoc_fp32.onnx': '33c81ed056c950c59fcda447b117abbcd27d30fd58ac5d4620f7d050dc5c2f6f',
-        },
-    },
 ]
 # ── END MODELS_CONFIG ──
 

@@ -92,13 +92,6 @@ REPOS = [
         "local_dir": "orientation",
         "description": "PaddleOCR PP-LCNet 4-way page-orientation classifier",
     },
-    {
-        "model_id": "uvdoc-paddleocr-onnx",
-        "repo_id":  "welcomyou/scanindex-models",
-        "type":     "huggingface",
-        "local_dir": "uvdoc",
-        "description": "UVDoc PaddleOCR document dewarp model (ONNX FP32)",
-    },
 ]
 
 
