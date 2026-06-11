@@ -131,6 +131,39 @@ def _looks_like_doc_symbol_continuation_norm(norm: str) -> bool:
     return bool(_RE_DOC_SYMBOL_CONTINUATION.fullmatch(norm))
 
 
+def _looks_like_subject_stop_doc_number_norm(norm: str) -> bool:
+    """True only for a doc-number line, not content mentioning a document."""
+    norm = str(norm or "").strip()
+    if not norm:
+        return False
+    if _RE_DOC_NUMBER_PREFIX.match(norm):
+        return bool(
+            _RE_STANDALONE_DOC_NUMBER_ONLY.fullmatch(norm)
+            or _RE_STANDALONE_DOC_NUMBER_SYMBOL.fullmatch(norm)
+        )
+    if _looks_like_standalone_doc_number_norm(norm):
+        return True
+    return _looks_like_doc_symbol_continuation_norm(norm)
+
+
+def _looks_like_subject_stop_place_date_norm(norm: str) -> bool:
+    """True for header place/date lines, not dates referenced in subject text."""
+    norm = str(norm or "").strip()
+    if not norm:
+        return False
+    words = norm.split()
+    if len(words) > 12:
+        return False
+    has_date = bool(re.search(r"\bngay\s*\d{1,2}\b|\bngay\s*\d{1,2}\s*thang\b", norm, re.IGNORECASE))
+    if not has_date:
+        return False
+    if re.match(r"^\s*(?:tp\.?\s*)?(?:ho\s+chi\s+minh|ha\s+noi)\b", norm, re.IGNORECASE):
+        return True
+    if re.match(r"^\s*ngay\s*\d{1,2}\b", norm, re.IGNORECASE):
+        return True
+    return False
+
+
 def _word_id(word: dict[str, Any]) -> str | None:
     value = word.get("id") or word.get("word_id")
     return str(value) if value is not None else None
@@ -400,10 +433,19 @@ def _issue_org_header_candidate_from_predictions(
     if len(superior_lines) > _MAX_SUPERIOR_LINES:
         return None
 
+    org_line_limit = _MAX_ORG_NAME_LINES
+    if existing_name_lines:
+        contiguous_predicted = 0
+        for line in lines[split_idx:]:
+            if line["line_id"] not in existing_name_lines:
+                break
+            contiguous_predicted += 1
+        org_line_limit = max(org_line_limit, contiguous_predicted)
+
     org_lines: list[dict[str, Any]] = []
     previous = None
     for line in lines[split_idx:]:
-        if len(org_lines) >= _MAX_ORG_NAME_LINES:
+        if len(org_lines) >= org_line_limit:
             break
         if _is_header_stop_norm(line["norm"]):
             break
@@ -1137,6 +1179,11 @@ def _is_leading_subject_noise_line(line: dict[str, Any], lines: list[dict[str, A
     return False
 
 
+def _is_subject_transparent_noise_line(line: dict[str, Any]) -> bool:
+    norm = str(line.get("norm") or normalize_vn_text(line.get("text") or ""))
+    return bool(_RE_STAMP_MARK_LINE.fullmatch(norm))
+
+
 def _format_doc_subject_text(text: str) -> str:
     lines = [part.strip() for part in re.split(r"[\r\n]+", str(text or "")) if part.strip()]
     if not lines:
@@ -1205,9 +1252,18 @@ def _subject_line_allowed(line: dict[str, Any]) -> bool:
     norm = str(line.get("norm") or normalize_vn_text(text))
     if not norm:
         return False
-    if _RE_DATE.search(norm) or _RE_REGIME.search(norm):
+    if _looks_like_subject_stop_place_date_norm(norm):
+        try:
+            is_header_date = float(line.get("top", 0.0) or 0.0) < 0.22
+        except (TypeError, ValueError):
+            is_header_date = True
+        if is_header_date:
+            return False
+    if _RE_REGIME.search(norm):
         return False
     if _RE_STAMP_MARK_LINE.fullmatch(norm):
+        return False
+    if _looks_like_subject_stop_doc_number_norm(norm):
         return False
     if re.fullmatch(r"[\d\s/.-]+", norm):
         return False
@@ -1279,7 +1335,11 @@ def _subject_block_from_prediction(page: dict[str, Any], instances: list[dict[st
     for idx in selected_indices:
         has_stop_between = (
             last_idx is not None
-            and any(not _subject_line_allowed(lines[mid]) for mid in range(last_idx + 1, idx))
+            and any(
+                not _subject_line_allowed(lines[mid])
+                and not _is_subject_transparent_noise_line(lines[mid])
+                for mid in range(last_idx + 1, idx)
+            )
         )
         if current and has_stop_between:
             segments.append(current)
@@ -1317,8 +1377,6 @@ def _subject_block_from_prediction(page: dict[str, Any], instances: list[dict[st
         if not _subject_expand_allowed(seed, prev_line, page):
             break
         start -= 1
-        if end - start + 1 >= 6:
-            break
 
     while end + 1 < len(lines):
         next_line = lines[end + 1]
@@ -1330,8 +1388,6 @@ def _subject_block_from_prediction(page: dict[str, Any], instances: list[dict[st
         if not _subject_expand_allowed(seed, next_line, page):
             break
         end += 1
-        if end - start + 1 >= 6:
-            break
 
     result = [line for line in lines[start:end + 1] if _subject_line_allowed(line)]
     line_index_by_id = {str(line.get("line_id") or ""): idx for idx, line in enumerate(lines)}
@@ -1654,6 +1710,12 @@ def _single_line_block_repair_needed(
         # Keep OCR-split date blocks intact. Only repair one-line date fragments,
         # e.g. a word in the same visual date line was assigned to ADDRESSEE.
         if len(predicted_line_ids) > 1:
+            return False
+        existing_text = _text_for_instance_group(existing)
+        existing_norm = normalize_vn_text(existing_text)
+        existing_strict = bool(_RE_PLACE_DATE_STRICT.search(existing_norm))
+        existing_loose = bool(_RE_DATE.search(existing_norm) and ("ngay" in existing_norm or "thang" in existing_norm or "nam" in existing_norm))
+        if len(existing) == 1 and (existing_strict or existing_loose):
             return False
         line = line_by_id.get(next(iter(predicted_line_ids)))
         if line is None or _place_date_block_score([line], predicted_word_ids) is None:
