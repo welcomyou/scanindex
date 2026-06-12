@@ -5,14 +5,18 @@ import os
 import json
 import re
 import shutil
+import socket
+import ssl
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Optional
+from urllib.parse import urlparse
 
 from PySide6.QtCore import QPoint, QRectF, QSize, Qt, QThread, Signal
 from PySide6.QtGui import QColor, QBrush, QPainter, QPen, QPixmap, QPolygon
 from PySide6.QtWidgets import (
-    QAbstractItemView, QButtonGroup, QCheckBox, QComboBox, QFileDialog, QFrame, QGridLayout, QHBoxLayout,
+    QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox, QFileDialog, QFrame, QGridLayout, QHBoxLayout,
     QHeaderView, QLabel, QLineEdit, QInputDialog, QMessageBox, QPushButton,
     QAbstractSpinBox, QDoubleSpinBox, QRadioButton, QScrollArea, QSizePolicy, QSpinBox, QSplitter, QTableWidget,
     QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget,
@@ -65,6 +69,7 @@ _CONFIG_DIR = os.path.join(get_base_dir(), "config")
 _TEMPLATE_FILE = os.path.join(_CONFIG_DIR, "sign_templates.json")
 _SETTINGS_FILE = os.path.join(_CONFIG_DIR, "sign_settings.json")
 _STAMP_IMAGE_DIR = os.path.join(_CONFIG_DIR, "sign_stamp_images")
+_TSA_CONNECT_TIMEOUT_SECONDS = 5.0
 _VISIBLE_TEMPLATE_FIELDS = tuple(
     f for f in STAMP_TEMPLATE_FIELDS if f not in {"reason", "location"}
 )
@@ -78,6 +83,12 @@ class _SignItem:
     status: str = "Chờ ký"
     output_path: str = ""
     error: str = ""
+
+
+@dataclass(frozen=True)
+class _BatchTimeDecision:
+    tsa_url: str = ""
+    mode: str = "local_config"
 
 
 class _ComboBox(QComboBox):
@@ -571,6 +582,85 @@ class ArchiveStep3Sign(QWidget):
         if inputs_enabled is None:
             inputs_enabled = self.chk_tsa.isEnabled()
         self.edit_tsa_url.setEnabled(bool(inputs_enabled and self.chk_tsa.isChecked()))
+
+    def _check_tsa_connection(self, tsa_url: str) -> tuple[bool, str]:
+        parsed = urlparse(str(tsa_url or "").strip())
+        scheme = parsed.scheme.lower()
+        host = parsed.hostname
+        if scheme not in {"http", "https"} or not host:
+            return False, "Địa chỉ TSA không hợp lệ."
+
+        port = parsed.port or (443 if scheme == "https" else 80)
+        sock = None
+        try:
+            sock = socket.create_connection(
+                (host, port),
+                timeout=_TSA_CONNECT_TIMEOUT_SECONDS,
+            )
+            if scheme == "https":
+                context = ssl.create_default_context()
+                with context.wrap_socket(sock, server_hostname=host):
+                    pass
+                sock = None
+            return True, ""
+        except Exception as exc:
+            return False, f"{host}:{port} - {exc}"
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+
+    def _ask_local_time_fallback(self, detail: str = "") -> str:
+        current_time = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Không kết nối được TSA")
+        box.setText(
+            "Không kết nối được máy chủ cấp dấu thời gian (TSA).\n\n"
+            "Bạn có thể tiếp tục ký sử dụng thời gian của máy tính nội bộ. "
+            "Thời gian này không phải là dấu thời gian tin cậy từ TSA và phụ thuộc "
+            "vào thiết lập ngày giờ trên máy tính.\n\n"
+            f"Thời gian máy hiện tại: {current_time}\n\n"
+            "Vui lòng điều chỉnh thời gian chính xác, sau đó chọn Đồng ý để ký "
+            "sử dụng thời gian nội bộ."
+        )
+        if detail:
+            box.setDetailedText(str(detail))
+        retry_btn = box.addButton("Thử lại TSA", QMessageBox.ButtonRole.ActionRole)
+        agree_btn = box.addButton("Đồng ý", QMessageBox.ButtonRole.AcceptRole)
+        cancel_btn = box.addButton("Hủy", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(cancel_btn)
+        box.setEscapeButton(cancel_btn)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked == retry_btn:
+            return "retry"
+        if clicked == agree_btn:
+            return "local"
+        return "cancel"
+
+    def _resolve_batch_time_decision(self, tsa_url: str) -> Optional[_BatchTimeDecision]:
+        """Resolve the time source once for the current signing batch."""
+        while True:
+            self.lbl_status.setText("Đang kiểm tra kết nối TSA...")
+            QApplication.processEvents()
+            ok, detail = self._check_tsa_connection(tsa_url)
+            if ok:
+                return _BatchTimeDecision(tsa_url=tsa_url, mode="tsa")
+
+            action = self._ask_local_time_fallback(detail)
+            if action == "retry":
+                continue
+            if action == "local":
+                self.log_message.emit(
+                    "Archive Step 3: TSA unavailable; user confirmed signing "
+                    "with local computer time"
+                )
+                return _BatchTimeDecision(tsa_url="", mode="local_fallback")
+            self.lbl_status.setText("Đã hủy ký số.")
+            return None
 
     def _build_metadata_section(self, parent: QVBoxLayout):
         frame, layout = self._section("Nội dung chữ ký")
@@ -1630,6 +1720,7 @@ class ArchiveStep3Sign(QWidget):
         stamp_text_position = self._current_stamp_text_position()
         use_tsa = bool(self.chk_tsa.isChecked()) if hasattr(self, "chk_tsa") else True
         tsa_url = self.edit_tsa_url.text().strip() if use_tsa and hasattr(self, "edit_tsa_url") else ""
+        time_decision = _BatchTimeDecision()
         if not stamp_template:
             QMessageBox.warning(self, "Mẫu chữ ký", "Mẫu hiển thị không được để trống.")
             return
@@ -1661,6 +1752,15 @@ class ArchiveStep3Sign(QWidget):
         if float(self.spin_h.value()) < min_h:
             self.spin_h.setValue(min_h)
 
+        if use_tsa:
+            resolved_time_decision = self._resolve_batch_time_decision(tsa_url)
+            if resolved_time_decision is None:
+                return
+            time_decision = resolved_time_decision
+            tsa_url = time_decision.tsa_url
+        else:
+            tsa_url = ""
+
         for item in self._items:
             item.status = "Chờ ký"
             item.output_path = ""
@@ -1674,6 +1774,17 @@ class ArchiveStep3Sign(QWidget):
             float(self.spin_h.value()),
         )
         self._save_settings()
+        if time_decision.mode == "tsa":
+            self.log_message.emit(f"Archive Step 3: signing with TSA {tsa_url}")
+        elif time_decision.mode == "local_fallback":
+            self.log_message.emit(
+                "Archive Step 3: batch time source fixed to local computer time "
+                "after TSA connection failure"
+            )
+        else:
+            self.log_message.emit(
+                "Archive Step 3: signing without TSA; using local computer time"
+            )
         self.btn_sign.setText("Dừng")
         self.btn_sign.setEnabled(True)
         self._set_inputs_enabled(False)

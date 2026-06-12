@@ -160,7 +160,7 @@ class SettingsTab(QWidget):
         card = SectionCard(translations.get_text("sec_correction"))
 
         self.chk_correct_enabled = QCheckBox(translations.get_text("chk_correct_enabled"))
-        self.chk_correct_enabled.setChecked(True)
+        self.chk_correct_enabled.setChecked(False)
         card.content_layout().addWidget(self.chk_correct_enabled)
 
         # EN→VI translation toggle. When on, _export_single writes an extra
@@ -188,7 +188,7 @@ class SettingsTab(QWidget):
         card = SectionCard(translations.get_text("sec_logging"))
 
         self.chk_show_log_panel = QCheckBox(translations.get_text("chk_show_log_panel"))
-        self.chk_show_log_panel.setChecked(True)
+        self.chk_show_log_panel.setChecked(False)
         self.chk_show_log_panel.toggled.connect(self.log_panel_toggled.emit)
         card.content_layout().addWidget(self.chk_show_log_panel)
 
@@ -526,8 +526,8 @@ class SettingsTab(QWidget):
 
     def set_values(self, wait_page: str, compare_int: str, concurrency: str,
                    export_workers: str, model: str, verbose: bool,
-                   correct: bool = True, export: bool = True,
-                   show_log_panel: bool = True,
+                   correct: bool = False, export: bool = True,
+                   show_log_panel: bool = False,
                    kie_mode: str = "layoutlmv3",
                    doc_types: list[str] | None = None,
                    catalogs: dict | None = None,

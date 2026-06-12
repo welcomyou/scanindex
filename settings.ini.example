@@ -12,14 +12,14 @@ maxconcurrentocr = 4
 ; CorrectEnabled = bật/tắt module sửa chính tả ở mức toàn app.
 ; True  -> tải Proton CT2 (~350MB) khi mở screen có dùng correction.
 ; False -> không bao giờ tải module sửa chính tả; OCR chạy không qua correction.
-correctenabled = True
+correctenabled = False
 exportenabled = True
 ; TranslateVietnamese: nếu True, xuất thêm {name}_vi.docx (bản dịch tiếng Việt)
 ; sau khi tạo {name}.docx. Dùng Google ***REMOVED*** shim trong models/translate/
 ; (~96MB asset, beam=4 default). Thêm 2-30s/file tùy độ dài.
 translatevietnamese = False
 verboselog = False
-showlogpanel = True
+showlogpanel = False
 
 [Correction]
 model = protonx-models/protonx-legal-tc-[CTranslate2-OPTIMIZE]

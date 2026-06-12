@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import unicodedata
 
 import fitz
 
@@ -468,8 +469,8 @@ def merge_native_and_ocr_page_records(page_index: int, native_page, ocr_record: 
     )
     native_items = _word_items_from_page_record(native_record, "native")
     ocr_items = _word_items_from_page_record(ocr_record or {}, "ocr")
-    native_broken = _looks_like_broken_native_text(_items_text(native_items))
-    if native_broken and ocr_items:
+    rejection = _native_rejection_stats(native_items, ocr_items)
+    if rejection["reject_native"]:
         merge_items = ocr_items
         ocr_only: list[dict] = []
         primary_layer = "ocr"
@@ -498,7 +499,10 @@ def merge_native_and_ocr_page_records(page_index: int, native_page, ocr_record: 
     merged_record["source_mode"] = "mixed"
     merged_record["text_layers"] = {
         "primary": primary_layer,
-        "native_mojibake_rejected": bool(native_broken and ocr_items),
+        "native_mojibake_rejected": rejection["native_mojibake_rejected"],
+        "native_spacing_rejected": rejection["native_spacing_rejected"],
+        "native_joined_token_count": rejection["native_joined_token_count"],
+        "native_ocr_word_ratio": rejection["ocr_word_ratio"],
         "merged_ocr_only_words": len(ocr_only),
     }
     return merged_record
@@ -524,6 +528,115 @@ def _looks_like_broken_native_text(text: str) -> bool:
         return False
     suspicious = sum(1 for ch in chars if _is_mojibake_char(ch))
     return suspicious >= max(8, int(len(chars) * 0.025))
+
+
+def _diacritic_mark_count(text: str) -> int:
+    return sum(
+        1
+        for ch in unicodedata.normalize("NFD", text or "")
+        if unicodedata.category(ch) == "Mn"
+    )
+
+
+def _has_letter_digit_join(text: str) -> bool:
+    chars = list(text or "")
+    for idx in range(1, len(chars)):
+        prev = chars[idx - 1]
+        cur = chars[idx]
+        if (prev.isalpha() and cur.isdigit()) or (prev.isdigit() and cur.isalpha()):
+            return True
+    return False
+
+
+def _has_lower_to_upper_join(text: str) -> bool:
+    chars = list(text or "")
+    for idx in range(1, len(chars)):
+        prev = chars[idx - 1]
+        cur = chars[idx]
+        if prev.islower() and cur.isupper():
+            return True
+    return False
+
+
+def _looks_like_joined_native_token(text: str) -> bool:
+    token = str(text or "").strip().strip(".,;:()[]{}\"'")
+    if len(token) < 4:
+        return False
+    if _has_letter_digit_join(token) or _has_lower_to_upper_join(token):
+        return True
+
+    letters = [ch for ch in token if ch.isalpha()]
+    if len(letters) < 6 or len(letters) != len(token):
+        return False
+
+    marks = _diacritic_mark_count(token)
+    if marks < 2:
+        return False
+
+    # Vietnamese text is syllable-spaced. Long all-letter tokens with multiple
+    # tone/diacritic marks are often two or more syllables glued by a broken
+    # native text layer.
+    return True
+
+
+def _native_spacing_damage(native_items: list[dict], ocr_items: list[dict]) -> dict:
+    tokens = [
+        str(item.get("text") or item.get("ocr_text") or "").strip()
+        for item in native_items or []
+    ]
+    tokens = [token for token in tokens if token]
+    ocr_count = len([
+        item for item in (ocr_items or [])
+        if str(item.get("text") or item.get("ocr_text") or "").strip()
+    ])
+    native_count = len(tokens)
+    if native_count < 40 or ocr_count <= native_count:
+        return {
+            "rejected": False,
+            "joined_token_count": 0,
+            "native_word_count": native_count,
+            "ocr_word_count": ocr_count,
+            "ocr_word_ratio": 0.0 if native_count <= 0 else round(ocr_count / native_count, 4),
+        }
+
+    joined_tokens = [token for token in tokens if _looks_like_joined_native_token(token)]
+    joined_count = len(joined_tokens)
+    ocr_ratio = ocr_count / max(1, native_count)
+
+    # The OCR words are already available here. If OCR sees materially more
+    # words and native has several glued tokens, prefer the OCR cache without
+    # triggering another OCR pass.
+    rejected = (
+        ocr_ratio >= 1.08
+        and joined_count >= max(4, int(native_count * 0.015))
+    ) or (
+        ocr_ratio >= 1.03
+        and joined_count >= max(10, int(native_count * 0.035))
+    )
+    return {
+        "rejected": bool(rejected),
+        "joined_token_count": joined_count,
+        "native_word_count": native_count,
+        "ocr_word_count": ocr_count,
+        "ocr_word_ratio": round(ocr_ratio, 4),
+        "joined_token_examples": joined_tokens[:8],
+    }
+
+
+def _native_rejection_stats(native_items: list[dict], ocr_items: list[dict]) -> dict:
+    native_text = _items_text(native_items)
+    mojibake_rejected = bool(ocr_items and _looks_like_broken_native_text(native_text))
+    spacing = _native_spacing_damage(native_items, ocr_items)
+    return {
+        "reject_native": bool(ocr_items and (mojibake_rejected or spacing["rejected"])),
+        "native_mojibake_rejected": mojibake_rejected,
+        "native_spacing_rejected": bool(spacing["rejected"]),
+        "native_joined_token_count": spacing["joined_token_count"],
+        "native_word_count": spacing["native_word_count"],
+        "ocr_word_count": spacing["ocr_word_count"],
+        "ocr_word_ratio": spacing["ocr_word_ratio"],
+        "native_joined_token_examples": spacing.get("joined_token_examples", []),
+    }
 
 
 def merge_native_text_layer_into_canonical_json(
@@ -557,8 +670,8 @@ def merge_native_text_layer_into_canonical_json(
             )
             native_items = _word_items_from_page_record(native_record, "native")
             ocr_items = _word_items_from_page_record(pages_by_index.get(page_index, {}), "ocr")
-            native_broken = _looks_like_broken_native_text(_items_text(native_items))
-            if native_broken and ocr_items:
+            rejection = _native_rejection_stats(native_items, ocr_items)
+            if rejection["reject_native"]:
                 merge_items = ocr_items
                 ocr_only: list[dict] = []
                 primary_layer = "ocr"
@@ -567,7 +680,11 @@ def merge_native_text_layer_into_canonical_json(
                 ocr_only = []
                 for item in ocr_items:
                     box = item["bbox"]
-                    if any(_bbox_coverage(box, native_box) >= 0.55 or _bbox_coverage(native_box, box) >= 0.55 for native_box in native_boxes):
+                    if any(
+                        _bbox_coverage(box, native_box) >= 0.55
+                        or _bbox_coverage(native_box, box) >= 0.55
+                        for native_box in native_boxes
+                    ):
                         continue
                     ocr_only.append(item)
                 merge_items = native_items + ocr_only
@@ -582,7 +699,10 @@ def merge_native_text_layer_into_canonical_json(
             merged_record["coord_origin"] = "top-left"
             merged_record["text_layers"] = {
                 "primary": primary_layer,
-                "native_mojibake_rejected": bool(native_broken and ocr_items),
+                "native_mojibake_rejected": rejection["native_mojibake_rejected"],
+                "native_spacing_rejected": rejection["native_spacing_rejected"],
+                "native_joined_token_count": rejection["native_joined_token_count"],
+                "native_ocr_word_ratio": rejection["ocr_word_ratio"],
                 "merged_ocr_only_words": len(ocr_only),
             }
 
@@ -600,7 +720,11 @@ def merge_native_text_layer_into_canonical_json(
                 "page_index": page_index,
                 "native_words": len(native_items),
                 "ocr_words": len(ocr_items),
-                "native_mojibake_rejected": bool(native_broken and ocr_items),
+                "native_mojibake_rejected": rejection["native_mojibake_rejected"],
+                "native_spacing_rejected": rejection["native_spacing_rejected"],
+                "native_joined_token_count": rejection["native_joined_token_count"],
+                "native_ocr_word_ratio": rejection["ocr_word_ratio"],
+                "native_joined_token_examples": rejection["native_joined_token_examples"],
                 "merged_ocr_only_words": len(ocr_only),
             })
     finally:

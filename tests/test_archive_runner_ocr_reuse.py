@@ -203,3 +203,41 @@ def test_clean_signer_page_reocrs_only_selected_annotated_page(monkeypatch, tmp_
 
     assert runner._prepare_signature_page_clean_ocr_for_kie(task) is True
     assert ocr_calls == [(task.input_path, 3, False)]
+
+
+def test_native_spacing_damage_rejects_glued_native_without_reocr():
+    from scanindex.core.pdf.text_extractor import _native_rejection_stats
+
+    glued_tokens = [
+        "\u0110\u1ea2NG",
+        "B\u1ed8TH\u00c0NH",
+        "PH\u1ed0H\u1ed2CH\u00cdMINH",
+        "V\u1ec1t\u00ecnh",
+        "h\u1ec7th\u1ed1ng",
+        "h\u1ea1t\u1ea7ng",
+        "b\u1ecbc\u00f4ng",
+        "ngh\u1ec7th\u00f4ng",
+        "s\u1ed105-TB/BC\u0110",
+        "s\u1ed1Th\u00e0nh",
+    ]
+    native_items = [{"text": token} for token in glued_tokens]
+    native_items.extend({"text": "sample"} for _ in range(60))
+    ocr_items = [{"text": "ocr"} for _ in range(85)]
+
+    stats = _native_rejection_stats(native_items, ocr_items)
+
+    assert stats["reject_native"] is True
+    assert stats["native_spacing_rejected"] is True
+    assert stats["native_mojibake_rejected"] is False
+
+
+def test_native_spacing_damage_keeps_native_without_ocr_word_gain():
+    from scanindex.core.pdf.text_extractor import _native_rejection_stats
+
+    native_items = [{"text": "sample"} for _ in range(70)]
+    ocr_items = [{"text": "ocr"} for _ in range(72)]
+
+    stats = _native_rejection_stats(native_items, ocr_items)
+
+    assert stats["reject_native"] is False
+    assert stats["native_spacing_rejected"] is False

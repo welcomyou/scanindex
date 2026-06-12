@@ -4462,7 +4462,7 @@ class RepositoryScreen(ScreenContent):
 
         cfg_path = Path(get_base_dir()) / "settings.ini"
         kie_mode = "layoutlmv3"
-        enable_correction = True
+        enable_correction = False
         if cfg_path.exists():
             cfg = configparser.ConfigParser()
             try:
@@ -4474,7 +4474,7 @@ class RepositoryScreen(ScreenContent):
                     )
                 if cfg.has_section("OCR"):
                     enable_correction = cfg.getboolean(
-                        "OCR", "CorrectEnabled", fallback=True
+                        "OCR", "CorrectEnabled", fallback=False
                     )
             except Exception:
                 pass

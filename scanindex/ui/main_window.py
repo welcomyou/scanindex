@@ -504,13 +504,17 @@ class MainWindow(QMainWindow):
         self._digitization_splitter_warmup_started = False
         self._digitization_splitter_ready = False
         self._digitization_splitter_failed = False
+        self._digitization_correction_failed = False
         self._digitization_kie_failed = False
 
         # Track which function declares which model groups
         self.screen_model_groups: dict[str, list[str]] = {
             FUNCTION_HOME: [],  # idle on home
             FUNCTION_PDF_TO_WORD: [],  # loaded in background; the screen opens immediately
-            FUNCTION_DIGITIZATION: [GROUP_CORE_OCR, GROUP_CORRECTION],
+            # Step 1 can start as soon as OCR is ready. Correction is warmed in
+            # the background so entering the archive workflow does not wait on
+            # the Proton CT2 model.
+            FUNCTION_DIGITIZATION: [GROUP_CORE_OCR],
             FUNCTION_REPOSITORY: [],
             FUNCTION_SUPPORT_TOOLS: [GROUP_CORE_OCR],
             FUNCTION_SETTINGS: [],
@@ -520,7 +524,7 @@ class MainWindow(QMainWindow):
             FUNCTION_PDF_TO_WORD: [GROUP_CORE_OCR, GROUP_CORRECTION, GROUP_TABLE_EXTRACTION],
             # KIE is warmed by a custom background chain after the LightGBM
             # splitter is ready; it must not block Step 1 OCR/splitting.
-            FUNCTION_DIGITIZATION: [],
+            FUNCTION_DIGITIZATION: [GROUP_CORRECTION],
         }
 
         self.splitter.addWidget(self.stack)
@@ -613,7 +617,7 @@ class MainWindow(QMainWindow):
 
     def _effective_model_groups(self, function_id: str, groups: list[str]) -> list[str]:
         effective = list(groups or [])
-        if GROUP_CORRECTION in effective and not bool(self._saved.get("correct", True)):
+        if GROUP_CORRECTION in effective and not bool(self._saved.get("correct", False)):
             effective.remove(GROUP_CORRECTION)
         return effective
 
@@ -639,7 +643,7 @@ class MainWindow(QMainWindow):
             function_id, self.screen_background_model_groups.get(function_id, [])))
         # Honor the global "Bật sửa chính tả" setting: if disabled, never load
         # the correction model — even on screens that would normally use it.
-        if GROUP_CORRECTION in required and not bool(self._saved.get("correct", True)):
+        if GROUP_CORRECTION in required and not bool(self._saved.get("correct", False)):
             required.remove(GROUP_CORRECTION)
         required_set = set(required)
 
@@ -715,6 +719,8 @@ class MainWindow(QMainWindow):
         for group in groups:
             if self.model_manager.is_loaded(group) or group in self._background_model_loading:
                 continue
+            if function_id == FUNCTION_DIGITIZATION and group == GROUP_CORRECTION:
+                self._digitization_correction_failed = False
             self._background_model_loading.add(group)
             label = GROUP_LABELS.get(group, group)
             self.signals.background_model_status.emit(
@@ -855,7 +861,7 @@ class MainWindow(QMainWindow):
     def _on_background_model_status(self, group: str, text: str):
         self._background_model_status[group] = text or GROUP_LABELS.get(group, group)
         self._refresh_background_model_status()
-        if group in (GROUP_ARCHIVE_SPLITTER, GROUP_KIE):
+        if group in (GROUP_ARCHIVE_SPLITTER, GROUP_CORRECTION, GROUP_KIE):
             self._refresh_digitization_model_status()
 
     def _on_background_model_finished(self, group: str, ok: bool):
@@ -874,9 +880,11 @@ class MainWindow(QMainWindow):
             self._digitization_splitter_failed = not bool(ok)
             if ok and getattr(self, "_current_function", None) == FUNCTION_DIGITIZATION:
                 self._start_background_model_loads_for_groups([GROUP_KIE])
+        elif group == GROUP_CORRECTION:
+            self._digitization_correction_failed = not bool(ok)
         elif group == GROUP_KIE:
             self._digitization_kie_failed = not bool(ok)
-        if group in (GROUP_ARCHIVE_SPLITTER, GROUP_KIE):
+        if group in (GROUP_ARCHIVE_SPLITTER, GROUP_CORRECTION, GROUP_KIE):
             self._refresh_digitization_model_status()
         self._refresh_background_model_status(done=ok)
         if ok:
@@ -898,7 +906,7 @@ class MainWindow(QMainWindow):
             return
         self._background_model_status.pop(group, None)
         self._refresh_background_model_status()
-        if group in (GROUP_ARCHIVE_SPLITTER, GROUP_KIE):
+        if group in (GROUP_ARCHIVE_SPLITTER, GROUP_CORRECTION, GROUP_KIE):
             self._refresh_digitization_model_status()
 
     def _refresh_background_model_status(self, *, done: bool = False):
@@ -917,6 +925,19 @@ class MainWindow(QMainWindow):
         if label is None:
             return
         parts: list[str] = []
+        correction_enabled = bool(self._saved.get("correct", False))
+        correction_loaded = (
+            self.model_manager is not None
+            and self.model_manager.is_loaded(GROUP_CORRECTION)
+        )
+        if correction_enabled:
+            if GROUP_CORRECTION in self._background_model_loading:
+                parts.append("Correction: loading")
+            elif correction_loaded:
+                parts.append("Correction: ready")
+            elif self._digitization_correction_failed:
+                parts.append("Correction: failed")
+
         if GROUP_ARCHIVE_SPLITTER in self._background_model_loading:
             parts.append("LightGBM: loading")
         elif self._digitization_splitter_ready:
@@ -1031,9 +1052,9 @@ class MainWindow(QMainWindow):
             "concurrency": "4",   # default 4 page workers
             "export_workers": "1",
             "model": "", "gpu": "CPU", "verbose": True,
-            "correct": True, "export": True,
+            "correct": False, "export": True,
             "translate_vi": False,
-            "show_log_panel": True,
+            "show_log_panel": False,
             "kie_mode": None,
             "doc_types": doc_type_defaults,
             "catalogs": catalog_defaults,
@@ -1063,13 +1084,13 @@ class MainWindow(QMainWindow):
                     self._saved["concurrency"] = str(conc)
                     self.max_parallel_ocr_files = conc  # legacy attribute name kept
 
-                    self._saved["correct"] = self.config["OCR"].getboolean("CorrectEnabled", True)
+                    self._saved["correct"] = self.config["OCR"].getboolean("CorrectEnabled", False)
                     # PDF-to-Word now always exports DOCX; keep the old
                     # setting ignored so stale settings.ini cannot disable it.
                     self._saved["export"] = True
                     self._saved["translate_vi"] = self.config["OCR"].getboolean("TranslateVietnamese", False)
                     self._saved["verbose"] = self.config["OCR"].getboolean("VerboseLog", True)
-                    self._saved["show_log_panel"] = self.config["OCR"].getboolean("ShowLogPanel", True)
+                    self._saved["show_log_panel"] = self.config["OCR"].getboolean("ShowLogPanel", False)
 
                 if "Correction" in self.config:
                     self._saved["model"] = self.config["Correction"].get("Model", "")
@@ -1183,13 +1204,13 @@ class MainWindow(QMainWindow):
             "WaitPerPage": vals["wait_page"],
             "ComparisonInterval": vals["compare_int"],
             "MaxConcurrentOCR": str(val_ocr),
-            "CorrectEnabled": str(bool(vals.get("correct", True))),
+            "CorrectEnabled": str(bool(vals.get("correct", False))),
             "ExportEnabled": "True",
             "TranslateVietnamese": str(bool(vals.get("translate_vi", False))),
             "VerboseLog": str(vals["verbose"]),
             "ShowLogPanel": str(vals["show_log_panel"]),
         }
-        self._saved["correct"] = bool(vals.get("correct", True))
+        self._saved["correct"] = bool(vals.get("correct", False))
         self._saved["translate_vi"] = bool(vals.get("translate_vi", False))
         self.config["Correction"] = {
             "Model": vals["model"],
@@ -2198,7 +2219,7 @@ class MainWindow(QMainWindow):
             on_event=on_event,
             log_cb=lambda m: self.signals.log_message.emit(str(m), LOG_INFO),
             write_excel_on_done=False,    # Excel is exported manually via the button
-            enable_correction=bool(self._saved.get("correct", True)),
+            enable_correction=bool(self._saved.get("correct", False)),
         )
         self._archive_runner.start()
         self.log(f"Archive: pipeline started on {len(pdf_files)} files (KIE={kie_mode})")
@@ -2348,7 +2369,7 @@ class MainWindow(QMainWindow):
             on_event=on_event,
             log_cb=lambda m: self.signals.log_message.emit(str(m), LOG_INFO),
             write_excel_on_done=False,
-            enable_correction=bool(self._saved.get("correct", True)),
+            enable_correction=bool(self._saved.get("correct", False)),
         )
         self._archive_runner.start()
         self.log(f"Archive: Step 1→2 pipeline started on {len(specs)} segments (KIE={kie_mode})")
@@ -2784,7 +2805,7 @@ class MainWindow(QMainWindow):
             "wait_page": cfg_wait_page,
             "wait_int": cfg_wait_int,
             "max_workers": max_w,
-            "do_correct": bool(self._saved.get("correct", True)),
+            "do_correct": bool(self._saved.get("correct", False)),
             "do_metadata": False,
             "do_export": True,
             "force_rerun": False,
@@ -2866,7 +2887,7 @@ class MainWindow(QMainWindow):
         if idx < 0 or idx >= len(self.dnd_files):
             return
         f = self.dnd_files[idx]
-        do_correct = bool(self._saved.get("correct", True))
+        do_correct = bool(self._saved.get("correct", False))
         do_export = True
 
         vals = self.settings_tab.get_values()
