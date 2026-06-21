@@ -762,10 +762,19 @@ def _copy_source_page_background(doc_out, doc_in, page_idx, page_w, page_h, bake
     """
     if not bake_angle:
         doc_out.insert_pdf(doc_in, from_page=page_idx, to_page=page_idx)
-        return doc_out[-1]
+        pg = doc_out[-1]
+        # Strip existing text layer to avoid double text with ScreenAI overlay
+        if pg.get_text("text").strip():
+            pg.add_redact_annot(pg.rect)
+            pg.apply_redactions()
+        return pg
 
     new_page = doc_out.new_page(width=page_w, height=page_h)
     new_page.show_pdf_page(new_page.rect, doc_in, page_idx, rotate=bake_angle)
+    # show_pdf_page copies text layer too — strip it
+    if new_page.get_text("text").strip():
+        new_page.add_redact_annot(new_page.rect)
+        new_page.apply_redactions()
     return new_page
 
 
@@ -792,7 +801,14 @@ def _append_backgrounds_preserving_inline_images(doc_out, doc_in, background_spe
     def flush_copy_range():
         nonlocal range_start, range_end
         if range_start is not None and range_end is not None:
+            before = len(doc_out)
             doc_out.insert_pdf(doc_in, from_page=range_start, to_page=range_end)
+            # Strip existing text layer from copied pages (scan_ocr_low fix)
+            for out_idx in range(before, len(doc_out)):
+                pg = doc_out[out_idx]
+                if pg.get_text("text").strip():
+                    pg.add_redact_annot(pg.rect)
+                    pg.apply_redactions()
         range_start = None
         range_end = None
 
