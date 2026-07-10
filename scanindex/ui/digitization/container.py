@@ -202,6 +202,25 @@ class ArchiveContainer(QWidget):
     def hide_preprocess_progress(self): self._step2.hide_preprocess_progress()
     def get_documents(self): return self._step2.get_documents()
     def refresh_current_doc(self): self._step2.refresh_current_doc()
+
+    def total_scanned_pages(self) -> int | None:
+        """Sum of page counts across all Step-2 docs, or None when no PDF
+        is resolvable yet. Used to pre-warn in the dossier dialog when the
+        operator's typed "Số lượng trang" disagrees with the scan."""
+        docs = self._step2.get_documents() or []
+        if not docs:
+            return None
+        count = getattr(self._step2, "_count_doc_pages", None)
+        if not callable(count):
+            return None
+        total = 0
+        any_found = False
+        for d in docs:
+            n = count(d)
+            if n:
+                total += n
+                any_found = True
+        return total if any_found else None
     def update_texts(self):
         self._step_bar.update_texts()
         self._step2.update_texts()

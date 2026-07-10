@@ -69,7 +69,18 @@ NAME_PATTERN = re.compile(r"^[\w]+-[\w]+-\d{2}-\d{4}[a-zA-Z]?-\d{3}\.pdf$",
 
 
 # Section 1 form: derived/projected metadata the user sees and edits.
+# Order matters: the two operator-controlled dossier-sequencing fields
+# (Số thứ tự, Trang số) sit on top so they're visible without scrolling,
+# then come the KIE-derived content fields.
 _FIELDS = [
+    # "Số thứ tự" = SoThuTuVanBanTrongHoSo (1-based doc ordinal). Editable so
+    # the operator can reserve a slot for a doc that wasn't scanned; editing
+    # re-anchors the +1 sequence for the docs that follow.
+    ("so_thu_tu",        "arc_field_so_thu_tu", False),
+    # "Trang số" = PMKhoSohoa ToSoTrangSo (starting page of this doc). Not a
+    # KIE field — running page numbering is computed locally and edited by
+    # the operator; the recompute logic cascades changes to later docs.
+    ("trang_so",         "arc_field_trang_so",  False),
     ("co_quan_ban_hanh", "arc_field_co_quan",   True),
     ("loai_van_ban",     "arc_field_loai_vb",   True),
     ("so_van_ban",       "arc_field_so",        True),
@@ -80,6 +91,10 @@ _FIELDS = [
     ("nguoi_ky",         "arc_field_nguoi_ky",  True),
     ("do_mat",           "arc_field_do_mat",    False),
 ]
+
+# Fields that are plain single-line numeric QLineEdit (no KIE label, no
+# multiline). Rendered specially in `_build_metadata_panel`.
+_NUMERIC_LINE_FIELDS = {"trang_so", "so_thu_tu"}
 
 
 # Form key → KIE label used for: bbox highlight on label click, field-active
@@ -794,6 +809,21 @@ class ArchiveStep2Kie(QWidget):
                 w.setFixedHeight(_H)
                 w.currentTextChanged.connect(
                     lambda _t, k=key: self._on_field_text_changed(k)
+                )
+            elif key in _NUMERIC_LINE_FIELDS:
+                # Single-line integer input (e.g. Trang số / ToSoTrangSo).
+                # No KIE label mapping, no multiline. editingFinished
+                # triggers the running-number recompute that cascades any
+                # edit to the docs *after* this one.
+                from PySide6.QtGui import QIntValidator
+                w = QLineEdit()
+                w.setPlaceholderText("VD: 1")
+                w.setValidator(QIntValidator(0, 9999999))
+                w.setFixedHeight(_H)
+                w.setStyleSheet(self._field_qss("QLineEdit", invalid=False))
+                w.textChanged.connect(lambda _t, k=key: self._on_field_text_changed(k))
+                w.editingFinished.connect(
+                    lambda k=key: self._on_numeric_field_edited(k)
                 )
             else:
                 w = QTextEdit()
@@ -1692,6 +1722,10 @@ class ArchiveStep2Kie(QWidget):
         # whose KIE has finished. The handler can therefore assume
         # annotation/output paths are present.
 
+        # Seed Trang số (ToSoTrangSo) running numbering on first contact —
+        # no-op once any doc already has a value (preserves user edits).
+        self._ensure_trang_so_initialised()
+
         prev_row = self._current_doc_idx
         if prev_row != row and prev_row >= 0:
             if not self.confirm_unsaved_before_leave():
@@ -1939,6 +1973,130 @@ class ArchiveStep2Kie(QWidget):
             meta[key] = self._field_value(key)
         self._form_dirty = False
         return True
+
+    # ── Trang số (ToSoTrangSo) running-number recompute ───────────────
+    #
+    # "Trang số" is the page each document starts on. The operator can
+    # edit any doc's value; the edit re-anchors the running sequence so
+    # docs *after* it shift automatically (doc[i+1].start = doc[i].start
+    # + doc[i].page_count). Logic mirrors metadata_export.compute_trang_so
+    # but is applied live to the GUI metadata + form widget.
+
+    def _count_doc_pages(self, doc: dict) -> int:
+        """Return the page count of one doc's final PDF, 0 if unknown."""
+        for k in ("output_path", "ocr_path", "pdf_path"):
+            p = doc.get(k) or ""
+            if p and os.path.isfile(p):
+                try:
+                    import fitz
+                    with fitz.open(str(p)) as f:
+                        return int(f.page_count)
+                except Exception:
+                    return 0
+        return 0
+
+    def _on_numeric_field_edited(self, key: str) -> None:
+        """editingFinished slot for numeric single-line fields. Saves the
+        typed value then cascades the change to the docs that follow."""
+        if key == "trang_so":
+            idx = self._current_doc_idx
+            if idx < 0 or idx >= len(self._documents):
+                return
+            meta = self._documents[idx].setdefault("metadata", {})
+            meta[key] = self._field_value(key)
+            self._recompute_trang_so_from(idx)
+        elif key == "so_thu_tu":
+            idx = self._current_doc_idx
+            if idx < 0 or idx >= len(self._documents):
+                return
+            meta = self._documents[idx].setdefault("metadata", {})
+            meta[key] = self._field_value(key)
+            self._recompute_so_thu_tu_from(idx)
+
+    def _recompute_trang_so_from(self, anchor_idx: int) -> None:
+        """Recompute trang_so for docs after `anchor_idx` using each doc's
+        page count. Docs before/including the anchor keep their values."""
+        n = len(self._documents)
+        if anchor_idx < 0 or anchor_idx >= n:
+            return
+        try:
+            cur = int(
+                (self._documents[anchor_idx].get("metadata", {}) or {})
+                .get("trang_so", "") or 0
+            )
+        except (ValueError, TypeError):
+            return
+        for i in range(anchor_idx + 1, n):
+            prev_pages = self._count_doc_pages(self._documents[i - 1])
+            cur = cur + max(1, prev_pages)
+            meta = self._documents[i].setdefault("metadata", {})
+            meta["trang_so"] = str(cur)
+            # If that doc is currently displayed, refresh its field widget
+            # without disturbing the operator's focus on other rows.
+            if i == self._current_doc_idx:
+                self._set_field_value("trang_so", str(cur), block_signals=True)
+
+    def _recompute_so_thu_tu_from(self, anchor_idx: int) -> None:
+        """Recompute so_thu_tu for docs after `anchor_idx` as a +1
+        sequence. Docs before/including the anchor keep their values."""
+        n = len(self._documents)
+        if anchor_idx < 0 or anchor_idx >= n:
+            return
+        try:
+            cur = int(
+                (self._documents[anchor_idx].get("metadata", {}) or {})
+                .get("so_thu_tu", "") or 0
+            )
+        except (ValueError, TypeError):
+            return
+        for i in range(anchor_idx + 1, n):
+            cur = cur + 1
+            meta = self._documents[i].setdefault("metadata", {})
+            meta["so_thu_tu"] = str(cur)
+            if i == self._current_doc_idx:
+                self._set_field_value("so_thu_tu", str(cur), block_signals=True)
+
+    def _ensure_trang_so_initialised(self) -> None:
+        """First-run seeding: if no doc has a trang_so yet, assign the
+        running numbering starting at 1. Also seeds so_thu_tu (1, 2, 3…).
+        Called after KIE finishes so the export never ships empty Trang số
+        / Số thứ tự cells for VB that exist."""
+        n = len(self._documents)
+        if n == 0:
+            return
+        from scanindex.core.digitization.metadata_export import (
+            compute_trang_so, compute_so_thu_tu,
+        )
+        need_trang = not any(
+            str((d.get("metadata", {}) or {}).get("trang_so", "")).strip()
+            for d in self._documents
+        )
+        need_stt = not any(
+            str((d.get("metadata", {}) or {}).get("so_thu_tu", "")).strip()
+            for d in self._documents
+        )
+        if not (need_trang or need_stt):
+            return  # both already populated — don't clobber user edits
+        page_counts = [self._count_doc_pages(d) for d in self._documents]
+        trang = compute_trang_so(page_counts, first_default=1)
+        stt = compute_so_thu_tu(n, first_default=1)
+        for i, d in enumerate(self._documents):
+            meta = d.setdefault("metadata", {})
+            if need_trang:
+                meta["trang_so"] = str(trang[i])
+            if need_stt:
+                meta["so_thu_tu"] = str(stt[i])
+        # Refresh the visible row's widgets if their metadata was just seeded.
+        if 0 <= self._current_doc_idx < n:
+            cur_meta = self._documents[self._current_doc_idx].get("metadata", {}) or {}
+            if need_trang:
+                self._set_field_value(
+                    "trang_so", str(cur_meta.get("trang_so", "")),
+                    block_signals=True)
+            if need_stt:
+                self._set_field_value(
+                    "so_thu_tu", str(cur_meta.get("so_thu_tu", "")),
+                    block_signals=True)
 
     def _show_saved_notice(self):
         self._lbl_saved_notice.setText(translations.get_text("arc_saved_notice"))

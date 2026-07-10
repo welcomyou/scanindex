@@ -18,9 +18,11 @@ Width-limited fields:
 from __future__ import annotations
 
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QIntValidator
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QLineEdit, QTextEdit,
     QPushButton, QLabel, QFrame, QCheckBox, QComboBox, QScrollArea, QWidget,
+    QMessageBox,
 )
 
 from scanindex.ui.widgets.fuzzy_combobox import FuzzyComboBox
@@ -54,7 +56,8 @@ class DossierInfoDialog(QDialog):
 
     def __init__(self, initial: IdentityCodes | None = None,
                  seed_for_unstructured: str = "default",
-                 parent=None):
+                 parent=None,
+                 actual_page_count: int | None = None):
         super().__init__(parent)
         self.setWindowTitle(translations.get_text("arc_session_dialog_title"))
         self.setModal(True)
@@ -67,6 +70,10 @@ class DossierInfoDialog(QDialog):
         # stays stable across re-opens within the same session.
         self._seed = seed_for_unstructured
         self._result: IdentityCodes | None = None
+        # Total scanned pages across all split docs, when known. Lets us
+        # warn the operator when their typed "Số lượng trang" disagrees
+        # with the actual scan. None = unknown (no warning shown).
+        self._actual_page_count = actual_page_count
 
         self._setup_ui()
         if initial is not None:
@@ -156,6 +163,32 @@ class DossierInfoDialog(QDialog):
         term_layout.addWidget(self._ed_term)
         term_layout.addWidget(self._term_hint)
 
+        # Số lượng tờ / Số lượng trang: operator-typed dossier counts.
+        # PMKhoSohoa's importer only honours a non-empty cell, so leaving
+        # these blank is the documented "auto" path (Số lượng trang falls
+        # back to the scanned-page total; Số lượng tờ stays blank).
+        self._ed_so_luong_to = self._mk_input(
+            placeholder="Số tờ (để trống = tự tính)")
+        self._ed_so_luong_to.setValidator(
+            self._uint_validator())
+        self._ed_so_luong_trang = self._mk_input(
+            placeholder="Số trang (để trống = theo scan thực tế)")
+        self._ed_so_luong_trang.setValidator(
+            self._uint_validator())
+        self._page_warn = QLabel("")
+        self._page_warn.setStyleSheet(
+            f"font-size: 10px; color: {COLOR_RED}; font-family: {FONT_UI};"
+        )
+        self._page_warn.setWordWrap(True)
+        self._page_warn.setVisible(False)
+        self._ed_so_luong_trang.textChanged.connect(self._refresh_page_warn)
+        trang_box = QWidget()
+        trang_layout = QVBoxLayout(trang_box)
+        trang_layout.setContentsMargins(0, 0, 0, 0)
+        trang_layout.setSpacing(2)
+        trang_layout.addWidget(self._ed_so_luong_trang)
+        trang_layout.addWidget(self._page_warn)
+
         # Free-text 1000-char fields stored in IdentityCodes only (not in
         # HSLTCQ 13-col Hồ sơ schema).
         self._ed_topic = self._mk_textarea(placeholder="Chuyên đề (tùy chọn)")
@@ -171,6 +204,8 @@ class DossierInfoDialog(QDialog):
         form.addRow(self._mk_label("Thời hạn bảo quản"), self._cb_retention)
         form.addRow(self._mk_label("Tình trạng vật lý"), self._cb_physical)
         form.addRow(self._mk_label("Nhiệm kỳ"), term_box)
+        form.addRow(self._mk_label("Số lượng tờ"), self._ed_so_luong_to)
+        form.addRow(self._mk_label("Số lượng trang"), trang_box)
         form.addRow(self._mk_label("Chuyên đề"), self._ed_topic)
         form.addRow(self._mk_label("Chú thích"), self._ed_note)
 
@@ -258,6 +293,11 @@ class DossierInfoDialog(QDialog):
         w.setFixedHeight(32)
         return w
 
+    def _uint_validator(self) -> QIntValidator:
+        # Whole-number ≥0 so "Số lượng tờ/trang" can't be typed as text.
+        v = QIntValidator(0, 9999999)
+        return v
+
     def _enforce_textarea_cap(self, widget: QTextEdit) -> None:
         text = widget.toPlainText()
         if len(text) > _TITLE_MAX:
@@ -331,6 +371,10 @@ class DossierInfoDialog(QDialog):
         idx2 = self._cb_physical.findText(ph)
         self._cb_physical.setCurrentIndex(max(0, idx2))
         self._ed_term.setText(initial.nhiem_ky or "")
+        self._ed_so_luong_to.setText(
+            str(getattr(initial, "so_luong_to", "") or ""))
+        self._ed_so_luong_trang.setText(
+            str(getattr(initial, "so_luong_trang", "") or ""))
         self._ed_topic.setPlainText(initial.chuyen_de or "")
         self._ed_note.setPlainText(initial.chu_thich or "")
 
@@ -370,6 +414,26 @@ class DossierInfoDialog(QDialog):
         self._term_hint.setVisible(too_long)
         self._ed_term.setStyleSheet(self._input_qss(invalid=too_long))
 
+    def _refresh_page_warn(self, _text: str) -> None:
+        """Show a soft inline hint when the typed page count disagrees
+        with the scanned total. Non-blocking — the operator can still
+        save the typed value (a confirm dialog fires once on OK)."""
+        typed = self._ed_so_luong_trang.text().strip()
+        if not typed or self._actual_page_count is None:
+            self._page_warn.setVisible(False)
+            return
+        try:
+            n = int(typed)
+        except ValueError:
+            self._page_warn.setVisible(False)
+            return
+        if n != int(self._actual_page_count):
+            self._page_warn.setText(
+                f"Khác tổng trang scan thực tế ({self._actual_page_count}).")
+            self._page_warn.setVisible(True)
+        else:
+            self._page_warn.setVisible(False)
+
     # ── validation ──────────────────────────────────────────────────
 
     def _on_ok(self):
@@ -380,9 +444,15 @@ class DossierInfoDialog(QDialog):
         term = self._ed_term.text().strip()
         topic = self._ed_topic.toPlainText().strip()[:_TITLE_MAX]
         note = self._ed_note.toPlainText().strip()[:_TITLE_MAX]
+        so_luong_to = self._ed_so_luong_to.text().strip()
+        so_luong_trang = self._ed_so_luong_trang.text().strip()
         errs = []
         if len(term) > _TERM_MAX:
             errs.append(f"Nhiệm kỳ không được vượt quá {_TERM_MAX} ký tự")
+        # Soft page-count mismatch: warn but allow saving the typed value.
+        if (so_luong_trang and self._actual_page_count is not None
+                and not self._confirm_page_mismatch(so_luong_trang)):
+            return  # user chose to go back and fix it
         if unstructured:
             if not title:
                 errs.append(translations.get_text("arc_err_title_required"))
@@ -395,6 +465,8 @@ class DossierInfoDialog(QDialog):
             self._result.thoi_han_bao_quan = retention
             self._result.tinh_trang_vat_ly = physical
             self._result.nhiem_ky = term
+            self._result.so_luong_to = so_luong_to
+            self._result.so_luong_trang = so_luong_trang
             self._result.chuyen_de = topic
             self._result.chu_thich = note
             self.accept()
@@ -429,10 +501,31 @@ class DossierInfoDialog(QDialog):
             thoi_han_bao_quan=retention,
             tinh_trang_vat_ly=physical,
             nhiem_ky=term,
+            so_luong_to=so_luong_to,
+            so_luong_trang=so_luong_trang,
             chuyen_de=topic,
             chu_thich=note,
         )
         self.accept()
+
+    def _confirm_page_mismatch(self, typed: str) -> bool:
+        """One-shot confirm when the typed Số lượng trang differs from the
+        scanned total. Returns True to keep the typed value."""
+        try:
+            n = int(typed)
+        except ValueError:
+            return True
+        if n == int(self._actual_page_count or 0):
+            return True
+        btn = QMessageBox.warning(
+            self,
+            "Số lượng trang khác thực tế",
+            f"Số lượng trang bạn nhập ({n}) khác tổng trang scan thực tế "
+            f"({self._actual_page_count}).\n\nBạn có muốn giữ giá trị đã nhập?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return btn == QMessageBox.StandardButton.Yes
 
     def result_codes(self) -> IdentityCodes | None:
         return self._result

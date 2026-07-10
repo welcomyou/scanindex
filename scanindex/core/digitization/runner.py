@@ -76,6 +76,8 @@ def write_aggregated_excel(tasks_or_docs, excel_path: str,
         "ngon_ngu":         "Ngôn ngữ",
         "nguoi_ky":         "Người ký",
         "do_mat":           "Độ mật",
+        "trang_so":         "Tờ số trang số",
+        "so_thu_tu":        "Số thứ tự văn bản trong hồ sơ",
     }
 
     # Lightweight validators for two fields that have UI red-border
@@ -131,6 +133,24 @@ def write_aggregated_excel(tasks_or_docs, excel_path: str,
             elif form_key == "so_van_ban":
                 if not _number_input_re.match(v):
                     continue   # not a number-like token → don't override
+            elif form_key == "trang_so":
+                # ToSoTrangSo is parsed by PMKhoSohoa as Int32
+                # (Convert.ToInt32). Drop anything that isn't a bare
+                # non-negative integer so the importer can't throw.
+                if not v.lstrip("0").isdigit() and v != "0":
+                    continue
+                try:
+                    v = str(int(v))
+                except ValueError:
+                    continue
+            elif form_key == "so_thu_tu":
+                # SoThuTuVanBanTrongHoSo: same Int32 constraint as trang_so.
+                if not v.lstrip("0").isdigit() and v != "0":
+                    continue
+                try:
+                    v = str(int(v))
+                except ValueError:
+                    continue
             row[col] = v
 
     def _hydrate_annotation_from_json(entry: dict) -> dict:
@@ -164,7 +184,7 @@ def write_aggregated_excel(tasks_or_docs, excel_path: str,
 
     rows = []
     docs_for_hoso: list[dict] = []
-    for entry in tasks_or_docs:
+    for stt_1based, entry in enumerate(tasks_or_docs, start=1):
         if isinstance(entry, dict):
             # GUI document — prefer annotation if present, else fall back to
             # the form metadata dict directly.
@@ -187,12 +207,19 @@ def write_aggregated_excel(tasks_or_docs, excel_path: str,
             # rendered as blank rows in the workbook.
             row = annotation_to_row(ann, file_id)
             _apply_form_overrides(row, meta)
+            # "Số thứ tự văn bản trong hồ sơ": operator-typed value (set by
+            # _apply_form_overrides via so_thu_tu) wins; only fall back to the
+            # 1-based list position when the operator left it blank.
+            if not (row.get("Số thứ tự văn bản trong hồ sơ") or "").strip():
+                row["Số thứ tự văn bản trong hồ sơ"] = str(stt_1based)
             rows.append(row)
             docs_for_hoso.append(entry)
         else:
             ann = getattr(entry, "kie_annotation", None) or {}
             file_id = getattr(entry, "file_id", "") or "unknown.pdf"
-            rows.append(annotation_to_row(ann, file_id))
+            row = annotation_to_row(ann, file_id)
+            row["Số thứ tự văn bản trong hồ sơ"] = str(stt_1based)
+            rows.append(row)
             docs_for_hoso.append({
                 "pdf_path": getattr(entry, "input_path", "") or file_id,
             })
@@ -577,13 +604,16 @@ class ArchiveRunner:
             task.selected_pages = list(spec.selected_pages) if spec.selected_pages else None
             task.source_page_indices = list(spec.source_page_indices) if spec.source_page_indices else None
             task.from_step1_cache = bool(from_step1)
-            # Step 1 handoff uses the visual OCR cache and may no longer have
-            # the temporary split PDF by the time KIE assembles output, so keep
-            # it on the OCR-backed path instead of the native-text copy path.
-            task.is_digital = (
-                False if from_step1
-                else (classify_pdf(original_input_path) == "digital")
-            )
+            # Detect whether the segment is a true digital (text-vector, no
+            # full-page image) PDF exported from Word/Writer/etc. Only those
+            # keep the original file + native-text merge (is_digital path
+            # below) so importing to Kho doesn't produce double text.
+            # scan_ocr_low / scan_no_text keep is_digital=False and go through
+            # the ScreenAI overlay path as before.
+            # Previously this was forced False for ALL step1 handoffs, which
+            # meant digital segments got a ScreenAI overlay on top of their
+            # native text → double text in Kho search.
+            task.is_digital = classify_pdf(original_input_path) == "digital"
             tasks.append(task)
             with self._results_lock:
                 self.results[file_id] = ArchiveResult(file_name=file_id)
@@ -768,13 +798,14 @@ class ArchiveRunner:
                 # visual-only words such as stamps/handwriting.
                 shutil.copy2(task.input_path, task.output_pdf_path)
                 from scanindex.core.pdf.text_extractor import merge_native_text_layer_into_canonical_json
+                merge_pages = list(range(task.num_pages))
                 merge_stats = merge_native_text_layer_into_canonical_json(
                     task.output_json_path,
                     task.input_path,
-                    merge_pages=[0],
+                    merge_pages=merge_pages,
                     canonical_profile="layoutlmv3_runtime",
                 )
-                self.log(f"[{task.file_id}] Digital layer merge page0: {merge_stats}")
+                self.log(f"[{task.file_id}] Digital layer merge {len(merge_pages)} page(s): {merge_stats}")
             except Exception as e:
                 self.log(f"[{task.file_id}] digital layer merge failed: {e}")
                 raise

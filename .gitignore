@@ -52,11 +52,15 @@ debug_screenshot.png
 # --- IDEs & Editors ---
 .vscode/
 .idea/
+.kilo/
 *.swp
 *.swo
 .project
 .pydevproject
 .settings/
+
+# --- Local temp cleanup logs ---
+temp_cleanup_*.csv
 
 # --- Operating System ---
 .DS_Store

@@ -411,6 +411,7 @@ class ArchiveStep1Split(QWidget):
             initial=self.session.identity,
             seed_for_unstructured=self.session.session_id,
             parent=self,
+            actual_page_count=(self.session.source_page_count or None),
         )
         if dlg.exec():
             self.session.identity = dlg.result_codes()

@@ -1992,6 +1992,7 @@ class MainWindow(QMainWindow):
             initial=session.identity,
             seed_for_unstructured=session.session_id,
             parent=self,
+            actual_page_count=self.archive_tab.total_scanned_pages(),
         )
         if not dlg.exec():
             self.log("Archive: folder pick cancelled (no identity)", LOG_INFO)

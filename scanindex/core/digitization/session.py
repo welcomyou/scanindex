@@ -77,11 +77,12 @@ class IdentityCodes:
         has a stable composite key in Kho but doesn't pretend to follow
         the archive code system.
 
-    The trailing five fields cover the dossier-level metadata required by
-    the official "Hồ sơ" sheet — three of them (retention / physical
-    state / term) flow into the exported MetaDuLieu.xlsx, while
-    `chuyen_de` and `chu_thich` are kept for in-app display + Kho
-    persistence only (not in the 13-col HSLTCQ schema).
+    The trailing fields cover the dossier-level metadata required by
+    the official "Hồ sơ" sheet — retention / physical state / term flow
+    into the exported MetaDuLieu.xlsx, as do `so_luong_to` /
+    `so_luong_trang` (operator-typed, blank = auto). `chuyen_de` and
+    `chu_thich` are kept for in-app display + Kho persistence only
+    (not in the HSLTCQ schema).
     """
     ma_dinh_danh: str = ""      # Mã định danh đơn vị lưu trữ
     ma_phong: str = ""          # Mã phông
@@ -96,6 +97,12 @@ class IdentityCodes:
     nhiem_ky: str = ""          # Nhiệm kỳ
     chuyen_de: str = ""         # Chuyên đề (≤1000 chars; not in xlsx)
     chu_thich: str = ""         # Chú thích (≤1000 chars; not in xlsx)
+    # Dossier-level page/sheet counts. Stored as strings to match the
+    # reference workbook's text-typed columns. Blank = let PMKhoSohoa /
+    # the page-scan fallback decide (build_hoso_row fills Số lượng trang
+    # from the scanned-page total when so_luong_trang is empty).
+    so_luong_to: str = ""       # Số lượng tờ (operator-typed; PMKhoSohoa SoLuongTo)
+    so_luong_trang: str = ""    # Số lượng trang override (PMKhoSohoa SoLuongTrang)
 
     def is_complete(self) -> bool:
         if self.is_unstructured:

@@ -430,6 +430,8 @@ The software prioritizes local processing when models and dependencies are insta
     "arc_field_ngon_ngu": { "en": "Language", "vi": "Ngôn ngữ" },
     "arc_field_nguoi_ky": { "en": "Signer", "vi": "Người ký" },
     "arc_field_do_mat": { "en": "Secrecy", "vi": "Độ mật" },
+    "arc_field_trang_so": { "en": "Page no.", "vi": "Trang số" },
+    "arc_field_so_thu_tu": { "en": "Ordinal", "vi": "Số thứ tự" },
     "arc_raw_kie_title": { "en": "Raw KIE", "vi": "Thông tin thô (Raw KIE)" },
     "arc_viewer_hint": {
         "en": "Click a field on the left to view its location in the document.",

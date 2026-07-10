@@ -1640,6 +1640,7 @@ class ArchiveStep3Sign(QWidget):
             initial=getattr(self._session, "identity", None),
             seed_for_unstructured=getattr(self._session, "session_id", "step3"),
             parent=self,
+            actual_page_count=self._total_scanned_pages(),
         )
         if not dlg.exec():
             return
@@ -1652,6 +1653,23 @@ class ArchiveStep3Sign(QWidget):
         if moved:
             msg += f"; renamed {moved} signed PDF file(s)"
         self.log_message.emit(msg)
+
+    def _total_scanned_pages(self):
+        """Total pages across all Step-3 sign items, for the dossier
+        dialog's "Số lượng trang" mismatch warning. None if unknown."""
+        if not self._items:
+            return None
+        total = 0
+        any_found = False
+        for it in self._items:
+            try:
+                n = _page_count(it.source_path)
+            except Exception:
+                n = 0
+            if n:
+                total += n
+                any_found = True
+        return total if any_found else None
 
     def _auto_fit_box(self):
         idx = self.combo_cert.currentIndex()

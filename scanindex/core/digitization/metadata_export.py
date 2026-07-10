@@ -19,7 +19,12 @@ import unicodedata
 from pathlib import Path
 from typing import Iterable
 
-# Column order matches MetaDuLieu.xlsx "Văn bản" sheet (20 columns)
+# Column order matches MetaDuLieu.xlsx "Văn bản" sheet (22 columns).
+# The last two columns map onto PMKhoSohoa's DocTempLTLSZip model after
+# header normalisation (GetHeaderNameColumn: strip diacritics + TitleCase
+# + drop non-alphanumerics):
+#   "Tờ số trang số"                -> ToSoTrangSo              ✅
+#   "Số thứ tự văn bản trong hồ sơ" -> SoThuTuVanBanTrongHoSo  ✅
 EXCEL_COLUMNS = [
     "Tên cơ quan, tổ chức ban hành văn bản",
     "Tên loại văn bản",
@@ -44,9 +49,13 @@ EXCEL_COLUMNS = [
     "Tình trạng vật lý",
     "Tên tệp",
     "Thời gian tài liệu",
+    "Tờ số trang số",
+    "Số thứ tự văn bản trong hồ sơ",
 ]
 
-# "Hồ sơ" sheet (13 cols, one row for the dossier itself).
+# "Hồ sơ" sheet (14 cols, one row for the dossier itself).
+# "Số lượng tờ" (SoLuongTo) is inserted right after "Số lượng trang"
+# (SoLuongTrang) to match the PMKhoSohoa ProfileTempLTLSZip model.
 HOSO_COLUMNS = [
     "Tiêu đề hồ sơ",
     "Thời hạn bảo quản",
@@ -57,6 +66,7 @@ HOSO_COLUMNS = [
     "Thời gian kết thúc",
     "Tình trạng vật lý",
     "Số lượng trang",
+    "Số lượng tờ",
     "Tổng số văn bản trong hồ sơ",
     "Độ mật",
     "Đơn vị bảo quản số",
@@ -157,6 +167,73 @@ def _parse_date_from_place_date(text: str | None) -> str | None:
     if len(y) == 2:
         y = "20" + y if int(y) < 50 else "19" + y
     return f"{int(d):02d}/{int(mth):02d}/{int(y):04d}"
+
+
+def compute_trang_so(page_counts: list[int],
+                      start_values: list[int | None] | None = None,
+                      first_default: int = 1) -> list[int]:
+    """Assign a starting page number ("Tờ số trang số") to each document.
+
+    PMKhoSohoa's ``ToSoTrangSo`` holds the page a document *starts* on.
+    The natural running numbering is: doc[i] starts where doc[i-1] left
+    off, i.e. ``trang_so[i] = trang_so[i-1] + page_count[i-1]``.
+
+    ``page_counts``: page count of each doc (from the split PDF), in order.
+    ``start_values``: optional per-doc override the operator typed in Step 2.
+        When a non-None entry appears, it re-anchors the running sequence
+        from that doc onward (so editing doc n automatically shifts n+1..N).
+    ``first_default``: starting page for doc 0 when no override is given.
+
+    Returns one ``int`` per document. Docs with 0 or negative page counts
+    are treated as 1 page so the sequence never stalls.
+
+    Examples (first_default=1):
+        page_counts=[2,3,2]                  -> [1, 3, 6]
+        page_counts=[2,3,2], start=[7,..,..] -> [7, 9, 12]
+        page_counts=[2,3,2], start=[1,..,5]  -> [1, 3, 5]  (re-anchored at 5)
+    """
+    n = len(page_counts)
+    out = [0] * n
+    starts = list(start_values) if start_values else [None] * n
+    if len(starts) < n:
+        starts += [None] * (n - len(starts))
+    cursor = first_default
+    for i in range(n):
+        if starts[i] is not None:
+            cursor = int(starts[i])
+        out[i] = cursor
+        pages = page_counts[i] if i < n else 0
+        cursor += max(1, int(pages or 0))
+    return out
+
+
+def compute_so_thu_tu(count: int,
+                       start_values: list[int | None] | None = None,
+                       first_default: int = 1) -> list[int]:
+    """Assign a 1-based ordinal ("Số thứ tự văn bản trong hồ sơ") to each
+    document. Unlike page numbering this is a simple +1 sequence — every
+    doc counts as one slot regardless of page count.
+
+    ``start_values``: optional per-doc override the operator typed in
+    Step 2. A non-None entry re-anchors the running sequence from that
+    doc onward, so editing doc n shifts n+1..N (useful when some docs
+    aren't scanned and need a manual ordinal).
+
+    Examples (first_default=1):
+        count=4                                -> [1, 2, 3, 4]
+        count=4, start=[None, 5, None, None]   -> [1, 5, 6, 7]
+    """
+    starts = list(start_values) if start_values else []
+    if len(starts) < count:
+        starts += [None] * (count - len(starts))
+    out = [0] * count
+    cursor = first_default
+    for i in range(count):
+        if starts[i] is not None:
+            cursor = int(starts[i])
+        out[i] = cursor
+        cursor += 1
+    return out
 
 
 def annotation_to_row(annotation: dict, file_name: str) -> dict:
@@ -282,6 +359,20 @@ def build_hoso_row(identity, vanban_rows: list[dict],
     """
     row = {col: "" for col in HOSO_COLUMNS}
 
+    # Số lượng tờ / Số lượng trang: the operator may type these in the
+    # dossier popup. PMKhoSohoa only applies the value when the cell is
+    # non-empty (IsNullOrEmpty guard in ApplyDataProfileZIPNew), so a
+    # blank here means "let the receiving system / page-scan decide".
+    so_luong_to_input = ""
+    so_luong_trang_input = ""
+    if identity is not None:
+        so_luong_to_input = str(
+            getattr(identity, "so_luong_to", "") or ""
+        ).strip()
+        so_luong_trang_input = str(
+            getattr(identity, "so_luong_trang", "") or ""
+        ).strip()
+
     if identity is not None:
         title = (getattr(identity, "title", "") or "").strip()
         ma_phong = (
@@ -346,10 +437,11 @@ def build_hoso_row(identity, vanban_rows: list[dict],
         # rejected by the importer ("Cannot convert null object")
         # because it expected a single date, not a range.
 
-    # Tổng số văn bản trong hồ sơ — stored as STRING (the reference
-    # workbook keeps numeric counters as strings so the downstream
-    # importer's string-typed reader doesn't choke).
-    row["Tổng số văn bản trong hồ sơ"] = str(len(vanban_rows or []))
+    # Tổng số văn bản trong hồ sơ — LEFT BLANK. PMKhoSohoa's
+    # ImportProfileAndDocsFromZIP always overrides TotalDoc with the
+    # actual row count (profile.TotalDoc = model.Docs.Count), so writing
+    # our own value here is pointless and can only disagree.
+    row["Tổng số văn bản trong hồ sơ"] = ""
 
     # Độ mật: max secrecy across docs (highest wins).
     max_rank = 0
@@ -362,8 +454,17 @@ def build_hoso_row(identity, vanban_rows: list[dict],
             max_label = s
     row["Độ mật"] = max_label
 
-    # Số lượng trang: sum across source PDFs (cheap to count via pypdf).
-    if documents:
+    # Số lượng tờ: only the operator knows (1 tờ ≈ 2 trang scan). PMKhoSohoa
+    # leaves it at 0 when the cell is empty, so we emit exactly what was typed.
+    if so_luong_to_input:
+        row["Số lượng tờ"] = so_luong_to_input
+
+    # Số lượng trang: operator-typed value wins. Otherwise fall back to the
+    # scanned-page total counted via pypdf (so the cell isn't blank, which
+    # PMKhoSohoa would interpret as 0).
+    if so_luong_trang_input:
+        row["Số lượng trang"] = so_luong_trang_input
+    elif documents:
         try:
             from pypdf import PdfReader
             total_pages = 0

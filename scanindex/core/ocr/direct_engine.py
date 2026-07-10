@@ -751,31 +751,116 @@ def _build_text_page_words(page, words_data, font_path, *, fallback_lines=None):
             continue
 
 
+def _estimate_page_native_dpi(page) -> int:
+    """Best-effort DPI of the largest image on the page.
+
+    When a page is a full-page scan with an embedded native text layer
+    (scan_ocr_low), we rasterize it to drop that text before the ScreenAI
+    overlay. Re-rendering at the embedded image's own DPI keeps the file
+    from ballooning: rendering at OCR_DPI (240) when the source is only
+    150-200 DPI just invents pixels and bloats the output. Returns
+    OCR_DPI as a safe fallback when no usable image is found.
+    """
+    import fitz  # PyMuPDF - lazy import
+    page_rect = page.rect
+    best_dpi = None
+    best_coverage = 0.0
+    try:
+        for img in page.get_images(full=True):
+            xref = img[0]
+            iw = img[2]
+            ih = img[3]
+            if not iw or not ih:
+                continue
+            # Find the display rect(s) of this image on the page.
+            coverage = 0.0
+            for r in page.get_image_rects(xref):
+                coverage = max(coverage, (r.width * r.height) / max(page_rect.width * page_rect.height, 1))
+            if coverage < 0.5:  # not a full-page image, skip
+                continue
+            dpi = round(((iw / r.width if r.width else 0) + (ih / r.height if r.height else 0)) * 72 / 2)
+            if coverage > best_coverage:
+                best_coverage = coverage
+                best_dpi = max(72, min(dpi, OCR_DPI))
+    except Exception:
+        pass
+    return best_dpi or OCR_DPI
+
+
+def _rasterize_page_to_jpeg_background(doc, src_page, *, page_w, page_h, bake_angle=0, jpeg_quality=85):
+    """Create a fresh text-free page whose visual is a JPEG rasterization of
+    ``src_page``.
+
+    Used for scan_ocr_low pages: they carry a native (often OCR-quality) text
+    layer that would double up with the ScreenAI overlay. Rasterizing drops
+    the text layer while keeping the scanned image. JPEG encoding (not the
+    default PNG/Flate) keeps the output size close to the source — a 200 DPI
+    scan stays ~0.5 MB instead of the ~16 MB an uncompressed pixmap costs.
+    """
+    import fitz  # PyMuPDF - lazy import
+    dpi = _estimate_page_native_dpi(src_page)
+    zoom = dpi / 72.0
+    matrix = fitz.Matrix(zoom, zoom)
+    if bake_angle:
+        matrix = matrix * fitz.Matrix(fitz.Identity).prerotate(bake_angle)
+    pix = src_page.get_pixmap(matrix=matrix, annots=True)
+    # Save as JPEG and insert the JPEG stream directly. PyMuPDF's
+    # insert_image(pixmap=...) re-encodes as PNG/Flate (~20-30x larger for a
+    # scan); passing a JPEG filename embeds the DCT stream verbatim.
+    import os
+    import tempfile
+    jpg_fd, jpg_path = tempfile.mkstemp(suffix=".jpg")
+    os.close(jpg_fd)
+    try:
+        pix.save(jpg_path, output="jpeg", jpg_quality=jpeg_quality)
+        new_page = doc.new_page(width=page_w, height=page_h)
+        new_page.insert_image(new_page.rect, filename=jpg_path)
+        return new_page
+    finally:
+        try:
+            os.remove(jpg_path)
+        except OSError:
+            pass
+
+
 def _copy_source_page_background(doc_out, doc_in, page_idx, page_w, page_h, bake_angle=0):
     """
-    Copy one source page into the output PDF.
+    Copy one source page into the output PDF as a text-free background.
 
-    Preserve the original page object whenever no baked transform is needed so
-    page-level rotation metadata such as /Rotate=270 survives intact. Rebuilding
-    via new_page()+show_pdf_page() can otherwise flatten the page into a new
-    portrait canvas and visually clip landscape scan content.
+    Three cases:
+    - Page already has a native text layer (scan_ocr_low: a scanned page that
+      was OCR'd before, so it carries both a full-page image AND a text layer).
+      Rasterize it to a JPEG image so the old text layer is gone before the
+      ScreenAI overlay is added — otherwise importing to Kho yields double
+      text (native + overlay). Rasterizing at the embedded image's own DPI and
+      re-encoding as JPEG keeps the size close to the original.
+    - No baked transform and no text layer (a plain scan): copy the page object
+      verbatim via ``insert_pdf`` so page-level metadata such as /Rotate=270
+      survives. show_pdf_page would flatten it into a portrait canvas and
+      visually clip landscape scans.
+    - A baked rotation is needed: rebuild via show_pdf_page (rare).
     """
+    import fitz  # PyMuPDF - lazy import
+    src_page = doc_in[page_idx]
+    if _page_has_text_layer(src_page):
+        return _rasterize_page_to_jpeg_background(
+            doc_out, src_page, page_w=page_w, page_h=page_h, bake_angle=bake_angle
+        )
     if not bake_angle:
         doc_out.insert_pdf(doc_in, from_page=page_idx, to_page=page_idx)
-        pg = doc_out[-1]
-        # Strip existing text layer to avoid double text with ScreenAI overlay
-        if pg.get_text("text").strip():
-            pg.add_redact_annot(pg.rect)
-            pg.apply_redactions()
-        return pg
-
+        return doc_out[-1]
     new_page = doc_out.new_page(width=page_w, height=page_h)
     new_page.show_pdf_page(new_page.rect, doc_in, page_idx, rotate=bake_angle)
-    # show_pdf_page copies text layer too — strip it
-    if new_page.get_text("text").strip():
-        new_page.add_redact_annot(new_page.rect)
-        new_page.apply_redactions()
     return new_page
+
+
+def _page_has_text_layer(page) -> bool:
+    """True when the page carries a native text layer that would double up
+    with the ScreenAI invisible-text overlay."""
+    try:
+        return bool(page.get_text("text").strip())
+    except Exception:
+        return False
 
 
 def _append_backgrounds_preserving_inline_images(doc_out, doc_in, background_specs):
@@ -790,10 +875,13 @@ def _append_backgrounds_preserving_inline_images(doc_out, doc_in, background_spe
       layers.
 
     Strategy:
-    - batch consecutive pages whose ``bake_angle == 0`` into a single range
-      insert_pdf call
-    - only use show_pdf_page/new_page for pages that truly require a baked
-      rotation transform.
+    - Pages that carry a native text layer are handled individually via
+      `_copy_source_page_background` (which rasterizes them to drop the text).
+      They can never go through the batch insert_pdf path: insert_pdf would
+      copy the very text layer we need to remove.
+    - Other consecutive pages with ``bake_angle == 0`` are batched into a
+      single range insert_pdf call (preserves inline/transparency image layers).
+    - A baked rotation is handled individually via show_pdf_page.
     """
     range_start = None
     range_end = None
@@ -801,21 +889,19 @@ def _append_backgrounds_preserving_inline_images(doc_out, doc_in, background_spe
     def flush_copy_range():
         nonlocal range_start, range_end
         if range_start is not None and range_end is not None:
-            before = len(doc_out)
             doc_out.insert_pdf(doc_in, from_page=range_start, to_page=range_end)
-            # Strip existing text layer from copied pages (scan_ocr_low fix)
-            for out_idx in range(before, len(doc_out)):
-                pg = doc_out[out_idx]
-                if pg.get_text("text").strip():
-                    pg.add_redact_annot(pg.rect)
-                    pg.apply_redactions()
         range_start = None
         range_end = None
 
     for spec in background_specs:
         page_idx = spec["page_idx"]
         bake_angle = int(spec.get("bake_angle", 0) or 0)
-        if bake_angle == 0:
+        src_page = doc_in[page_idx]
+        has_text = _page_has_text_layer(src_page)
+
+        # Text-layer pages must be rasterized individually; never batch them
+        # (insert_pdf would copy the native text we need to drop).
+        if bake_angle == 0 and not has_text:
             if range_start is None:
                 range_start = range_end = page_idx
             elif page_idx == range_end + 1:
