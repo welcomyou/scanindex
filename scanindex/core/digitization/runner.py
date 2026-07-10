@@ -793,21 +793,25 @@ class ArchiveRunner:
             raise RuntimeError(f"OCR result assembly failed: {msg}")
         if task.is_digital and task.num_pages > 0:
             try:
-                # Keep the visible output as the original digital PDF, but feed
-                # KIE a merged JSON: native text wins, OCR contributes only
-                # visual-only words such as stamps/handwriting.
-                shutil.copy2(task.input_path, task.output_pdf_path)
-                from scanindex.core.pdf.text_extractor import merge_native_text_layer_into_canonical_json
-                merge_pages = list(range(task.num_pages))
-                merge_stats = merge_native_text_layer_into_canonical_json(
-                    task.output_json_path,
+                # Digital PDF: the native text layer is the source of truth.
+                # Rebuild the visible output AND the canonical JSON from native
+                # text only — no ScreenAI OCR overlay, no merge with the OCR
+                # cache. The previous merge-based approach added native words on
+                # top of the cached OCR words, doubling the JSON word count and
+                # breaking Kho search / KIE. extract_digital_pdf_as_ocr copies
+                # the original PDF verbatim and emits a clean native-only JSON.
+                from scanindex.core.pdf.text_extractor import extract_digital_pdf_as_ocr
+                ok_dig, msg_dig = extract_digital_pdf_as_ocr(
                     task.input_path,
-                    merge_pages=merge_pages,
+                    task.output_pdf_path,
+                    source_document_path=task.input_path,
                     canonical_profile="layoutlmv3_runtime",
                 )
-                self.log(f"[{task.file_id}] Digital layer merge {len(merge_pages)} page(s): {merge_stats}")
+                if not ok_dig:
+                    raise RuntimeError(msg_dig or "digital extraction failed")
+                self.log(f"[{task.file_id}] Digital native-text rebuild OK ({task.num_pages} pages)")
             except Exception as e:
-                self.log(f"[{task.file_id}] digital layer merge failed: {e}")
+                self.log(f"[{task.file_id}] digital rebuild failed: {e}")
                 raise
         # Apply correction overlay to the _ocr.pdf
         if task.raw_text and task.corrected_text and task.raw_text != task.corrected_text:
