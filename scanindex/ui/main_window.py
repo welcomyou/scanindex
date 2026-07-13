@@ -257,9 +257,12 @@ class _KhoImportWorker(QThread):
             from scanindex.core.repository.store import ArchiveStore
             from scanindex.core.repository.indexer import HybridIndex
             from scanindex.core.repository.importer import Importer
+            from scanindex.infra.data_versioning import get_active_db_filename
 
             res = None
-            store = ArchiveStore(self._archive_path)
+            store = ArchiveStore(
+                self._archive_path, db_filename=get_active_db_filename()
+            )
             with store:
                 idx = HybridIndex(self._archive_path)
                 idx.open()
@@ -601,7 +604,8 @@ class MainWindow(QMainWindow):
         # Persist the single OCR.TranslateVietnamese key without rewriting the
         # whole settings dict (avoids touching catalogs / KIE values).
         try:
-            settings_path = get_resource_path("settings.ini")
+            from scanindex.infra.data_versioning import get_active_settings_path
+            settings_path = get_active_settings_path()
             if "OCR" not in self.config:
                 self.config["OCR"] = {}
             self.config["OCR"]["TranslateVietnamese"] = str(bool(checked))
@@ -1022,16 +1026,13 @@ class MainWindow(QMainWindow):
         raise ValueError(f"Invalid KIE mode setting {value!r}; expected 'layoutlmv3'.")
 
     def load_settings(self):
-        settings_path = get_resource_path("settings.ini")
-        if not os.path.exists(settings_path):
-            example = get_resource_path("settings.ini.example")
-            if os.path.exists(example):
-                try:
-                    import shutil
-                    shutil.copy(example, settings_path)
-                    portable_utils.ensure_writable(settings_path)
-                except Exception:
-                    pass
+        from scanindex.infra.data_versioning import get_active_settings_path
+        settings_path = get_active_settings_path()
+        # NOTE: we no longer seed settings.ini from .example on first launch.
+        # Fresh installs use in-RAM defaults below; a real file is only written
+        # when the user explicitly saves in the Settings tab. This keeps a
+        # "fresh launch then copy-over" scenario from stamping a default file
+        # that could be mistaken for user data.
 
         self.config.read(settings_path, encoding="utf-8")
 
@@ -1100,8 +1101,11 @@ class MainWindow(QMainWindow):
                     self._saved["kie_mode"] = self._normalize_kie_mode_setting(
                         self.config["KIE"].get("Mode")
                     )
-                else:
+                elif os.path.exists(settings_path):
+                    # File exists but lacks [KIE] — treat as a real config error.
                     raise ValueError("Missing [KIE] section in settings.ini.")
+                # else: no settings file yet (fresh install) → kie_mode stays
+                # at its default None; no need to raise.
 
                 # DOCX export workers are intentionally fixed at 1. Older
                 # settings.ini files may still contain MaxExportWorkers, but
@@ -1177,7 +1181,8 @@ class MainWindow(QMainWindow):
         self._toggle_log_panel(s["show_log_panel"])
 
     def save_settings(self):
-        settings_path = get_resource_path("settings.ini")
+        from scanindex.infra.data_versioning import get_active_settings_path
+        settings_path = get_active_settings_path()
         vals = self.settings_tab.get_values()
 
         # Validate OCR pages concurrency (1..cpu_count)
@@ -1252,6 +1257,13 @@ class MainWindow(QMainWindow):
         self.log_panel.set_verbose(vals["verbose"])
 
         portable_utils.ensure_writable(settings_path)
+        # A user-initiated save means the file is now real, authored config —
+        # clear any auto_seeded marker left by first-launch seeding so a later
+        # version-per-file merge won't treat it as a throwaway default.
+        if self.config.has_section("Meta"):
+            self.config.remove_option("Meta", "auto_seeded")
+            if not self.config.options("Meta"):
+                self.config.remove_section("Meta")
         try:
             with open(settings_path, "w", encoding="utf-8") as f:
                 self.config.write(f)

@@ -105,16 +105,30 @@ python ocr_app.py
 build_portable.bat
 ```
 
-### Portable updates
+### Portable updates (version-per-file)
 
-The dist payload contains config samples only. To update an existing portable
-installation, close the app and copy the new dist contents over the old folder.
-Existing `settings.ini`, `config/sign_settings.json`,
-`config/sign_templates.json`, `config/sign_stamp_images/`, `ignored_words.txt`,
-and `repository/` are preserved. On first launch, missing runtime config files
-are created from their `.example` samples.
-For GitHub Releases, upload a ZIP made from the generated
-`dist/ScanIndex-<version>/` folder only, not from the source tree or an old dist.
+> Từ 1.1.4, ScanIndex dùng **version-per-file** để chống mất dữ liệu khi update
+> bằng copy-đè folder. Mỗi release ghi config/DB vào tên file mang version
+> (`settings-1.1.4.ini`, `repository/repository-1.1.4.db`), khác tên với bản cũ
+> → copy đè folder không bao giờ ghi đè data thật. Xem chi tiết trong
+> [BUILD_AND_VERSIONING.md](BUILD_AND_VERSIONING.md).
+
+**Cách nâng cấp (cho người dùng cuối):**
+
+1. Tải bản mới (`.7z`), giải nén.
+2. Đóng app cũ nếu đang mở.
+3. Copy **toàn bộ nội dung** folder bản mới đè vào folder bản cũ (Windows
+   Explorer merge folder, không xóa file cũ).
+4. Mở app — dữ liệu cũ (settings, kho lưu trữ, file PDF) được tự động chuyển
+   sang tên file mới. Không cần làm gì thêm.
+
+**An toàn ngay cả khi lỡ mở bản mới trước rồi mới copy đè:** app phát hiện cả
+file mới (rỗng/default) và file cũ (có data), tự lấy data cũ. Khởi động lần đầu
+trên thư mục sạch không tạo file nào, nên copy đi đâu cũng vô hại.
+
+The dist payload contains config samples only (`.example` files). For GitHub
+Releases, upload a 7z made from the generated `dist/ScanIndex-<version>/`
+folder only, not from the source tree or an old dist.
 
 Output ở `dist/ScanIndex-<version>/` (auto-derived từ `git describe`). Spec: [Lightweight_OCR.spec](Lightweight_OCR.spec).
 

@@ -128,10 +128,16 @@ _PALETTE_LIGHT = {
 
 
 def _read_theme_setting() -> str:
-    """Read [General]Theme from settings.ini once. Default 'dark'."""
+    """Read [General]Theme from the active settings file once. Default 'dark'.
+
+    Uses the versioned settings path resolved by data_versioning. This runs at
+    module import time, so it must succeed even if migration hasn't run yet
+    (the resolver falls back to a sensible path; the read is best-effort and
+    defaults to 'dark' on any failure)."""
     try:
+        from scanindex.infra.data_versioning import get_active_settings_path
         cfg = configparser.ConfigParser()
-        cfg.read(_get_resource_path("settings.ini"), encoding="utf-8")
+        cfg.read(get_active_settings_path(), encoding="utf-8")
         val = cfg.get("General", "Theme", fallback="dark").strip().lower()
         return "light" if val == "light" else "dark"
     except Exception:

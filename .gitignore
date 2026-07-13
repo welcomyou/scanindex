@@ -36,8 +36,19 @@ chrome_data/
 ocr_chrome_data*/
 # ScreenAI binaries (large versioned folder)
 140.14/
-# Local configuration
+# Local configuration (version-per-file runtime state — never commit user data).
+# Live config files are seeded/migrated at runtime by data_versioning; only the
+# *.example samples ship in the release.
 settings.ini
+settings-*.ini
+config/sign_settings.json
+config/sign_settings-*.json
+config/sign_templates.json
+config/sign_templates-*.json
+ignored_words.txt
+ignored_words-*.txt
+# Pre-schema-conversion backup DBs
+*.preconv.bak
 # Output/Input PDFs (ignore all except listed exceptions)
 *.pdf
 !test_dummy.pdf

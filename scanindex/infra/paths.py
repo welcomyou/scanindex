@@ -5,12 +5,11 @@ import stat
 import sys
 
 
-_RUNTIME_CONFIG_SEEDS = (
-    ("settings.ini", "settings.ini.example"),
-    ("ignored_words.txt", "ignored_words.txt.example"),
-    ("config/sign_settings.json", "config/sign_settings.json.example"),
-    ("config/sign_templates.json", "config/sign_templates.json.example"),
-)
+# Note: first-launch seeding of live config files (settings, sign json,
+# ignored_words) is now handled by scanindex.infra.data_versioning, which also
+# performs the version-per-file migration. This tuple is kept (empty) only so
+# older code/tests referencing it don't break; nothing is seeded here anymore.
+_RUNTIME_CONFIG_SEEDS: tuple[tuple[str, str], ...] = ()
 
 
 def ensure_writable(path):
@@ -97,29 +96,17 @@ def _copy_file_if_missing(source_path, target_path):
 
 
 def ensure_runtime_config_files():
-    """
-    Seed portable runtime config from read-only samples on first launch only.
+    """Ensure the writable runtime *directories* exist.
 
-    Release payloads intentionally ship ``*.example`` files instead of live
-    config so copying a newer portable build over an existing installation
-    preserves local settings, stamp templates, stamp images, and repository.
+    Live config *files* are no longer seeded here. Version-per-file migration
+    (``scanindex.infra.data_versioning.run_startup_migration``) owns all
+    first-launch seeding and upgrade merging now; it runs before this function
+    at startup. We only guarantee the stamp-image directory tree exists so
+    signing features have somewhere to write.
     """
     base_dir = get_base_dir()
-    created = []
-    for target_rel, sample_rel in _RUNTIME_CONFIG_SEEDS:
-        target_path = os.path.join(base_dir, target_rel)
-        if os.path.exists(target_path):
-            continue
-        sample_path = get_resource_path(sample_rel)
-        if not os.path.isfile(sample_path):
-            print(f"[Portable] Warning: Missing config sample {sample_rel}")
-            continue
-        if _copy_file_if_missing(sample_path, target_path):
-            created.append(target_path)
-            print(f"[Portable] Info: Created runtime config {target_rel}")
-
     os.makedirs(os.path.join(base_dir, "config", "sign_stamp_images"), exist_ok=True)
-    return created
+    return []
 
 
 def is_frozen():

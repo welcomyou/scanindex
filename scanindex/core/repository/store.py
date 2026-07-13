@@ -30,9 +30,14 @@ _SCHEMA_FILE = Path(__file__).parent / "schema.sql"
 class ArchiveStore:
     """SQLite-backed archive metadata store."""
 
-    def __init__(self, archive_path: Path | str):
+    def __init__(self, archive_path: Path | str,
+                 db_filename: Optional[str] = None):
         self.archive_path = Path(archive_path).resolve()
-        self.db_path = self.archive_path / C.SQLITE_FILE
+        # db_filename lets the caller request a versioned DB name (see
+        # scanindex.infra.data_versioning.get_active_db_filename). Defaults to
+        # the historical bare name for backward compatibility with tests and
+        # any call site that hasn't been migrated yet.
+        self.db_path = self.archive_path / (db_filename or C.SQLITE_FILE)
         self._conn: Optional[sqlite3.Connection] = None
 
     # ---------- Folder + connection ----------
@@ -115,10 +120,13 @@ class ArchiveStore:
         """Close the connection, then delete every derived store + the DB
         itself, then re-create the empty folder layout. Caller re-opens."""
         self.close()
+        # Derive WAL/SHM/import_log from the actual DB name so a versioned
+        # filename (e.g. repository-1.1.4.db) cleans up its own sidecars.
+        db_name = self.db_path.name
         for child in (
-            self.archive_path / C.SQLITE_FILE,
-            self.archive_path / f"{C.SQLITE_FILE}-wal",
-            self.archive_path / f"{C.SQLITE_FILE}-shm",
+            self.archive_path / db_name,
+            self.archive_path / f"{db_name}-wal",
+            self.archive_path / f"{db_name}-shm",
             self.archive_path / C.IMPORT_LOG_FILE,
         ):
             try:

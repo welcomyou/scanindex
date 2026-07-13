@@ -66,8 +66,12 @@ _RAD = 4
 _LEFT_PANEL_W = 380
 _DEFAULT_TEMPLATE_NAME = "Mặc định"
 _CONFIG_DIR = os.path.join(get_base_dir(), "config")
-_TEMPLATE_FILE = os.path.join(_CONFIG_DIR, "sign_templates.json")
-_SETTINGS_FILE = os.path.join(_CONFIG_DIR, "sign_settings.json")
+# Versioned config files (see scanindex.infra.data_versioning). Resolved at
+# import time, after run_startup_migration has run — so these point at the
+# migrated versioned name if any legacy file existed.
+from scanindex.infra.data_versioning import get_active_config_path
+_TEMPLATE_FILE = get_active_config_path("config/sign_templates", ".json")
+_SETTINGS_FILE = get_active_config_path("config/sign_settings", ".json")
 _STAMP_IMAGE_DIR = os.path.join(_CONFIG_DIR, "sign_stamp_images")
 _TSA_CONNECT_TIMEOUT_SECONDS = 5.0
 _VISIBLE_TEMPLATE_FIELDS = tuple(

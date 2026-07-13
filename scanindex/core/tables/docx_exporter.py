@@ -7702,9 +7702,9 @@ def get_table_config() -> dict:
     Returns dict with 'engine' and 'device' keys.
     """
     import configparser
-    from scanindex.infra.paths import get_base_dir
+    from scanindex.infra.data_versioning import get_active_settings_path
     config = configparser.ConfigParser()
-    config.read(os.path.join(get_base_dir(), "settings.ini"))
+    config.read(get_active_settings_path())
     
     return {
         "engine": "hybrid",

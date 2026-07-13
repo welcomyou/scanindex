@@ -223,7 +223,8 @@ def normalize_display_names(names: list[str] | tuple[str, ...]) -> list[str]:
 
 
 def _settings_path() -> Path:
-    return Path(get_base_dir()) / "settings.ini"
+    from scanindex.infra.data_versioning import get_active_settings_path
+    return Path(get_active_settings_path())
 
 
 def _read_configured_display_names() -> Optional[list[str]]:

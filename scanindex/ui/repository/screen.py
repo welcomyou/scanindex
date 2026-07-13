@@ -150,8 +150,11 @@ class _AddFileWorker(QThread):
             from scanindex.core.repository.store import ArchiveStore
             from scanindex.core.repository.indexer import HybridIndex
             from scanindex.core.repository import admin
+            from scanindex.infra.data_versioning import get_active_db_filename
             doc_id = ""
-            store = ArchiveStore(self._archive_path)
+            store = ArchiveStore(
+                self._archive_path, db_filename=get_active_db_filename()
+            )
             with store:
                 idx = HybridIndex(self._archive_path)
                 idx.open()
@@ -199,10 +202,13 @@ class _AddFilesWorker(QThread):
             from scanindex.core.repository.store import ArchiveStore
             from scanindex.core.repository.indexer import HybridIndex
             from scanindex.core.repository import admin
+            from scanindex.infra.data_versioning import get_active_db_filename
 
             imported = []
             total = len(self._items)
-            store = ArchiveStore(self._archive_path)
+            store = ArchiveStore(
+                self._archive_path, db_filename=get_active_db_filename()
+            )
             with store:
                 idx = HybridIndex(self._archive_path)
                 idx.open()
@@ -375,9 +381,11 @@ class _PrepareAddFileWorker(QThread):
 
 
 def _read_repository_path_setting() -> Path:
-    """Read [Repository] path from settings.ini; default to <base>/repository."""
+    """Read [Repository] path from the active settings file; default to
+    <base>/repository."""
+    from scanindex.infra.data_versioning import get_active_settings_path
+    cfg_path = Path(get_active_settings_path())
     base = Path(get_base_dir())
-    cfg_path = base / "settings.ini"
     if cfg_path.exists():
         cfg = configparser.ConfigParser()
         try:
@@ -400,7 +408,8 @@ def _read_archive_path_setting() -> Path:
 
 
 def _write_repository_path_setting(path: Path) -> None:
-    cfg_path = Path(get_base_dir()) / "settings.ini"
+    from scanindex.infra.data_versioning import get_active_settings_path
+    cfg_path = Path(get_active_settings_path())
     cfg = configparser.ConfigParser()
     if cfg_path.exists():
         try:
@@ -2785,7 +2794,20 @@ class RepositoryScreen(ScreenContent):
 
     def _open_store(self):
         try:
-            self._store = ArchiveStore(self._archive_path)
+            # Migrate any legacy repository DB into this version's filename
+            # BEFORE opening the store, so ArchiveStore opens the right file.
+            from scanindex.infra.data_versioning import (
+                migrate_db_if_needed, get_active_db_filename,
+            )
+            try:
+                migrate_db_if_needed(self._archive_path)
+            except Exception as e:
+                self.log_message.emit(
+                    f"DB migration skipped (non-fatal): {e}", "info"
+                )
+            self._store = ArchiveStore(
+                self._archive_path, db_filename=get_active_db_filename()
+            )
             self._store.connect()
             self._store.ensure_schema()
             mismatches = self._store.version_mismatches()
@@ -4460,7 +4482,8 @@ class RepositoryScreen(ScreenContent):
         if not pdf_paths:
             return
 
-        cfg_path = Path(get_base_dir()) / "settings.ini"
+        from scanindex.infra.data_versioning import get_active_settings_path
+        cfg_path = Path(get_active_settings_path())
         kie_mode = "layoutlmv3"
         enable_correction = False
         if cfg_path.exists():
@@ -4810,7 +4833,10 @@ class RepositoryScreen(ScreenContent):
         self._selected_doc_ids.clear()
         self._selected_dossier_ids.clear()
 
-        store = ArchiveStore(self._archive_path)
+        from scanindex.infra.data_versioning import get_active_db_filename
+        store = ArchiveStore(
+            self._archive_path, db_filename=get_active_db_filename()
+        )
         store.reset_archive_data()
         store.close()
 

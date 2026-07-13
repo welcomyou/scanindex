@@ -30,6 +30,21 @@ def _patch_six_meta_path_importer():
             importer._path = []
 
 
+# Version-per-file migration MUST run before any module reads settings/sign
+# config at import time (theme.py, signing_step.py both do module-level reads).
+# It also must run before ensure_runtime_config_files, which used to seed the
+# bare settings.ini name and would race the migration. We import paths only
+# after the migration so the seeding path is the versioned one.
+try:
+    from scanindex.infra.data_versioning import run_startup_migration
+except Exception as exc:
+    print(f"[Versioning] Warning: migration module import failed: {exc}")
+else:
+    try:
+        run_startup_migration()
+    except Exception as exc:
+        print(f"[Versioning] Warning: startup migration failed: {exc}")
+
 # Portable/offline setup must run before any torch/transformers import.
 try:
     from scanindex.infra import paths as portable_utils
@@ -77,9 +92,9 @@ def _apply_ocr_page_worker_setting():
     if os.environ.get("DIRECT_OCR_NUM_PAGE_WORKERS"):
         return  # explicit env wins — don't clobber it
     try:
-        from scanindex.infra.paths import get_resource_path
+        from scanindex.infra.data_versioning import get_active_settings_path
         import configparser
-        path = get_resource_path("settings.ini")
+        path = get_active_settings_path()
         if not os.path.exists(path):
             return
         cfg = configparser.ConfigParser()
