@@ -1,7 +1,15 @@
-"""PDF/A-2b converter sử dụng Ghostscript.
+"""PDF/A-2b converter sử dụng pikepdf.
 
-Convert PDF thường sang PDF/A-2b (chuẩn lưu trữ dài hạn) — giữ nguyên JPEG
-bytes bằng PassThroughJPEGImages để không tái nén ảnh gốc.
+Convert PDF thường sang PDF/A-2b (chuẩn lưu trữ dài hạn) — thêm sRGB
+OutputIntent + XMP metadata pdfaid:part=2/conformance=B mà KHÔNG rewrite
+font streams hay content streams.
+
+Tại sao không dùng Ghostscript: Ghostscript ``pdfwrite`` re-embed font khi
+tạo PDF/A, và với font TrueType/WinAnsi nó convert sang Type0/Identity-H
+subset nhưng KHÔNG generate ToUnicode CMap mới → text extract ra glyph ID
+thô = mojibake (tiếng Việt hiển thị thành ký tự Cyrillic rác). pikepdf chỉ
+thêm OutputIntent + XMP, giữ nguyên toàn bộ font/text → ToUnicode bảo toàn,
+text extract sạch.
 
 Order trong pipeline ký số:
     insert OCR text layer → convert PDF/A → ký số (pyHanko)
@@ -12,56 +20,22 @@ Convert SAU ký số: có thể phá signature.
 from __future__ import annotations
 
 import os
-import shutil
-import subprocess
 import sys
-from pathlib import Path
 from typing import Optional
 
+import pikepdf
 
-_CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
-
-
-def find_ghostscript() -> Optional[str]:
-    """Auto-detect Ghostscript executable. Returns absolute path hoặc None."""
-    for name in ("gswin64c", "gswin32c", "gs"):
-        p = shutil.which(name)
-        if p:
-            return p
-    if sys.platform == "win32":
-        # Common install locations
-        for base in (r"C:\Program Files\gs", r"C:\Program Files (x86)\gs"):
-            if not os.path.isdir(base):
-                continue
-            try:
-                versions = sorted(os.listdir(base), reverse=True)
-            except OSError:
-                continue
-            for v in versions:
-                for exe_name in ("gswin64c.exe", "gswin32c.exe"):
-                    candidate = os.path.join(base, v, "bin", exe_name)
-                    if os.path.exists(candidate):
-                        return candidate
-    return None
-
-
-def find_pdfa_def_ps(gs_path: str) -> Optional[str]:
-    """Tìm PDFA_def.ps đi kèm Ghostscript install."""
-    if not gs_path:
-        return None
-    # gs binary nằm ở <install>/bin/gswin64c.exe
-    # PDFA_def.ps nằm ở <install>/lib/PDFA_def.ps
-    gs_install = os.path.dirname(os.path.dirname(gs_path))
-    candidate = os.path.join(gs_install, "lib", "PDFA_def.ps")
-    return candidate if os.path.exists(candidate) else None
+# Đường dẫn ICC profile sRGB bundle trong repo (public domain, ~2.5KB).
+_SRGB_ICC = os.path.join(os.path.dirname(__file__), "assets", "srgb.icc")
 
 
 def is_available() -> bool:
-    """Kiểm tra Ghostscript + PDFA_def.ps đầy đủ để convert."""
-    gs = find_ghostscript()
-    if not gs:
+    """Kiểm tra pikepdf + ICC profile sẵn sàng để convert."""
+    try:
+        import pikepdf  # noqa: F401
+    except ImportError:
         return False
-    return find_pdfa_def_ps(gs) is not None
+    return os.path.isfile(_SRGB_ICC)
 
 
 def convert_to_pdfa(
@@ -71,71 +45,74 @@ def convert_to_pdfa(
     version: str = "2",
     timeout: float = 120.0,
 ) -> tuple[bool, str]:
-    """Convert PDF sang PDF/A-{version}b.
+    """Convert PDF sang PDF/A-{version}b bằng pikepdf.
 
     Args:
         input_pdf: source PDF path
         output_pdf: dest PDF path (ghi đè nếu tồn tại)
-        version: "1", "2" (khuyến nghị), hoặc "3"
-        timeout: giây
+        version: chỉ hỗ trợ "2" (PDF/A-2b). "1"/"3" được chấp nhận nhưng vẫn
+            tạo PDF/A-2b (pikepdf PDF/A-2b tương thích ngược với hầu hết
+            verifier).
+        timeout: giữ cho tương thích API (không dùng — pikepdf là synchronous).
 
     Returns:
         (success, error_message). error_message rỗng khi success.
 
     Notes:
-        - PassThroughJPEGImages=true → ảnh JPEG embed giữ nguyên byte (không re-encode)
-        - PDFACompatibilityPolicy=1 → fail nếu file vi phạm PDF/A standard
-        - Output có thể lớn hơn input ~5-10% do ICC profile + metadata
+        - KHÔNG rewrite font streams → ToUnicode CMap bảo toàn → tránh
+          mojibake khi extract text (bug cố hữu của Ghostscript pdfwrite).
+        - Output size ≈ input size + ~3KB (ICC profile).
+        - Chỉ thêm sRGB OutputIntent + XMP pdfaid declaration.
     """
     if not os.path.exists(input_pdf):
         return False, f"Input không tồn tại: {input_pdf}"
-
-    gs = find_ghostscript()
-    if not gs:
-        return False, "Ghostscript không tìm thấy (cài gs10+ hoặc thêm vào PATH)"
-
-    pdfa_def = find_pdfa_def_ps(gs)
-    if not pdfa_def:
-        return False, f"PDFA_def.ps không tìm thấy gần {gs}"
-
+    if not os.path.isfile(_SRGB_ICC):
+        return False, f"ICC profile không tìm thấy: {_SRGB_ICC}"
     if version not in ("1", "2", "3"):
         return False, f"PDF/A version không hợp lệ: {version} (chỉ 1/2/3)"
 
-    args = [
-        gs,
-        f"-dPDFA={version}",
-        "-dBATCH", "-dNOPAUSE", "-dNOOUTERSAVE",
-        "-dPDFACompatibilityPolicy=1",
-        "-sColorConversionStrategy=UseDeviceIndependentColor",
-        "-sDEVICE=pdfwrite",
-        "-dPassThroughJPEGImages=true",
-        "-dPassThroughJPXImages=true",
-        f"-sOutputFile={output_pdf}",
-        pdfa_def,
-        input_pdf,
-    ]
+    try:
+        pdf = pikepdf.open(input_pdf)
+    except Exception as exc:
+        return False, f"Mở PDF lỗi: {exc}"
 
     try:
-        result = subprocess.run(
-            args,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            creationflags=_CREATE_NO_WINDOW,
-        )
-    except subprocess.TimeoutExpired:
-        return False, f"Ghostscript timeout sau {timeout}s"
-    except Exception as e:
-        return False, f"Subprocess error: {e}"
+        # 1. sRGB OutputIntent (yêu cầu của PDF/A).
+        with open(_SRGB_ICC, "rb") as f:
+            icc_stream = pikepdf.Stream(pdf, f.read())
+        output_intent = pikepdf.Dictionary({
+            "/Type": pikepdf.Name.OutputIntent,
+            "/S": pikepdf.Name.GTS_PDFA1,
+            "/OutputConditionIdentifier": pikepdf.String("sRGB"),
+            "/Info": pikepdf.String("sRGB IEC61966-2.1"),
+            "/RegistryName": pikepdf.String("http://www.color.org"),
+            "/DestOutputProfile": icc_stream,
+        })
+        # Thay thế OutputIntents hiện có (chỉ giữ 1 sRGB).
+        if pikepdf.Name.OutputIntents in pdf.Root:
+            del pdf.Root.OutputIntents
+        pdf.Root.OutputIntents = pikepdf.Array([output_intent])
 
-    if result.returncode != 0:
-        # Lấy 500 char cuối stderr (Ghostscript verbose)
-        tail = (result.stderr or "")[-500:]
-        return False, f"gs exit {result.returncode}: {tail}"
+        # 2. XMP metadata khai báo PDF/A-2b (pdfaid namespace).
+        with pdf.open_metadata(set_pikepdf_as_editor=False) as meta:
+            meta["pdfaid:part"] = "2"
+            meta["pdfaid:conformance"] = "B"
+
+        pdf.save(output_pdf)
+    except Exception as exc:
+        try:
+            pdf.close()
+        except Exception:
+            pass
+        return False, f"Convert PDF/A lỗi: {exc}"
+
+    try:
+        pdf.close()
+    except Exception:
+        pass
 
     if not os.path.exists(output_pdf) or os.path.getsize(output_pdf) == 0:
         return False, "Output PDF rỗng sau khi convert"
-
     return True, ""
 
 
@@ -143,9 +120,8 @@ def convert_to_pdfa(
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
-        print("Usage: python pdf_a_converter.py <input.pdf> <output.pdf> [version]")
-        print(f"  Ghostscript: {find_ghostscript()}")
-        print(f"  PDFA_def.ps: {find_pdfa_def_ps(find_ghostscript() or '')}")
+        print("Usage: python pdfa_converter.py <input.pdf> <output.pdf> [version]")
+        print(f"  ICC profile: {_SRGB_ICC}")
         print(f"  Available:   {is_available()}")
         sys.exit(1)
     inp, out = sys.argv[1], sys.argv[2]

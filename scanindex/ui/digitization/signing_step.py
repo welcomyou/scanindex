@@ -85,6 +85,36 @@ class _SignItem:
     error: str = ""
 
 
+def _pdf_has_digital_signature(pdf_path: str) -> bool:
+    """True if the PDF already carries a PKCS#7 digital signature.
+
+    Checks for AcroForm signature widgets (`/FT == /Sig`) first (fast), then
+    falls back to scanning xref objects for the `/ByteRange` + `/Contents`
+    pair that marks an embedded signature dictionary. Used so a reopened
+    ZIP (whose PDFs were already signed at export time) shows "Đã ký" in
+    Step 3 instead of "Chờ ký"."""
+    try:
+        import fitz  # PyMuPDF — lazy import
+        doc = fitz.open(pdf_path)
+    except Exception:
+        return False
+    try:
+        for i in range(doc.page_count):
+            for widget in doc[i].widgets() or []:
+                if widget.field_type_string == "Signature":
+                    return True
+        for xref in range(1, doc.xref_length()):
+            try:
+                obj = doc.xref_object(xref)
+            except Exception:
+                continue
+            if "/ByteRange" in obj and "/Contents" in obj:
+                return True
+        return False
+    finally:
+        doc.close()
+
+
 @dataclass(frozen=True)
 class _BatchTimeDecision:
     tsa_url: str = ""
@@ -316,7 +346,6 @@ class ArchiveStep3Sign(QWidget):
     """Step 3 screen that signs the PDFs produced by Step 2."""
 
     log_message = Signal(str)
-    refresh_requested = Signal()
     export_clicked = Signal()        # Xuất hồ sơ nén ra thư mục ngoài
     import_kho_clicked = Signal()    # Chuyển vào Kho lưu trữ nội bộ
 
@@ -404,15 +433,21 @@ class ArchiveStep3Sign(QWidget):
         h.setContentsMargins(8, 0, 8, 0)
         h.setSpacing(6)
 
-        self._btn_refresh = self._button("Nạp PDF từ Bước 2", "ghost")
-        self._btn_refresh.clicked.connect(self.refresh_requested.emit)
-        h.addWidget(self._btn_refresh)
+        # Step 2's output is auto-loaded into Step 3 when the user opens the
+        # tab (see container._prepare_step3), so there is no manual "load"
+        # button — this label just reports how many files were carried over.
+        self._lbl_load_info = QLabel("Chưa nạp file")
+        self._lbl_load_info.setStyleSheet(
+            f"color: {COLOR_TEXT_SECONDARY}; font-size: {_FONT_SM}px;"
+            f" padding: 0 6px;"
+        )
+        h.addWidget(self._lbl_load_info)
 
-        self._btn_open_output = self._button("Mở thư mục đã ký", "ghost")
+        self._btn_open_output = self._button("Mở thư mục đã ký", "success")
         self._btn_open_output.clicked.connect(self._open_output_dir)
         h.addWidget(self._btn_open_output)
 
-        self._btn_edit_dossier = self._button("Sửa thông tin hồ sơ", "ghost")
+        self._btn_edit_dossier = self._button("Sửa thông tin hồ sơ", "success")
         self._btn_edit_dossier.clicked.connect(self._edit_dossier_info)
         h.addWidget(self._btn_edit_dossier)
 
@@ -531,7 +566,8 @@ class ArchiveStep3Sign(QWidget):
 
         # PDF/A-2b conversion option (chuẩn lưu trữ dài hạn).
         # Convert TRƯỚC khi ký số: signature trong PDF/A-2 vẫn valid.
-        # Cần Ghostscript đã cài (auto-detect).
+        # Dùng pikepdf (luôn sẵn sàng) — KHÔNG dùng Ghostscript vì GS pdfwrite
+        # hỏng ToUnicode CMap khi re-embed font → mojibake text Việt.
         from scanindex.core.pdf.pdfa_converter import is_available as _pdfa_available
         self.chk_pdfa = QCheckBox("Convert PDF/A-2b trước khi ký")
         self.chk_pdfa.setStyleSheet(
@@ -540,12 +576,12 @@ class ArchiveStep3Sign(QWidget):
         if not _pdfa_available():
             self.chk_pdfa.setEnabled(False)
             self.chk_pdfa.setToolTip(
-                "Cần cài Ghostscript (gswin64c) để dùng tính năng này."
+                "Cài lại pikepdf để dùng tính năng này."
             )
         else:
             self.chk_pdfa.setToolTip(
                 "Convert PDF sang PDF/A-2b (chuẩn ISO 19005-2) trước khi ký số. "
-                "Giữ nguyên ảnh JPEG gốc (PassThroughJPEGImages)."
+                "Giữ nguyên text layer + font gốc, tránh lỗi mojibake."
             )
         self.chk_pdfa.stateChanged.connect(lambda *_: self._save_settings())
         layout.addWidget(self.chk_pdfa)
@@ -1424,7 +1460,15 @@ class ArchiveStep3Sign(QWidget):
                 continue
             new_output = self._signed_output_path(item)
             candidates = []
-            if old_output:
+            # ONLY consider candidates that live INSIDE the signed output
+            # directory. A reopened ZIP marks its already-signed source PDFs
+            # by pointing item.output_path back at the original file under
+            # `_zip_input/` — that is Step 2's source-of-truth, NOT a signed
+            # copy we may move. Moving it out would delete the file Step 2
+            # still reads, making those documents unviewable after the next
+            # navigation. So never rename anything outside _step3_signed/.
+            if old_output and os.path.abspath(old_output).startswith(
+                    os.path.abspath(out_dir) + os.sep):
                 candidates.append(old_output)
             # Legacy signed name before this change: signed_dir/<step2 basename>.
             candidates.append(os.path.join(out_dir, os.path.basename(item.source_path)))
@@ -1475,15 +1519,34 @@ class ArchiveStep3Sign(QWidget):
                 display_name=self._display_name_for_source(row, source),
                 signature_page=sig_page,
             ))
+            # A reopened ZIP's PDFs are often already digitally signed at
+            # export time — flag them so Step 3 shows "Đã ký" instead of
+            # "Chờ ký". The output must point at a COPY inside _step3_signed/,
+            # NOT at the source file itself: the source lives in _zip_input/
+            # and is Step 2's source-of-truth. Pointing output_path at it
+            # would let _refresh_identity_file_names rename/move it out of
+            # _zip_input/ on the next identity edit, breaking Step 2.
+            if _pdf_has_digital_signature(source):
+                items[-1].status = "Đã ký (có sẵn)"
+                signed_copy = self._signed_output_path(items[-1])
+                try:
+                    os.makedirs(os.path.dirname(signed_copy), exist_ok=True)
+                    if not os.path.exists(signed_copy):
+                        shutil.copyfile(source, signed_copy)
+                    items[-1].output_path = signed_copy
+                except Exception:
+                    # If the copy fails, leave output_path empty so the
+                    # operator can re-sign rather than corrupt Step 2's file.
+                    items[-1].output_path = ""
         self._items = items
         # `default_output_dir` is no longer threaded through — signed PDFs
         # always land in `<session_temp>/_step3_signed/` per the new
         # workflow contract.
         self._refresh_table()
         if items:
-            self.lbl_status.setText(f"Đã nạp {len(items)} file từ Bước 2.")
+            self._lbl_load_info.setText(f"Đã nạp {len(items)} file từ Bước 2")
         else:
-            self.lbl_status.setText("Chưa có file đầu ra từ Bước 2 để ký.")
+            self._lbl_load_info.setText("Chưa có file từ Bước 2")
 
     def _add_item_path(self, path: str):
         path = os.path.abspath(os.path.normpath(path))
@@ -1877,7 +1940,7 @@ class ArchiveStep3Sign(QWidget):
 
     def _set_inputs_enabled(self, enabled: bool):
         for widget in [
-            self._btn_refresh, self._btn_export, self._btn_import_kho,
+            self._btn_export, self._btn_import_kho,
             self._btn_open_output, self._btn_edit_dossier, self._btn_reload_certs,
             self._btn_add_files, self._btn_add_folder, self._btn_remove,
             self._btn_clear, self.combo_cert, self.combo_template,

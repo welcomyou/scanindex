@@ -27,7 +27,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QFrame, QHBoxLayout, QLabel, QMenu, QMessageBox, QPushButton, QScrollArea,
-    QVBoxLayout, QWidget,
+    QSpinBox, QVBoxLayout, QWidget,
 )
 from PySide6.QtGui import QAction, QKeySequence, QShortcut
 
@@ -262,6 +262,17 @@ class _PdfPageWidget(QLabel):
         self._non_edit_click_pos: Optional[QPointF] = None
         self._overlaid_pixmap: Optional[QPixmap] = None
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        # Blink animation for the selected field's pill badge so the
+        # operator can see at a glance which KIE field is active. The
+        # timer only runs while edit mode is on AND a selected icon is
+        # present; it drives _blink_phase between 0..1 via a cosine.
+        self._blink_phase = 0.0
+        self._blink_dir_up = True
+        self._blink_timer = QTimer(self)
+        # 77ms ≈ 13fps, ~30% snappier than the original 100ms while still
+        # reading as a gentle pulse rather than a flash.
+        self._blink_timer.setInterval(77)
+        self._blink_timer.timeout.connect(self._on_blink_tick)
 
     # ---- public ----------------------------------------------------
 
@@ -282,6 +293,9 @@ class _PdfPageWidget(QLabel):
         self.render_scale = scale
         self._overlaid_pixmap = None
         self.rescale_from_source(scale)
+        # Pixmap materialised — resume the blink redraw if this page hosts
+        # the active field's pill.
+        self._update_blink_timer()
 
     def rescale_from_source(self, display_scale: float):
         """Update the visible pixmap from the high-res source render."""
@@ -312,6 +326,10 @@ class _PdfPageWidget(QLabel):
         self._source_pixmap = None
         self.base_pixmap = None
         self._overlaid_pixmap = None
+        # No pixmap to paint onto — pause the blink redraws until the page
+        # is materialised again.
+        if self._blink_timer.isActive():
+            self._blink_timer.stop()
         self.clear()
         self.setFixedSize(target_w, target_h)
 
@@ -330,6 +348,7 @@ class _PdfPageWidget(QLabel):
         self.highlight_bboxes = list(highlight_bboxes or [])
         self.selected_word_ids = {str(wid) for wid in (selected_word_ids or [])}
         self.field_icons = list(field_icons or [])
+        self._update_blink_timer()
         self._repaint()
 
     def set_edit_mode(self, on: bool):
@@ -338,6 +357,7 @@ class _PdfPageWidget(QLabel):
             self.unsetCursor()
         else:
             self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self._update_blink_timer()
         self._repaint()
 
     def set_pan_scroll_area(self, scroll_area: QScrollArea):
@@ -372,6 +392,68 @@ class _PdfPageWidget(QLabel):
             left_x = x0
         return QRectF(left_x * s, top_y * s, (x1 - x0) * s, (y1 - y0) * s)
 
+    def _draw_word_level_rects(self, painter: QPainter):
+        """One outline per word — the original behaviour, used when no line
+        grouping is available (older canonical JSON without line metadata)."""
+        for wid, bbox in self.word_rects:
+            if wid in self.selected_word_ids:
+                continue  # rendered by highlight_bboxes pass below
+            rect = self._bbox_to_rect(bbox)
+            if wid in self.word_ownership:
+                label = self.word_ownership[wid]
+                dark, light = _label_color(label)
+                fill = QColor(dark); fill.setAlpha(20)
+                painter.setBrush(QBrush(fill))
+                painter.setPen(QPen(QColor(light).darker(150), 0.8))
+                painter.drawRect(rect)
+            else:
+                fill = QColor(0, 200, 255, 15)
+                painter.setBrush(QBrush(fill))
+                painter.setPen(QPen(QColor(0, 200, 255, 120), 1.2))
+                painter.drawRect(rect)
+
+    def _draw_line_level_rects(self, painter: QPainter):
+        """One merged outline per text line.
+
+        Digital PDFs expose their text layer as many tiny word fragments
+        (punctuation, single glyphs), which made the per-word outline look
+        like scattered confetti. Merging the words of each line into one
+        wide bbox gives a clean, readable overlay. Word-level ownership
+        (field colours) is preserved at the line level: a line whose words
+        all belong to one field is tinted with that field's colour; a line
+        with mixed/unassigned words falls back to the neutral cyan."""
+        # word_id → bbox, for merging.
+        bbox_by_id: dict[str, list[float]] = {}
+        for wid, bbox in self.word_rects:
+            bbox_by_id[wid] = bbox
+        # Group word ids by line, preserving the line ordering already
+        # established when the page data was applied.
+        for line_id, word_ids in self.line_to_words.items():
+            boxes = [bbox_by_id[w] for w in word_ids
+                     if w in bbox_by_id and w not in self.selected_word_ids]
+            if not boxes:
+                continue
+            merged = [
+                min(b[0] for b in boxes),
+                min(b[1] for b in boxes),
+                max(b[2] for b in boxes),
+                max(b[3] for b in boxes),
+            ]
+            rect = self._bbox_to_rect(merged)
+            owners = {self.word_ownership[w] for w in word_ids
+                      if w in self.word_ownership}
+            if len(owners) == 1:
+                label = next(iter(owners))
+                dark, light = _label_color(label)
+                fill = QColor(dark); fill.setAlpha(20)
+                painter.setBrush(QBrush(fill))
+                painter.setPen(QPen(QColor(light).darker(150), 0.8))
+            else:
+                fill = QColor(0, 200, 255, 15)
+                painter.setBrush(QBrush(fill))
+                painter.setPen(QPen(QColor(0, 200, 255, 120), 1.2))
+            painter.drawRect(rect)
+
     def _repaint(self):
         if not self.base_pixmap:
             return
@@ -379,25 +461,17 @@ class _PdfPageWidget(QLabel):
         painter = QPainter(pm)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-        # Draw ALL words in edit mode (cyan outline for unassigned, dim per-label
-        # for words owned by other fields)
+        # Draw ALL words in edit mode. To avoid the "swiss-cheese" look on
+        # digital PDFs (whose text layer yields hundreds of tiny single-char
+        # word fragments), group words by line and draw one merged bbox per
+        # line instead of one per word. Hit-testing still works at word
+        # granularity (mousePressEvent iterates word_rects), so selection
+        # precision is unaffected.
         if self.edit_mode and self.word_rects:
-            for wid, bbox in self.word_rects:
-                rect = self._bbox_to_rect(bbox)
-                if wid in self.selected_word_ids:
-                    continue  # rendered by highlight_bboxes pass below
-                if wid in self.word_ownership:
-                    label = self.word_ownership[wid]
-                    dark, light = _label_color(label)
-                    fill = QColor(dark); fill.setAlpha(20)
-                    painter.setBrush(QBrush(fill))
-                    painter.setPen(QPen(QColor(light).darker(150), 0.8))
-                    painter.drawRect(rect)
-                else:
-                    fill = QColor(0, 200, 255, 15)
-                    painter.setBrush(QBrush(fill))
-                    painter.setPen(QPen(QColor(0, 200, 255, 120), 1.2))
-                    painter.drawRect(rect)
+            if self.line_to_words:
+                self._draw_line_level_rects(painter)
+            else:
+                self._draw_word_level_rects(painter)
 
         # Draw highlighted bboxes (selected field's words)
         for bbox, label, is_selected in self.highlight_bboxes:
@@ -442,15 +516,28 @@ class _PdfPageWidget(QLabel):
     def _draw_field_icon(self, painter: QPainter, anchor_bbox: list[float],
                           number, label: str, is_selected: bool):
         """Pill (ellipse) + text + connector line, placed to the right of the
-        field's bbox. Width grows with text length so multi-char badges fit."""
+        field's bbox. Width grows with text length so multi-char badges fit.
+
+        When ``is_selected`` and the blink animation is running, the pill
+        gently grows/shrinks and its border brightens so the operator can
+        spot the active KIE field among several same-numbered fields."""
         rect = self._bbox_to_rect(anchor_bbox)
         if rect.isEmpty():
             return
         dark, light = _label_color(label)
         text = str(number)
 
+        # Blink modulation only applies to the active field's pill.
+        # _blink_phase oscillates 0..1; map it to a +0..2px size bump and
+        # a brighter border so the effect reads as a soft pulse.
+        scale_bump = 0.0
+        border_boost = 0.0
+        if is_selected and self._blink_timer.isActive():
+            scale_bump = self._blink_phase * 2.0
+            border_boost = self._blink_phase * 0.8
+
         ay = rect.center().y()
-        ry = 12 if is_selected else 10
+        ry = (12 if is_selected else 10) + scale_bump
         rx = ry + max(0, len(text) - 1) * 4
         line_len = 14
 
@@ -472,9 +559,14 @@ class _PdfPageWidget(QLabel):
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawLine(QPointF(line_start_x, ay), QPointF(line_end_x, cy))
 
-        # Pill (filled dark, light border)
+        # Pill (filled dark, light border). Selected+blinking border grows
+        # toward pure white to draw the eye.
         painter.setBrush(QBrush(QColor(dark)))
-        painter.setPen(QPen(QColor(light), 2.0 if is_selected else 1.2))
+        if is_selected:
+            border_color = QColor(light).lighter(100 + int(border_boost * 25))
+            painter.setPen(QPen(border_color, 2.0 + border_boost))
+        else:
+            painter.setPen(QPen(QColor(light), 1.2))
         painter.drawEllipse(QPointF(cx, cy), rx, ry)
 
         # Text (white, bold)
@@ -489,6 +581,42 @@ class _PdfPageWidget(QLabel):
             QRectF(cx - rx, cy - ry, 2 * rx, 2 * ry),
             Qt.AlignmentFlag.AlignCenter, text,
         )
+
+    # ---- blink animation for the active field's pill badge ------------
+
+    def _has_selected_icon(self) -> bool:
+        return any(is_sel for _bbox, _num, _label, is_sel in self.field_icons)
+
+    def _update_blink_timer(self):
+        """Start the blink heartbeat when edit mode is on AND this page
+        hosts the active field's icon; stop otherwise so we don't burn CPU
+        redrawing idle pages."""
+        should_run = bool(self.edit_mode) and self._has_selected_icon()
+        if should_run and not self._blink_timer.isActive():
+            self._blink_phase = 0.0
+            self._blink_dir_up = True
+            self._blink_timer.start()
+        elif not should_run and self._blink_timer.isActive():
+            self._blink_timer.stop()
+            self._blink_phase = 0.0
+            self._blink_dir_up = True
+            if self.base_pixmap:
+                self._repaint()
+
+    def _on_blink_tick(self):
+        # Advance the phase with an explicit direction so it forms a clean
+        # 0 → 1 → 0 → 1 ... pulse (~1.2s period, 12 ticks at 100ms) rather
+        # than a reflection that stalls near the peak.
+        step = 1.0 / 6.0
+        self._blink_phase += step if self._blink_dir_up else -step
+        if self._blink_phase >= 1.0:
+            self._blink_phase = 1.0
+            self._blink_dir_up = False
+        elif self._blink_phase <= 0.0:
+            self._blink_phase = 0.0
+            self._blink_dir_up = True
+        if self.base_pixmap:
+            self._repaint()
 
     def _draw_rubber_band(self):
         if not self._overlaid_pixmap or not self._drag_origin or not self._drag_current:
@@ -787,11 +915,27 @@ class KieArchiveViewer(QWidget):
         h.setContentsMargins(6, 0, 6, 0)
         h.setSpacing(4)
 
-        self._lbl_page = QLabel("")
-        self._lbl_page.setStyleSheet(f"color: {COLOR_TEXT_MUTED}; font-size: 11px;")
-        self._lbl_page.setMinimumWidth(80)
-        self._lbl_page.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        h.addWidget(self._lbl_page)
+        # Page navigation: editable spinbox (current page) + "/ total" label.
+        # Typing a number or using the up/down buttons jumps to that page.
+        self._spin_page = QSpinBox()
+        self._spin_page.setRange(1, 1)
+        self._spin_page.setValue(1)
+        self._spin_page.setFixedHeight(24)
+        self._spin_page.setFixedWidth(58)
+        self._spin_page.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._spin_page.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
+        self._spin_page.setStyleSheet(
+            f"QSpinBox {{ background: transparent; border: 1px solid {COLOR_BORDER_DEFAULT};"
+            f" border-radius: 4px; color: {COLOR_TEXT}; font-size: 11px; padding: 0 2px; }}"
+            f"QSpinBox:hover {{ border-color: {COLOR_ACCENT}; }}"
+            f"QSpinBox:disabled {{ color: {COLOR_TEXT_MUTED}; border-color: {COLOR_BORDER}; }}"
+        )
+        self._spin_page.valueChanged.connect(self._on_spin_page_changed)
+        h.addWidget(self._spin_page)
+
+        self._lbl_page_total = QLabel("/ 1")
+        self._lbl_page_total.setStyleSheet(f"color: {COLOR_TEXT_MUTED}; font-size: 11px;")
+        h.addWidget(self._lbl_page_total)
 
         h.addSpacing(8)
         self._btn_zoom_out = self._mini_btn("−")
@@ -816,8 +960,12 @@ class KieArchiveViewer(QWidget):
         self._lbl_active.hide()
         h.addWidget(self._lbl_active)
 
-        # Edit mode toggle
-        self._btn_edit = QPushButton("✎ Sửa bbox")
+        # Edit mode toggle — "select & lasso" lets the operator pick a KIE
+        # field in the metadata panel, then drag a rectangle over the PDF to
+        # capture the words that belong to that field. Works for both KIE
+        # output (refining existing bboxes) and ZIP-reopened PDFs (building
+        # annotations from scratch).
+        self._btn_edit = QPushButton("⬚ Chọn & Khoanh vùng")
         self._btn_edit.setCheckable(True)
         self._btn_edit.setStyleSheet(self._toggle_style())
         self._btn_edit.toggled.connect(self._on_edit_toggled)
@@ -1534,6 +1682,9 @@ class KieArchiveViewer(QWidget):
             page = pages[pi] if pi < len(pages) else {}
             words = page.get("words") or []
             word_rects = []
+            word_to_line: dict[str, str] = {}
+            line_to_words: dict[str, list[str]] = {}
+            word_bbox_by_id: dict[str, list[float]] = {}
             for w in words:
                 wid = w.get("id") or w.get("word_id")
                 if not wid:
@@ -1541,8 +1692,20 @@ class KieArchiveViewer(QWidget):
                 wid = str(wid)
                 bbox = w.get("bbox") or [0, 0, 0, 0]
                 word_rects.append((wid, list(bbox)))
+                word_bbox_by_id[wid] = list(bbox)
+                lid = w.get("line_id")
+                if lid:
+                    lid = str(lid)
+                    word_to_line[wid] = lid
+                    line_to_words.setdefault(lid, []).append(wid)
+            for line_word_ids in line_to_words.values():
+                line_word_ids.sort(
+                    key=lambda wid: (word_bbox_by_id.get(wid, [0, 0, 0, 0])[0], wid)
+                )
             pw.set_word_rects(word_rects)
             pw.set_word_ownership(ownership.get(pi, {}))
+            pw.word_to_line = word_to_line
+            pw.line_to_words = line_to_words
         self._refresh_active_field_highlight()
 
     # ---- field selection -------------------------------------------
@@ -1775,10 +1938,16 @@ class KieArchiveViewer(QWidget):
         self._scroll.verticalScrollBar().setValue(0)
         self._update_page_label(0)
 
-    def _update_page_label(self, current_idx: Optional[int] = None):
+    def _update_page_label(self, current_idx=None):
         total = int(self._doc.page_count) if self._doc is not None else len(self._page_widgets)
         if total <= 0:
-            self._lbl_page.setText("")
+            # No document loaded — disable the spinbox and blank the total.
+            self._spin_page.blockSignals(True)
+            self._spin_page.setRange(0, 0)
+            self._spin_page.setValue(0)
+            self._spin_page.setEnabled(False)
+            self._spin_page.blockSignals(False)
+            self._lbl_page_total.setText("")
             return
         if current_idx is None:
             current_idx = self._current_page_index()
@@ -1789,7 +1958,27 @@ class KieArchiveViewer(QWidget):
         except (TypeError, ValueError):
             idx = 0
         idx = max(0, min(idx, total - 1))
-        self._lbl_page.setText(f"{idx + 1} / {total}")
+        # Keep the spinbox range in sync with the document; block signals so
+        # updating the displayed page from a scroll does not re-trigger a jump.
+        self._spin_page.blockSignals(True)
+        self._spin_page.setRange(1, total)
+        self._spin_page.setValue(idx + 1)
+        self._spin_page.setEnabled(True)
+        self._spin_page.blockSignals(False)
+        self._lbl_page_total.setText(f"/ {total}")
+
+    def _on_spin_page_changed(self, value: int):
+        """User typed/changed the page spinbox — scroll the viewport to it."""
+        self._jump_to_page(int(value) - 1)
+
+    def _jump_to_page(self, page_idx: int):
+        """Scroll so that page `page_idx` (0-based) is at the top of the viewport."""
+        if not self._page_widgets or not (0 <= page_idx < len(self._page_widgets)):
+            return
+        target_y = self._page_top(page_idx)
+        self._scroll.horizontalScrollBar().setValue(0)
+        self._scroll.verticalScrollBar().setValue(target_y)
+        self._update_page_label(page_idx)
 
     def set_file_label(self, current_idx: int, total: int):
         """Kept for older callers; Step 2 now shows page position here."""
@@ -2248,7 +2437,16 @@ class KieArchiveViewer(QWidget):
                     new_set.append(wid); current.add(wid)
 
         if not new_set:
-            self._remove_field_instance(self._active_field_id, confirm=False)
+            # An empty result from a "set" with no hits (e.g. the operator
+            # dragged over an empty area) shouldn't destroy the field — that
+            # would erase the selection focus (green border) and force the
+            # user to re-create the field. Only auto-remove when the field
+            # explicitly became empty via toggle/remove on a real selection.
+            if op in ("toggle", "remove") and word_ids:
+                self._remove_field_instance(self._active_field_id, confirm=False)
+                return
+            # op == "set" with no hits, or remove with nothing to remove:
+            # keep the field as-is and preserve the active-field highlight.
             return
 
         target["word_ids"] = new_set

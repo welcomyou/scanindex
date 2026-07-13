@@ -431,6 +431,7 @@ The software prioritizes local processing when models and dependencies are insta
     "arc_field_nguoi_ky": { "en": "Signer", "vi": "Người ký" },
     "arc_field_do_mat": { "en": "Secrecy", "vi": "Độ mật" },
     "arc_field_trang_so": { "en": "Page no.", "vi": "Trang số" },
+    "arc_field_so_trang": { "en": "Pages", "vi": "Số trang" },
     "arc_field_so_thu_tu": { "en": "Ordinal", "vi": "Số thứ tự" },
     "arc_raw_kie_title": { "en": "Raw KIE", "vi": "Thông tin thô (Raw KIE)" },
     "arc_viewer_hint": {
@@ -537,6 +538,26 @@ The software prioritizes local processing when models and dependencies are insta
     "arc_step2_name_warn": {
         "en": "Filename does not match expected pattern <ID>-<Fonds>-<Catalog>-<File>-<NNN>.pdf",
         "vi": "Tên file chưa đúng mẫu <Mã ĐD>-<Mã phông>-<Mục lục>-<Hồ sơ>-<STT>.pdf",
+    },
+
+    # ── Step 2 — reopen exported ZIP to edit ────────────────────────
+    "arc_step2_open_zip": { "en": "Open ZIP", "vi": "Mở ZIP" },
+    "arc_step2_open_zip_title": { "en": "Select an exported ZIP", "vi": "Chọn file ZIP đã xuất" },
+    "arc_step2_zip_replace_confirm": {
+        "en": "A dossier is already loaded. Replace it with the ZIP contents? Unsaved edits will be lost.",
+        "vi": "Đang có hồ sơ trong Bước 2. Thay thế bằng nội dung của file ZIP này? Các chỉnh sửa chưa lưu sẽ bị mất.",
+    },
+    "arc_step2_zip_loaded": {
+        "en": "Loaded ZIP — {n} document(s) ready to edit.",
+        "vi": "Đã nạp ZIP — {n} văn bản sẵn sàng để chỉnh sửa.",
+    },
+    "arc_step2_zip_invalid": {
+        "en": "Not a valid archive ZIP (missing MetaDuLieu.xlsx under HSLTCQ/METADATA/).",
+        "vi": "Không phải file ZIP hồ sơ hợp lệ (thiếu MetaDuLieu.xlsx trong HSLTCQ/METADATA/).",
+    },
+    "arc_step2_zip_failed": {
+        "en": "Failed to read ZIP: {0}",
+        "vi": "Không đọc được file ZIP: {0}",
     },
 
     # ── Step 3 placeholder ──────────────────────────────────────────

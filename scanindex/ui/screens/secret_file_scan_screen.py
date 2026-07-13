@@ -18,6 +18,7 @@ from PySide6.QtCore import Qt, QUrl, Signal
 from PySide6.QtGui import QColor, QDesktopServices
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QCheckBox,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -55,6 +56,9 @@ from scanindex.ui.theme import (
 SUPPORTED_EXTS = {".pdf", ".png", ".jpg", ".jpeg", ".doc", ".docx"}
 _MIN_NATIVE_TEXT_CHARS = 40
 _DOC_NATIVE_FIRST_PAGE_LINE_LIMIT = 70
+# DPI cho riêng chức năng tìm văn bản mật. Dấu MẬT/TỐI MẬT/TUYỆT MẬT là stamp
+# lớn, font to → 200 DPI là đủ để nhận diện, nhanh hơn 240 DPI của engine chung.
+_SECRET_SCAN_DPI = 200
 
 
 class _ScanCancelled(Exception):
@@ -723,11 +727,19 @@ def _preprocess_pdf_for_ocr(
     return pdf_path, None
 
 
-def _ocr_one_page_single_worker(direct_ocr_engine, input_pdf: str, page_idx: int) -> dict | None:
+def _ocr_one_page_single_worker(
+    direct_ocr_engine,
+    input_pdf: str,
+    page_idx: int,
+    *,
+    dpi: int = _SECRET_SCAN_DPI,
+) -> dict | None:
     """OCR one page through the in-process ScreenAI singleton.
 
     The shared pool is useful for many pages, but expensive to start for this
     tool's default first-page scan. This path initializes one DLL instance only.
+    ``dpi`` defaults to _SECRET_SCAN_DPI (200) instead of the engine-wide 240 —
+    stamps are large enough to read at 200 DPI and this is noticeably faster.
     """
     import fitz
     from PIL import Image
@@ -736,7 +748,6 @@ def _ocr_one_page_single_worker(direct_ocr_engine, input_pdf: str, page_idx: int
         page = doc[page_idx]
         page_w = float(page.rect.width)
         page_h = float(page.rect.height)
-        dpi = direct_ocr_engine.OCR_DPI
         mat = fitz.Matrix(dpi / 72, dpi / 72)
         pix = page.get_pixmap(matrix=mat, annots=True)
         img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
@@ -852,6 +863,209 @@ def _ocr_pdf_to_canonical(
         page["lines"] = lines_data
         page["words"] = words_data
         canonical["pages"].append(page)
+
+    return _finalize_canonical(canonical, json_path)
+
+
+def _build_native_page_record_from_pdf(
+    page,
+    page_idx: int,
+) -> dict:
+    """Build a canonical page record from native (digital) PDF text.
+
+    Mirrors ``_canonical_from_pdf_text`` but for a single already-open page,
+    so the per-page classifier can reuse it without re-opening the document.
+    """
+    import fitz  # noqa: F401  — type hint clarity; fitz already imported by caller
+
+    from scanindex.core.kie.json_utils import (
+        make_line_record,
+        make_page_record,
+    )
+
+    page_record = make_page_record(
+        page_index=page_idx,
+        width=float(page.rect.width),
+        height=float(page.rect.height),
+        render_width=int(page.rect.width),
+        render_height=int(page.rect.height),
+    )
+    page_record["coord_origin"] = "top-left"
+    line_index = 0
+    data = page.get_text("dict") or {}
+    for block_index, block in enumerate(data.get("blocks") or []):
+        if block.get("type", 0) != 0:
+            continue
+        for raw_line in block.get("lines") or []:
+            spans = raw_line.get("spans") or []
+            text = "".join(span.get("text") or "" for span in spans).strip()
+            if not text:
+                continue
+            bbox = raw_line.get("bbox") or (0, 0, 0, 0)
+            x0, y0, x1, y1 = [float(v or 0) for v in bbox[:4]]
+            font_size = 11.0
+            for span in spans:
+                try:
+                    font_size = max(font_size, float(span.get("size") or 0))
+                except Exception:
+                    pass
+            page_record["lines"].append(
+                make_line_record(
+                    page_idx,
+                    line_index,
+                    text,
+                    x0,
+                    y0,
+                    max(0.0, x1 - x0),
+                    max(0.0, y1 - y0),
+                    font_size,
+                    f"b{block_index}",
+                    f"p{block_index}",
+                    1.0,
+                    "native_text",
+                    0,
+                    [],
+                    ocr_text=text,
+                )
+            )
+            line_index += 1
+    return page_record
+
+
+def _process_pdf_per_page(
+    pdf_path: str,
+    source_path: str,
+    page_indices: list[int],
+    cancel_event: threading.Event,
+    log_cb: Callable[[str], None],
+    *,
+    dpi: int = _SECRET_SCAN_DPI,
+    json_path: str | None = None,
+) -> dict:
+    """Build a canonical document from a PDF, classifying each page.
+
+    Reuses ``classify_pdf_page`` (the same per-page classifier the PDF-to-Word
+    feature uses) so each page is handled correctly:
+      - ``digital``  → native text via ``page.get_text`` (OCR skipped)
+      - ``scan``/``mixed`` → ScreenAI OCR at ``dpi``
+
+    This avoids the false negative the old fast-path had (scan_ocr_low text
+    layer accepted blindly) and the wasted OCR of purely-digital pages.
+    """
+    import fitz
+
+    from scanindex.core.kie.json_utils import make_document_stub, make_page_record
+    from scanindex.core.ocr import direct_engine as direct_ocr_engine
+    from scanindex.core.ocr.text_normalizer import OCR_TEXT_NORMALIZATION
+    from scanindex.core.pdf.docx_page_manifest import classify_pdf_page
+
+    with fitz.open(pdf_path) as doc:
+        total = len(doc)
+        page_rects = [
+            (float(page.rect.width), float(page.rect.height)) for page in doc
+        ]
+        # Pre-open pages we need; classify once.
+        classifications: dict[int, str] = {}
+        for page_idx in page_indices:
+            if page_idx < 0 or page_idx >= total:
+                continue
+            try:
+                info = classify_pdf_page(doc, page_idx)
+                classifications[page_idx] = info.get("source_mode") or "scan"
+            except Exception as exc:
+                log_cb(f"Phân loại trang {page_idx + 1} lỗi: {exc} → OCR")
+                classifications[page_idx] = "scan"
+
+    canonical = make_document_stub(
+        input_path=pdf_path,
+        engine="direct_screen_ai",
+        ocr_dpi=dpi,
+        source_path=source_path,
+        text_normalization=OCR_TEXT_NORMALIZATION,
+        raw_text_preserved=True,
+    )
+
+    # OCR scan/mixed pages. Always route through the shared page-level pool so
+    # multiple files (run in parallel file-worker threads) share its workers —
+    # this is what gives real 2-page concurrency. The screen pre-warms the pool
+    # on show, so the DLL load cost is paid up-front. DPI override keeps
+    # _SECRET_SCAN_DPI (200) instead of the engine-wide 240. The single-worker
+    # path is only a fallback if the pool itself fails.
+    ocr_pages = [p for p in page_indices if classifications.get(p, "scan") != "digital"]
+    ocr_results: dict[int, dict | None] = {}
+    if ocr_pages:
+        use_pool = direct_ocr_engine.get_parallel_capacity() > 1
+        if use_pool:
+            log_cb(
+                f"OCR {len(ocr_pages)}/{len(page_indices)} trang (scan/mixed) @ {dpi} DPI "
+                f"qua pool {direct_ocr_engine.get_parallel_capacity()} worker..."
+            )
+            try:
+                ocr_results = direct_ocr_engine._process_selected_pages_parallel(
+                    pdf_path,
+                    ocr_pages,
+                    total,
+                    lambda msg, lvl="info": (
+                        log_cb(str(msg)) if str(lvl).lower() != "debug" else None
+                    ),
+                    dpi=dpi,
+                )
+            except Exception as exc:
+                log_cb(f"Pool OCR lỗi, chuyển single-worker: {exc}")
+                ocr_results = {}
+        if not ocr_results:
+            log_cb(f"OCR {len(ocr_pages)} trang (scan/mixed) @ {dpi} DPI single-worker...")
+            for pidx in ocr_pages:
+                if cancel_event.is_set():
+                    raise _ScanCancelled()
+                ocr_results[pidx] = _ocr_one_page_single_worker(
+                    direct_ocr_engine, pdf_path, pidx, dpi=dpi
+                )
+    else:
+        log_cb(f"Tất cả {len(page_indices)} trang là digital — bỏ OCR")
+
+    # Assemble canonical pages in the requested order. Digital pages use
+    # native text; scan/mixed pages consume the OCR results above.
+    for page_idx in page_indices:
+        if cancel_event.is_set():
+            raise _ScanCancelled()
+        if page_idx < 0 or page_idx >= total:
+            continue
+        page_w, page_h = page_rects[page_idx]
+        source_mode = classifications.get(page_idx, "scan")
+
+        if source_mode == "digital":
+            with fitz.open(pdf_path) as doc:
+                page = doc[page_idx]
+                page_record = _build_native_page_record_from_pdf(page, page_idx)
+            page_record["source_mode"] = "digital"
+            canonical["pages"].append(page_record)
+            continue
+
+        result = ocr_results.get(page_idx)
+        if result is None:
+            raise RuntimeError(f"OCR thất bại ở trang {page_idx + 1}")
+        lines_data = result.get("lines_data") or []
+        words_data = result.get("words_data") or []
+        coord_flipped = direct_ocr_engine._normalize_page_coord_to_top_left(
+            lines_data,
+            words_data,
+            page_h,
+        )
+        page_record = make_page_record(
+            page_index=page_idx,
+            width=page_w,
+            height=page_h,
+            render_width=result.get("render_width", 0),
+            render_height=result.get("render_height", 0),
+        )
+        page_record["coord_origin"] = "top-left"
+        if coord_flipped:
+            page_record["coord_origin_source"] = "normalized_from_bottom_left"
+        page_record["lines"] = lines_data
+        page_record["words"] = words_data
+        page_record["source_mode"] = source_mode
+        canonical["pages"].append(page_record)
 
     return _finalize_canonical(canonical, json_path)
 
@@ -995,53 +1209,66 @@ def scan_one_file_for_secret_artifact(
     source_path: str,
     relative_path: str,
     file_work_dir: str,
-    thorough: bool,
+    first_page_only: bool,
     cancel_event: threading.Event,
     log_cb: Callable[[str], None],
-    prefer_native_text: bool = True,
     ocr_workers: int | None = None,
 ) -> SecretScanArtifact:
+    """Scan one file for classified-document stamps.
+
+    Routing:
+      - Word (.doc/.docx): always treated as digital — native text only, no OCR.
+      - PDF: each page is classified (digital/scan/mixed) via ``classify_pdf_page``
+        (same classifier as PDF-to-Word). Digital pages use native text; scan/mixed
+        pages are OCR'd at ``_SECRET_SCAN_DPI`` (200).
+
+    Modes:
+      - ``first_page_only=True``  ("Tìm nhanh"): process only page 0, detect the
+        secrecy mark on it, no LightGBM, no other pages.
+      - ``first_page_only=False`` ("Tìm kỹ"): process ALL pages, detect secrecy
+        on every page (cheap token match), then run LightGBM doc-start only on
+        the candidate pages to filter false positives. For non-classified files
+        (the common case) there are no candidates, so LightGBM is skipped.
+    """
     os.makedirs(file_work_dir, exist_ok=True)
     ext = os.path.splitext(source_path)[1].lower()
     word_document = ext in {".doc", ".docx"}
-    first_page_only = word_document or not thorough
-    mode = "Trang đầu DOC/DOCX" if word_document else ("Tìm kỹ" if thorough else "Trang đầu")
+    mode = "Trang đầu" if first_page_only else "Tìm kỹ"
     canonical_json_path = os.path.join(file_work_dir, "ocr.json.zst")
 
-    if prefer_native_text:
+    # ── Word: always digital, native text, never OCR ──────────────────────
+    if word_document:
         native_canonical, native_note = _native_canonical_for_source(
             source_path,
-            thorough=False if word_document else thorough,
+            thorough=not first_page_only,
             json_path=canonical_json_path,
         )
-        if native_canonical is not None:
-            note = native_note
-            page_indices, note = _page_indices_to_check(
-                native_canonical,
-                thorough=False if word_document else thorough,
-                note=note,
-            )
-            native_matches = _collect_secret_matches(
-                native_canonical,
-                page_indices,
-                source_path=source_path,
-                relative_path=relative_path,
-                mode=mode,
-                artifact_path=canonical_json_path,
-                note=note,
-                cancel_event=cancel_event,
-            )
-            if native_matches or _native_text_is_usable(native_canonical):
-                chars, lines = _native_text_stats(native_canonical)
-                log_cb(f"Dùng text sẵn có, bỏ OCR ({lines} dòng, {chars} ký tự)")
-                return SecretScanArtifact(
-                    matches=native_matches,
-                    source_pdf="",
-                    canonical=native_canonical,
-                    rotations=None,
-                )
-            log_cb("Text sẵn có quá ít, chuyển sang OCR trang đang quét")
+        if native_canonical is None:
+            raise RuntimeError("Không đọc được DOC/DOCX — cần Word hoặc LibreOffice")
+        chars, lines = _native_text_stats(native_canonical)
+        log_cb(f"DOC/DOCX digital: dùng text trực tiếp ({lines} dòng, {chars} ký tự)")
+        note = native_note
+        page_indices = [0] if first_page_only else _all_page_indices(native_canonical)
+        if first_page_only:
+            note = f"{note}; DOC/DOCX trang đầu"
+        matches = _collect_secret_matches(
+            native_canonical,
+            page_indices,
+            source_path=source_path,
+            relative_path=relative_path,
+            mode=mode,
+            artifact_path=canonical_json_path,
+            note=note,
+            cancel_event=cancel_event,
+        )
+        return SecretScanArtifact(
+            matches=matches,
+            source_pdf="",
+            canonical=native_canonical,
+            rotations=None,
+        )
 
+    # ── PDF: per-page classify (digital / scan / mixed) ───────────────────
     source_pdf, source_note = _source_to_pdf(
         source_path,
         file_work_dir,
@@ -1050,27 +1277,38 @@ def scan_one_file_for_secret_artifact(
     if cancel_event.is_set():
         raise _ScanCancelled()
 
+    # Determine which pages to process.
+    import fitz
+
+    with fitz.open(source_pdf) as doc:
+        total_pages = len(doc)
+    if total_pages <= 0:
+        raise RuntimeError("PDF không có trang")
+    if first_page_only:
+        page_indices = [0]
+    else:
+        page_indices = list(range(total_pages))
+
+    # For single-page PDFs, no need to extract a sub-PDF — classify + OCR in place.
     scan_pdf = source_pdf
-    rotations = None
-    try:
-        use_pool = max(1, int(ocr_workers or 1)) > 1
-    except (TypeError, ValueError):
-        use_pool = False
-    if first_page_only and ext == ".pdf":
+    if first_page_only and ext == ".pdf" and total_pages > 1:
         first_pdf = os.path.join(file_work_dir, "first_page.pdf")
         scan_pdf = _extract_pdf_pages(source_pdf, first_pdf, [0])
+        page_indices = [0]
 
-    canonical = _ocr_pdf_to_canonical(
+    canonical = _process_pdf_per_page(
         scan_pdf,
         source_path,
-        None,
+        page_indices,
         cancel_event,
         log_cb,
+        dpi=_SECRET_SCAN_DPI,
         json_path=canonical_json_path,
-        use_pool=use_pool,
     )
-    if not _canonical_has_text(canonical):
-        log_cb("OCR không ra chữ, thử preprocess xoay/nghiêng trang đang quét...")
+
+    # If OCR produced no text at all on a scan page, try preprocess (deskew/rotate).
+    if not _canonical_has_text(canonical) and not first_page_only:
+        log_cb("OCR không ra chữ, thử preprocess xoay/nghiêng...")
         pre_pdf = os.path.join(file_work_dir, "preprocessed.pdf")
         ocr_input_pdf, rotations = _preprocess_pdf_for_ocr(
             scan_pdf,
@@ -1079,27 +1317,48 @@ def scan_one_file_for_secret_artifact(
             max_workers=ocr_workers,
         )
         if os.path.abspath(ocr_input_pdf) != os.path.abspath(scan_pdf):
-            scan_pdf = ocr_input_pdf
-            canonical = _ocr_pdf_to_canonical(
+            canonical = _process_pdf_per_page(
                 ocr_input_pdf,
                 source_path,
-                rotations,
+                page_indices,
                 cancel_event,
                 log_cb,
+                dpi=_SECRET_SCAN_DPI,
                 json_path=canonical_json_path,
-                use_pool=use_pool,
             )
+        else:
+            rotations = None
+    else:
+        rotations = None
 
     note = source_note
-    if word_document:
-        page_indices = [0]
-        note = f"{note}; DOC/DOCX chỉ kiểm trang đầu sau chuyển PDF"
-    else:
-        page_indices, note = _page_indices_to_check(
+    if first_page_only:
+        # "Tìm nhanh": detect secrecy on page 0 only, no LightGBM.
+        matches = _collect_secret_matches(
             canonical,
-            thorough=thorough,
-            note=note,
+            [0],
+            source_path=source_path,
+            relative_path=relative_path,
+            mode=mode,
+            artifact_path=canonical_json_path,
+            note=f"{note}; trang đầu",
+            cancel_event=cancel_event,
         )
+        return SecretScanArtifact(
+            matches=matches,
+            source_pdf=scan_pdf,
+            canonical=canonical,
+            rotations=rotations,
+        )
+
+    # "Tìm kỹ": detect secrecy on ALL pages first (cheap token match), then
+    # run LightGBM doc-start only on the candidate pages that matched a secrecy
+    # keyword. This is faster than running LightGBM across the whole document:
+    # detection is near-free regex, while LightGBM scores 8 features per page.
+    # For the common case (file is NOT classified) there are zero candidates,
+    # so LightGBM is skipped entirely via the early-return in
+    # _filter_matches_by_doc_start.
+    note = f"{note}; kiểm tất cả {len(page_indices)} trang"
     matches = _collect_secret_matches(
         canonical,
         page_indices,
@@ -1110,8 +1369,7 @@ def scan_one_file_for_secret_artifact(
         note=note,
         cancel_event=cancel_event,
     )
-    if not word_document and thorough:
-        matches = _filter_matches_by_doc_start(matches, canonical_json_path, log_cb)
+    matches = _filter_matches_by_doc_start(matches, canonical_json_path, log_cb)
     return SecretScanArtifact(
         matches=matches,
         source_pdf=scan_pdf,
@@ -1124,20 +1382,18 @@ def scan_one_file_for_secret(
     source_path: str,
     relative_path: str,
     file_work_dir: str,
-    thorough: bool,
+    first_page_only: bool,
     cancel_event: threading.Event,
     log_cb: Callable[[str], None],
-    prefer_native_text: bool = True,
     ocr_workers: int | None = None,
 ) -> list[SecretScanMatch]:
     return scan_one_file_for_secret_artifact(
         source_path=source_path,
         relative_path=relative_path,
         file_work_dir=file_work_dir,
-        thorough=thorough,
+        first_page_only=first_page_only,
         cancel_event=cancel_event,
         log_cb=log_cb,
-        prefer_native_text=prefer_native_text,
         ocr_workers=ocr_workers,
     ).matches
 
@@ -1150,6 +1406,9 @@ class SecretFileScanScreen(ScreenContent):
     _progress_changed = Signal(int, int)
     _result_found = Signal(object)
     _scan_finished = Signal(object)
+    # Emitted from the background warm-up thread once the OCR pool is ready
+    # (or failed); handled on the main thread by _on_pool_ready.
+    _pool_ready = Signal(bool, str)
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -1157,17 +1416,64 @@ class SecretFileScanScreen(ScreenContent):
         self._busy = False
         self._cancel_event = threading.Event()
         self._results: list[SecretScanMatch] = []
+        self._pool_warm_started = False
+        self._pool_ready_flag = False
         self._build_ui()
         self._status_changed.connect(self._set_status)
         self._progress_changed.connect(self._set_progress)
         self._result_found.connect(self._add_result)
         self._scan_finished.connect(self._on_finished)
+        self._pool_ready.connect(self._on_pool_ready)
 
     def is_busy(self) -> bool:
         return self._busy
 
     def request_cancel(self) -> None:
         self._cancel_event.set()
+
+    def showEvent(self, event):
+        """Pre-warm the OCR pool the first time this screen is shown so the
+        DLL load cost is paid up-front instead of at the first scan."""
+        super().showEvent(event)
+        self._maybe_warm_pool()
+
+    def _maybe_warm_pool(self) -> None:
+        if self._pool_warm_started or self._pool_ready_flag:
+            return
+        self._pool_warm_started = True
+        self._status_changed.emit("Đang khởi tạo OCR...")
+        # Nút Bắt đầu quét mờ cho đến khi pool sẵn sàng (xem _on_pool_ready).
+        # _set_running_ui(False) luôn bật lại nút, nên ta disable trực tiếp
+        # và để _on_pool_ready bật lại khi xong.
+        self.btn_run.setEnabled(False)
+
+        def _warm():
+            ok = False
+            message = ""
+            try:
+                from scanindex.core.ocr import direct_engine
+                direct_engine.get_page_pool()
+                ok = True
+            except Exception as exc:
+                message = f"{type(exc).__name__}: {exc}"
+            self._pool_ready.emit(ok, message)
+
+        threading.Thread(
+            target=_warm, daemon=True, name="secret-scan-pool-warm"
+        ).start()
+
+    def _on_pool_ready(self, ok: bool, message: str) -> None:
+        self._pool_ready_flag = True
+        if self._busy:
+            return  # Một lượt quét đang chạy; không đụng vào UI.
+        if ok:
+            self._status_changed.emit("Sẵn sàng")
+        else:
+            self.log_message.emit(
+                f"Khởi tạo OCR thất bại: {message}", "err"
+            )
+            self._status_changed.emit("OCR chưa sẵn sàng")
+        self.btn_run.setEnabled(True)
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
@@ -1203,6 +1509,21 @@ class SecretFileScanScreen(ScreenContent):
 
         opts = QHBoxLayout()
         opts.addStretch(1)
+
+        self.fast_checkbox = QCheckBox("Tìm nhanh — chỉ trang đầu")
+        self.fast_checkbox.setChecked(True)
+        self.fast_checkbox.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.fast_checkbox.setStyleSheet(
+            f"QCheckBox {{ color: {COLOR_TEXT}; font: 13px '{FONT_UI}';"
+            f" padding: 4px 8px; }}"
+            f"QCheckBox::indicator {{ width: 16px; height: 16px; }}"
+        )
+        self.fast_checkbox.setToolTip(
+            "Bật: chỉ kiểm tra trang đầu mỗi tài liệu (rất nhanh).\n"
+            "Tắt: Tìm kỹ — quét toàn bộ trang, phát hiện dấu mật trên mọi trang "
+            "rồi chạy LightGBM để lọc các trang không phải trang đầu văn bản."
+        )
+        opts.addWidget(self.fast_checkbox)
 
         self.btn_run = QPushButton("Bắt đầu quét")
         self.btn_run.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1307,11 +1628,10 @@ class SecretFileScanScreen(ScreenContent):
         self.progress.setValue(0)
         self.progress.setMaximum(1)
 
-        thorough = True
-        prefer_native_text = False
+        first_page_only = self.fast_checkbox.isChecked()
         thread = threading.Thread(
             target=self._run_worker,
-            args=(folder, thorough, prefer_native_text),
+            args=(folder, first_page_only),
             daemon=True,
             name="secret-file-scan",
         )
@@ -1324,25 +1644,37 @@ class SecretFileScanScreen(ScreenContent):
     def _set_running_ui(self, running: bool) -> None:
         self.btn_browse.setEnabled(not running)
         self.folder_edit.setEnabled(not running)
+        self.fast_checkbox.setEnabled(not running)
         self.btn_run.setVisible(not running)
         self.btn_stop.setVisible(running)
 
-    def _run_worker(self, folder: str, thorough: bool, prefer_native_text: bool) -> None:
+    def _run_worker(self, folder: str, first_page_only: bool) -> None:
+        from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+
         started = time.strftime("%Y%m%d_%H%M%S")
         work_root = os.path.join(get_base_dir(), "temp", f"secret_scan_{started}")
         os.makedirs(work_root, exist_ok=True)
         files = list(_iter_supported_files(folder))
         total = len(files)
-        failures = 0
-        scanned = 0
-        cancelled = False
         self._progress_changed.emit(0, max(1, total))
         self.log_message.emit(f"Quét file mật: tìm thấy {total} file hỗ trợ", "info")
 
-        for idx, path in enumerate(files, start=1):
+        # File-level parallelism: each worker thread processes one file. The
+        # OCR pool (when used inside _process_pdf_per_page) is a shared global,
+        # so scan pages from multiple files are distributed across its workers
+        # automatically — this is what makes "2 pages at a time regardless of
+        # file" work in Tìm kỹ mode. In Tìm nhanh mode, two files' first pages
+        # are OCR'd concurrently.
+        max_file_workers = max(1, min(2, total))
+        progress_lock = threading.Lock()
+        done = [0]
+        scanned = [0]
+        failures = [0]
+        cancelled = [False]
+
+        def process_one(idx: int, path: str) -> None:
             if self._cancel_event.is_set():
-                cancelled = True
-                break
+                return
             rel = os.path.relpath(path, folder)
             self._status_changed.emit(f"Đang quét {idx}/{total}: {rel}")
             file_work = os.path.join(work_root, f"{idx:05d}_{_safe_name(Path(path).stem)}")
@@ -1355,34 +1687,62 @@ class SecretFileScanScreen(ScreenContent):
                     path,
                     rel,
                     file_work,
-                    thorough,
+                    first_page_only,
                     self._cancel_event,
                     file_log,
-                    prefer_native_text=prefer_native_text,
                 )
                 for match in matches:
                     self._result_found.emit(match)
-                scanned += 1
+                with progress_lock:
+                    scanned[0] += 1
             except _ScanCancelled:
-                cancelled = True
-                break
+                cancelled[0] = True
             except Exception as exc:
-                failures += 1
+                with progress_lock:
+                    failures[0] += 1
                 self.log_message.emit(f"[{rel}] Lỗi: {exc}", "err")
             finally:
                 if os.path.isdir(file_work):
                     shutil.rmtree(file_work, ignore_errors=True)
-            self._progress_changed.emit(idx, max(1, total))
+                with progress_lock:
+                    done[0] += 1
+                    self._progress_changed.emit(done[0], max(1, total))
 
-        self._scan_finished.emit(
-            {
-                "total": total,
-                "scanned": scanned,
-                "failures": failures,
-                "cancelled": cancelled,
-                "work_root": work_root,
-            }
-        )
+        try:
+            with ThreadPoolExecutor(
+                max_workers=max_file_workers, thread_name_prefix="secret-scan-file"
+            ) as executor:
+                futures = {
+                    executor.submit(process_one, idx, path): idx
+                    for idx, path in enumerate(files, start=1)
+                }
+                pending = set(futures)
+                try:
+                    while pending and not self._cancel_event.is_set():
+                        done_set, pending = wait(pending, timeout=0.2, return_when=FIRST_COMPLETED)
+                        for fut in done_set:
+                            # Re-raise any exception from the worker (except
+                            # _ScanCancelled, which only flags cancellation).
+                            try:
+                                fut.result()
+                            except _ScanCancelled:
+                                cancelled[0] = True
+                except _ScanCancelled:
+                    cancelled[0] = True
+                if self._cancel_event.is_set():
+                    cancelled[0] = True
+                    for fut in futures:
+                        fut.cancel()
+        finally:
+            self._scan_finished.emit(
+                {
+                    "total": total,
+                    "scanned": scanned[0],
+                    "failures": failures[0],
+                    "cancelled": cancelled[0],
+                    "work_root": work_root,
+                }
+            )
 
     def _set_status(self, text: str) -> None:
         self.status_label.setText(text)

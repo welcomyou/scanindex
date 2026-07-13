@@ -9706,6 +9706,326 @@ def _infer_native_pdf_source_mode(pdf_path: str, logger: Logger) -> str:
     return ""
 
 
+def _find_neighbour_span(orig_text: str, left_norm: Optional[str], right_norm: Optional[str]) -> Optional[int]:
+    """Return a character index in ``orig_text`` at which to insert a missing
+    token that sits (by bbox x-order) between a surviving left neighbour and a
+    surviving right neighbour.
+
+    Both neighbours are given in NORMALISED form (unaccented, upper-cased,
+    punctuation-stripped). We walk ``orig_text`` word by word, normalising each,
+    and find the index right after the left neighbour's word (or, if only a
+    right neighbour is known, right before it). Returns None when neither
+    neighbour is present in the node text.
+    """
+    import re as _re
+    import unicodedata as _ud
+    if not left_norm and not right_norm:
+        return None
+
+    def _ntok(s: str) -> str:
+        return _unaccent_upper(_ud.normalize("NFKC", (s or "")).strip(" \t.,;:()[]{}\"'-/"))
+
+    # Walk orig_text token by token, recording (norm, start, end) of each word.
+    tokens = []  # (norm, start_idx, end_idx)
+    for m in _re.finditer(r"\S+", orig_text):
+        word = m.group(0)
+        nw = _ntok(word)
+        if nw:
+            tokens.append((nw, m.start(), m.end()))
+
+    if left_norm:
+        for ni, (nw, _s, e) in enumerate(tokens):
+            if nw == left_norm:
+                # Insert right after this word's end (before the gap to the next).
+                return e
+    if right_norm:
+        for ni, (nw, s, _e) in enumerate(tokens):
+            if nw == right_norm:
+                return s
+    return None
+
+
+def _backfill_native_text_into_docx(pdf_path: str, docx_path: str, logger: Logger) -> None:
+    """Patch pdf2docx output to restore text the converter dropped.
+
+    pdf2docx discards text lines that overlap other content (it logs
+    "Ignore Line ... due to overlap") and sometimes swallows neighbouring
+    text when rasterising vector drawings. On administrative documents this
+    commonly loses the document number and date values (e.g. "3171", "07",
+    "5" in a "Số __ -CV/VPTU" / "ngày __ tháng __ năm __" template), which
+    the source PDF carries as standalone text runs placed over the blanks.
+
+    This pass walks the source PDF's native text lines, finds tokens that are
+    entirely absent from the DOCX text, and inlines them back into the DOCX
+    line whose text already matches the neighbouring native line. Only tokens
+    genuinely missing from the whole document are added — existing DOCX text
+    is never rewritten.
+    """
+    import re
+    import tempfile
+    import zipfile
+
+    try:
+        pdf_lines, _page_info = extract_pdf_lines(pdf_path, logger)
+    except Exception as exc:
+        logger.log(f"Warning: backfill could not read PDF text: {exc}")
+        return
+    if not pdf_lines:
+        return
+
+    def _norm_tok(t: str) -> str:
+        t = unicodedata.normalize("NFKC", (t or "")).strip(" \t.,;:()[]{}\"'-/")
+        return _unaccent_upper(t)
+
+    def _token_set(text: str) -> set:
+        return {_norm_tok(w) for w in re.split(r"\s+", (text or "").strip()) if w}
+
+    try:
+        from docx import Document as _DocxDocument
+        docx_doc = _DocxDocument(docx_path)
+    except Exception as exc:
+        logger.log(f"Warning: backfill could not open DOCX: {exc}")
+        return
+
+    # Full DOCX text + its normalised token set (paragraphs + table cells).
+    text_parts = [p.text or "" for p in docx_doc.paragraphs]
+    for tbl in docx_doc.tables:
+        for row in tbl.rows:
+            for cell in row.cells:
+                text_parts.append(cell.text or "")
+    docx_text = "\n".join(text_parts)
+    docx_tokens = _token_set(docx_text)
+    if not docx_tokens:
+        return
+
+    # Native words with their bbox x-centres, grouped by page. PyMuPDF
+    # get_text("words") returns one row per word; x-centre lets us order tokens
+    # left-to-right and place a missing token between its surviving neighbours.
+    import fitz as _fitz
+    native_words_by_page: Dict[int, List[Tuple[float, str]]] = {}  # (x_center, text)
+    try:
+        _pdfdoc = _fitz.open(pdf_path)
+        for pidx, _pg in enumerate(_pdfdoc):
+            page_no = pidx + 1
+            for w in _pg.get_text("words", sort=False) or []:
+                x0, y0, x1, y1, text = w[0], w[1], w[2], w[3], w[4]
+                if text and text.strip():
+                    native_words_by_page.setdefault(page_no, []).append(
+                        (((x0 + x1) / 2.0), text)
+                    )
+        _pdfdoc.close()
+    except Exception as exc:
+        logger.log(f"Warning: backfill could not read native words: {exc}")
+        return
+
+    # Pre-scan the DOCX XML to enumerate every <w:t> node: its normalised text
+    # and token set. This is the patch granularity (a node is one visual line
+    # segment), so missing tokens are inserted into a node — not a paragraph.
+    import zipfile
+    from xml.sax.saxutils import escape, unescape
+    text_re = re.compile(r"<w:t(?=\s|>)(?P<attrs>[^>]*)>(?P<text>.*?)</w:t>", re.DOTALL)
+    try:
+        with zipfile.ZipFile(docx_path, "r") as zin:
+            xml = zin.read("word/document.xml").decode("utf-8")
+    except Exception as exc:
+        logger.log(f"Warning: backfill could not read document.xml: {exc}")
+        return
+
+    node_entries = []  # list of {match_span:(start,end), norm, tokens, orig}
+    for m in text_re.finditer(xml):
+        node_text = unescape(m.group("text") or "")
+        norm = _unaccent_upper(_clean_extracted_text(node_text, strip=True))
+        if norm:
+            node_entries.append({
+                "span": m.span(),
+                "norm": norm,
+                "tokens": _token_set(norm),
+                "orig": node_text,
+            })
+
+    # Map each native line to its best-matching <w:t> node (token overlap).
+    matched: List[Tuple[int, float, int]] = []  # (page, native_y, node_index)
+    for ln in pdf_lines:
+        norm_line = _unaccent_upper(_clean_extracted_text(ln.text, strip=True))
+        native_set = _token_set(norm_line)
+        if not native_set:
+            continue
+        best_idx = -1
+        best_overlap = 0
+        for ni, ne in enumerate(node_entries):
+            overlap = len(native_set & ne["tokens"])
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_idx = ni
+        if best_idx >= 0 and best_overlap > 0:
+            matched.append((ln.page, ln.y, best_idx))
+
+    def _nearest_node_index(page: int, y: float) -> int:
+        same_page = [(my, ni) for mp, my, ni in matched if mp == page]
+        if not same_page:
+            return -1
+        near = sorted(same_page, key=lambda item: abs(item[0] - y))
+        for my, ni in near:
+            if abs(my - y) <= 6.0:
+                return ni
+        return near[0][1]
+
+    # For each missing token we record, besides the target node, the original
+    # (non-normalised) text of its left and right surviving neighbours on the
+    # same native row. That lets the patcher splice the token *between* those
+    # neighbours inside the <w:t> text rather than appending at line end.
+    # additions: node_index -> list of {token, left_norm, right_norm}
+    additions: Dict[int, List[dict]] = {}
+
+    def _neighbours(page: int, xc: float, missing_norm: str):
+        """Return (left_orig, right_orig) — the closest surviving native words
+        on the same page to the left and right of x=xc whose normalised form is
+        present in the DOCX. 'orig' is the original-cased word from the PDF."""
+        words = native_words_by_page.get(page, [])
+        left_orig = None
+        right_orig = None
+        for wx, wtext in words:
+            wn = _norm_tok(wtext)
+            if wn == missing_norm or not wn:
+                continue
+            present = wn in docx_tokens
+            if wx < xc and present:
+                left_orig = wtext
+            elif wx > xc and present and right_orig is None:
+                right_orig = wtext
+        return left_orig, right_orig
+
+    for ln in pdf_lines:
+        norm_line = _unaccent_upper(_clean_extracted_text(ln.text, strip=True))
+        if not norm_line:
+            continue
+        native_tokens = re.split(r"\s+", (ln.text or "").strip())
+        missing = [t for t in native_tokens
+                   if t and _norm_tok(t) not in docx_tokens]
+        if not missing:
+            continue
+        native_set = _token_set(norm_line)
+        best_idx = -1
+        best_overlap = 0
+        for ni, ne in enumerate(node_entries):
+            overlap = len(native_set & ne["tokens"])
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_idx = ni
+        if best_overlap == 0:
+            best_idx = _nearest_node_index(ln.page, ln.y)
+        if best_idx < 0:
+            continue
+        # x-centre of this standalone token from native words (fallback to ln.x).
+        for t in missing:
+            tn = _norm_tok(t)
+            xc = ln.x
+            for wx, wtext in native_words_by_page.get(ln.page, []):
+                if _norm_tok(wtext) == tn and abs(ln.y - ln.y) == 0:
+                    xc = wx
+                    break
+            left_orig, right_orig = _neighbours(ln.page, xc, tn)
+            additions.setdefault(best_idx, [])
+            if not any(e["token"] == t for e in additions[best_idx]):
+                additions[best_idx].append({
+                    "token": t,
+                    "left_norm": _norm_tok(left_orig) if left_orig else None,
+                    "right_norm": _norm_tok(right_orig) if right_orig else None,
+                })
+
+    if not additions:
+        return
+
+    # Build the patched XML. For each targeted node, splice each missing token
+    # between its surviving neighbours (matched by normalised substring) inside
+    # the <w:t> text. Tokens whose neighbours can't be located fall back to the
+    # first long blank run, then to the line end.
+    out_parts = []
+    cursor = 0
+    patched = 0
+    blank_run_re = re.compile(r" {2,}")
+    for ni, ne in enumerate(node_entries):
+        if ni not in additions:
+            continue
+        start, end = ne["span"]
+        out_parts.append(xml[cursor:start])
+        text = ne["orig"]
+        norm_text = _unaccent_upper(_clean_extracted_text(text, strip=True))
+        entries = additions[ni]
+        used_tokens = []
+        # 1) Splice tokens between their surviving neighbours.
+        for e in entries:
+            left_n = e["left_norm"]
+            right_n = e["right_norm"]
+            if not left_n and not right_n:
+                continue
+            # Find an occurrence of left ... right in the (still-splicing) text.
+            # We operate on normalised positions but edit the original string.
+            positions = _find_neighbour_span(text, left_n, right_n)
+            if positions is None:
+                continue
+            ins_idx = positions  # insert right after the left neighbour match
+            tok = e["token"]
+            text = text[:ins_idx] + " " + tok + " " + text[ins_idx:]
+            # norm_text must be rebuilt to keep indexes consistent.
+            norm_text = _unaccent_upper(_clean_extracted_text(text, strip=True))
+            used_tokens.append(tok)
+        remaining = [e["token"] for e in entries if e["token"] not in used_tokens]
+        # 2) Remaining tokens: fill the first blank runs, then append.
+        if remaining:
+            gaps = list(blank_run_re.finditer(text))
+            new_remaining = []
+            pieces = []
+            last = 0
+            for ti, g in enumerate(gaps):
+                if ti >= len(remaining):
+                    break
+                pieces.append(text[last:g.start()])
+                pieces.append(f" {remaining[ti]} ")
+                last = g.end()
+                used_tokens.append(remaining[ti])
+            pieces.append(text[last:])
+            text = "".join(pieces)
+            new_remaining = [t for t in remaining if t not in used_tokens]
+            if new_remaining:
+                tail = " ".join(new_remaining)
+                if text and not text.endswith(" ") and not text.endswith("\t"):
+                    tail = " " + tail
+                text = text + tail
+        fixed = text
+        am = re.match(r"<w:t(?P<a>\s[^>]*)?>", xml[start:end])
+        raw_attrs = am.group("a") or "" if am else ""
+        if fixed[:1].isspace() or fixed[-1:].isspace():
+            raw_attrs = re.sub(r'\s+xml:space="[^"]*"', "", raw_attrs)
+            raw_attrs = raw_attrs + ' xml:space="preserve"'
+        out_parts.append(f"<w:t{raw_attrs}>{escape(fixed)}</w:t>")
+        cursor = end
+        patched += 1
+    out_parts.append(xml[cursor:])
+    new_xml = "".join(out_parts)
+
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".docx", dir=os.path.dirname(os.path.abspath(docx_path)))
+    os.close(tmp_fd)
+    try:
+        with zipfile.ZipFile(docx_path, "r") as zin, zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_DEFLATED) as zout:
+            for info in zin.infolist():
+                data = zin.read(info.filename)
+                if info.filename == "word/document.xml":
+                    data = new_xml.encode("utf-8")
+                zout.writestr(info, data)
+        os.replace(tmp_path, docx_path)
+        if patched:
+            logger.log(f"Backfilled {patched} missing native token(s) into DOCX")
+    except Exception as exc:
+        logger.log(f"Warning: backfill DOCX patch failed: {exc}")
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+
 def _try_pdf2docx_native_export(
     pdf_path: str,
     output_path: str,
@@ -9730,6 +10050,12 @@ def _try_pdf2docx_native_export(
         converter.convert(output_path, start=0, end=None, multi_processing=False)
         _sanitize_pdf2docx_ooxml(output_path, logger)
         _repair_pdf2docx_visual_spaces(pdf_path, output_path, logger)
+        # Restore native tokens pdf2docx dropped due to overlap/rasterisation
+        # (e.g. document number / date values in administrative templates).
+        try:
+            _backfill_native_text_into_docx(pdf_path, output_path, logger)
+        except Exception as exc:
+            logger.log(f"Warning: backfill native text into DOCX failed: {exc}")
         if metadata:
             try:
                 doc = Document(output_path)

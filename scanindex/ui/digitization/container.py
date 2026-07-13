@@ -129,6 +129,8 @@ class ArchiveContainer(QWidget):
     # New signals
     step1_segments_ready = Signal(list)  # emitted with list[Segment] when user moves to step 2
     log_message = Signal(str)
+    # Step 2 → reopen an exported archive ZIP for editing (path is the .zip).
+    zip_dropped = Signal(str)
 
     def __init__(self, icons=None, parent=None):
         super().__init__(parent)
@@ -170,11 +172,12 @@ class ArchiveContainer(QWidget):
         self._step2.stop_clicked.connect(self.stop_clicked.emit)
         self._step2.field_label_clicked.connect(self.field_label_clicked.emit)
         self._step2.log_message.connect(self.log_message.emit)
+        self._step2.zip_dropped.connect(self.zip_dropped.emit)
 
         self._step1.request_step2.connect(self._on_step1_to_step2)
         self._step1.log_message.connect(self.log_message.emit)
         self._step1.busy_changed.connect(self._on_step1_busy)
-        self._step3.refresh_requested.connect(self._prepare_step3)
+        self._step1.zip_dropped.connect(self.zip_dropped.emit)
         self._step3.log_message.connect(self.log_message.emit)
         self._step3.export_clicked.connect(self.export_external_clicked.emit)
         self._step3.import_kho_clicked.connect(self.import_kho_clicked.emit)

@@ -68,6 +68,9 @@ class ArchiveStep1Split(QWidget):
     request_step2 = Signal(list)  # list[Segment] (segments with absolute paths in name field via session.segments)
     log_message = Signal(str)
     busy_changed = Signal(bool)
+    # Reopen an exported archive ZIP — forwarded to the host so it runs the
+    # same ZIP-roundtrip path as the Step 2 "Mở ZIP" button.
+    zip_dropped = Signal(str)
     _ocr_page_done = Signal(int, int, int)  # run_id, page_idx, done_count
     _ocr_stage = Signal(int, str, str, int)  # run_id, status, title, total progress
     _ocr_finished = Signal(int, str, object, str)  # run_id, ocr_pdf_path, split_result, error
@@ -430,7 +433,8 @@ class ArchiveStep1Split(QWidget):
         if event.mimeData().hasUrls():
             for url in event.mimeData().urls():
                 p = url.toLocalFile()
-                if p and p.lower().endswith(".pdf"):
+                low = p.lower()
+                if p and (low.endswith(".pdf") or low.endswith(".zip")):
                     event.acceptProposedAction()
                     return
         super().dragEnterEvent(event)
@@ -443,8 +447,13 @@ class ArchiveStep1Split(QWidget):
             return super().dropEvent(event)
         for url in event.mimeData().urls():
             p = url.toLocalFile()
-            if p and p.lower().endswith(".pdf"):
+            low = p.lower()
+            if p and low.endswith(".pdf"):
                 self._load_pdf(p)
+                event.acceptProposedAction()
+                return
+            if p and low.endswith(".zip"):
+                self.zip_dropped.emit(p)
                 event.acceptProposedAction()
                 return
 

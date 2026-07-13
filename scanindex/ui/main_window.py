@@ -581,6 +581,7 @@ class MainWindow(QMainWindow):
         self.archive_tab.stop_clicked.connect(self.stop_ocr)
         self.archive_tab.export_external_clicked.connect(self._arc_export_external)
         self.archive_tab.import_kho_clicked.connect(self._arc_import_to_kho)
+        self.archive_tab.zip_dropped.connect(self._on_zip_dropped)
 
         # Settings tab
         self.settings_tab.save_clicked.connect(self.save_settings)
@@ -2029,6 +2030,13 @@ class MainWindow(QMainWindow):
         if not in_dir:
             QMessageBox.warning(self, "Warning", "Please select an input folder.")
             return
+        # ZIP-reopen fast-path: when the input folder is the `_zip_input/`
+        # scratch dir (populated by `_on_zip_dropped`), the PDFs already carry
+        # a text layer — run the lightweight KIE-only path instead of the full
+        # OCR + correction pipeline.
+        if os.path.basename(in_dir.rstrip(os.sep)) == "_zip_input":
+            self._arc_start_process_from_zip()
+            return
         out_dir = self.archive_tab.session.step2_kie_dir()
         self.archive_tab.set_output_folder(out_dir)
 
@@ -2050,12 +2058,31 @@ class MainWindow(QMainWindow):
             f"Archive: Found {len(pdf_files)} PDF file(s) recursively in {in_dir}"
         )
 
-        # Mirror to UI documents list
-        self._arc_documents = [
-            {"pdf_path": f, "path": f, "output_path": None, "ocr_path": None,
-             "json_path": None, "metadata": {}, "zones": {}, "status": "Pending"}
-            for f in pdf_files
-        ]
+        # Build the UI documents list. When the input came from an exported
+        # ZIP (zip_roundtrip), each PDF already carries a `metadata` dict
+        # parsed from the ZIP's MetaDuLieu.xlsx — preserve it so the operator's
+        # prior edits survive re-running OCR + KIE. Only pipeline-owned fields
+        # (output_path / json_path / status) reset for a fresh run.
+        prior_by_path = {}
+        for d in (self._arc_documents or []):
+            p = d.get("pdf_path") or d.get("path")
+            if p:
+                prior_by_path[p] = d
+        self._arc_documents = []
+        for f in pdf_files:
+            prior = prior_by_path.get(f)
+            if prior is not None:
+                doc = dict(prior)
+                doc["output_path"] = None
+                doc["ocr_path"] = None
+                doc["json_path"] = None
+                doc["zones"] = {}
+                doc["status"] = "Pending"
+            else:
+                doc = {"pdf_path": f, "path": f, "output_path": None,
+                       "ocr_path": None, "json_path": None,
+                       "metadata": {}, "zones": {}, "status": "Pending"}
+            self._arc_documents.append(doc)
         self.archive_tab.set_documents(self._arc_documents)
         step2 = getattr(self.archive_tab, "_step2", None) \
             or getattr(self.archive_tab, "archive_tab", None)
@@ -2224,6 +2251,271 @@ class MainWindow(QMainWindow):
         )
         self._archive_runner.start()
         self.log(f"Archive: pipeline started on {len(pdf_files)} files (KIE={kie_mode})")
+
+    def _arc_start_process_from_zip(self):
+        """Fast-path "Xử lý" for the ZIP-reopen workflow.
+
+        The PDFs in the reopened ZIP already carry a text layer, so we skip the
+        heavy OCR/correction pipeline entirely: for each file we extract the
+        native text layer into a canonical JSON (with word/line bboxes) — or
+        fall back to a single re-OCR for scan PDFs whose image needs it — then
+        run KIE and enrich the JSON. Reuses the same per-event state machine
+        as the folder/Step-1 paths so the UI (row states, progress bar) works
+        unchanged.
+
+        Runs on a daemon thread so the GUI stays responsive; events are
+        forwarded to the UI thread via Qt signals (thread-safe)."""
+        from scanindex.core.pipeline.batch_pipeline import (
+            EVENT_FILE_QUEUED, EVENT_PAGE_DONE, EVENT_FILE_OCR_DONE,
+            EVENT_CORRECTION_START, EVENT_CORRECTION_DONE,
+            EVENT_KIE_START, EVENT_KIE_DONE,
+            EVENT_FILE_COMPLETE, EVENT_FILE_FAILED, EVENT_PIPELINE_DONE,
+        )
+
+        # Anchor on Step 2's own document list so pipeline-thread mutations
+        # (output_path / json_path / status) are visible when the user clicks.
+        step2 = getattr(self.archive_tab, "_step2", None) \
+            or getattr(self.archive_tab, "archive_tab", None)
+        if step2 is not None and getattr(step2, "_documents", None):
+            self._arc_documents = step2._documents
+        else:
+            self.log("Archive: ZIP fast-path has no document list", LOG_ERROR)
+            return
+        if step2 is not None and getattr(step2, "pdf_viewer", None) is not None:
+            try:
+                step2.pdf_viewer.clear()
+                step2._current_doc_idx = -1
+            except Exception:
+                pass
+
+        # Reset per-doc pipeline state but keep the metadata parsed from the
+        # ZIP's MetaDuLieu.xlsx — the operator's prior edits must survive.
+        for doc in self._arc_documents:
+            doc["status"] = "Pending"
+            doc["output_path"] = doc.get("pdf_path")  # viewer fallback pre-KIE
+            doc["ocr_path"] = None
+            doc["json_path"] = ""
+            doc.setdefault("metadata", {})
+
+        self.archive_tab.set_processing_state(True)
+        self._arc_completed_count = 0
+        self.is_processing = True
+        kie_mode = self._normalize_kie_mode_setting(self._saved.get("kie_mode"))
+        self._saved["kie_mode"] = kie_mode
+
+        out_dir = self.archive_tab.session.step2_kie_dir()
+        self.archive_tab.set_output_folder(out_dir)
+        total = len(self._arc_documents)
+        self.archive_tab.set_progress(0, total)
+
+        session = self.archive_tab.session
+
+        # Per-event state machine — mirror of the folder/Step-1 handlers, but
+        # fed by our own worker instead of ArchiveRunner.
+        def on_event(evt, payload):
+            file_id = payload.get("file_id") if isinstance(payload, dict) else None
+            if file_id is not None:
+                for i, doc in enumerate(self._arc_documents):
+                    if os.path.basename(doc.get("path", "")) != file_id:
+                        continue
+                    changed = False
+                    if evt == EVENT_FILE_QUEUED:
+                        doc["status"] = "KIE..."; changed = True
+                    elif evt == EVENT_KIE_START:
+                        doc["status"] = "KIE..."; changed = True
+                    elif evt == EVENT_KIE_DONE:
+                        task = payload.get("task")
+                        if task is not None:
+                            doc["output_path"] = task.get("output_pdf_path")
+                            doc["json_path"] = task.get("output_json_path")
+                            ann = task.get("annotation")
+                            if ann:
+                                doc["annotation"] = ann
+                                for f in ann.get("field_instances", []) or []:
+                                    if (f.get("label") == "SECRECY_MARK"
+                                            and (f.get("text") or "").strip()):
+                                        doc["_secrecy"] = f["text"].strip()
+                                        break
+                        doc["status"] = "Pending"; changed = True
+                    elif evt == EVENT_FILE_COMPLETE:
+                        doc["status"] = "Done"
+                        self._arc_completed_count += 1
+                        self.archive_tab.set_progress(
+                            self._arc_completed_count, total
+                        )
+                        self.signals.cache_updated.emit(
+                            "archive", i, "_refresh", "1",
+                        )
+                        changed = True
+                    elif evt == EVENT_FILE_FAILED:
+                        doc["status"] = "Failed"
+                        self._arc_completed_count += 1
+                        self.archive_tab.set_progress(
+                            self._arc_completed_count, total
+                        )
+                        changed = True
+                    if changed:
+                        self.signals.status_updated.emit("archive", i, doc["status"])
+                    break
+            if evt == EVENT_PIPELINE_DONE:
+                self.is_processing = False
+                self.signals.processing_finished.emit()
+
+        def worker():
+            try:
+                from scanindex.core.pdf.text_extractor import extract_digital_pdf_as_ocr
+                from scanindex.core.kie import engine as kie_engine
+                from scanindex.core.kie.engine import extract_metadata_kie
+                from scanindex.core.digitization.metadata_export import (
+                    write_enriched_canonical_json,
+                )
+                from scanindex.core.digitization import page_splitter
+                from scanindex.core.digitization.runner import _unique_output_pdf_path
+
+                self.signals.log_message.emit(
+                    f"Warming KIE ({kie_mode}) for ZIP fast-path...", LOG_INFO
+                )
+                if not kie_engine.warmup_kie(
+                    kie_mode, log_cb=lambda m: self.signals.log_message.emit(str(m), LOG_INFO)
+                ):
+                    raise RuntimeError(f"KIE warmup failed for mode={kie_mode}")
+
+                for doc in self._arc_documents:
+                    in_pdf = doc.get("pdf_path") or doc.get("path")
+                    file_id = os.path.basename(in_pdf)
+                    try:
+                        on_event(EVENT_FILE_QUEUED, {"file_id": file_id})
+                        stem = os.path.splitext(file_id)[0]
+                        out_pdf = _unique_output_pdf_path(out_dir, stem)
+                        out_json = out_pdf + ".json.zst"
+
+                        # The PDFs in a reopened ZIP always carry a text layer
+                        # (they were already processed through Step 2 + signed
+                        # before export). So we extract that text layer into a
+                        # canonical JSON — which gives us word/line bboxes for
+                        # KIE — WITHOUT re-OCR. This is critical:
+                        #   - re-OCR (`process_pdf`) rebuilds the PDF from
+                        #     scratch and DESTROYS the digital signature;
+                        #   - re-OCR also degrades text quality (ScreenAI
+                        #     re-recognizes, introducing typos like
+                        #     "VĂN PHÒNG" → "VĂN PHNG").
+                        # `extract_digital_pdf_as_ocr` copies the source file
+                        # verbatim (signature intact) and reads its text layer.
+                        # Files without a text layer are skipped (kept with
+                        # their ZIP-parsed metadata) rather than re-OCR'd.
+                        self.signals.log_message.emit(
+                            f"[{file_id}] Extracting text layer (no re-OCR, "
+                            f"signature preserved)...",
+                            LOG_INFO,
+                        )
+                        ok, err = extract_digital_pdf_as_ocr(
+                            in_pdf, out_pdf,
+                            source_document_path=in_pdf,
+                            canonical_profile="layoutlmv3_runtime",
+                        )
+                        if not ok:
+                            raise RuntimeError(
+                                f"extract_digital_pdf_as_ocr failed: {err}"
+                            )
+                        # Skip KIE for files whose text layer is empty (e.g.
+                        # a pure scan with no overlay) — re-OCR would destroy
+                        # the signature. Keep the metadata parsed from Excel.
+                        from scanindex.core.canonical_io import load_canonical
+                        try:
+                            _check = load_canonical(out_json)
+                            _nwords = sum(
+                                len(p.get("words", []))
+                                for p in _check.get("pages", [])
+                            )
+                        except Exception:
+                            _nwords = 0
+                        if _nwords == 0:
+                            self.signals.log_message.emit(
+                                f"[{file_id}] No text layer found — skipping "
+                                f"KIE (signature would be lost by re-OCR). "
+                                f"Metadata kept from ZIP.",
+                                LOG_ERROR,
+                            )
+                            doc["output_path"] = out_pdf
+                            doc["json_path"] = out_json
+                            doc["status"] = "Done"
+                            self._arc_completed_count += 1
+                            self.archive_tab.set_progress(
+                                self._arc_completed_count, total
+                            )
+                            self.signals.cache_updated.emit(
+                                "archive", self._arc_documents.index(doc),
+                                "_refresh", "1",
+                            )
+                            self.signals.status_updated.emit(
+                                "archive", self._arc_documents.index(doc), "Done"
+                            )
+                            continue
+
+                        # Signer-page selection (page 0 + predicted signer).
+                        selected_pages = None
+                        signature_page = None
+                        page_selection = {}
+                        try:
+                            result = page_splitter.predict_signer_page(out_json)
+                            page_selection = result
+                            sp = result.get("signer_page")
+                            if sp is None:
+                                selected_pages = [0]
+                            else:
+                                signature_page = int(sp)
+                                selected_pages = sorted({0, int(sp)})
+                        except Exception as e:
+                            self.signals.log_message.emit(
+                                f"[{file_id}] signer-page selector failed: {e}",
+                                LOG_ERROR,
+                            )
+                            selected_pages = [0]
+
+                        on_event(EVENT_KIE_START, {"file_id": file_id})
+                        ann = extract_metadata_kie(
+                            out_json, kie_mode, selected_pages=selected_pages
+                        )
+                        write_enriched_canonical_json(out_json, ann)
+
+                        # Hand the results to the UI state machine.
+                        doc["selected_pages"] = selected_pages
+                        doc["signature_page"] = signature_page
+                        doc["page_selection"] = page_selection
+                        on_event(EVENT_KIE_DONE, {
+                            "file_id": file_id,
+                            "task": {
+                                "output_pdf_path": out_pdf,
+                                "output_json_path": out_json,
+                                "annotation": ann,
+                            },
+                        })
+                        on_event(EVENT_FILE_COMPLETE, {"file_id": file_id})
+                        self.signals.log_message.emit(
+                            f"[{file_id}] KIE done "
+                            f"({len(ann.get('field_instances', []))} fields)",
+                            LOG_SUCCESS,
+                        )
+                    except Exception as e:
+                        self.signals.log_message.emit(
+                            f"[{file_id}] ZIP fast-path failed: {e}", LOG_ERROR
+                        )
+                        on_event(EVENT_FILE_FAILED, {"file_id": file_id})
+            except Exception as e:
+                # Surface any worker-level failure (import, warmup, …) that
+                # would otherwise die silently on the daemon thread.
+                self.signals.log_message.emit(
+                    f"ZIP fast-path aborted: {e}", LOG_ERROR
+                )
+            finally:
+                on_event(EVENT_PIPELINE_DONE, {})
+
+        self._archive_runner = None  # signal "no ArchiveRunner to cancel"
+        t = threading.Thread(target=worker, daemon=True, name="arc-zip-fastpath")
+        t.start()
+        self.log(
+            f"Archive: ZIP fast-path started on {total} file(s) (KIE-only, KIE={kie_mode})"
+        )
 
     def _arc_start_from_step1(self, documents):
         """Pipeline kicked off from Step 1's "Chuyển bước 2" handoff. The
@@ -2748,6 +3040,105 @@ class MainWindow(QMainWindow):
         self._arc_kho_worker = worker
         worker.start()
 
+    def _on_zip_dropped(self, zip_path: str):
+        """Reopen an exported archive ZIP (`<dossier>.zip`) into Step 2 so the
+        operator can fix metadata and re-export. The ZIP's MetaDuLieu.xlsx is
+        parsed back into identity + per-doc `metadata`; the PDFs are extracted
+        into the session temp dir so the viewer and Step 3 export both work
+        unchanged. The ZIP format itself is not modified."""
+        from scanindex.core.digitization.zip_roundtrip import (
+            parse_export_zip, ZipRoundtripError,
+        )
+
+        # If Step 2 already has documents, replacing them loses unsaved work —
+        # confirm first. Also cancel any in-flight pipeline so its file events
+        # can't clobber the freshly-loaded rows.
+        if self.archive_tab.get_documents():
+            if not self.archive_tab.confirm_unsaved_before_leave():
+                return
+            ask = QMessageBox(self)
+            ask.setWindowTitle(get_text("arc_workflow_reset_title"))
+            ask.setIcon(QMessageBox.Icon.Question)
+            ask.setText(get_text("arc_step2_zip_replace_confirm"))
+            ask.setStandardButtons(
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel
+            )
+            ask.setDefaultButton(QMessageBox.StandardButton.Cancel)
+            if ask.exec() != QMessageBox.StandardButton.Yes:
+                return
+            prev = getattr(self, "_archive_runner", None)
+            if prev is not None:
+                try:
+                    prev.cancel()
+                except Exception:
+                    pass
+                self._archive_runner = None
+            self._arc_documents = []
+            self._arc_completed_count = 0
+            self.is_processing = False
+            try:
+                self.archive_tab.reset_workflow()
+            except Exception as e:
+                self.log(f"Archive: reset before ZIP load failed: {e}", LOG_ERROR)
+
+        session = self.archive_tab.session
+        try:
+            identity, documents, input_dir = parse_export_zip(
+                zip_path, session.temp_dir()
+            )
+        except ZipRoundtripError as e:
+            QMessageBox.warning(
+                self, get_text("arc_workflow_reset_title"),
+                get_text("arc_step2_zip_invalid") + f"\n\n{e}",
+            )
+            self.log(f"Archive: ZIP load rejected — {e}", LOG_ERROR)
+            return
+        except Exception as e:
+            QMessageBox.critical(
+                self, get_text("arc_workflow_reset_title"),
+                get_text("arc_step2_zip_failed", str(e)),
+            )
+            self.log(f"Archive: ZIP load failed — {e}", LOG_ERROR)
+            return
+
+        session.identity = identity
+
+        # Step 2 is the editing surface: switch to folder mode so the file
+        # list + viewer are visible. The input folder is the `_zip_input/`
+        # dir the ZIP was extracted into — NOT the folder the ZIP came from.
+        # That way the "Xử lý" button re-runs OCR + KIE on the extracted
+        # PDFs (recovering bbox overlays the ZIP didn't carry) and writes
+        # fresh overlays into `_step2_kie/`, exactly like folder mode.
+        try:
+            self.archive_tab._step2.set_source_mode("folder")
+        except Exception:
+            pass
+        try:
+            self.archive_tab._step2.set_input_folder(input_dir)
+        except Exception:
+            pass
+        self.archive_tab._step2.set_documents(
+            documents, default_status="Corrected"
+        )
+        self._arc_documents = documents
+        self.is_processing = False
+
+        # Jump to Step 2 so the operator lands on the editor.
+        try:
+            self.archive_tab.goto_step(1)
+        except Exception:
+            pass
+
+        self.log(
+            f"Archive: ZIP reopened — {len(documents)} doc(s) from "
+            f"{os.path.basename(zip_path)} (input: {input_dir})",
+            LOG_SUCCESS,
+        )
+        QMessageBox.information(
+            self, get_text("arc_workflow_reset_title"),
+            get_text("arc_step2_zip_loaded").format(n=len(documents)),
+        )
+
     # ================================================================
     # PROCESSING CONTROL
     # ================================================================
@@ -3082,7 +3473,24 @@ class MainWindow(QMainWindow):
 # ====================================================================
 
 class ProcessingPipeline:
-    """3-phase processing pipeline: OCR (parallel) → Correction (serial) → Export (parallel)."""
+    """Per-file streaming pipeline: each file runs OCR → Correction → Metadata →
+    Export independently. A file's downstream stages (correct/metadata/export)
+    start as soon as THAT file's OCR finishes — they do not wait for other
+    files' OCR. This lets a small file produce its .docx while a large file is
+    still being OCR'd in the shared page-level OCR pool.
+
+    Concurrency model (no deadlock possible — no circular waits):
+      - ocr_executor (ThreadPool, shared on app): submits one task per file;
+        each task feeds pages into the single shared multiprocessing page pool
+        (see core/ocr/direct_engine._get_pool). Pages of different files are
+        OCR'd interleaved automatically.
+      - downstream_executor (ThreadPool, per-pipeline, 2 workers): runs the
+        correct→metadata→export sequence for one file. 2 workers let one file
+        export while another file waits on the correction lock.
+      - Correction is serialized by app.correction_lock; Export is serialized
+        by app.export_executor (ProcessPool, max_workers=1). Both are safe to
+        call concurrently from multiple downstream workers.
+    """
 
     def __init__(self, app: MainWindow, files: list, config: dict):
         self.app = app
@@ -3090,6 +3498,11 @@ class ProcessingPipeline:
         self.config = config
         self.parallel_files = int(config.get("max_workers", 4))
         self.stop_event = threading.Event()
+        # Track downstream futures so _run can wait for the whole run.
+        self._down_futures: list = []
+        # Guard list mutation: callbacks (from OCR threads) append here while
+        # _run's main thread iterates/waits. A lock keeps it consistent.
+        self._down_lock = threading.Lock()
 
         if self.app.ocr_executor is None:
             total_workers = self.parallel_files * SCREEN_AI_WORKERS_PER_FILE
@@ -3097,6 +3510,10 @@ class ProcessingPipeline:
             self.app.ocr_executor = concurrent.futures.ThreadPoolExecutor(
                 max_workers=self.parallel_files)
         self.executor = self.app.ocr_executor
+
+        # Dedicated pool for correct→metadata→export. Lives for the run.
+        self.downstream_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="dnd-downstream")
 
     def start(self):
         self.thread = threading.Thread(target=self._run, daemon=True)
@@ -3106,104 +3523,126 @@ class ProcessingPipeline:
         self.stop_event.set()
 
     def _run(self):
-        batch_size = self.parallel_files
-        batches = [self.files[i:i + batch_size]
-                   for i in range(0, len(self.files), batch_size)]
+        self.app.log(f"Pipeline: streaming {len(self.files)} file(s), "
+                     f"{self.parallel_files} parallel OCR")
 
-        self.app.log(f"Pipeline: {len(batches)} batches, size {batch_size}")
-
-        for b_idx, batch in enumerate(batches):
+        all_ocr = []
+        for item in self.files:
             if self.stop_event.is_set():
                 break
-            self.app.log(f"--- Batch {b_idx + 1}/{len(batches)} ({len(batch)} files) ---")
+            f = item["dnd_item"]
+            need_ocr = (f["status"] not in ("Done", "Corrected", "OCR Done")
+                        or self.config["force_rerun"])
+            if need_ocr:
+                self.app.update_item_status(item["list_type"], item["index"],
+                                            "OCR Processing")
+                fut = self.executor.submit(self._ocr_single, f, item)
+                all_ocr.append(fut)
+                fut.add_done_callback(self._make_ocr_done_cb(item))
+            else:
+                # Already OCR'd (e.g. Done/Corrected/OCR Done) — go straight
+                # to downstream stages.
+                item["skipped_ocr"] = True
+                self._submit_downstream(item)
 
-            # Phase 1: OCR
-            ocr_items = []
-            for item in batch:
-                f = item["dnd_item"]
-                if f["status"] not in ("Done", "Corrected", "OCR Done") or self.config["force_rerun"]:
-                    ocr_items.append(item)
-                else:
-                    item["skipped_ocr"] = True
+        # Wait for every file to finish its OCR (the page pool handles page
+        # interleaving; here we just need every file task to have returned).
+        concurrent.futures.wait(all_ocr)
+        # Wait for all downstream (correct/metadata/export) work to finish so
+        # we only emit processing_finished once the whole batch is truly done.
+        with self._down_lock:
+            down_snapshot = list(self._down_futures)
+        if down_snapshot:
+            concurrent.futures.wait(down_snapshot)
 
-            if ocr_items:
-                futures = {self.executor.submit(self._ocr_single, it["dnd_item"], it): it
-                           for it in ocr_items}
-                for it in ocr_items:
-                    self.app.update_item_status(it["list_type"], it["index"], "OCR Processing")
-                concurrent.futures.wait(futures)
+        # All downstream work is done — release the pool promptly. (shutdown
+        # with wait=False is safe: at this point every submitted task has
+        # already completed, so there is nothing left to cancel.)
+        self.downstream_executor.shutdown(wait=False)
 
-                for fut in futures:
-                    it = futures[fut]
-                    try:
-                        res, msg, out_path = fut.result()
-                        if res:
-                            it["dnd_item"]["output_path"] = out_path
-                            it["dnd_item"]["status"] = "OCR Done"
-                            self.app.update_item_status(it["list_type"], it["index"],
-                                                        "OCR Done", out_path)
-                            it["ocr_success"] = True
-                        else:
-                            self.app.log(f"OCR Fail: {msg}", LOG_ERROR)
-                            it["dnd_item"]["status"] = "Failed"
-                            self.app.update_item_status(it["list_type"], it["index"], "Failed")
-                            it["ocr_success"] = False
-                    except Exception as e:
-                        self.app.log(f"OCR Exception: {e}", LOG_ERROR)
-                        self.app.update_item_status(it["list_type"], it["index"], "Failed")
-                        it["ocr_success"] = False
-
-            if self.stop_event.is_set():
-                break
-
-            # Phase 2: Correction (serial)
-            if self.config["do_correct"]:
-                for item in batch:
-                    if self.stop_event.is_set():
-                        break
-                    f = item["dnd_item"]
-                    can_run = item.get("ocr_success", False)
-                    if not can_run and item.get("skipped_ocr") and f["status"] == "OCR Done":
-                        can_run = True
-                    if can_run:
-                        self._correct_single(item)
-
-            if self.stop_event.is_set():
-                break
-
-            # Phase 2.5: Metadata Extraction (fast, serial)
-            if self.config.get("do_metadata", True):
-                for item in batch:
-                    if self.stop_event.is_set():
-                        break
-                    f = item["dnd_item"]
-                    if f["status"] in ("Corrected", "OCR Done"):
-                        self._extract_metadata_single(item)
-
-            if self.stop_event.is_set():
-                break
-
-            # Phase 3: Export (parallel)
-            if self.config["do_export"]:
-                export_items = []
-                for item in batch:
-                    f = item["dnd_item"]
-                    pdf_to_export = None
-                    if f["status"] == "Corrected":
-                        pdf_to_export = f.get("output_path")
-                    elif f["status"] == "OCR Done" and not self.config["do_correct"]:
-                        pdf_to_export = f.get("output_path")
-                    if pdf_to_export and os.path.exists(pdf_to_export):
-                        item["pdf_to_export"] = pdf_to_export
-                        export_items.append(item)
-
-                if export_items:
-                    exp_futures = {self.executor.submit(self._export_single, it): it
-                                   for it in export_items}
-                    concurrent.futures.wait(exp_futures)
-
-        self.app.log("All batches finished.", LOG_SUCCESS)
+        self.app.log("All files finished.", LOG_SUCCESS)
         self.app.signals.processing_finished.emit()
+
+    def _submit_downstream(self, item: dict):
+        """Queue one file's correct→metadata→export on the downstream pool."""
+        if self.stop_event.is_set():
+            return
+        fut = self.downstream_executor.submit(self._process_downstream, item)
+        with self._down_lock:
+            self._down_futures.append(fut)
+
+    def _make_ocr_done_cb(self, item: dict):
+        """Build a per-file done-callback for the OCR future.
+
+        Returns a closure that captures `item` correctly (avoiding the classic
+        loop-closure bug). Wrapped in try/except so a failure in one file's
+        post-OCR handling cannot crash the executor's callback machinery or
+        silently swallow the error.
+        """
+        def _cb(fut):
+            try:
+                res, msg, out_path = fut.result()
+                f = item["dnd_item"]
+                if res:
+                    f["output_path"] = out_path
+                    f["status"] = "OCR Done"
+                    item["ocr_success"] = True
+                    self.app.update_item_status(item["list_type"], item["index"],
+                                                "OCR Done", out_path)
+                    # OCR done → immediately start this file's downstream
+                    # stages without waiting for other files.
+                    self._submit_downstream(item)
+                else:
+                    self.app.log(f"OCR Fail: {msg}", LOG_ERROR)
+                    f["status"] = "Failed"
+                    item["ocr_success"] = False
+                    self.app.update_item_status(item["list_type"], item["index"],
+                                                "Failed")
+            except Exception as e:
+                # Never let an exception escape a done-callback — the executor
+                # would only log it opaquely. Surface it explicitly instead.
+                self.app.log(f"OCR post-processing error: {e}", LOG_ERROR)
+                try:
+                    item["dnd_item"]["status"] = "Failed"
+                    item["ocr_success"] = False
+                    self.app.update_item_status(item["list_type"], item["index"],
+                                                "Failed")
+                except Exception:
+                    pass
+        return _cb
+
+    def _process_downstream(self, item: dict):
+        """Run Correction → Metadata → Export for ONE file (sequential)."""
+        if self.stop_event.is_set():
+            return
+        f = item["dnd_item"]
+
+        # Phase 2: Correction. Runs only when this file OCR'd just now
+        # (skipped_ocr files that were already Corrected are left as-is).
+        if self.config["do_correct"] and f["status"] == "OCR Done":
+            self._correct_single(item)
+        if self.stop_event.is_set():
+            return
+
+        # Phase 2.5: Metadata extraction (fast, best-effort).
+        f = item["dnd_item"]
+        if self.config.get("do_metadata", True) and f["status"] in ("Corrected", "OCR Done"):
+            self._extract_metadata_single(item)
+        if self.stop_event.is_set():
+            return
+
+        # Phase 3: Export to .docx. Corrected files always export; OCR-Done
+        # files export only when correction was skipped.
+        f = item["dnd_item"]
+        if self.config["do_export"]:
+            pdf_to_export = None
+            if f["status"] == "Corrected":
+                pdf_to_export = f.get("output_path")
+            elif f["status"] == "OCR Done" and not self.config["do_correct"]:
+                pdf_to_export = f.get("output_path")
+            if pdf_to_export and os.path.exists(pdf_to_export):
+                item["pdf_to_export"] = pdf_to_export
+                self._export_single(item)
 
     def _ocr_single(self, f, item):
         file_path = f["path"]

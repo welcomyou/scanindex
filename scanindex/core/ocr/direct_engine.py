@@ -220,8 +220,12 @@ def _worker_init(dll_path, model_dir):
         logger.exception("ScreenAI worker initialization failed")
 
 
-def _worker_ocr_single(input_path, page_idx, render_annots=True):
-    """OCR a single page using this worker's DLL instance."""
+def _worker_ocr_single(input_path, page_idx, render_annots=True, dpi=None):
+    """OCR a single page using this worker's DLL instance.
+
+    ``dpi`` overrides the module-wide OCR_DPI (default 240). Callers like the
+    secret-file scanner pass a lower DPI (e.g. 200) for faster stamp detection.
+    """
     try:
         if _worker_ocr is None:
             return (page_idx, {
@@ -237,8 +241,8 @@ def _worker_ocr_single(input_path, page_idx, render_annots=True):
         page_w = page.rect.width
         page_h = page.rect.height
 
-        dpi = OCR_DPI
-        mat = fitz.Matrix(dpi / 72, dpi / 72)
+        render_dpi = dpi if dpi is not None else OCR_DPI
+        mat = fitz.Matrix(render_dpi / 72, render_dpi / 72)
         pix = page.get_pixmap(matrix=mat, annots=bool(render_annots))
         img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
         render_w, render_h = pix.width, pix.height
@@ -757,9 +761,11 @@ def _estimate_page_native_dpi(page) -> int:
     When a page is a full-page scan with an embedded native text layer
     (scan_ocr_low), we rasterize it to drop that text before the ScreenAI
     overlay. Re-rendering at the embedded image's own DPI keeps the file
-    from ballooning: rendering at OCR_DPI (240) when the source is only
-    150-200 DPI just invents pixels and bloats the output. Returns
-    OCR_DPI as a safe fallback when no usable image is found.
+    from ballooning: rendering at 300 DPI when the source is only
+    150-200 DPI just invents pixels and bloats the output. DPI is clamped to
+    [72, 300]: 72 floors nonsensical metadata readings, 300 caps high-DPI
+    scans (still preserves print quality while avoiding oversized JPEGs).
+    Returns OCR_DPI as a safe fallback when no usable image is found.
     """
     import fitz  # PyMuPDF - lazy import
     page_rect = page.rect
@@ -781,7 +787,7 @@ def _estimate_page_native_dpi(page) -> int:
             dpi = round(((iw / r.width if r.width else 0) + (ih / r.height if r.height else 0)) * 72 / 2)
             if coverage > best_coverage:
                 best_coverage = coverage
-                best_dpi = max(72, min(dpi, OCR_DPI))
+                best_dpi = max(72, min(dpi, 300))
     except Exception:
         pass
     return best_dpi or OCR_DPI
@@ -855,12 +861,37 @@ def _copy_source_page_background(doc_out, doc_in, page_idx, page_w, page_h, bake
 
 
 def _page_has_text_layer(page) -> bool:
-    """True when the page carries a native text layer that would double up
-    with the ScreenAI invisible-text overlay."""
+    """True when the page is a scanned page that also carries a native text
+    layer (scan_ocr_low), i.e. it would double up with the ScreenAI
+    invisible-text overlay.
+
+    Only flag pages that are BOTH a full-page scan (a large background image)
+    AND carry a text layer. A pure digital page (text vector, little/no image)
+    must NOT be rasterised — doing so would turn an editable text PDF into a
+    flat image and break DOCX export.
+    """
     try:
-        return bool(page.get_text("text").strip())
+        if not (page.get_text("text") or "").strip():
+            return False
     except Exception:
         return False
+    # Require a near-full-page image: that's what distinguishes a scanned
+    # page with an OCR text layer from a born-digital text page.
+    import fitz  # PyMuPDF - lazy import
+    try:
+        page_area = max(float(page.rect.width * page.rect.height), 1.0)
+        infos = page.get_image_info() or []
+    except Exception:
+        return False
+    for info in infos:
+        try:
+            bbox = fitz.Rect(info.get("bbox"))
+        except Exception:
+            continue
+        coverage = max(0.0, float(bbox.width * bbox.height) / page_area)
+        if coverage >= 0.80:
+            return True
+    return False
 
 
 def _append_backgrounds_preserving_inline_images(doc_out, doc_in, background_specs):
@@ -1870,8 +1901,11 @@ def _empty_page_ocr_result():
 
 
 def _collect_page_ocr_bounded(input_path, page_indices, total_pages, log,
-                              page_timeout: float = 120.0):
-    """Collect page OCR through a bounded apply_async queue."""
+                              page_timeout: float = 120.0, dpi=None):
+    """Collect page OCR through a bounded apply_async queue.
+
+    ``dpi`` is forwarded to each worker (None → OCR_DPI default 240).
+    """
     import time
 
     pool = _get_pool()
@@ -1897,7 +1931,11 @@ def _collect_page_ocr_bounded(input_path, page_indices, total_pages, log,
             next_pos += 1
             pending.append((
                 page_idx,
-                pool.apply_async(_worker_ocr_single, (input_path, page_idx)),
+                pool.apply_async(
+                    _worker_ocr_single,
+                    (input_path, page_idx),
+                    {"dpi": dpi} if dpi is not None else {},
+                ),
                 time.monotonic(),
             ))
 
@@ -1985,8 +2023,11 @@ def _process_selected_pages_serial(input_path, doc_in, page_indices, total_pages
 
 
 def _process_selected_pages_parallel(input_path, page_indices, total_pages, log,
-                                     page_timeout: float = 120.0):
-    """Submit only OCR-required pages to the shared page-level pool."""
+                                     page_timeout: float = 120.0, dpi=None):
+    """Submit only OCR-required pages to the shared page-level pool.
+
+    ``dpi`` overrides the worker default (None → OCR_DPI 240).
+    """
     import time
 
     t0 = time.perf_counter()
@@ -1994,7 +2035,7 @@ def _process_selected_pages_parallel(input_path, page_indices, total_pages, log,
 
     try:
         results, max_in_flight = _collect_page_ocr_bounded(
-            input_path, page_indices, total_pages, log, page_timeout
+            input_path, page_indices, total_pages, log, page_timeout, dpi=dpi
         )
 
         dt = time.perf_counter() - t0
@@ -2018,15 +2059,18 @@ def _process_selected_pages_parallel(input_path, page_indices, total_pages, log,
 
 
 def _process_pages_parallel(input_path, total_pages, log,
-                              page_timeout: float = 120.0):
-    """Submit pages to the page-level pool with bounded in-flight work."""
+                              page_timeout: float = 120.0, dpi=None):
+    """Submit pages to the page-level pool with bounded in-flight work.
+
+    ``dpi`` overrides the worker default (None → OCR_DPI 240).
+    """
     import time
 
     t0 = time.perf_counter()
 
     try:
         results, max_in_flight = _collect_page_ocr_bounded(
-            input_path, range(total_pages), total_pages, log, page_timeout
+            input_path, range(total_pages), total_pages, log, page_timeout, dpi=dpi
         )
 
         dt = time.perf_counter() - t0

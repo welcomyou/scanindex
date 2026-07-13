@@ -57,8 +57,53 @@ except ImportError:
     pass
 
 
+def _apply_ocr_page_worker_setting():
+    """Read MaxConcurrentOCR from settings.ini and export it as
+    DIRECT_OCR_NUM_PAGE_WORKERS so core/ocr/direct_engine.py picks it up.
+
+    Why this is needed: direct_engine computes `_NUM_PAGE_WORKERS` exactly
+    once at import time from that env var (default 2). The UI setting
+    "MaxConcurrentOCR" previously only controlled the *file-level* thread
+    pool size, NOT the actual number of OCR worker processes — so setting it
+    to 3 in the UI had no effect on real page parallelism. By mapping the UI
+    setting onto the env var here (before any heavy module import), the user
+    value becomes the true process count.
+
+    We do NOT override a value the user set explicitly via the environment
+    (power-user / portable flag), and we clamp to 1..cpu_count to avoid
+    oversubscription. This single OCR pool is shared app-wide, so it governs
+    page parallelism for both PDF→Word and Archive Digitization.
+    """
+    if os.environ.get("DIRECT_OCR_NUM_PAGE_WORKERS"):
+        return  # explicit env wins — don't clobber it
+    try:
+        from scanindex.infra.paths import get_resource_path
+        import configparser
+        path = get_resource_path("settings.ini")
+        if not os.path.exists(path):
+            return
+        cfg = configparser.ConfigParser()
+        cfg.read(path, encoding="utf-8")
+        if "OCR" not in cfg:
+            return
+        raw = cfg["OCR"].get("MaxConcurrentOCR", "").strip()
+        if not raw:
+            return
+        val = max(1, int(raw))
+        val = min(val, os.cpu_count() or 4)
+        os.environ["DIRECT_OCR_NUM_PAGE_WORKERS"] = str(val)
+    except Exception as exc:
+        # Never let settings parsing break app startup — the engine simply
+        # falls back to its built-in default.
+        print(f"[OCR] Warning: could not apply MaxConcurrentOCR: {exc}")
+
+
 def main():
     multiprocessing.freeze_support()
+
+    # Apply OCR page-worker count from settings.ini BEFORE any heavy module
+    # (direct_engine reads DIRECT_OCR_NUM_PAGE_WORKERS once at import time).
+    _apply_ocr_page_worker_setting()
 
     from PySide6.QtWidgets import QApplication
     from PySide6.QtCore import Qt

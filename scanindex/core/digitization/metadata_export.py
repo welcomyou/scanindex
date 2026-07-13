@@ -51,6 +51,12 @@ EXCEL_COLUMNS = [
     "Thời gian tài liệu",
     "Tờ số trang số",
     "Số thứ tự văn bản trong hồ sơ",
+    # NB: PMKhoSohoa's ZIP import (DocTempLTLSZip) has no matching property
+    # for this column, so it's silently ignored on import — PageAmount is
+    # shown as 0 after import unless set via the doc editor UI. Kept here so
+    # the workbook matches PMKhoSohoa's own export layout + stays useful for
+    # human review of per-doc page counts.
+    "Số lượng trang của văn bản",
 ]
 
 # "Hồ sơ" sheet (14 cols, one row for the dossier itself).
@@ -469,7 +475,12 @@ def build_hoso_row(identity, vanban_rows: list[dict],
             from pypdf import PdfReader
             total_pages = 0
             for d in documents:
-                p = d.get("pdf_path") or d.get("path") or ""
+                # `export_source_path` is the export-chosen, existence-verified
+                # PDF (set by _arc_pick_final_pdf); prefer it over pdf_path /
+                # path, which may point at a _zip_input/ file that a prior bug
+                # (or a later move) has removed from disk.
+                p = (d.get("export_source_path")
+                     or d.get("pdf_path") or d.get("path") or "")
                 if p and os.path.isfile(p):
                     try:
                         total_pages += len(PdfReader(p).pages)

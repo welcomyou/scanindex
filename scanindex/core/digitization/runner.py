@@ -182,6 +182,30 @@ def write_aggregated_excel(tasks_or_docs, excel_path: str,
             pass
         return ann
 
+    def _count_pages_for_entry(entry) -> int:
+        """Page count for one doc's final PDF. Looks at export_source_path
+        (set by the zip-export path) first, then output_path / pdf_path.
+        Returns 0 when no readable PDF is resolvable. Accepts both GUI doc
+        dicts and FileTask dataclass-style objects."""
+        for k in ("export_source_path", "output_path", "ocr_path", "pdf_path",
+                  "input_path"):
+            if isinstance(entry, dict):
+                p = entry.get(k)
+            else:
+                p = getattr(entry, k, None)
+            if p and os.path.isfile(p):
+                try:
+                    from pypdf import PdfReader
+                    return len(PdfReader(p).pages)
+                except Exception:
+                    try:
+                        import fitz
+                        with fitz.open(str(p)) as f:
+                            return int(f.page_count)
+                    except Exception:
+                        return 0
+        return 0
+
     rows = []
     docs_for_hoso: list[dict] = []
     for stt_1based, entry in enumerate(tasks_or_docs, start=1):
@@ -212,6 +236,13 @@ def write_aggregated_excel(tasks_or_docs, excel_path: str,
             # 1-based list position when the operator left it blank.
             if not (row.get("Số thứ tự văn bản trong hồ sơ") or "").strip():
                 row["Số thứ tự văn bản trong hồ sơ"] = str(stt_1based)
+            # "Số lượng trang của văn bản" = page count of this doc's PDF.
+            # PMKhoSohoa's ZIP importer ignores this column (no matching
+            # property on DocTempLTLSZip), but it makes the workbook match the
+            # system's own export layout and is useful for human review.
+            n_pages = _count_pages_for_entry(entry)
+            if n_pages:
+                row["Số lượng trang của văn bản"] = str(n_pages)
             rows.append(row)
             docs_for_hoso.append(entry)
         else:
@@ -219,6 +250,9 @@ def write_aggregated_excel(tasks_or_docs, excel_path: str,
             file_id = getattr(entry, "file_id", "") or "unknown.pdf"
             row = annotation_to_row(ann, file_id)
             row["Số thứ tự văn bản trong hồ sơ"] = str(stt_1based)
+            n_pages = _count_pages_for_entry(entry)
+            if n_pages:
+                row["Số lượng trang của văn bản"] = str(n_pages)
             rows.append(row)
             docs_for_hoso.append({
                 "pdf_path": getattr(entry, "input_path", "") or file_id,
@@ -605,14 +639,13 @@ class ArchiveRunner:
             task.source_page_indices = list(spec.source_page_indices) if spec.source_page_indices else None
             task.from_step1_cache = bool(from_step1)
             # Detect whether the segment is a true digital (text-vector, no
-            # full-page image) PDF exported from Word/Writer/etc. Only those
-            # keep the original file + native-text merge (is_digital path
-            # below) so importing to Kho doesn't produce double text.
-            # scan_ocr_low / scan_no_text keep is_digital=False and go through
-            # the ScreenAI overlay path as before.
-            # Previously this was forced False for ALL step1 handoffs, which
-            # meant digital segments got a ScreenAI overlay on top of their
-            # native text → double text in Kho search.
+            # full-page image) PDF. Only those keep the original file + native
+            # text merge (is_digital path below) so importing to Kho doesn't
+            # produce double text. scan_ocr_low / scan_no_text keep is_digital
+            # False and go through the ScreenAI overlay path.
+            # NB: applies to step1 handoff too — if the segment file is gone by
+            # the time we assemble output, _assemble_outputs skips the native
+            # merge and keeps the OCR-backed output (graceful fallback).
             task.is_digital = classify_pdf(original_input_path) == "digital"
             tasks.append(task)
             with self._results_lock:
@@ -792,27 +825,32 @@ class ArchiveRunner:
         if not ok:
             raise RuntimeError(f"OCR result assembly failed: {msg}")
         if task.is_digital and task.num_pages > 0:
-            try:
-                # Digital PDF: the native text layer is the source of truth.
-                # Rebuild the visible output AND the canonical JSON from native
-                # text only — no ScreenAI OCR overlay, no merge with the OCR
-                # cache. The previous merge-based approach added native words on
-                # top of the cached OCR words, doubling the JSON word count and
-                # breaking Kho search / KIE. extract_digital_pdf_as_ocr copies
-                # the original PDF verbatim and emits a clean native-only JSON.
-                from scanindex.core.pdf.text_extractor import extract_digital_pdf_as_ocr
-                ok_dig, msg_dig = extract_digital_pdf_as_ocr(
-                    task.input_path,
-                    task.output_pdf_path,
-                    source_document_path=task.input_path,
-                    canonical_profile="layoutlmv3_runtime",
+            # The native-text overwrite needs the source segment file. If it is
+            # gone (e.g. a step1 segment temp file cleaned up mid-run), keep the
+            # OCR-backed output assembled above instead of crashing — KIE then
+            # runs on the OCR JSON, a graceful degradation.
+            if not os.path.isfile(task.input_path):
+                self.log(
+                    f"[{task.file_id}] digital merge skipped: source file no "
+                    f"longer exists ({task.input_path}); keeping OCR-backed output"
                 )
-                if not ok_dig:
-                    raise RuntimeError(msg_dig or "digital extraction failed")
-                self.log(f"[{task.file_id}] Digital native-text rebuild OK ({task.num_pages} pages)")
-            except Exception as e:
-                self.log(f"[{task.file_id}] digital rebuild failed: {e}")
-                raise
+            else:
+                try:
+                    # Keep the visible output as the original digital PDF, but feed
+                    # KIE a merged JSON: native text wins, OCR contributes only
+                    # visual-only words such as stamps/handwriting.
+                    shutil.copy2(task.input_path, task.output_pdf_path)
+                    from scanindex.core.pdf.text_extractor import merge_native_text_layer_into_canonical_json
+                    merge_stats = merge_native_text_layer_into_canonical_json(
+                        task.output_json_path,
+                        task.input_path,
+                        merge_pages=[0],
+                        canonical_profile="layoutlmv3_runtime",
+                    )
+                    self.log(f"[{task.file_id}] Digital layer merge page0: {merge_stats}")
+                except Exception as e:
+                    self.log(f"[{task.file_id}] digital layer merge failed: {e}")
+                    raise
         # Apply correction overlay to the _ocr.pdf
         if task.raw_text and task.corrected_text and task.raw_text != task.corrected_text:
             try:

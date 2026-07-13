@@ -426,6 +426,9 @@ class ArchiveStep2Kie(QWidget):
     field_label_clicked = Signal(str)
     log_message = Signal(str)
     _canonical_ready = Signal(int, int, str, object)
+    # Emitted when the user opens an exported archive ZIP (via the toolbar
+    # button or drag&drop) to reopen it for editing in Step 2.
+    zip_dropped = Signal(str)
 
     def __init__(self, icons=None, parent=None):
         super().__init__(parent)
@@ -434,6 +437,7 @@ class ArchiveStep2Kie(QWidget):
         self._current_doc_idx = -1
         self._field_widgets = {}
         self._field_labels = {}
+        self._lbl_so_trang_value = None  # read-only "Số trang" widget (built in _build_metadata_panel)
         self._flist_visible = True
         self._review_mode = False
         self._source_mode = "folder"   # "folder" | "step1"
@@ -455,6 +459,11 @@ class ArchiveStep2Kie(QWidget):
         # existing set_output_folder/get_output_folder callers still work.
         self._output_folder = ""
         self._fuzzy_active_field = None
+        # Form field whose KIE label is the viewer's active field. Its
+        # accent border must persist even when the input loses focus to
+        # the PDF viewer (lasso mode grabs focus), so we drive that border
+        # manually instead of relying on the :focus pseudo-state alone.
+        self._active_form_field = None
         self._fuzzy_timer = QTimer(self)
         self._fuzzy_timer.setSingleShot(True)
         self._fuzzy_timer.setInterval(300)
@@ -465,6 +474,8 @@ class ArchiveStep2Kie(QWidget):
         self._save_notice_timer.timeout.connect(self._hide_saved_notice)
         self._canonical_ready.connect(self._on_canonical_ready)
         self._setup_ui()
+        # Accept dropped exported ZIPs (reopen-for-edit round-trip).
+        self.setAcceptDrops(True)
 
     # ── ui construction ────────────────────────────────────────────
 
@@ -669,6 +680,14 @@ class ArchiveStep2Kie(QWidget):
         self._btn_browse_in.clicked.connect(self.browse_input_clicked.emit)
         h.addWidget(self._btn_browse_in)
 
+        # "Mở ZIP" — reopen an exported archive ZIP to edit its metadata in
+        # Step 2, then re-export. Mirrors the folder picker so the same
+        # operator workflow covers both input shapes.
+        self._btn_open_zip = self._make_browse_btn(
+            translations.get_text("arc_step2_open_zip"))
+        self._btn_open_zip.clicked.connect(self._on_open_zip_clicked)
+        h.addWidget(self._btn_open_zip)
+
         h.addSpacing(6)
 
         self.btn_process = QPushButton(translations.get_text("arc_btn_process"))
@@ -852,6 +871,30 @@ class ArchiveStep2Kie(QWidget):
             self._field_widgets[key] = w
             form_l.addWidget(w)
             w.installEventFilter(self)
+            # QTextEdit dispatches mouse events to its viewport, not to the
+            # QTextEdit itself. A field that already has focus (e.g. it was
+            # the last one populated / clicked) does NOT re-emit FocusIn on
+            # the next click, so we'd miss the click entirely. Installing
+            # the filter on the viewport as well lets MouseButtonPress fire
+            # reliably on every click into the field — which is what turns
+            # on "Khoanh vùng" mode.
+            if hasattr(w, "viewport"):
+                w.viewport().installEventFilter(self)
+
+            # Read-only "Số trang" (total page count of this doc's final PDF)
+            # sits directly under "Trang số". Not part of `_FIELDS` so it is
+            # never saved/exported; derived from the file via fitz.
+            if key == "trang_so":
+                so_lbl = _FieldLabel("so_trang", translations.get_text("arc_field_so_trang"))
+                form_l.addWidget(so_lbl)
+                self._lbl_so_trang_value = QLineEdit()
+                self._lbl_so_trang_value.setReadOnly(True)
+                self._lbl_so_trang_value.setFixedHeight(_H)
+                self._lbl_so_trang_value.setStyleSheet(
+                    self._field_qss("QLineEdit", invalid=False)
+                    + f"QLineEdit {{ color: {COLOR_TEXT_SECONDARY}; background: {COLOR_SURFACE}; }}"
+                )
+                form_l.addWidget(self._lbl_so_trang_value)
 
         # ── Section 2: raw KIE viewer ───────────────────────────────────
         # All 14 raw KIE labels with their badge colour + on-PDF number.
@@ -1003,8 +1046,13 @@ class ArchiveStep2Kie(QWidget):
             text_lbl.setText(by_label.get(label, "—"))
 
     def _on_raw_kie_clicked(self, kie_label: str):
-        """Click on a raw KIE row → activate that field in the PDF viewer
-        and scroll to its bbox. Mirrors the Section 1 label-click path."""
+        """Click on a raw KIE row → activate that field in the PDF viewer,
+        turn on lasso mode, and scroll to its bbox.
+
+        When the field doesn't exist yet (e.g. a ZIP-reopened PDF with no
+        KIE annotation), create an empty field for this label, select it,
+        and turn on edit mode so the operator can immediately drag a
+        rectangle to capture its words."""
         idx = self._current_doc_idx
         if idx < 0 or idx >= len(self._documents):
             return
@@ -1015,8 +1063,15 @@ class ArchiveStep2Kie(QWidget):
                 bbox = f.get("bbox") or []
                 if bbox:
                     self.pdf_viewer.highlight_zone(int(f.get("page_index", 0)), bbox)
+                # Always enter lasso mode on field pick so the operator can
+                # start refining the bbox right away.
+                if not self.pdf_viewer._edit_mode:
+                    self.pdf_viewer._btn_edit.setChecked(True)
                 return
-        self.pdf_viewer.clear_highlight()
+        # No existing instance for this label — create an empty one so the
+        # operator can lasso its words. Falls back to page 0.
+        self.pdf_viewer._create_empty_field(kie_label, 0)
+        self._on_viewer_field_changed(self.pdf_viewer._active_field_id, "created")
 
     def _build_file_list_panel(self):
         layout = QVBoxLayout(self._flist_panel)
@@ -1086,8 +1141,8 @@ class ArchiveStep2Kie(QWidget):
         """)
         return w
 
-    def _make_browse_btn(self):
-        b = QPushButton("Chọn")
+    def _make_browse_btn(self, label: str = "Chọn"):
+        b = QPushButton(label)
         b.setFixedHeight(_H)
         b.setCursor(Qt.CursorShape.PointingHandCursor)
         b.setStyleSheet(f"""
@@ -1105,6 +1160,46 @@ class ArchiveStep2Kie(QWidget):
         return b
 
     # ── source mode ─────────────────────────────────────────────────
+
+    def _on_open_zip_clicked(self):
+        """Toolbar "Mở ZIP": pick an exported archive ZIP to reopen for
+        editing. The actual parsing + document rebuild happens in the host
+        (`main_window._on_zip_dropped`) — this widget just forwards the path."""
+        from PySide6.QtWidgets import QFileDialog
+        path, _ = QFileDialog.getOpenFileName(
+            self, translations.get_text("arc_step2_open_zip_title"),
+            "", "ZIP Files (*.zip)",
+        )
+        if path:
+            self.zip_dropped.emit(path)
+
+    def dragEnterEvent(self, event):
+        """Accept a dropped .zip so the operator can reopen an exported
+        archive ZIP straight into Step 2. Mirrors Step 1's PDF drop but for
+        the round-trip artifact."""
+        if self._is_processing:
+            event.ignore()
+            return
+        if event.mimeData().hasUrls():
+            for url in event.mimeData().urls():
+                p = url.toLocalFile()
+                if p and p.lower().endswith(".zip"):
+                    event.acceptProposedAction()
+                    return
+        super().dragEnterEvent(event)
+
+    def dropEvent(self, event):
+        if self._is_processing:
+            event.ignore()
+            return
+        if not event.mimeData().hasUrls():
+            return super().dropEvent(event)
+        for url in event.mimeData().urls():
+            p = url.toLocalFile()
+            if p and p.lower().endswith(".zip"):
+                self.zip_dropped.emit(p)
+                event.acceptProposedAction()
+                return
 
     def set_source_mode(self, mode: str):
         """`mode` is "folder" or "step1". In step1 mode the input folder
@@ -1127,6 +1222,8 @@ class ArchiveStep2Kie(QWidget):
                 translations.get_text("arc_step2_source_folder_hint"))
             self._btn_browse_in.setVisible(True)
             self.btn_process.setVisible(not self._is_processing)
+        # "Mở ZIP" stays available in both modes — reopening an exported
+        # ZIP is a separate entry point that resets into folder mode.
 
     def set_review_mode(self, enabled: bool = True, *, show_file_list: bool = False):
         """Reuse the Step 2 editor inside another workflow.
@@ -1194,6 +1291,7 @@ class ArchiveStep2Kie(QWidget):
         self.btn_process.setVisible((not is_running) and self._source_mode != "step1")
         self.btn_stop.setVisible(is_running)
         self._btn_browse_in.setEnabled(not is_running)
+        self._btn_open_zip.setEnabled(not is_running)
         if not is_running:
             self.hide_preprocess_progress()
 
@@ -1322,6 +1420,16 @@ class ArchiveStep2Kie(QWidget):
         if not self._review_mode and documents:
             self._flist_panel.setVisible(True)
             self._flist_visible = True
+        # Back-compat safety net: archives from 1.1.3 (and earlier) and any
+        # path that hands us docs without trang_so/so_thu_tu get the running
+        # numbering seeded now, so exporting without clicking a row still
+        # produces a complete workbook. (zip_roundtrip also does this, but
+        # other loaders — e.g. a future CLI — may not.)
+        if documents:
+            try:
+                self._ensure_trang_so_initialised()
+            except Exception:
+                pass
 
     def update_doc_status(self, idx: int, status: str):
         if not (0 <= idx < self.doc_list.count()):
@@ -1355,10 +1463,13 @@ class ArchiveStep2Kie(QWidget):
 
         is_failed = status in ("Failed", "Done (Export Failed)")
         is_done_status = status == "Done"
-        is_complete = is_done_status or has_output
+        # "Corrected" = reopened from an exported ZIP (zip_roundtrip) — the
+        # doc already has a final PDF + metadata, so it behaves like "Done":
+        # clickable and editable, no spinner.
+        is_complete = is_done_status or status == "Corrected" or has_output
         is_active = (
             not is_complete and not is_failed
-            and status not in ("Pending", "", "Corrected", "OCR Done")
+            and status not in ("Pending", "", "OCR Done")
         )
 
         name = self._strip_state_prefix(item.text())
@@ -1389,7 +1500,7 @@ class ArchiveStep2Kie(QWidget):
         if not isinstance(doc, dict):
             return False
         status = doc.get("status", "")
-        return status == "Done" or bool(doc.get("json_path"))
+        return status in ("Done", "Corrected") or bool(doc.get("json_path"))
 
     def _strip_state_prefix(self, text):
         if not text:
@@ -1572,10 +1683,16 @@ class ArchiveStep2Kie(QWidget):
         except Exception:
             pass
 
-    def _field_qss(self, widget_type: str, *, invalid: bool) -> str:
+    def _field_qss(self, widget_type: str, *, invalid: bool,
+                    selected: bool = False) -> str:
         """Build the per-field stylesheet. When ``invalid`` is True, the
         border swaps to ``COLOR_RED`` even on focus so the alert is
         visible until the user fixes the value.
+
+        When ``selected`` is True the accent border is forced on (not just
+        via :focus). This keeps the blue outline on the active field while
+        the operator clicks into the PDF viewer to lasso words — the input
+        loses keyboard focus there, so :focus alone would drop the border.
 
         For QComboBox, append the shared ::drop-down/::down-arrow rules
         so the chevron stays visible — Qt isolates a widget's QSS from
@@ -1588,7 +1705,8 @@ class ArchiveStep2Kie(QWidget):
             )
         else:
             qss = (
-                f"{widget_type} {{ {_TEXTAREA} }}"
+                f"{widget_type} {{ {_TEXTAREA}"
+                f" border: 1px solid {COLOR_ACCENT if selected else COLOR_BORDER}; }}"
                 f"{widget_type}:focus {{ {_INPUT_FOCUS} }}"
             )
         if widget_type == "QComboBox":
@@ -1617,14 +1735,17 @@ class ArchiveStep2Kie(QWidget):
         """Toggle the red-border style for date / number fields based on
         their current text. Empty *or* unparseable counts as invalid —
         empty means KIE failed to extract the value, both deserve the
-        attention prompt."""
+        attention prompt. Preserves the active-selection accent border."""
         widget = self._field_widgets.get(key)
         if widget is None:
             return
+        selected = (key == self._active_form_field)
         if key == "ngay_ban_hanh":
             text = widget.text().strip() if isinstance(widget, QLineEdit) else ""
             valid = bool(text) and bool(_normalize_date_input(text))
-            widget.setStyleSheet(self._field_qss("QLineEdit", invalid=not valid))
+            widget.setStyleSheet(
+                self._field_qss("QLineEdit", invalid=not valid, selected=selected)
+            )
         elif key == "so_van_ban":
             if isinstance(widget, QTextEdit):
                 text = widget.toPlainText().strip()
@@ -1634,7 +1755,9 @@ class ArchiveStep2Kie(QWidget):
                 return
             valid = bool(text) and bool(_NUMBER_INPUT_RE.match(text))
             widget_type = "QTextEdit" if isinstance(widget, QTextEdit) else "QLineEdit"
-            widget.setStyleSheet(self._field_qss(widget_type, invalid=not valid))
+            widget.setStyleSheet(
+                self._field_qss(widget_type, invalid=not valid, selected=selected)
+            )
         elif key == "loai_van_ban":
             if not isinstance(widget, QComboBox):
                 return
@@ -1644,7 +1767,9 @@ class ArchiveStep2Kie(QWidget):
                 valid = bool(text) and text in set(all_display_names())
             except Exception:
                 valid = bool(text)
-            widget.setStyleSheet(self._field_qss("QComboBox", invalid=not valid))
+            widget.setStyleSheet(
+                self._field_qss("QComboBox", invalid=not valid, selected=selected)
+            )
             if valid:
                 widget.setToolTip("")
             else:
@@ -1774,11 +1899,20 @@ class ArchiveStep2Kie(QWidget):
         else:
             self.pdf_viewer.clear()
 
+        # Read-only "Số trang" reflects the final PDF's actual page count.
+        self._update_so_trang(doc)
+
         selected_json = str(resolved_json or json_path) if json_path else ""
-        if selected_json:
+        if resolved_json is not None:
+            # Companion JSON exists on disk — load it normally.
             self._request_canonical_for_selection(row, selected_json)
         else:
+            # No canonical JSON yet (e.g. a ZIP-reopened PDF before KIE has
+            # run). The PDF already carries a text layer, so extract it on
+            # the fly into a companion JSON — that gives the viewer word/line
+            # bboxes to draw in edit mode without needing a full KIE pass.
             self.pdf_viewer.clear_field_overlays()
+            self._extract_text_layer_for_selection(row, pdf_candidate)
             QTimer.singleShot(30, lambda r=row: self._apply_doc_metadata(r, None, ""))
 
     def _prefetch_adjacent_pdfs(self, row: int):
@@ -1798,6 +1932,76 @@ class ArchiveStep2Kie(QWidget):
                     except Exception:
                         pass
                     break
+
+    def _extract_text_layer_for_selection(self, row: int, pdf_path: str):
+        """Build a companion canonical JSON from the PDF's text layer so the
+        viewer can draw word/line bboxes in edit mode *before* KIE runs.
+
+        This is the lightweight path for ZIP-reopened PDFs (which already
+        carry a text layer but have no `.json.zst` companion until the user
+        clicks "Xử lý"). It reuses `extract_digital_pdf_as_ocr` to copy the
+        PDF verbatim (signature preserved) and emit a canonical JSON with
+        pages[].words[].bbox. Runs on a daemon thread; the result is fed
+        back through `_canonical_ready` exactly like a normal companion
+        load so the viewer + bbox-edit machinery work unchanged."""
+        if not pdf_path or not os.path.isfile(pdf_path):
+            return
+        self._canonical_request_gen += 1
+        gen = self._canonical_request_gen
+        json_path = pdf_path + ".json.zst"
+        # Already cached from a previous selection of this row? Skip the
+        # extraction.
+        if json_path in self._canonical_cache:
+            cached = self._canonical_cache[json_path][1]
+            QTimer.singleShot(
+                30,
+                lambda r=row, g=gen, p=json_path, c=cached:
+                    self._on_canonical_ready(r, g, p, c),
+            )
+            return
+
+        def _worker():
+            try:
+                from scanindex.core.pdf.text_extractor import (
+                    extract_digital_pdf_as_ocr,
+                )
+                # extract_digital_pdf_as_ocr copies the input PDF to
+                # output_path and writes the companion JSON next to it. We
+                # only need the JSON, so point output at a throwaway copy and
+                # move its `.json.zst` companion next to the real PDF.
+                tmp_out = pdf_path + ".__native_extract__.pdf"
+                ok, err = extract_digital_pdf_as_ocr(
+                    pdf_path, tmp_out,
+                    source_document_path=pdf_path,
+                    canonical_profile="layoutlmv3_runtime",
+                )
+                tmp_json = tmp_out + ".json.zst"
+                if ok and os.path.isfile(tmp_json):
+                    try:
+                        if os.path.exists(json_path):
+                            os.remove(json_path)
+                        os.replace(tmp_json, json_path)
+                    except OSError:
+                        pass
+                try:
+                    if os.path.exists(tmp_out):
+                        os.remove(tmp_out)
+                except OSError:
+                    pass
+                if not ok:
+                    self._canonical_ready.emit(row, gen, json_path, None)
+                    return
+                canonical, resolved = _load_canonical_document(json_path)
+                self._canonical_ready.emit(
+                    row, gen, str(resolved or json_path), canonical
+                )
+            except Exception:
+                self._canonical_ready.emit(row, gen, json_path, None)
+
+        threading.Thread(
+            target=_worker, daemon=True,
+            name=f"step2-native-extract-{row}",
+        ).start()
 
     def _request_canonical_for_selection(self, row: int, json_path: str):
         self._canonical_request_gen += 1
@@ -1943,17 +2147,46 @@ class ArchiveStep2Kie(QWidget):
         impacted = _metadata_keys_impacted_by_kie_label(changed_label)
         if not impacted and not changed_label:
             impacted = set(derived.keys())
+        # Preserve user / metadata-loaded values until the operator actually
+        # captures words for the field:
+        #  - op == "created" → a freshly-created EMPTY field (e.g. clicking
+        #    a raw-KIE row on a reopened ZIP that has metadata but no
+        #    annotation yet). It carries no content, so it must NOT wipe
+        #    the metadata that came from the file or from prior typing.
+        #  - otherwise, when the field now resolves to empty text, keep the
+        #    existing value rather than blanking it — last-action-wins only
+        #    applies to real content changes, not to a stray empty result.
+        skip_metadata_overwrite = (op == "created")
         for k in impacted:
-            if k in derived:
-                merged[k] = derived[k]
-            else:
+            new_val = derived.get(k)
+            if new_val:
+                merged[k] = new_val
+            elif not skip_metadata_overwrite and k not in derived:
+                # Label legitimately dropped from the annotation (e.g.
+                # field deleted) → remove its derived key.
                 merged.pop(k, None)
+            # else: empty value from a freshly-created field, or a label
+            # that simply has no text yet → keep whatever the user had.
         doc["metadata"] = merged
         doc["zones"] = _annotation_to_zone_map(ann)
         doc["_canonical_cache"] = canonical
         for k, _, multiline in _FIELDS:
             val = merged.get(k, "") or ""
             self._set_field_value(k, val, block_signals=True)
+        # Re-assert the active-field accent border — _set_field_value runs
+        # _refresh_validity for date/number/doctype which rebuilds the QSS
+        # and would otherwise drop the "selected" outline.
+        if self._active_form_field:
+            self._refresh_field_border(self._active_form_field)
+        # If the active field was just deleted, clear the outline.
+        if isinstance(op, str) and op.startswith("deleted:") and self._active_form_field:
+            impacted_deleted = _metadata_keys_impacted_by_kie_label(
+                op.split(":", 1)[1].strip()
+            )
+            if self._active_form_field in impacted_deleted:
+                prev_active = self._active_form_field
+                self._active_form_field = None
+                self._refresh_field_border(prev_active)
         self._refresh_raw_kie_panel(ann)
         self._resize_fields_soon()
 
@@ -1963,6 +2196,19 @@ class ArchiveStep2Kie(QWidget):
 
     def _on_viewer_field_clicked(self, field_id):
         self.pdf_viewer.set_active_field(field_id)
+        # User picked the field by clicking its bbox directly on the PDF.
+        # Mirror the active KIE label back onto the matching form input so
+        # that input keeps its accent border even though the PDF now holds
+        # focus.
+        idx = self._current_doc_idx
+        if 0 <= idx < len(self._documents):
+            ann = (self._documents[idx].get("annotation") or {})
+            kie_label = _kie_label_for_field_id(ann, field_id)
+            if kie_label:
+                form_keys = _metadata_keys_impacted_by_kie_label(kie_label)
+                # Pick the primary (first) form key for the outline.
+                if form_keys:
+                    self._set_active_form_field(next(iter(form_keys)))
 
     def _save_current_fields(self):
         idx = self._current_doc_idx
@@ -1994,6 +2240,14 @@ class ArchiveStep2Kie(QWidget):
                 except Exception:
                     return 0
         return 0
+
+    def _update_so_trang(self, doc) -> None:
+        """Refresh the read-only 'Số trang' widget from the selected doc's file."""
+        if self._lbl_so_trang_value is None:
+            return
+        n = self._count_doc_pages(doc) if doc else 0
+        self._lbl_so_trang_value.setText(str(n) if n else "")
+
 
     def _on_numeric_field_edited(self, key: str) -> None:
         """editingFinished slot for numeric single-line fields. Saves the
@@ -2111,8 +2365,11 @@ class ArchiveStep2Kie(QWidget):
     def _clear_fields(self):
         for key, _, multiline in _FIELDS:
             self._clear_field_value(key)
+        self._update_so_trang(None)
         self._refresh_raw_kie_panel(None)
         self._resize_fields_soon()
+        # Row switch — drop the active-field outline from the previous doc.
+        self._set_active_form_field(None)
 
     def _resize_fields_soon(self):
         # Programmatic KIE updates block textChanged signals and can happen
@@ -2153,60 +2410,135 @@ class ArchiveStep2Kie(QWidget):
             widget.updateGeometry()
 
     def _on_field_label_clicked(self, field_key):
+        """Click on a Section-1 field label → mirror the raw-KIE row behaviour:
+        activate the matching field in the PDF viewer, turn on "Khoanh vùng"
+        mode, scroll to its bbox, and if no field_instance exists yet for this
+        label create an empty one so the operator can lasso its words.
+
+        Form keys with no KIE mapping (so_thu_tu, trang_so, ngon_ngu) are
+        ignored — they carry no bbox to edit."""
         self.field_label_clicked.emit(field_key)
         idx = self._current_doc_idx
         if idx < 0 or idx >= len(self._documents):
             return
-        doc = self._documents[idx]
-        annotation = doc.get("annotation") or {}
         kie_label = _FORM_TO_KIE_LABEL.get(field_key)
-
-        target = None
-        for f in annotation.get("field_instances") or []:
-            if f.get("label") == kie_label:
-                target = f; break
-        if target is not None:
-            self.pdf_viewer.set_active_field(target.get("field_id", ""))
-            page_idx = int(target.get("page_index", 0))
-            bbox = target.get("bbox") or []
-            if bbox:
-                self.pdf_viewer.highlight_zone(page_idx, bbox)
+        if not kie_label:
+            # No bbox-bound KIE label for this form field — nothing to lasso.
+            self.pdf_viewer.clear_highlight()
             return
-        zone_info = doc.get("zones", {}).get(field_key)
-        if zone_info:
-            bbox = zone_info.get("bbox_pdf")
-            if bbox:
-                self.pdf_viewer.highlight_zone(zone_info.get("page", 0), bbox)
-                return
-        self.pdf_viewer.clear_highlight()
+        # Delegate to the same code path used by the raw-KIE panel so both
+        # entry points stay in lockstep (activate-or-create + lasso on).
+        self._on_raw_kie_clicked(kie_label)
 
     # ── fuzzy ───────────────────────────────────────────────────────
+
+    def _kick_lasso_for_field(self, key: str):
+        """Turn on "Khoanh vùng" (lasso) mode and make sure a field_instance
+        exists for the form field `key`, so the operator's next drag assigns
+        words to the right KIE label. No-op when `key` has no KIE mapping
+        (so_thu_tu / trang_so / ngon_ngu) — those carry no bbox to edit."""
+        kie_label = _FORM_TO_KIE_LABEL.get(key)
+        if not kie_label:
+            return
+        self._set_active_form_field(key)
+        self._on_raw_kie_clicked(kie_label)
+
+    def _set_active_form_field(self, key: str | None):
+        """Mark `key` as the form field bound to the viewer's active KIE
+        field, forcing its accent border to stay visible even after the
+        input loses keyboard focus to the PDF lasso. Restores the previous
+        field's normal styling first so only one field shows the active
+        outline at a time."""
+        prev = self._active_form_field
+        if prev == key:
+            return
+        self._active_form_field = key
+        if prev and prev in self._field_widgets and prev != key:
+            self._refresh_field_border(prev)
+        if key and key in self._field_widgets:
+            self._refresh_field_border(key)
+
+    def _refresh_field_border(self, key: str):
+        """Re-apply the per-field stylesheet, honouring both validity and
+        the active-selection outline."""
+        widget = self._field_widgets.get(key)
+        if widget is None:
+            return
+        if isinstance(widget, QComboBox):
+            wt = "QComboBox"
+        elif isinstance(widget, QTextEdit):
+            wt = "QTextEdit"
+        else:
+            wt = "QLineEdit"
+        # Re-derive invalid from current content for the fields that use it;
+        # other fields stay valid (their red-border logic is self-contained).
+        invalid = False
+        if key == "ngay_ban_hanh" and isinstance(widget, QLineEdit):
+            invalid = not (widget.text().strip()
+                           and _normalize_date_input(widget.text()))
+        elif key == "so_van_ban":
+            txt = (widget.toPlainText() if isinstance(widget, QTextEdit)
+                   else widget.text())
+            invalid = not (txt.strip() and _NUMBER_INPUT_RE.match(txt))
+        elif key == "loai_van_ban" and isinstance(widget, QComboBox):
+            try:
+                from scanindex.core.digitization.doctype import all_display_names
+                invalid = widget.currentText().strip() not in set(all_display_names())
+            except Exception:
+                invalid = False
+        selected = (key == self._active_form_field)
+        widget.setStyleSheet(self._field_qss(wt, invalid=invalid, selected=selected))
 
     def eventFilter(self, obj, event):
         from PySide6.QtCore import QEvent as _QE
         if event.type() == _QE.Type.FocusIn:
+            # Catches focus gained via Tab / popup / programmatic setFocus.
+            # A click into an *already-focused* QTextEdit does NOT emit
+            # FocusIn again — that case is handled by MouseButtonPress below.
             for key, w in self._field_widgets.items():
                 if obj is w:
                     self._fuzzy_active_field = key
-                    self._sync_viewer_active_field(key)
+                    if event.reason() == Qt.FocusReason.MouseFocusReason:
+                        self._kick_lasso_for_field(key)
+                    else:
+                        self._sync_viewer_active_field(key)
+                    break
+        elif event.type() == _QE.Type.MouseButtonPress:
+            # QTextEdit routes mouse events to its viewport. Map the
+            # viewport back to its owning field widget so we can trigger
+            # lasso mode on every click — even when the field already had
+            # focus (no FocusIn would fire in that case).
+            for key, w in self._field_widgets.items():
+                vp = w.viewport() if hasattr(w, "viewport") else None
+                if obj is w or (vp is not None and obj is vp):
+                    self._fuzzy_active_field = key
+                    self._kick_lasso_for_field(key)
                     break
         elif event.type() == _QE.Type.FocusOut:
             self.pdf_viewer.clear_fuzzy_matches()
         return super().eventFilter(obj, event)
 
     def _sync_viewer_active_field(self, form_key):
+        """Activate the viewer's field for `form_key`. Returns True when a
+        matching field_instance was found and activated; False when there is
+        no field to activate (caller should not turn on lasso mode, since the
+        viewer's _on_edit_toggled would otherwise auto-pick the first field
+        of the document — wrong target for a form field with no bbox yet)."""
         idx = self._current_doc_idx
         if idx < 0 or idx >= len(self._documents):
-            return
+            return False
         annotation = self._documents[idx].get("annotation") or {}
         kie_label = _FORM_TO_KIE_LABEL.get(form_key)
+        if not kie_label:
+            return False
         for f in annotation.get("field_instances") or []:
             if f.get("label") == kie_label:
                 self.pdf_viewer.set_active_field(f.get("field_id", ""))
                 bbox = f.get("bbox")
                 if bbox:
                     self.pdf_viewer.highlight_zone(int(f.get("page_index", 0)), bbox)
-                return
+                return True
+        return False
 
     def _on_field_text_changed(self, field_key):
         # Real user edit (signals are blocked during programmatic
