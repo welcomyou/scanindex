@@ -631,16 +631,21 @@ def _schema_gt(a: Optional[str], b: Optional[str]) -> bool:
 def _try_convert(db_path: Path):
     """Run schema converters on db_path if its schema predates the current one.
     Returns the (from,to) tuple or None. Wraps a backup so a failed conversion
-    never destroys the original."""
+    never destroys the original — but only backs up when conversion is actually
+    needed, to avoid leaving stray ``.preconv.bak`` files on same-schema DBs."""
     from scanindex.core.repository.schema_converters import (
         convert_schema_to_latest,
+        needs_conversion,
         MissingConverterError,
     )
     try:
         conn = sqlite3.connect(str(db_path), isolation_level=None)
         conn.row_factory = sqlite3.Row
         try:
-            # Backup before any conversion attempt.
+            # Only back up when a conversion is actually pending. Same-schema
+            # DBs (the common case) must not produce a leftover .preconv.bak.
+            if not needs_conversion(conn):
+                return None
             backup = Path(str(db_path) + ".preconv.bak")
             if not backup.exists():
                 shutil.copy2(db_path, backup)

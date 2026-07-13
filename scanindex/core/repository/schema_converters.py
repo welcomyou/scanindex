@@ -76,6 +76,23 @@ def _next_version(v: str) -> str:
     return ".".join(parts)
 
 
+def needs_conversion(conn: sqlite3.Connection) -> bool:
+    """True if the DB records a schema_version older than the current target
+    AND at least one converter is registered to advance it.
+
+    Use this to decide whether to take an expensive/side-effecting action
+    (like backing up the DB file) *before* calling
+    :func:`convert_schema_to_latest`. Without it you'd back up even when no
+    conversion runs (e.g. same schema), leaving stray ``.preconv.bak`` files.
+    """
+    current = _read_schema_version(conn)
+    if current is None or current == C.SCHEMA_VERSION:
+        return False
+    # The full chain may still hit a MissingConverterError at convert time;
+    # this helper only reports whether *any* conversion step is pending.
+    return True
+
+
 def convert_schema_to_latest(
     conn: sqlite3.Connection, log: Optional[Callable[[str], None]] = None
 ) -> Optional[tuple[str, str]]:
