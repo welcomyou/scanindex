@@ -32,11 +32,29 @@ from . import constants as C
 
 Converter = Callable[[sqlite3.Connection], None]
 
+
+def _convert_v8_to_v9(conn: sqlite3.Connection) -> None:
+    """v8 → v9: add ``trang_so`` and ``so_thu_tu`` columns to ``documents``.
+
+    These hold the HSLTCQ dossier-sequencing fields (Tờ số trang số / Số thứ
+    tự văn bản trong hồ sơ) captured in Step 2's metadata form, so the
+    archive ZIP export reproduces the operator's exact numbering instead of
+    falling back to a positional default. Existing rows default to NULL and
+    are backfilled at export time (or on the next import that carries the
+    values)."""
+    # ALTER TABLE ADD COLUMN is idempotent-safe via PRAGMA check: if a prior
+    # partial run already added one, the column exists and we skip it.
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(documents)")}
+    if "trang_so" not in cols:
+        conn.execute("ALTER TABLE documents ADD COLUMN trang_so INTEGER")
+    if "so_thu_tu" not in cols:
+        conn.execute("ALTER TABLE documents ADD COLUMN so_thu_tu INTEGER")
+
+
 # schema_version (source) -> converter to the next version.
-# Empty for 1.1.4 because it ships schema v8, same as 1.1.3.
 _CONVERTERS: dict[str, Converter] = {
     # "7": _convert_v7_to_v8,
-    # "8": _convert_v8_to_v9,
+    "8": _convert_v8_to_v9,
 }
 
 

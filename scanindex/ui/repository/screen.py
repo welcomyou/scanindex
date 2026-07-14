@@ -454,6 +454,7 @@ class DossierRow:
     note: str = ""
     fonds_name: str = ""
     catalog_name: str = ""
+    stored_at: Optional[int] = None  # epoch of when the dossier entered the repo (dossiers.created_at)
 
 
 @dataclass
@@ -472,6 +473,8 @@ class FileRow:
     secrecy_mark: str
     page_count: int
     dossier_title: str = ""
+    trang_so: Optional[int] = None
+    so_thu_tu: Optional[int] = None
 
 
 @dataclass
@@ -769,6 +772,17 @@ def _format_issue_date(value: str | None) -> str:
     return f"{d:02d}/{mo:02d}/{y:04d}"
 
 
+def _format_stored_at(epoch: Optional[int]) -> str:
+    """Format a unix epoch (dossier.created_at — the moment the dossier first
+    entered the repository) as "HH:MM dd/mm/yyyy" for display."""
+    if not epoch:
+        return ""
+    try:
+        return datetime.fromtimestamp(int(epoch)).strftime("%H:%M %d/%m/%Y")
+    except (ValueError, OSError, OverflowError):
+        return ""
+
+
 def _format_doc_number(value: str | None) -> str:
     text = _single_line(value)
     if not text:
@@ -868,6 +882,9 @@ def _dossier_stats_text(dossier: "DossierRow",
         span = " - ".join(filter(None, (dossier.start_date, dossier.end_date)))
         if span:
             bits.append(span)
+    stored = _format_stored_at(getattr(dossier, "stored_at", None))
+    if stored:
+        bits.append(f"Lưu kho: {stored}")
     return " · ".join(bits)
 
 
@@ -908,6 +925,20 @@ def _reordered_doc_ids(doc_ids: List[str], dragged_doc_id: str,
         target_index += 1
     out.insert(target_index, dragged_doc_id)
     return out
+
+
+def _files_so_thu_tu_is_contiguous(files: List["FileRow"]) -> bool:
+    """True when the files' stored so_thu_tu values form a complete 1..N
+    sequence. All-blank (None) also counts as contiguous — legacy docs that
+    predate the column have no explicit numbering, so dragging just assigns
+    one. A gap (e.g. 1,2,4,5,6,7) means a slot was reserved for a doc that
+    wasn't scanned, and a drag would clobber it, so we warn first."""
+    vals = [f.so_thu_tu for f in files if f.so_thu_tu is not None]
+    if not vals:
+        return True
+    if any(v <= 0 for v in vals) or len(vals) != len(files):
+        return False
+    return sorted(vals) == list(range(1, len(files) + 1))
 
 
 class _DateFilterInput(QWidget):
@@ -1286,9 +1317,10 @@ class _FileCard(QFrame):
     _REORDER_MIME = _FILE_REORDER_MIME
     _LONG_PRESS_MS = 450
 
-    def __init__(self, file: FileRow, parent=None):
+    def __init__(self, file: FileRow, ordinal: int = 0, parent=None):
         super().__init__(parent)
         self.file = file
+        self.ordinal = ordinal
         self.setObjectName("Card")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setStyleSheet(_CARD_QSS)
@@ -1305,8 +1337,10 @@ class _FileCard(QFrame):
         h.setContentsMargins(SP[3], SP[2], SP[3], SP[2])
         h.setSpacing(SP[2])
 
-        # Checkbox — independent of card body click; toggling it doesn't
-        # navigate to the file.
+        # Narrow left rail: checkbox on top, ordinal number right below it.
+        # Stacking them vertically (instead of two side-by-side columns)
+        # keeps the rail ~20px wide so the title/meta content gets the
+        # horizontal space back.
         from PySide6.QtWidgets import QCheckBox
         self._cb = QCheckBox()
         self._cb.setStyleSheet(
@@ -1315,7 +1349,21 @@ class _FileCard(QFrame):
         self._cb.toggled.connect(
             lambda checked: self.selection_changed.emit(self.file.doc_id, checked)
         )
-        h.addWidget(self._cb, 0, Qt.AlignmentFlag.AlignTop)
+        self._ord_label = QLabel(str(ordinal) if ordinal else "")
+        self._ord_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._ord_label.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents
+        )
+        self._ord_label.setStyleSheet(
+            f"color: {COLOR_TEXT_MUTED}; font: 600 12px '{FONT_UI}';"
+        )
+        rail = QVBoxLayout()
+        rail.setSpacing(2)
+        rail.setContentsMargins(0, 0, 0, 0)
+        rail.addWidget(self._cb, 0, Qt.AlignmentFlag.AlignHCenter)
+        rail.addWidget(self._ord_label, 0, Qt.AlignmentFlag.AlignHCenter)
+        rail.addStretch(1)
+        h.addLayout(rail)
 
         v = QVBoxLayout()
         v.setSpacing(SP[1])
@@ -1348,6 +1396,12 @@ class _FileCard(QFrame):
         self._cb.blockSignals(True)
         self._cb.setChecked(checked)
         self._cb.blockSignals(False)
+
+    def set_ordinal(self, ordinal: int) -> None:
+        """Update the left ordinal badge after a reorder without rebuilding
+        the whole card list."""
+        self.ordinal = ordinal
+        self._ord_label.setText(str(ordinal) if ordinal else "")
 
     def set_active(self, active: bool) -> None:
         _set_card_active(self, active)
@@ -1712,6 +1766,9 @@ class _RightPanel(QWidget):
             span = " – ".join(filter(None, (d.start_date, d.end_date)))
             if span:
                 rows.append(f"<b>Thời gian:</b> {span}")
+        stored = _format_stored_at(getattr(d, "stored_at", None))
+        if stored:
+            rows.append(f"<b>Ngày lưu kho:</b> {stored}")
         self._info_box.setText("<br>".join(rows))
         self._active_chunk_id = 0
         self._snippet_cards_by_id.clear()
@@ -2941,6 +2998,7 @@ class RepositoryScreen(ScreenContent):
             "       COALESCE(MAX(NULLIF(fonds_name, '')), '') AS fonds_name "
             "FROM dossiers "
             "WHERE COALESCE(fonds, '') != '' "
+            "  AND COALESCE(is_unstructured, 0) = 0 "
             "GROUP BY COALESCE(fonds, '') "
             "ORDER BY COALESCE(fonds, '') COLLATE NOCASE"
         ).fetchall()
@@ -2950,6 +3008,7 @@ class RepositoryScreen(ScreenContent):
         if self._store is None:
             return []
         where = "WHERE COALESCE(catalog, '') != '' "
+        where += "  AND COALESCE(is_unstructured, 0) = 0 "
         params: list[str] = []
         if fonds:
             where += "AND COALESCE(fonds, '') = ? "
@@ -3093,7 +3152,7 @@ class RepositoryScreen(ScreenContent):
             "       d.catalog, d.catalog_name,"
             "       d.dossier_code, d.is_unstructured, d.retention, d.term,"
             "       d.storage_unit, d.physical_state, d.topic, d.note,"
-            "       d.start_date, d.end_date,"
+            "       d.start_date, d.end_date, d.created_at,"
             "       COUNT(doc.doc_id) AS doc_count,"
             "       COALESCE(SUM(doc.page_count), 0) AS page_count "
             "FROM dossiers d "
@@ -3127,6 +3186,7 @@ class RepositoryScreen(ScreenContent):
                 physical_state=r["physical_state"] or "",
                 topic=r["topic"] or "",
                 note=r["note"] or "",
+                stored_at=int(r["created_at"] or 0),
             )
             for r in rows
         ]
@@ -3153,8 +3213,8 @@ class RepositoryScreen(ScreenContent):
         self._clear_list()
         files = self._fetch_files_for_dossier(dossier.dossier_id)
         self._list_count_label.setText(_dossier_status_html(dossier, doc_count=len(files)))
-        for f in files:
-            card = _FileCard(f)
+        for idx, f in enumerate(files, start=1):
+            card = _FileCard(f, ordinal=idx)
             card.clicked.connect(lambda _did, ff=f: self._show_file(ff))
             card.selection_changed.connect(self._on_file_selection_changed)
             card.reorder_requested.connect(self._on_file_reorder_requested)
@@ -3171,6 +3231,7 @@ class RepositoryScreen(ScreenContent):
             "       d.kie_issue_org_name, d.kie_issue_org_superior,"
             "       d.kie_signer_name, d.kie_place_date,"
             "       d.kie_doc_type, d.kie_secrecy_mark, d.page_count,"
+            "       d.trang_so, d.so_thu_tu,"
             "       ds.title AS dossier_title "
             "FROM documents d "
             "LEFT JOIN dossiers ds ON ds.dossier_id = d.dossier_id "
@@ -3197,6 +3258,8 @@ class RepositoryScreen(ScreenContent):
             secrecy_mark=r["kie_secrecy_mark"] or "",
             page_count=int(r["page_count"] or 0),
             dossier_title=r["dossier_title"] or "",
+            trang_so=r["trang_so"] if r["trang_so"] is not None else None,
+            so_thu_tu=r["so_thu_tu"] if r["so_thu_tu"] is not None else None,
         )
 
     def _fetch_dossier_by_id(self, dossier_id: int) -> Optional[DossierRow]:
@@ -3302,6 +3365,7 @@ class RepositoryScreen(ScreenContent):
         kie_cols = ", ".join(f"d.kie_{label.lower()}" for label in KIE_LABELS)
         rows = self._store.connect().execute(
             "SELECT d.doc_id, d.file_name, d.file_path, d.page_count, "
+            "       d.trang_so, d.so_thu_tu, "
             f"{kie_cols} "
             "FROM documents d "
             "WHERE d.dossier_id = ? AND d.indexed_status != 'deleted' "
@@ -3318,16 +3382,70 @@ class RepositoryScreen(ScreenContent):
             if not pdf_path.is_file():
                 skipped += 1
                 continue
+            # Name the ZIP member by the doc's so_thu_tu so it matches the
+            # workbook's "Số thứ tự" cell and the on-screen order. Fall back
+            # to the 1-based position when the column is blank (legacy docs).
+            stored_stt = r["so_thu_tu"]
+            try:
+                stt = int(stored_stt) if stored_stt else 0
+            except (ValueError, TypeError):
+                stt = 0
+            if stt <= 0:
+                stt = len(docs) + 1
             export_name = self._export_pdf_name_for_dossier(
-                identity, len(docs) + 1, r["file_name"] or ""
+                identity, stt, r["file_name"] or ""
             )
             docs.append({
                 "pdf_path": str(pdf_path),
                 "export_source_path": str(pdf_path),
                 "export_file_name": export_name,
                 "annotation": self._annotation_from_repository_doc(r),
-                "metadata": {},
+                # Carry the stored HSLTCQ sequencing fields through to the
+                # Excel writer. Empty string (not None) so
+                # write_aggregated_excel's form-override path treats them as
+                # "operator left blank" and applies its positional fallback.
+                "metadata": {
+                    "trang_so": str(r["trang_so"]) if r["trang_so"] is not None else "",
+                    "so_thu_tu": str(r["so_thu_tu"]) if r["so_thu_tu"] is not None else "",
+                },
             })
+        # Backfill trang_so when every doc is missing it (legacy DB pre-v9
+        # or a folder import that never carried the column). Cumulative
+        # start-page numbering derived from each doc's page_count, matching
+        # Step 2's `_ensure_trang_so_initialised` / zip_roundtrip backfill.
+        if docs and not any(d["metadata"].get("trang_so") for d in docs):
+            try:
+                from scanindex.core.digitization.metadata_export import (
+                    compute_trang_so,
+                )
+                page_counts = []
+                for d in docs:
+                    p = d.get("export_source_path") or d.get("pdf_path") or ""
+                    n = 0
+                    if p:
+                        try:
+                            import fitz
+                            with fitz.open(str(p)) as f:
+                                n = int(f.page_count)
+                        except Exception:
+                            n = 0
+                    page_counts.append(max(1, n))
+                trang = compute_trang_so(page_counts, first_default=1)
+                for d, t in zip(docs, trang):
+                    d["metadata"]["trang_so"] = str(t)
+            except Exception:
+                pass
+        # Order ZIP members + Excel rows by so_thu_tu so the file sequence
+        # in the archive matches the workbook's "Số thứ tự" column (and the
+        # on-screen order in Kho lưu trữ). Docs without a value keep their
+        # relative file-name order via a stable sort.
+        def _order_key(d):
+            try:
+                n = int(d["metadata"].get("so_thu_tu") or 0)
+                return (0, n) if n > 0 else (1, 0)
+            except (ValueError, TypeError):
+                return (1, 0)
+        docs.sort(key=_order_key)
         return docs, skipped
 
     def _export_one_dossier_zip(self, dossier: DossierRow,
@@ -3382,6 +3500,7 @@ class RepositoryScreen(ScreenContent):
             "       d.kie_issue_org_name, d.kie_issue_org_superior,"
             "       d.kie_signer_name, d.kie_place_date,"
             "       d.kie_doc_type, d.kie_secrecy_mark, d.page_count,"
+            "       d.trang_so, d.so_thu_tu,"
             "       ds.title AS dossier_title "
             "FROM documents d "
             "LEFT JOIN dossiers ds ON ds.dossier_id = d.dossier_id "
@@ -4006,6 +4125,25 @@ class RepositoryScreen(ScreenContent):
             return
         if ordered_ids == current_ids:
             return
+
+        # If the stored so_thu_tu sequence has gaps (a slot was skipped,
+        # e.g. for a secret doc not scanned), warn before reordering: the
+        # move re-stamps numbering to a flat 1..N and would clobber the
+        # reserved slot. A contiguous (or all-blank) sequence reorders
+        # silently.
+        if not _files_so_thu_tu_is_contiguous(files):
+            reply = QMessageBox.warning(
+                self,
+                "Kéo thả sẽ đánh lại số thứ tự",
+                "Số thứ tự hiện tại của các văn bản chưa đủ liên tiếp "
+                "(đã bỏ một vị trí). Việc kéo thả sẽ đánh lại số thứ tự tuần tự "
+                "(1, 2, 3…). Vui lòng kiểm tra chính xác thứ tự của từng văn bản "
+                "trước khi xác nhận.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
 
         active_doc_id = self._active_doc_id
         try:

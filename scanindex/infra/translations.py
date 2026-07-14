@@ -416,7 +416,7 @@ The software prioritizes local processing when models and dependencies are insta
     "arc_btn_stop": { "en": "Stop", "vi": "Dừng" },
     "arc_progress": { "en": "Processing {0}/{1}...", "vi": "Đang xử lý {0}/{1}..." },
     "arc_done": { "en": "Done: {0} files processed", "vi": "Hoàn tất: {0} file đã xử lý" },
-    "arc_doc_list": { "en": "Documents", "vi": "Tài liệu" },
+    "arc_doc_list": { "en": "Documents (drag to reorder)", "vi": "Tài liệu (kéo thả để sắp thứ tự)" },
     "arc_no_docs": {
         "en": "No documents yet.\nSelect an input folder and click Process.",
         "vi": "Chưa có tài liệu.\nChọn thư mục đầu vào và nhấn Xử lý."
@@ -535,10 +535,6 @@ The software prioritizes local processing when models and dependencies are insta
         "en": "From Step 1 ({n} files)",
         "vi": "Từ Bước 1 ({n} file)",
     },
-    "arc_step2_name_warn": {
-        "en": "Filename does not match expected pattern <ID>-<Fonds>-<Catalog>-<File>-<NNN>.pdf",
-        "vi": "Tên file chưa đúng mẫu <Mã ĐD>-<Mã phông>-<Mục lục>-<Hồ sơ>-<STT>.pdf",
-    },
 
     # ── Step 2 — reopen exported ZIP to edit ────────────────────────
     "arc_step2_open_zip": { "en": "Open ZIP", "vi": "Mở ZIP" },
@@ -558,6 +554,20 @@ The software prioritizes local processing when models and dependencies are insta
     "arc_step2_zip_failed": {
         "en": "Failed to read ZIP: {0}",
         "vi": "Không đọc được file ZIP: {0}",
+    },
+    "arc_step2_reorder_warn_title": {
+        "en": "Reorder will reset numbering",
+        "vi": "Kéo thả sẽ đánh lại số thứ tự",
+    },
+    "arc_step2_reorder_warn_body": {
+        "en": "The current document numbering is not a complete 1, 2, 3… "
+              "sequence (a slot was skipped). Dragging will renumber every "
+              "document sequentially (1, 2, 3…). Please verify the correct "
+              "order of each document before confirming.",
+        "vi": "Số thứ tự hiện tại của các văn bản chưa đủ liên tiếp "
+              "(đã bỏ một vị trí). Việc kéo thả sẽ đánh lại số thứ tự tuần tự "
+              "(1, 2, 3…). Vui lòng kiểm tra chính xác thứ tự của từng văn bản "
+              "trước khi xác nhận.",
     },
 
     # ── Step 3 placeholder ──────────────────────────────────────────

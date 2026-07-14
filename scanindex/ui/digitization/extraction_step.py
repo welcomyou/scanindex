@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QLabel, QLineEdit, QTextEdit, QPushButton,
     QListWidget, QListWidgetItem, QScrollArea, QFrame,
     QMessageBox, QSizePolicy, QSplitter, QProgressBar,
+    QAbstractItemView,
 )
 from PySide6.QtCore import Qt, QTimer, Signal, QDate
 from PySide6.QtGui import QBrush, QColor, QTextOption
@@ -64,8 +65,52 @@ _TEXTAREA = f"""
 
 # Canonical name pattern — see CLAUDE.md / Step 1 naming rules.
 # Example: H42-001-01-0123a-001.pdf
-NAME_PATTERN = re.compile(r"^[\w]+-[\w]+-\d{2}-\d{4}[a-zA-Z]?-\d{3}\.pdf$",
-                          re.IGNORECASE)
+# File names from the input folder are intentionally NOT validated here:
+# the canonical archive name is generated at ZIP-export time from the
+# dossier's identity codes (see ArchiveStep / `_export_pdf_name_for_dossier`),
+# so whatever the operator's source files happen to be named is fine.
+
+
+class _ReorderableDocList(QListWidget):
+    """QListWidget with internal-move drag-and-drop reordering.
+
+    Qt's built-in ``InternalMove`` mode shuffles the visible items but does
+    not tell the host about the new order, so we emit ``order_changed`` after
+    a drop completes. The host then mirrors the move into ``self._documents``
+    and re-stamps the ordinals / ``so_thu_tu`` fields."""
+
+    order_changed = Signal(int, int)  # (from_row, to_row)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setDragEnabled(True)
+        self.setAcceptDrops(True)
+        self.setDropIndicatorShown(True)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        # The vertical scroll bar would otherwise intercept drag moves near
+        # the list edges; InternalMove handles scrolling itself.
+        self._drop_from_row = -1
+
+    def dropEvent(self, event):
+        if self.model() is None:
+            super().dropEvent(event)
+            return
+        # Remember the selected row before the move so we can report it.
+        selected = self.selectedItems()
+        from_row = self.row(selected[0]) if selected else -1
+        self._drop_from_row = from_row
+        # Track count: after the drop the model will have the same row count
+        # (InternalMove moves, not copies), but we need the destination row.
+        super().dropEvent(event)
+        if from_row < 0:
+            return
+        # The moved item is now the current selected row.
+        cur = self.currentRow()
+        if cur >= 0 and cur != from_row:
+            self.order_changed.emit(from_row, cur)
+        self._drop_from_row = -1
 
 
 # Section 1 form: derived/projected metadata the user sees and edits.
@@ -1096,7 +1141,7 @@ class ArchiveStep2Kie(QWidget):
         hdr.addWidget(self._lbl_count)
         layout.addLayout(hdr)
 
-        self.doc_list = QListWidget()
+        self.doc_list = _ReorderableDocList()
         self.doc_list.setStyleSheet(f"""
             QListWidget {{
                 background: {COLOR_BG};
@@ -1111,7 +1156,40 @@ class ArchiveStep2Kie(QWidget):
             QListWidget::item:hover:!selected {{ background: {COLOR_ELEVATED}; }}
         """)
         self.doc_list.currentRowChanged.connect(self._on_doc_selected)
+        self.doc_list.order_changed.connect(self._on_doc_list_reordered)
         layout.addWidget(self.doc_list, 1)
+
+    # ── doc-list ordinal helpers ────────────────────────────────────
+
+    @staticmethod
+    def _format_doc_list_text(ordinal: int, name: str) -> str:
+        """Prefix a file name with its 1-based ordinal so the operator can
+        see each document's position (1, 2, 3…) and use it as a reference
+        when dragging to reorder."""
+        return f"{ordinal}.  {name}" if name else f"{ordinal}."
+
+    def _refresh_doc_list_ordinals(self) -> None:
+        """Re-stamp every list row's leading ordinal after a drag reorder.
+
+        The display name is read from the item's UserRole data (the raw file
+        name), never from ``item.text()`` — so re-stamping never accumulates
+        duplicate "N.  " prefixes regardless of how many times it runs."""
+        self.doc_list.blockSignals(True)
+        try:
+            for i in range(self.doc_list.count()):
+                item = self.doc_list.item(i)
+                if item is None:
+                    continue
+                name = (item.data(Qt.ItemDataRole.UserRole + 1)
+                        or item.data(Qt.ItemDataRole.UserRole)
+                        or "")
+                doc = self._documents[i] if 0 <= i < len(self._documents) else None
+                if doc is not None:
+                    self._apply_row_state(item, doc)
+                else:
+                    item.setText(self._format_doc_list_text(i + 1, name))
+        finally:
+            self.doc_list.blockSignals(False)
 
     # ── helpers ─────────────────────────────────────────────────────
 
@@ -1394,14 +1472,15 @@ class ArchiveStep2Kie(QWidget):
         self._documents = documents
         self.doc_list.blockSignals(True)
         self.doc_list.clear()
-        for doc in documents:
+        for idx, doc in enumerate(documents, start=1):
             name = os.path.basename(doc.get("pdf_path", ""))
-            item = QListWidgetItem(name)
-            # Soft-warn malformed names from folder mode
-            if (self._source_mode == "folder"
-                    and not NAME_PATTERN.match(name)):
-                item.setToolTip(translations.get_text("arc_step2_name_warn"))
-                item.setText(f"⚠ {name}")
+            item = QListWidgetItem()
+            # Store the raw file name in UserRole so state/ordinal refreshes
+            # can rebuild the visible text from a clean source instead of
+            # parsing the already-displayed (prefixed) text — which used to
+            # accumulate duplicate "N.  " prefixes on every refresh.
+            item.setData(Qt.ItemDataRole.UserRole, name)
+            item.setData(Qt.ItemDataRole.UserRole + 1, name)
             secrecy = doc.get("_secrecy") if isinstance(doc, dict) else None
             if secrecy:
                 item.setToolTip(f"Văn bản mật: {secrecy}")
@@ -1472,26 +1551,32 @@ class ArchiveStep2Kie(QWidget):
             and status not in ("Pending", "", "OCR Done")
         )
 
-        name = self._strip_state_prefix(item.text())
+        name = (item.data(Qt.ItemDataRole.UserRole + 1)
+                or item.data(Qt.ItemDataRole.UserRole)
+                or self._strip_state_prefix(item.text()))
+        # Ordinal prefix is derived from the row position so the displayed
+        # number always matches the document's place in the list.
+        row = self.doc_list.row(item)
+        ordinal = row + 1 if row >= 0 else 0
         selectable = item.flags() | _Qt.ItemFlag.ItemIsSelectable | _Qt.ItemFlag.ItemIsEnabled
         not_selectable = item.flags() & ~_Qt.ItemFlag.ItemIsSelectable & ~_Qt.ItemFlag.ItemIsEnabled
         if is_complete:
             # KIE produced annotation output → clickable.
-            item.setText(name)
+            item.setText(self._format_doc_list_text(ordinal, name))
             item.setForeground(QBrush(QColor(COLOR_RED if has_secrecy else COLOR_TEXT)))
             item.setFlags(selectable)
         elif is_failed:
-            item.setText(name)
+            item.setText(self._format_doc_list_text(ordinal, name))
             item.setForeground(QBrush(QColor(COLOR_RED)))
             item.setFlags(not_selectable)
         elif is_active:
             char = self._spinner_chars[self._spinner_idx % len(self._spinner_chars)]
-            item.setText(f"{char} {name}")
+            item.setText(self._format_doc_list_text(ordinal, f"{char} {name}"))
             item.setForeground(QBrush(QColor(COLOR_RED if has_secrecy else COLOR_TEXT_MUTED)))
             item.setFlags(not_selectable)
         else:
             # "Pending" before KIE has produced data for this file.
-            item.setText(name)
+            item.setText(self._format_doc_list_text(ordinal, name))
             item.setForeground(QBrush(QColor(COLOR_RED if has_secrecy else COLOR_TEXT_MUTED)))
             item.setFlags(not_selectable)
 
@@ -1524,8 +1609,15 @@ class ArchiveStep2Kie(QWidget):
                           "Failed", "Done (Export Failed)"):
                 continue
             txt = item.text()
-            if len(txt) >= 2 and txt[0] in self._spinner_chars:
-                item.setText(char + txt[1:])
+            # The active row's text is "<ordinal>.  <spinner> <name>", so the
+            # spinner glyph is no longer at index 0 — scan for the first char
+            # that is a spinner glyph and swap only it, preserving the ordinal
+            # prefix and the file name. Without this the spinner froze once
+            # ordinal prefixes were added to the displayed text.
+            for pos in range(len(txt)):
+                if txt[pos] in self._spinner_chars:
+                    item.setText(txt[:pos] + char + txt[pos + 1:])
+                    break
 
     def get_documents(self):
         self._save_current_fields()
@@ -2309,6 +2401,105 @@ class ArchiveStep2Kie(QWidget):
             meta["so_thu_tu"] = str(cur)
             if i == self._current_doc_idx:
                 self._set_field_value("so_thu_tu", str(cur), block_signals=True)
+
+    def _so_thu_tu_values(self) -> list[int]:
+        """Collect each doc's ``so_thu_tu`` as ints; blanks become 0 so they
+        are clearly distinguishable from a valid 1."""
+        out: list[int] = []
+        for d in self._documents:
+            raw = str((d.get("metadata", {}) or {}).get("so_thu_tu", "")).strip()
+            try:
+                out.append(int(raw))
+            except (ValueError, TypeError):
+                out.append(0)
+        return out
+
+    def _so_thu_tu_is_contiguous(self) -> bool:
+        """True when the documents' so_thu_tu values form a complete
+        1, 2, 3 … N sequence with no gaps and no blanks. A contiguous
+        sequence means the operator can drag-reorder freely: the new order
+        just re-stamps 1..N. A gap (e.g. 1,2,4,5,6,7 because slot 3 was
+        skipped for a secret doc) means dragging would clobber that reserved
+        slot, so we warn first."""
+        vals = self._so_thu_tu_values()
+        if not vals:
+            return True
+        if any(v <= 0 for v in vals):
+            return False
+        return sorted(vals) == list(range(1, len(vals) + 1))
+
+    def _resequence_so_thu_tu(self) -> None:
+        """Stamp every doc's so_thu_tu with its 1-based list position. Used
+        after a drag reorder that the operator confirmed."""
+        for i, d in enumerate(self._documents, start=1):
+            meta = d.setdefault("metadata", {})
+            meta["so_thu_tu"] = str(i)
+            if i - 1 == self._current_doc_idx:
+                self._set_field_value("so_thu_tu", str(i), block_signals=True)
+
+    def _resequence_trang_so(self) -> None:
+        """Recompute trang_so for every doc as a cumulative running page
+        numbering based on the NEW physical order. Doc 0 starts at 1; each
+        subsequent doc starts at the previous doc's trang_so + that doc's
+        page count. Used after a drag reorder so the starting-page column
+        stays consistent with the new document sequence."""
+        if not self._documents:
+            return
+        cur = 1
+        for i, d in enumerate(self._documents):
+            meta = d.setdefault("metadata", {})
+            meta["trang_so"] = str(cur)
+            if i == self._current_doc_idx:
+                self._set_field_value("trang_so", str(cur), block_signals=True)
+            pages = self._count_doc_pages(d)
+            cur = cur + max(1, pages)
+
+    def _on_doc_list_reordered(self, from_row: int, to_row: int) -> None:
+        """Handle a drag-and-drop reorder inside the document list.
+
+        If the current so_thu_tu sequence is contiguous (1..N) the move is
+        silent: we mirror it into ``self._documents`` and re-stamp the
+        ordinals. If it has gaps (a slot was skipped, e.g. for a secret doc
+        not scanned), we warn the operator that dragging will reset the
+        numbering to a flat 1..N and ask for confirmation."""
+        n = len(self._documents)
+        if not (0 <= from_row < n and 0 <= to_row < n) or from_row == to_row:
+            return
+        if not self._so_thu_tu_is_contiguous():
+            reply = QMessageBox.warning(
+                self,
+                translations.get_text("arc_step2_reorder_warn_title"),
+                translations.get_text("arc_step2_reorder_warn_body"),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                # Restore the previous order by reloading the list from the
+                # untouched ``self._documents`` (the QListWidget moved items,
+                # but ``self._documents`` is the source of truth).
+                self.set_documents(self._documents)
+                return
+        # Mirror the move into the underlying document list.
+        # Persist any pending field edits first so the moved doc's metadata
+        # (subject, signer, …) is not lost when we re-stamp numbering below.
+        if self._form_dirty:
+            self._save_current_fields()
+        doc = self._documents.pop(from_row)
+        self._documents.insert(to_row, doc)
+        # Re-stamp ordinals on the list rows and re-sequence the two
+        # dossier-sequencing fields: so_thu_tu (1, 2, 3…) and trang_so
+        # (cumulative starting page based on each doc's page count).
+        self._refresh_doc_list_ordinals()
+        self._resequence_so_thu_tu()
+        self._resequence_trang_so()
+        # Keep the selection on the moved row so the operator sees it land.
+        # Setting _current_doc_idx first makes _on_doc_selected see the move
+        # as a no-op (prev == new), avoiding a confirm-unsaved prompt.
+        self._current_doc_idx = to_row
+        self.doc_list.blockSignals(True)
+        self.doc_list.setCurrentRow(to_row)
+        self.doc_list.blockSignals(False)
+        self._on_doc_selected(to_row)
 
     def _ensure_trang_so_initialised(self) -> None:
         """First-run seeding: if no doc has a trang_so yet, assign the

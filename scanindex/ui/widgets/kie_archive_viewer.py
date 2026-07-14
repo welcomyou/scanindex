@@ -696,6 +696,12 @@ class _PdfPageWidget(QLabel):
         delta = pos - self._drag_origin
         if not self._is_dragging and (abs(delta.x()) > 4 or abs(delta.y()) > 4):
             self._is_dragging = True
+            # Pause the blink heartbeat while a rubber-band selection is in
+            # progress: `_on_blink_tick` calls `_repaint`, which rebuilds
+            # `_overlaid_pixmap` *without* the rubber band and would erase
+            # the box the operator is currently drawing every ~77ms.
+            if self._blink_timer.isActive():
+                self._blink_timer.stop()
         if self._is_dragging:
             self._drag_current = pos
             self._draw_rubber_band()
@@ -785,10 +791,15 @@ class _PdfPageWidget(QLabel):
         self.empty_clicked.emit()
 
     def _reset_drag(self):
+        was_dragging = self._is_dragging
         self._drag_origin = None
         self._drag_current = None
         self._is_dragging = False
         self._drag_modifiers = Qt.KeyboardModifier.NoModifier
+        # Resume the blink heartbeat if we paused it during a drag and the
+        # active field's icon is still on this page.
+        if was_dragging:
+            self._update_blink_timer()
 
     def _reset_pan(self):
         self._pan_origin = None

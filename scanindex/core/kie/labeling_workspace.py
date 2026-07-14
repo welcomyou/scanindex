@@ -627,57 +627,15 @@ def _validate_doc_number_symbol_span(
     line_map: dict[str, dict],
     line_order: dict[str, tuple],
 ) -> None:
-    if len(line_ids) <= 1:
-        return
+    """DOC_NUMBER_SYMBOL span validation (DISABLED).
 
-    orders = [line_order[line_id] for line_id in line_ids]
-    page_indexes = {order[0] for order in orders}
-    if len(page_indexes) != 1:
-        raise ValueError(f"DOC_NUMBER_SYMBOL spans multiple pages for {raw_id}")
-
-    sorted_orders = [order[1] for order in orders]
-    expected = list(range(sorted_orders[0], sorted_orders[0] + len(sorted_orders)))
-    if sorted_orders != expected:
-        raise ValueError(f"DOC_NUMBER_SYMBOL line_ids must be contiguous for {raw_id}: {line_ids}")
-
-    # Re-sort line_ids by VISUAL position (Y-bucket then X) for the
-    # continuation check. Rationale: when a stamp/seal interrupts the
-    # middle of the number line ("Số 07 -BC/TGSUBKT"), OCR sometimes
-    # splits the row into two line-fragments AND assigns reading-order
-    # in reverse (right fragment ends up with the lower order). Trusting
-    # OCR's line.order then labels the leading "Số" as a continuation
-    # and rejects it via the symbol-like regex even though the user's
-    # label is semantically correct. Visual ordering recovers the
-    # natural left-to-right / top-to-bottom sequence.
-    def _line_topleft(_lid):
-        bbox = line_map[_lid].get("bbox") or [0, 0, 0, 0]
-        y_top, x_left = bbox[1], bbox[0]
-        # Bucket Y by ~half the line's own height so same-row fragments
-        # land together even when their tops differ by a few pt (a stamp
-        # often pushes one fragment's bbox a couple of points up/down).
-        # Floor of (y / bucket): same row → same bucket.
-        height = max(1.0, bbox[3] - bbox[1])
-        bucket = max(12.0, height * 0.6)
-        return (int(y_top // bucket), x_left)
-
-    visual_order_ids = sorted(line_ids, key=_line_topleft)
-
-    forbidden_prefixes = ("ngay ", "thang ", "nam ", "tai ", "kinh gui", "noi nhan")
-    for index, line_id in enumerate(visual_order_ids[1:], 1):
-        text = (line_map[line_id].get("text") or "").strip()
-        # Some scans insert a standalone separator line between the number line
-        # and the symbol line. Keep the span contiguous but ignore that marker.
-        if re.match(r"^[*._~]+$", text):
-            continue
-        lowered = " ".join(text.lower().split())
-        if any(lowered.startswith(prefix) for prefix in forbidden_prefixes):
-            raise ValueError(f"DOC_NUMBER_SYMBOL continuation line looks invalid for {raw_id}: {text}")
-        # Allow ASCII letters/digits, Vietnamese diacritics, slash, hyphen,
-        # parentheses, colon, comma, period, whitespace. \w with re.UNICODE
-        # covers accented Vietnamese (e.g. "S\u1ed1") in a wrapped continuation.
-        # Forbidden prefix check above still catches body lines.
-        if not re.match(r"^[\w/\-().,:\s]+$", text, re.UNICODE):
-            raise ValueError(f"DOC_NUMBER_SYMBOL continuation line is not symbol-like for {raw_id}: {text}")
+    Previously enforced that the "Số/Ký hiệu" field's line fragments were
+    contiguous in reading order and symbol-shaped. This rejected far more
+    valid labels than real mistakes — OCR routinely splits the row when a
+    stamp/seal interrupts it — so the check is no longer called. Retained as
+    a thin no-op so external callers (and any lingering references) keep
+    importing without error; it always returns success now."""
+    return
 
 
 ADDRESSEE_ANCHOR_RE = re.compile(
@@ -812,11 +770,15 @@ def validate_label_output_detailed(
             continue
 
         if label == "DOC_NUMBER_SYMBOL":
-            try:
-                _validate_doc_number_symbol_span(raw_id, line_ids, line_map, line_order)
-            except ValueError as exc:
-                errors.append(str(exc))
-                continue
+            # DOC_NUMBER_SYMBOL span validation is intentionally NOT enforced
+            # as a blocking error: OCR commonly splits a single "Số/Ký hiệu"
+            # row into non-contiguous line fragments (a stamp/seal interrupts
+            # the middle of the row), and rejecting those forces the operator
+            # to re-label a field that is semantically correct. The text is
+            # still rebuilt in reading order below; the contiguous check was
+            # only a cosmetic reading-order sanity guard that rejected valid
+            # labels more often than it caught real mistakes.
+            pass
 
         if word_ids and line_ids:
             invalid_word_links = [

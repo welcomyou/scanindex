@@ -87,6 +87,7 @@ class _SignItem:
     status: str = "Chờ ký"
     output_path: str = ""
     error: str = ""
+    start_page: Optional[int] = None  # trang_so from Step 2 (starting page)
 
 
 def _pdf_has_digital_signature(pdf_path: str) -> bool:
@@ -518,7 +519,9 @@ class ArchiveStep3Sign(QWidget):
         self.spin_page.setMinimumWidth(82)
         self.spin_page.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.spin_page.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
-        self.spin_page.valueChanged.connect(self._refresh_page_column)
+        # spin_page controls signature placement; the "Trang số" column now
+        # shows each doc's trang_so from Step 2, so the column no longer
+        # needs to refresh when the spinbox value changes.
 
         defaults = SIG_BOX_DEFAULT if _DEPS_OK else (0.0, 0.0, 220.0, 60.0)
         self.spin_x = self._coord_spin(defaults[0])
@@ -823,12 +826,14 @@ class ArchiveStep3Sign(QWidget):
         parent.addLayout(hdr)
 
         self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["File", "Trang", "Trạng thái", "File đã ký"])
+        self.table.setHorizontalHeaderLabels(["Tên tập tin", "Trang số", "Trạng thái", "File đã ký"])
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        # "Tên tập tin" fits the longest name; "Trang số"/"Trạng thái" fit
+        # their content; "File đã ký" stretches to absorb the remaining space.
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
@@ -1440,12 +1445,24 @@ class ArchiveStep3Sign(QWidget):
 
     # ------------------------------------------------------------- documents
 
-    def _display_name_for_source(self, row_index: int, source_path: str) -> str:
+    def _display_name_for_source(self, row_index: int, source_path: str,
+                                 doc: dict | None = None) -> str:
         identity = getattr(self._session, "identity", None)
+        # Prefer the doc's so_thu_tu so the Bước 3 display name matches the
+        # ZIP export name; fall back to the 1-based row position.
+        stt = row_index + 1
+        if doc is not None:
+            raw = str((doc.get("metadata") or {}).get("so_thu_tu", "")).strip()
+            try:
+                n = int(raw)
+                if n > 0:
+                    stt = n
+            except (ValueError, TypeError):
+                pass
         if identity is not None:
             try:
                 if identity.is_complete():
-                    return _safe_pdf_name(identity.make_segment_name(row_index + 1))
+                    return _safe_pdf_name(identity.make_segment_name(stt))
             except Exception:
                 pass
         return _safe_pdf_name(os.path.basename(source_path))
@@ -1518,10 +1535,20 @@ class ArchiveStep3Sign(QWidget):
                     sig_page = int(sig_page)
                 except Exception:
                     sig_page = None
+            # Carry the doc's trang_so (starting page within the dossier)
+            # from Step 2 so the "Trang số" column reflects where this
+            # document begins — independent of the signing page spinbox.
+            start_page = None
+            raw_trang = str((doc.get("metadata") or {}).get("trang_so", "")).strip()
+            try:
+                start_page = int(raw_trang) if raw_trang else None
+            except (ValueError, TypeError):
+                start_page = None
             items.append(_SignItem(
                 source_path=os.path.abspath(source),
-                display_name=self._display_name_for_source(row, source),
+                display_name=self._display_name_for_source(row, source, doc),
                 signature_page=sig_page,
+                start_page=start_page,
             ))
             # A reopened ZIP's PDFs are often already digitally signed at
             # export time — flag them so Step 3 shows "Đã ký" instead of
@@ -1608,11 +1635,11 @@ class ArchiveStep3Sign(QWidget):
         self.table.setItem(row, col, cell)
 
     def _page_label(self, item: _SignItem) -> str:
-        return str(self.spin_page.value())
-
-    def _refresh_page_column(self):
-        for row, item in enumerate(self._items):
-            self._set_table_item(row, 1, self._page_label(item))
+        # "Trang số" shows the document's starting page (trang_so) carried
+        # over from Step 2, not the signature-placement page from the spinbox.
+        if item.start_page is not None and item.start_page > 0:
+            return str(item.start_page)
+        return ""
 
     # ------------------------------------------------------------- certs
 

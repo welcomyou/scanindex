@@ -94,6 +94,10 @@ DOC_HEADER_MAP = {
     "Tình trạng vật lý":        "physical_state",
     "Tên tệp":                  "file_name",
     "Thời gian tài liệu":       "doc_period",
+    # Dossier-sequencing fields (HSLTCQ Văn bản sheet). Mapped so a
+    # round-tripped archive ZIP's numbering is preserved on re-import.
+    "Tờ số trang số":                       "trang_so",
+    "Số thứ tự văn bản trong hồ sơ":        "so_thu_tu",
 }
 
 DOSSIER_HEADER_MAP = {
@@ -197,6 +201,15 @@ def _apply_step2_metadata_overrides(kie_fields: Dict[str, str],
     secrecy = " ".join(str(metadata.get("do_mat") or "").split())
     if secrecy:
         out["kie_secrecy_mark"] = secrecy
+    # Dossier-sequencing fields (not KIE labels): store as ints so the
+    # archive ZIP export reproduces the operator's exact numbering.
+    for seq_key in ("trang_so", "so_thu_tu"):
+        raw = str(metadata.get(seq_key) or "").strip()
+        if raw:
+            try:
+                out[seq_key] = int(raw)
+            except (ValueError, TypeError):
+                pass
     return out
 
 
@@ -457,6 +470,14 @@ def _xlsx_meta_to_kie_fields(doc_meta: dict) -> Dict[str, str]:
     iso = _normalize_date(doc_meta.get("issue_date"))
     if iso:
         fields["kie_place_date"] = iso
+    # Dossier-sequencing fields: store as ints (None when blank/invalid).
+    for seq_key in ("trang_so", "so_thu_tu"):
+        raw = str(doc_meta.get(seq_key) or "").strip()
+        if raw:
+            try:
+                fields[seq_key] = int(raw)
+            except (ValueError, TypeError):
+                pass
     return fields
 
 
@@ -973,6 +994,22 @@ class Importer:
                              page_count, status, created_at,
                              sha256: str = "") -> None:
         rel = str(target_pdf.relative_to(self.store.archive_path)).replace("\\", "/")
+        # trang_so / so_thu_tu ride in the same kie_fields dict (added by
+        # _apply_step2_metadata_overrides) but are not part of KIE_COLUMNS;
+        # pull them out so they land in their own columns. None is fine —
+        # SQLite stores NULL and the export backfills missing values.
+        trang_so = kie_fields.get("trang_so")
+        if isinstance(trang_so, str):
+            try:
+                trang_so = int(trang_so)
+            except (ValueError, TypeError):
+                trang_so = None
+        so_thu_tu = kie_fields.get("so_thu_tu")
+        if isinstance(so_thu_tu, str):
+            try:
+                so_thu_tu = int(so_thu_tu)
+            except (ValueError, TypeError):
+                so_thu_tu = None
         params = {
             "doc_id":              doc_id,
             "dossier_id":          dossier_id,
@@ -980,6 +1017,8 @@ class Importer:
             "file_path":           rel,
             **{col: kie_fields.get(col, "") for col in KIE_COLUMNS},
             "kie_annotation_json": kie_annotation_json,
+            "trang_so":            trang_so if isinstance(trang_so, int) else None,
+            "so_thu_tu":           so_thu_tu if isinstance(so_thu_tu, int) else None,
             "page_count":          page_count,
             "sha256":              sha256 or doc_id,
             "indexed_status":      status,

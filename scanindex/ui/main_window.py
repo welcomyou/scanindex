@@ -2076,7 +2076,7 @@ class MainWindow(QMainWindow):
         # prior edits survive re-running OCR + KIE. Only pipeline-owned fields
         # (output_path / json_path / status) reset for a fresh run.
         prior_by_path = {}
-        for d in (self._arc_documents or []):
+        for d in (getattr(self, "_arc_documents", None) or []):
             p = d.get("pdf_path") or d.get("path")
             if p:
                 prior_by_path[p] = d
@@ -2711,6 +2711,24 @@ class MainWindow(QMainWindow):
             stem = stem[:-4]
         return f"{stem}{ext}"
 
+    @staticmethod
+    def _arc_stt_for_doc(doc: dict, fallback_position: int) -> int:
+        """Resolve the document ordinal used to name its export PDF.
+
+        Prefers the operator's edited ``so_thu_tu`` from Step 2's metadata
+        form (kept in sync with the on-screen order by the drag-reorder
+        handler) so the ZIP member name ``…-NNN.pdf`` matches the workbook's
+        "Số thứ tự văn bản trong hồ sơ" cell. Falls back to the 1-based
+        list position when the field is blank or not an integer."""
+        raw = str((doc.get("metadata") or {}).get("so_thu_tu", "")).strip()
+        try:
+            n = int(raw)
+            if n > 0:
+                return n
+        except (ValueError, TypeError):
+            pass
+        return max(1, int(fallback_position))
+
     @classmethod
     def _arc_export_pdf_name(cls, identity, stt: int,
                              fallback_pdf_path: str | None = None) -> str:
@@ -2793,7 +2811,7 @@ class MainWindow(QMainWindow):
             export_docs = []
             skipped = 0
             for doc in documents:
-                stt = len(export_docs) + 1
+                stt = self._arc_stt_for_doc(doc, len(export_docs) + 1)
                 src = self._arc_pick_final_pdf(doc, stt=stt, identity=identity)
                 if not src or not os.path.isfile(src):
                     skipped += 1
@@ -2921,7 +2939,7 @@ class MainWindow(QMainWindow):
                     and json_path and os.path.exists(json_path)):
                 skipped_no_data += 1
                 continue
-            stt = len(docs_to_import) + 1
+            stt = self._arc_stt_for_doc(doc, len(docs_to_import) + 1)
             final_pdf = (
                 self._arc_pick_final_pdf(doc, stt=stt, identity=identity)
                 or kie_pdf

@@ -85,6 +85,13 @@ CREATE TABLE IF NOT EXISTS documents (
     -- Full canonical KIE annotation block — preserves bbox / page_index /
     -- score / field_id for re-display and downstream re-export.
     kie_annotation_json       TEXT,
+    -- HSLTCQ dossier-sequencing fields (from Step 2's metadata form).
+    -- trang_so = ToSoTrangSo (starting page of this doc within the dossier);
+    -- so_thu_tu = SoThuTuVanBanTrongHoSo (1-based doc ordinal). Stored so the
+    -- archive ZIP export reproduces the exact numbering the operator chose
+    -- rather than falling back to a positional default.
+    trang_so                  INTEGER,
+    so_thu_tu                 INTEGER,
     -- System
     page_count                INTEGER,
     sha256                    TEXT NOT NULL,

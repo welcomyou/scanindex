@@ -547,7 +547,7 @@ def reorder_dossier_documents(store: ArchiveStore, dossier_id: int,
         raise KeyError(f"dossier_id not found: {dossier_id}")
 
     docs = conn.execute(
-        "SELECT doc_id, file_name, file_path FROM documents "
+        "SELECT doc_id, file_name, file_path, page_count FROM documents "
         "WHERE dossier_id = ? AND indexed_status != 'deleted' "
         "ORDER BY file_name, created_at, doc_id",
         (dossier_id,),
@@ -598,6 +598,7 @@ def reorder_dossier_documents(store: ArchiveStore, dossier_id: int,
         move_ops.append({
             "doc_id": doc_id,
             "old_name": doc["file_name"] or "",
+            "page_count": int(doc["page_count"] or 0),
             "src": src,
             "dst": dst,
             "new_name": new_name,
@@ -645,6 +646,26 @@ def reorder_dossier_documents(store: ArchiveStore, dossier_id: int,
                 "updated_at = ? WHERE doc_id = ?",
                 (op["new_name"], op["rel"], now, op["doc_id"]),
             )
+        # Re-sequence so_thu_tu to match the new physical order (1, 2, 3…)
+        # so the archive ZIP export reflects the drag-and-drop reorder.
+        for idx, op in enumerate(move_ops, start=1):
+            conn.execute(
+                "UPDATE documents SET so_thu_tu = ?, updated_at = ? "
+                "WHERE doc_id = ?",
+                (idx, now, op["doc_id"]),
+            )
+        # Re-sequence trang_so (cumulative starting page) too: doc 0 starts
+        # at 1 and each subsequent doc starts at the previous doc's trang_so
+        # + that doc's page count. Uses each doc's stored page_count so the
+        # numbering stays consistent with the new document order.
+        running = 1
+        for op in move_ops:
+            conn.execute(
+                "UPDATE documents SET trang_so = ?, updated_at = ? "
+                "WHERE doc_id = ?",
+                (running, now, op["doc_id"]),
+            )
+            running += max(1, int(op["page_count"] or 0))
         conn.execute("COMMIT")
     except Exception:
         try:

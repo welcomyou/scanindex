@@ -276,6 +276,7 @@ def test_try_convert_older_schema_creates_preconv_bak(tmp_path):
     """When a real conversion is pending, the backup must be taken so a failed
     converter never destroys the original DB."""
     from scanindex.core.repository import schema_converters as sc
+    from scanindex.core.repository import constants as C
 
     def _fake_v7_v8(conn):
         conn.execute("ALTER TABLE documents ADD COLUMN new_col TEXT")
@@ -285,7 +286,10 @@ def test_try_convert_older_schema_creates_preconv_bak(tmp_path):
         db = tmp_path / "repository-1.1.4.db"
         _make_legacy_db(db, schema_version="7")
         result = dv._try_convert(db)
-        assert result == ("7", "8")
+        # The chain walks 7 → 8 (fake) → 9 (real v8→v9 converter), so the
+        # reported result is the full span from the recorded version to the
+        # current target.
+        assert result == ("7", C.SCHEMA_VERSION)
         assert Path(str(db) + ".preconv.bak").exists(), (
             "pre-conversion backup must exist when a converter ran"
         )
@@ -318,13 +322,14 @@ def test_converter_registered_runs_and_bumps_version(tmp_path):
     try:
         conn = sqlite3.connect(str(p))
         result = sc.convert_schema_to_latest(conn)
-        assert result == ("7", "8")
+        # Chain walks 7 → 8 (fake) → 9 (real), reaching the current target.
+        assert result == ("7", C.SCHEMA_VERSION)
         cols = [row[1] for row in conn.execute("PRAGMA table_info(documents)")]
         assert "new_col" in cols
         sv = conn.execute(
             "SELECT value FROM index_meta WHERE key = 'schema_version'"
         ).fetchone()[0]
-        assert sv == "8"
+        assert sv == C.SCHEMA_VERSION
         conn.close()
     finally:
         del sc._CONVERTERS["7"]

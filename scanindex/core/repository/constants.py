@@ -6,7 +6,7 @@ in a way that invalidates the on-disk index.
 """
 
 # ---------- Versions (bump to trigger rebuild) ----------
-SCHEMA_VERSION       = "8"      # v8: lexical-only repository; vector index removed
+SCHEMA_VERSION       = "9"      # v9: documents gain trang_so/so_thu_tu columns for HSLTCQ zip export
 CHUNKER_VERSION      = "2.1"    # tighter merge: TARGET=100 / MAX=250 / Y_RATIO=6 + tiny-chunk rescue
 TOKENIZER_NAME       = "underthesea"
 TOKENIZER_VERSION    = "1.x"           # filled at runtime if available
