@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
 )
 
 from scanindex.ui.screens.accuracy_screen import AccuracyScreen
+from scanindex.ui.screens.batch_signing_screen import BatchSigningScreen
 from scanindex.ui.screens.screen_base import ScreenContent
 from scanindex.ui.screens.secret_file_scan_screen import SecretFileScanScreen
 from scanindex.ui.theme import (
@@ -118,6 +119,7 @@ class SupportToolsScreen(ScreenContent):
     TOOL_TITLES = {
         "accuracy": "Đo độ chính xác OCR",
         "secret_scan": "Phát hiện file mật trong thư mục",
+        "batch_sign": "Ký số hàng loạt",
     }
 
     def __init__(self, parent: QWidget | None = None):
@@ -125,9 +127,11 @@ class SupportToolsScreen(ScreenContent):
         self.setStyleSheet(f"background: {COLOR_BG};")
         self._accuracy = AccuracyScreen()
         self._secret_scan = SecretFileScanScreen()
+        self._batch_sign = BatchSigningScreen()
         self._tools: dict[str, ScreenContent] = {
             "accuracy": self._accuracy,
             "secret_scan": self._secret_scan,
+            "batch_sign": self._batch_sign,
         }
         self._sub_pages: dict[str, QWidget] = {}
         self._build_ui()
@@ -149,6 +153,17 @@ class SupportToolsScreen(ScreenContent):
         for tool in self._tools.values():
             if tool.is_busy():
                 tool.request_cancel()
+
+    def cleanup(self) -> None:
+        """Persist each tool's state on exit (e.g. the bulk-signing tool's
+        stamp image / OCR option). Tools without ``cleanup`` are skipped."""
+        for tool in self._tools.values():
+            cleanup = getattr(tool, "cleanup", None)
+            if callable(cleanup):
+                try:
+                    cleanup()
+                except Exception:
+                    pass
 
     def handle_back_requested(self) -> bool:
         """Let the outer header's single Back button return to the tool menu."""
@@ -213,6 +228,15 @@ class SupportToolsScreen(ScreenContent):
         )
         secret_scan.clicked.connect(lambda: self._open_tool("secret_scan"))
         grid.addWidget(secret_scan, 0, 1)
+
+        batch_sign = _ToolTile(
+            "✍️",
+            "Ký số hàng loạt",
+            "Ký số hàng loạt PDF: chọn thư mục vào, thư mục ra rồi bắt đầu.",
+        )
+        batch_sign.clicked.connect(lambda: self._open_tool("batch_sign"))
+        grid.addWidget(batch_sign, 1, 0)
+
         grid.setColumnStretch(0, 1)
         grid.setColumnStretch(1, 1)
         menu_layout.addStretch(1)
@@ -220,8 +244,10 @@ class SupportToolsScreen(ScreenContent):
         self._stack.addWidget(self._menu)
         self._sub_pages["accuracy"] = self._accuracy
         self._sub_pages["secret_scan"] = self._secret_scan
+        self._sub_pages["batch_sign"] = self._batch_sign
         self._stack.addWidget(self._sub_pages["accuracy"])
         self._stack.addWidget(self._sub_pages["secret_scan"])
+        self._stack.addWidget(self._sub_pages["batch_sign"])
         self._stack.setCurrentWidget(self._menu)
 
     def _open_tool(self, key: str) -> None:

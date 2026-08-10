@@ -142,3 +142,12 @@ train-convert/**/artifacts/
 *.pt
 *.ckpt
 *.joblib
+
+# --- Local user data (private, machine-specific) ---
+# Signature stamp images chosen by the operator (private seals/dấu đỏ).
+config/sign_stamp_images/*.jpg
+config/sign_stamp_images/*.jpeg
+# Bulk-signing tool per-machine settings (input/output dirs of the last run).
+config/batch_sign_settings.json
+# Standalone dev benchmarks (not part of the app).
+benchmark_oneocr_vs_screenai.py

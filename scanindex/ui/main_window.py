@@ -3495,6 +3495,13 @@ class MainWindow(QMainWindow):
             self.archive_tab.cleanup()
         except Exception:
             pass
+        # Tools under "Công cụ" (e.g. Ký số hàng loạt) hold their own config
+        # state (stamp image, OCR option). Persist it on exit so the user's
+        # selections survive a restart.
+        try:
+            self.support_tools_screen.cleanup()
+        except Exception:
+            pass
         event.accept()
 
 
