@@ -14,6 +14,7 @@ from .home_screen import (
     FUNCTION_SUPPORT_TOOLS,
 )
 from .accuracy_screen import AccuracyScreen
+from .batch_signing_screen import BatchSigningScreen
 from .secret_file_scan_screen import SecretFileScanScreen
 from .support_tools_screen import SupportToolsScreen
 
@@ -29,8 +30,9 @@ def __getattr__(name):
 
 __all__ = [
     "ScreenContainer", "ScreenContent",
-    "HomeScreen", "AccuracyScreen", "SecretFileScanScreen",
-    "SupportToolsScreen", "RepositoryScreen", "KhoLuuTruScreen",
+    "HomeScreen", "AccuracyScreen", "BatchSigningScreen",
+    "SecretFileScanScreen", "SupportToolsScreen", "RepositoryScreen",
+    "KhoLuuTruScreen",
     "FUNCTION_HOME", "FUNCTION_PDF_TO_WORD", "FUNCTION_DIGITIZATION",
     "FUNCTION_REPOSITORY", "FUNCTION_ARCHIVE", "FUNCTION_KHO_LUU_TRU",
     "FUNCTION_SETTINGS", "FUNCTION_ABOUT", "FUNCTION_ACCURACY",
