@@ -1706,9 +1706,12 @@ class _SearchHitCard(QFrame):
     clicked = Signal(str)  # doc_id
     open_dossier = Signal(int)
 
-    def __init__(self, hit: FileHit, parent=None):
+    def __init__(self, hit: FileHit, parent=None, *,
+                 rank: int = 0, rank_width: int = 2):
         super().__init__(parent)
         self.hit = hit
+        self.rank = int(rank or 0)
+        self.rank_width = max(2, int(rank_width or 2))
         self.setObjectName("Card")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setStyleSheet(_CARD_QSS)
@@ -1717,7 +1720,7 @@ class _SearchHitCard(QFrame):
         v.setSpacing(SP[1])
 
         f = hit.file_row
-        title_text = f.subject or f.file_name or translations.localize_text("(không tiêu đề)")
+        title_text = self._ranked_title()
         self._title_label = QLabel(title_text)
         self._title_label.setProperty("_scanindex_i18n_skip", True)
         self._title_label.setWordWrap(True)
@@ -1788,8 +1791,7 @@ class _SearchHitCard(QFrame):
 
     def update_texts(self) -> None:
         f = self.hit.file_row
-        if not (f.subject or f.file_name):
-            self._title_label.setText(translations.localize_text("(không tiêu đề)"))
+        self._title_label.setText(self._ranked_title())
         if self._meta_label is not None:
             self._meta_label.setText(
                 _file_summary_text(self.hit.file_row, localized=True)
@@ -1814,6 +1816,17 @@ class _SearchHitCard(QFrame):
             f"<span style='color:{COLOR_ACCENT}'>"
             f"{translations.localize_text(source)}</span>{suffix}"
         )
+
+    def _ranked_title(self) -> str:
+        f = self.hit.file_row
+        title = (
+            f.subject
+            or f.file_name
+            or translations.localize_text("(không tiêu đề)")
+        )
+        if self.rank <= 0:
+            return title
+        return f"{self.rank:0{self.rank_width}d}. {title}"
 
     def mousePressEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton:
@@ -2008,18 +2021,20 @@ class _RightPanel(QWidget):
         self._display_dossier = d
         self._display_file = None
         self._display_chunks = []
-        display_fonds = d.fonds_name or d.fonds
-        display_catalog = d.catalog_name or d.catalog
+        def display(value: str) -> str:
+            return html.escape(_single_line(value) or "—")
+
+        # Keep codes and names on separate rows. Combining them made the
+        # right panel compact but difficult to scan and impossible to copy as
+        # distinct archival fields.
         rows = [
-            translations.localize_text(
-                f"<b>📁 Hồ sơ:</b> {d.title or translations.localize_text('(chưa đặt tên)')}"
-            ),
+            translations.localize_text(f"<b>Mã phông:</b> {display(d.fonds)}"),
+            translations.localize_text(f"<b>Tên phông:</b> {display(d.fonds_name)}"),
+            translations.localize_text(f"<b>Số mục lục:</b> {display(d.catalog)}"),
+            translations.localize_text(f"<b>Tên mục lục:</b> {display(d.catalog_name)}"),
+            translations.localize_text(f"<b>Số hồ sơ:</b> {display(d.dossier_code)}"),
+            translations.localize_text(f"<b>Tên hồ sơ:</b> {display(d.title)}"),
         ]
-        if not _is_unstructured_dossier(d):
-            rows.append(translations.localize_text(
-                f"<b>Phông / Mục lục / Hồ sơ:</b> "
-                f"{display_fonds} / {display_catalog} / {d.dossier_code}"
-            ))
         if d.doc_count:
             rows.append(translations.localize_text(f"<b>Số văn bản:</b> {d.doc_count}"))
         if d.page_count:
@@ -2716,9 +2731,10 @@ class RepositoryScreen(ScreenContent):
         self._hits_by_doc: dict[str, FileHit] = {}
         self._search_query = ""
         self._search_filters: dict = {}
-        self._search_mode = "all"
+        self._search_mode = "content"
         self._search_scroll_value = 0
         self._search_selected_doc_id = ""
+        self._search_rank_by_doc: dict[str, int] = {}
         self._dossier_scroll_value = 0
         self._return_to_search = False
         self._sort_by_mode = {
@@ -2775,7 +2791,6 @@ class RepositoryScreen(ScreenContent):
         self._filter_panel.setVisible(False)
         outer.addWidget(self._filter_panel)
         outer.addWidget(self._build_action_bar())
-        self.mode_combo.currentIndexChanged.connect(self._on_search_mode_changed)
         self._on_search_mode_changed()
 
         # 3-column splitter
@@ -2821,34 +2836,37 @@ class RepositoryScreen(ScreenContent):
         h.setSpacing(SP[2])
         action_h = 34
 
-        self._btn_back_to_dossiers = QPushButton("← Hồ sơ")
-        self._btn_back_to_dossiers.setVisible(False)
+        tab_qss = (
+            f"QPushButton {{ background: transparent; color: {COLOR_TEXT_SECONDARY};"
+            f" border: 1px solid {COLOR_BORDER}; border-radius: 4px;"
+            f" padding: 0 12px; font: 600 12px '{FONT_UI}'; }}"
+            f"QPushButton:hover {{ background: {COLOR_ELEVATED}; color: {COLOR_TEXT};"
+            f" border-color: {COLOR_ACCENT}; }}"
+            f"QPushButton:checked {{ background: {COLOR_ELEVATED}; color: {COLOR_ACCENT};"
+            f" border-color: {COLOR_ACCENT}; }}"
+            f"QPushButton:checked:disabled {{ background: {COLOR_ELEVATED};"
+            f" color: {COLOR_ACCENT}; border-color: {COLOR_ACCENT}; }}"
+        )
+
+        self._btn_back_to_dossiers = QPushButton("Hồ sơ")
+        self._btn_back_to_dossiers.setCheckable(True)
         self._btn_back_to_dossiers.setFixedHeight(action_h)
-        self._btn_back_to_dossiers.setMinimumWidth(64)
+        self._btn_back_to_dossiers.setMinimumWidth(82)
         self._btn_back_to_dossiers.setSizePolicy(
             QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
         )
         self._btn_back_to_dossiers.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._btn_back_to_dossiers.setStyleSheet(
-            f"QPushButton {{ background: transparent; color: {COLOR_ACCENT};"
-            f" border: 1px solid transparent; border-radius: 4px;"
-            f" padding: 0 10px; font: 600 12px '{FONT_UI}'; }}"
-            f"QPushButton:hover {{ background: {COLOR_ELEVATED};"
-            f" color: {COLOR_TEXT}; border-color: {COLOR_BORDER}; }}"
-        )
+        self._btn_back_to_dossiers.setStyleSheet(tab_qss)
         self._btn_back_to_dossiers.clicked.connect(self._show_dossier_list)
         h.addWidget(self._btn_back_to_dossiers)
 
-        self._btn_back_to_search = QPushButton("← Kết quả")
+        self._btn_back_to_search = QPushButton("Kết quả tìm kiếm")
+        self._btn_back_to_search.setCheckable(True)
         self._btn_back_to_search.setVisible(False)
         self._btn_back_to_search.setFixedHeight(action_h)
+        self._btn_back_to_search.setMinimumWidth(150)
         self._btn_back_to_search.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._btn_back_to_search.setStyleSheet(
-            f"QPushButton {{ background: transparent; color: {COLOR_ACCENT};"
-            f" border: 1px solid {COLOR_BORDER}; border-radius: 4px;"
-            f" padding: 0 10px; font: 600 12px '{FONT_UI}'; }}"
-            f"QPushButton:hover {{ background: {COLOR_ELEVATED}; color: {COLOR_TEXT}; }}"
-        )
+        self._btn_back_to_search.setStyleSheet(tab_qss)
         self._btn_back_to_search.clicked.connect(self._restore_search_results)
         h.addWidget(self._btn_back_to_search)
 
@@ -3040,14 +3058,27 @@ class RepositoryScreen(ScreenContent):
             self._render_search_results(restore_scroll=False)
 
     def _update_view_navigation(self) -> None:
-        self._btn_back_to_dossiers.setVisible(self._mode != self._MODE_DOSSIERS)
-        has_search = bool(self._search_hits)
-        self._btn_back_to_search.setVisible(has_search and self._mode != self._MODE_SEARCH)
-        if has_search:
-            prefix = "← " if self._mode == self._MODE_FILES else ""
-            self._btn_back_to_search.setText(
-                f"{prefix}Kết quả ({len(self._search_hits)})"
-            )
+        # These are top-level tabs, not two competing "back" buttons. Files
+        # inside a dossier remain part of the Hồ sơ tab; the other tab returns
+        # to the preserved search result list.
+        has_search_state = bool(
+            self._search_query or self._search_filters or self._search_hits
+        )
+        browsing = self._mode != self._MODE_SEARCH
+        for button, checked in (
+            (self._btn_back_to_dossiers, browsing),
+            (self._btn_back_to_search, not browsing),
+        ):
+            button.blockSignals(True)
+            button.setChecked(checked)
+            button.blockSignals(False)
+        self._btn_back_to_dossiers.setVisible(True)
+        self._btn_back_to_dossiers.setEnabled(self._mode != self._MODE_DOSSIERS)
+        self._btn_back_to_search.setVisible(has_search_state)
+        self._btn_back_to_search.setEnabled(self._mode != self._MODE_SEARCH)
+        self._btn_back_to_search.setText(
+            f"Kết quả tìm kiếm ({len(self._search_hits)})"
+        )
 
     def _set_splitter_for_mode(self) -> None:
         if not hasattr(self, "_splitter"):
@@ -3097,14 +3128,14 @@ class RepositoryScreen(ScreenContent):
 
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText(
-            "Nhập từ khóa tự nhiên (số văn bản, tên người ký, trích yếu, nội dung...)"
+            "Tìm trong nội dung OCR; mở ▾ để lọc thêm thông tin văn bản"
         )
         self.search_input.returnPressed.connect(self._on_search_clicked)
         h.addWidget(self.search_input, 1)
 
         self.btn_filter = QToolButton()
         self.btn_filter.setText("▾")
-        self.btn_filter.setToolTip("Tìm kiếm nâng cao")
+        self.btn_filter.setToolTip("Lọc thông tin văn bản (kết hợp AND)")
         self.btn_filter.setCheckable(True)
         self.btn_filter.setFixedSize(28, 26)
         self.btn_filter.toggled.connect(self._on_filter_toggle)
@@ -3139,37 +3170,12 @@ class RepositoryScreen(ScreenContent):
         self.btn_clear_search.clicked.connect(self._clear_search)
         h.addWidget(self.btn_clear_search)
 
+        # Kept as a non-visual compatibility handle for code/tests that read
+        # the former scope combo. The repository UI now has one unambiguous
+        # keyword scope: OCR content.
         self.mode_combo = QComboBox()
-        self.mode_combo.addItem("Tất cả", "all")
         self.mode_combo.addItem("Nội dung OCR", "content")
-        self.mode_combo.addItem("Thông tin văn bản", "metadata")
-        self.mode_combo.setToolTip("Phạm vi tìm kiếm")
-        # Scope is chosen before entering the query, so keep it immediately
-        # before the search field in the left-to-right reading order.
-        h.insertWidget(0, self.mode_combo)
-
-        # "Import folder…" removed: import path is now Số hóa lưu trữ
-        # → Bước 3 → "Chuyển vào Kho". Direct folder import is gone so
-        # there's exactly ONE place to ingest data into Kho.
-        # Exception: "Nhập từ ZIP" below — it does not create new data, it
-        # re-ingests a dossier this app itself exported (with its canonical
-        # sidecars), so no OCR/KIE is involved.
-
-        self.btn_import_zip = QPushButton("Nhập từ ZIP")
-        self.btn_import_zip.setToolTip(
-            "Nhập một hoặc nhiều file ZIP hồ sơ đã xuất (kèm .json.zst) vào "
-            "Kho — không chạy lại OCR/KIE. Có thể kéo thả trực tiếp các file "
-            "ZIP vào màn hình này."
-        )
-        self.btn_import_zip.setFixedHeight(26)
-        self.btn_import_zip.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_import_zip.setStyleSheet(BUTTON_PRIMARY_QSS)
-        self.btn_import_zip.clicked.connect(self._on_import_zip_clicked)
-        h.addWidget(self.btn_import_zip)
-
-        self.btn_settings = QPushButton("⚙ Vị trí kho")
-        self.btn_settings.clicked.connect(self._pick_archive_path)
-        h.addWidget(self.btn_settings)
+        self.mode_combo.setVisible(False)
 
         return bar
 
@@ -3205,6 +3211,25 @@ class RepositoryScreen(ScreenContent):
         )
         h.addWidget(self._stats_label)
 
+        # Repository-level actions use the otherwise empty header space and
+        # no longer compete with the primary search controls.
+        self.btn_import_zip = QPushButton("Nhập từ ZIP")
+        self.btn_import_zip.setToolTip(
+            "Nhập một hoặc nhiều file ZIP hồ sơ đã xuất (kèm .json.zst) vào "
+            "Kho — không chạy lại OCR/KIE. Có thể kéo thả trực tiếp các file "
+            "ZIP vào màn hình này."
+        )
+        self.btn_import_zip.setFixedHeight(24)
+        self.btn_import_zip.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_import_zip.setStyleSheet(BUTTON_PRIMARY_QSS)
+        self.btn_import_zip.clicked.connect(self._on_import_zip_clicked)
+        h.addWidget(self.btn_import_zip)
+
+        self.btn_settings = QPushButton("⚙ Vị trí kho")
+        self.btn_settings.setFixedHeight(24)
+        self.btn_settings.clicked.connect(self._pick_archive_path)
+        h.addWidget(self.btn_settings)
+
         return bar
 
     def _build_filter_panel(self) -> QWidget:
@@ -3217,6 +3242,14 @@ class RepositoryScreen(ScreenContent):
         v = QVBoxLayout(panel)
         v.setContentsMargins(SP[3], SP[2], SP[3], SP[2])
         v.setSpacing(SP[2])
+
+        filter_hint = QLabel(
+            "Các điều kiện dưới đây được kết hợp AND với nội dung cần tìm."
+        )
+        filter_hint.setStyleSheet(
+            f"color: {COLOR_TEXT_MUTED}; font: 11px '{FONT_UI}'; border: none;"
+        )
+        v.addWidget(filter_hint)
 
         grid = QGridLayout()
         grid.setHorizontalSpacing(SP[3])
@@ -3288,11 +3321,6 @@ class RepositoryScreen(ScreenContent):
         btn_reset = QPushButton("Đặt lại")
         btn_reset.clicked.connect(self._reset_filters)
         actions.addWidget(btn_reset)
-        btn_apply = QPushButton("Áp dụng")
-        btn_apply.setProperty("cssClass", "primary")
-        btn_apply.setStyleSheet(BUTTON_PRIMARY_QSS)
-        btn_apply.clicked.connect(self._on_search_clicked)
-        actions.addWidget(btn_apply)
         v.addLayout(actions)
         return panel
 
@@ -4286,24 +4314,15 @@ class RepositoryScreen(ScreenContent):
     def _on_search_mode_changed(self):
         if not hasattr(self, "_filter_panel"):
             return
-        mode = self.mode_combo.currentData() or "all"
-        if mode in {"all", "metadata"}:
-            self._refresh_doc_type_filter_choices()
+        self._refresh_doc_type_filter_choices()
         if hasattr(self, "btn_filter"):
             self.btn_filter.setVisible(True)
             self.btn_filter.setText("▴" if self.btn_filter.isChecked() else "▾")
         self._filter_panel.setVisible(self.btn_filter.isChecked())
         self.search_input.setEnabled(True)
-        if mode == "metadata":
-            self.search_input.setPlaceholderText(
-                "Tìm số ký hiệu, người ký, cơ quan, trích yếu..."
-            )
-        elif mode == "content":
-            self.search_input.setPlaceholderText("Tìm trong nội dung OCR...")
-        else:
-            self.search_input.setPlaceholderText(
-                "Tìm trong thông tin văn bản và nội dung OCR..."
-            )
+        self.search_input.setPlaceholderText(
+            "Tìm trong nội dung OCR; mở ▾ để lọc thêm thông tin văn bản"
+        )
 
     def _clear_search(self):
         """Drop search state and return to dossier-browse mode."""
@@ -4311,11 +4330,12 @@ class RepositoryScreen(ScreenContent):
         self._reset_filters()
         self._search_query = ""
         self._search_filters = {}
-        self._search_mode = "all"
+        self._search_mode = "content"
         self._search_hits = []
         self._hits_by_doc = {}
         self._search_scroll_value = 0
         self._search_selected_doc_id = ""
+        self._search_rank_by_doc = {}
         self._show_dossier_list()
 
     def _on_search_clicked(self):
@@ -4323,7 +4343,7 @@ class RepositoryScreen(ScreenContent):
             return
         if self._busy:
             return
-        mode = self.mode_combo.currentData() or "all"
+        mode = "content"
         query = self.search_input.text().strip()
         filters = self._collect_filters()
         if not query and not filters:
@@ -4335,12 +4355,14 @@ class RepositoryScreen(ScreenContent):
         self.btn_clear_search.setEnabled(False)
         self._list_count_label.setText("Đang tìm…")
 
-        if mode == "all":
-            self._list_count_label.setText("Đang tìm trong toàn bộ văn bản...")
-        elif mode == "content":
-            self._list_count_label.setText("Đang tìm trong nội dung...")
-        elif mode == "metadata":
-            self._list_count_label.setText("Đang tìm trong thông tin văn bản...")
+        if query and filters:
+            self._list_count_label.setText(
+                "Đang tìm nội dung và lọc thông tin văn bản..."
+            )
+        elif query:
+            self._list_count_label.setText("Đang tìm trong nội dung OCR...")
+        else:
+            self._list_count_label.setText("Đang lọc thông tin văn bản...")
 
         self._pending_search_query = query
         self._pending_search_filters = dict(filters)
@@ -4361,7 +4383,7 @@ class RepositoryScreen(ScreenContent):
             self, "_pending_search_filters", self._collect_filters()
         ))
         self._search_mode = str(getattr(
-            self, "_pending_search_mode", self.mode_combo.currentData() or "all"
+            self, "_pending_search_mode", "content"
         ))
         self._search_hits = _group_results_by_file(results)
         self._hits_by_doc = {h.file_row.doc_id: h for h in self._search_hits}
@@ -4421,6 +4443,7 @@ class RepositoryScreen(ScreenContent):
         self.btn_clear_search.setEnabled(True)
         self._clear_list()
         self._pdf_pane.clear()
+        self._search_rank_by_doc = {}
         if not self._search_hits:
             self._list_count_label.setText("Không có kết quả.")
             self._right_panel.show_dossier(DossierRow(
@@ -4440,13 +4463,19 @@ class RepositoryScreen(ScreenContent):
             ("fuzzy", "Kết quả gần đúng"),
         ]
         sorted_hits = self._sorted_search_hits()
+        rank = 0
+        rank_width = max(2, len(str(len(sorted_hits))))
         for kind, label in labels:
             group = [h for h in sorted_hits if h.match_kind == kind]
             if not group:
                 continue
             self._add_card(_GroupHeader(label, len(group)))
             for hit in group:
-                card = _SearchHitCard(hit)
+                rank += 1
+                self._search_rank_by_doc[hit.file_row.doc_id] = rank
+                card = _SearchHitCard(
+                    hit, rank=rank, rank_width=rank_width,
+                )
                 card.clicked.connect(lambda _did, hh=hit: self._show_search_hit(hh))
                 card.open_dossier.connect(self._open_search_hit_dossier)
                 self._doc_cards_by_id[hit.file_row.doc_id] = card
@@ -4488,6 +4517,13 @@ class RepositoryScreen(ScreenContent):
         """Headline chunk drives initial PDF page; full chunk list goes to
         the right panel as snippet cards (clickable to jump to bbox)."""
         self._search_selected_doc_id = hit.file_row.doc_id
+        if self._mode == self._MODE_SEARCH:
+            rank = self._search_rank_by_doc.get(hit.file_row.doc_id, 0)
+            if rank:
+                self._list_count_label.setText(
+                    f"{len(self._search_hits)} kết quả · đang xem "
+                    f"{rank}/{len(self._search_hits)}"
+                )
         full = self._fetch_file_by_doc_id(hit.file_row.doc_id) or hit.file_row
         # Carry over dossier_title from search projection if SQL didn't have one.
         if not full.dossier_title and hit.file_row.dossier_title:
