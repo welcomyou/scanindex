@@ -48,6 +48,11 @@ class SearchResult:
     file_name: Optional[str] = None
     file_path: Optional[str] = None
     dossier_title: Optional[str] = None
+    dossier_id: Optional[int] = None
+    fonds: Optional[str] = None
+    catalog: Optional[str] = None
+    dossier_code: Optional[str] = None
+    doc_type: Optional[str] = None
     chunk_type: str = "body"   # metadata | body
     match_kind: str = ""       # exact | fuzzy | filter
     match_count: int = 0
@@ -581,7 +586,7 @@ class SearchEngine:
     def search(self,
                query: str = "",
                filters: Optional[dict] = None,
-               mode: str = "content",
+               mode: str = "all",
                final_k: Optional[int] = None) -> List[SearchResult]:
         filters = filters or {}
         candidate_doc_ids = self._scope_doc_ids(filters)
@@ -589,15 +594,27 @@ class SearchEngine:
         if not query or not query.strip():
             return self._sql_only(candidate_doc_ids, limit=final_k or 50)
 
-        mode = (mode or "content").strip().lower()
+        mode = (mode or "all").strip().lower()
         if mode in {"metadata", "meta", "info", "document_info", "title", "subject"}:
             mode = "metadata"
-        else:
+        elif mode in {"content", "body", "ocr"}:
             mode = "content"
+        else:
+            mode = "all"
 
         t0 = time.time()
-        fields = metadata_text_fields() if mode == "metadata" else body_text_fields()
-        chunk_type_filter = "metadata" if mode == "metadata" else "body"
+        if mode == "metadata":
+            fields = metadata_text_fields()
+            chunk_type_filter: Optional[str] = "metadata"
+        elif mode == "content":
+            fields = body_text_fields()
+            chunk_type_filter = "body"
+        else:
+            # None means every indexed text field. The UI defaults to this so
+            # users do not need to know whether a value came from KIE metadata
+            # or from OCR body text.
+            fields = None
+            chunk_type_filter = None
         cset = set(candidate_doc_ids) if candidate_doc_ids is not None else None
 
         lex_hits = self.index.search_lexical(
@@ -621,21 +638,54 @@ class SearchEngine:
             build_match_bboxes=False,
         )
         exact_doc_ids = {r.doc_id for r in exact_results}
+        # Tantivy's dedicated no-diacritic field currently exists for OCR
+        # body chunks, while metadata chunks keep their canonical spelling.
+        # When lexical search is sparse, use SQLite's persisted normalized
+        # chunk text to recover literal phrase matches such as "uy ban" ↔
+        # "Ủy ban". `_build_results` then applies strict normalized word
+        # boundaries, so these remain high-confidence keyword matches rather
+        # than being mislabeled as typo-tolerant fuzzy results.
+        if len(exact_doc_ids) < C.MIN_RESULTS:
+            known_chunk_ids = {r.chunk_id for r in exact_results}
+            normalized_hits = [
+                (cid, score)
+                for cid, _did, score in self._normalized_exact_hits(
+                    query,
+                    candidate_doc_ids,
+                    chunk_type_filter=chunk_type_filter,
+                    limit=C.TANTIVY_TOP_K,
+                )
+                if cid not in known_chunk_ids
+            ]
+            exact_results.extend(self._build_results(
+                normalized_hits,
+                match_kind="exact",
+                query=query,
+                chunk_type_filter=chunk_type_filter,
+                build_match_bboxes=False,
+            ))
+            exact_doc_ids = {r.doc_id for r in exact_results}
         fuzzy_hits = [
             (cid, did, score)
             for cid, did, score in fuzzy_hits
             if did not in exact_doc_ids
         ]
-        span_fuzzy_hits = [
-            (cid, did, score)
-            for cid, did, score in self._span_fuzzy_hits(
-                query,
-                candidate_doc_ids,
-                chunk_type_filter=chunk_type_filter,
-                limit=C.TANTIVY_TOP_K,
-            )
-            if did not in exact_doc_ids
-        ]
+        # The Python span fallback is intentionally lazy: Tantivy fuzzy search
+        # is cheap, while scanning every chunk becomes prohibitive for a large
+        # archive. Only pay that cost when the keyword search found too few
+        # documents to be useful.
+        span_fuzzy_hits = []
+        if len(exact_doc_ids) < C.MIN_RESULTS:
+            span_fuzzy_hits = [
+                (cid, did, score)
+                for cid, did, score in self._span_fuzzy_hits(
+                    query,
+                    candidate_doc_ids,
+                    chunk_type_filter=chunk_type_filter,
+                    limit=C.TANTIVY_TOP_K,
+                )
+                if did not in exact_doc_ids
+            ]
         doc_id_by_chunk = {
             cid: did for cid, did, _score in fuzzy_hits + span_fuzzy_hits
         }
@@ -664,19 +714,59 @@ class SearchEngine:
         )
         return results
 
+    def _normalized_exact_hits(self,
+                               query: str,
+                               candidate_doc_ids: Optional[List[str]],
+                               *,
+                               chunk_type_filter: Optional[str],
+                               limit: int) -> List[Tuple[int, str, float]]:
+        normalized = " ".join(_tokens(query))
+        if not normalized:
+            return []
+        params: List[Any] = []
+        where = ["d.indexed_status = 'indexed'"]
+        if chunk_type_filter:
+            where.append("c.chunk_type = ?")
+            params.append(chunk_type_filter)
+        if candidate_doc_ids is not None:
+            if not candidate_doc_ids:
+                return []
+            ph = ",".join("?" * len(candidate_doc_ids))
+            where.append(f"c.doc_id IN ({ph})")
+            params.extend(candidate_doc_ids)
+        where.append("instr(lower(c.text_no_diacritic), ?) > 0")
+        params.append(normalized)
+        params.append(max(1, int(limit or 1)))
+        rows = self.store.connect().execute(
+            "SELECT c.chunk_id, c.doc_id, c.text_original "
+            "FROM chunks c "
+            "JOIN documents d ON c.doc_id = d.doc_id "
+            f"WHERE {' AND '.join(where)} "
+            "ORDER BY c.chunk_id LIMIT ?",
+            params,
+        ).fetchall()
+        out: List[Tuple[int, str, float]] = []
+        for row in rows:
+            frequency = _exact_frequency(str(row["text_original"] or ""), query)
+            if frequency > 0:
+                out.append((
+                    int(row["chunk_id"]), str(row["doc_id"]), float(frequency)
+                ))
+        return out
+
     def _span_fuzzy_hits(self,
                          query: str,
                          candidate_doc_ids: Optional[List[str]],
                          *,
-                         chunk_type_filter: str,
+                         chunk_type_filter: Optional[str],
                          limit: int) -> List[Tuple[int, str, float]]:
         if len(_content_tokens(_tokens(query))) < 2:
             return []
-        params: List[Any] = [chunk_type_filter]
-        where = [
-            "c.chunk_type = ?",
-            "d.indexed_status = 'indexed'",
-        ]
+        params: List[Any] = []
+        where = ["d.indexed_status = 'indexed'"]
+        if chunk_type_filter:
+            where.append("c.chunk_type = ?")
+            params.append(chunk_type_filter)
         if candidate_doc_ids is not None:
             if not candidate_doc_ids:
                 return []
@@ -1009,8 +1099,10 @@ class SearchEngine:
             f"       d.kie_issue_org_superior AS issue_org_superior,"
             f"       d.kie_signer_name       AS signer_name,"
             f"       d.kie_place_date        AS issue_date,"
+            f"       d.kie_doc_type          AS doc_type,"
             f"       d.file_name, d.file_path,"
-            f"       ds.title AS dossier_title "
+            f"       d.dossier_id, ds.title AS dossier_title,"
+            f"       ds.fonds, ds.catalog, ds.dossier_code "
             f"FROM chunks c "
             f"JOIN documents d ON c.doc_id = d.doc_id "
             f"LEFT JOIN dossiers ds ON d.dossier_id = ds.dossier_id "
@@ -1083,6 +1175,12 @@ class SearchEngine:
                 file_name=r["file_name"],
                 file_path=r["file_path"],
                 dossier_title=r["dossier_title"],
+                dossier_id=(int(r["dossier_id"])
+                            if r["dossier_id"] is not None else None),
+                fonds=r["fonds"],
+                catalog=r["catalog"],
+                dossier_code=r["dossier_code"],
+                doc_type=r["doc_type"],
                 chunk_type=r["chunk_type"] or "body",
                 match_kind=match_kind,
                 match_count=match_count,
@@ -1101,7 +1199,9 @@ class SearchEngine:
             "       d.kie_issue_org_superior AS issue_org_superior,"
             "       d.kie_signer_name       AS signer_name,"
             "       d.kie_place_date        AS issue_date,"
-            "       ds.title AS dossier_title "
+            "       d.kie_doc_type          AS doc_type,"
+            "       d.dossier_id, ds.title AS dossier_title,"
+            "       ds.fonds, ds.catalog, ds.dossier_code "
             "FROM documents d "
             "LEFT JOIN dossiers ds ON d.dossier_id = ds.dossier_id "
         )
@@ -1136,6 +1236,12 @@ class SearchEngine:
             file_name=r["file_name"],
             file_path=r["file_path"],
             dossier_title=r["dossier_title"],
+            dossier_id=(int(r["dossier_id"])
+                        if r["dossier_id"] is not None else None),
+            fonds=r["fonds"],
+            catalog=r["catalog"],
+            dossier_code=r["dossier_code"],
+            doc_type=r["doc_type"],
             chunk_type="metadata",
             match_kind="filter",
         ) for r in rows]

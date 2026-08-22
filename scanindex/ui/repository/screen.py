@@ -604,6 +604,9 @@ class FileRow:
     dossier_title: str = ""
     trang_so: Optional[int] = None
     so_thu_tu: Optional[int] = None
+    fonds: str = ""
+    catalog: str = ""
+    dossier_code: str = ""
 
 
 @dataclass
@@ -894,11 +897,25 @@ def _format_issue_date(value: str | None) -> str:
         pass
     m = re.search(r"(\d{1,2})[/.\-](\d{1,2})[/.\-](\d{2,4})", text)
     if not m:
-        return text
+        # The repository card only shows the canonical issue-date value. Do
+        # not leak the place portion (or arbitrary unparsed OCR prose) into the
+        # compact summary line.
+        return ""
     d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
     if y < 100:
         y = 2000 + y if y < 50 else 1900 + y
     return f"{d:02d}/{mo:02d}/{y:04d}"
+
+
+def _issue_date_sort_key(value: str | None) -> str:
+    """Return YYYYMMDD so display dates can be sorted chronologically."""
+    formatted = _format_issue_date(value)
+    if not formatted:
+        return ""
+    try:
+        return datetime.strptime(formatted, "%d/%m/%Y").strftime("%Y%m%d")
+    except ValueError:
+        return ""
 
 
 def _format_stored_at(epoch: Optional[int]) -> str:
@@ -951,10 +968,7 @@ def _file_summary_parts(file: "FileRow", *, localized: bool = False) -> list[str
     if doc_number:
         parts.append(doc_number)
     if date:
-        date_text = f"ngày {date}"
-        parts.append(
-            translations.localize_text(date_text) if localized else date_text
-        )
+        parts.append(date)
     if org:
         parts.append(org)
     if signer:
@@ -964,7 +978,12 @@ def _file_summary_parts(file: "FileRow", *, localized: bool = False) -> list[str
 
 def _file_summary_text(file: "FileRow", *, localized: bool = False) -> str:
     """Return the stable Vietnamese summary contract unless rendering UI."""
-    return ", ".join(_file_summary_parts(file, localized=localized))
+    return " · ".join(_file_summary_parts(file, localized=localized))
+
+
+def _file_card_title(file: "FileRow", ordinal: int = 0) -> str:
+    title = file.subject or file.file_name or translations.localize_text("(không tiêu đề)")
+    return f"{int(ordinal):02d}. {title}" if int(ordinal or 0) > 0 else title
 
 
 def _is_unstructured_dossier(dossier: "DossierRow") -> bool:
@@ -1008,20 +1027,13 @@ def _dossier_stats_text(dossier: "DossierRow",
     docs = int(doc_count if doc_count is not None else (dossier.doc_count or 0))
     pages = int(page_count if page_count is not None else (dossier.page_count or 0))
     bits = []
-    if docs:
-        value = f"{docs} tài liệu"
-        bits.append(translations.localize_text(value) if localized else value)
-    if pages:
-        value = f"{pages} trang"
-        bits.append(translations.localize_text(value) if localized else value)
-    if dossier.start_date or dossier.end_date:
-        span = " - ".join(filter(None, (dossier.start_date, dossier.end_date)))
-        if span:
-            bits.append(span)
+    value = f"{docs} tài liệu"
+    bits.append(translations.localize_text(value) if localized else value)
+    value = f"{pages} trang"
+    bits.append(translations.localize_text(value) if localized else value)
     stored = _format_stored_at(getattr(dossier, "stored_at", None))
     if stored:
-        value = f"Lưu kho: {stored}"
-        bits.append(translations.localize_text(value) if localized else value)
+        bits.append(stored)
     return " · ".join(bits)
 
 
@@ -1205,7 +1217,7 @@ def _group_results_by_file(results: List[SearchResult]) -> List[FileHit]:
         # already projects raw kie_* under the legacy attribute names).
         fr = FileRow(
             doc_id=doc_id,
-            dossier_id=None,
+            dossier_id=getattr(head, "dossier_id", None),
             file_name=head.file_name or "",
             file_path=head.file_path or "",
             subject=head.subject or "",
@@ -1214,10 +1226,13 @@ def _group_results_by_file(results: List[SearchResult]) -> List[FileHit]:
             issue_org_superior=getattr(head, "issue_org_superior", "") or "",
             signer_name=head.signer_name or "",
             issue_date=head.issue_date or "",
-            doc_type="",
+            doc_type=getattr(head, "doc_type", "") or "",
             secrecy_mark="",
             page_count=0,
             dossier_title=head.dossier_title or "",
+            fonds=getattr(head, "fonds", "") or "",
+            catalog=getattr(head, "catalog", "") or "",
+            dossier_code=getattr(head, "dossier_code", "") or "",
         )
         out.append(FileHit(
             file_row=fr,
@@ -1284,9 +1299,10 @@ class _DossierCard(QFrame):
         self.setObjectName("Card")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setStyleSheet(_CARD_QSS)
-        h = QHBoxLayout(self)
-        h.setContentsMargins(SP[3], SP[2], SP[3], SP[2])
-        h.setSpacing(SP[2])
+        grid = QGridLayout(self)
+        grid.setContentsMargins(SP[3], SP[2], SP[3], SP[2])
+        grid.setHorizontalSpacing(SP[2])
+        grid.setVerticalSpacing(SP[1])
 
         self._cb = QCheckBox()
         self._cb.setStyleSheet(
@@ -1297,15 +1313,12 @@ class _DossierCard(QFrame):
                 self.dossier.dossier_id, checked
             )
         )
-        h.addWidget(self._cb, 0, Qt.AlignmentFlag.AlignTop)
+        grid.addWidget(self._cb, 0, 0, Qt.AlignmentFlag.AlignTop)
 
-        # Left side: title + sub-info column (clickable area)
-        left = QVBoxLayout()
-        left.setSpacing(SP[1])
         self._title_label = QLabel()
         self._title_label.setWordWrap(True)
         self._title_label.setStyleSheet(f"color: {COLOR_TEXT}; font: 600 13px '{FONT_UI}';")
-        left.addWidget(self._title_label)
+        grid.addWidget(self._title_label, 0, 1)
 
         stats_text = _dossier_stats_text(dossier, localized=True)
         self._stats_label = None
@@ -1313,7 +1326,9 @@ class _DossierCard(QFrame):
             self._stats_label = QLabel(stats_text)
             self._stats_label.setWordWrap(True)
             self._stats_label.setStyleSheet(f"color: {COLOR_TEXT_MUTED}; font: 11px '{FONT_UI}';")
-            left.addWidget(self._stats_label)
+            # Span the full card width so the area below the selection rail is
+            # useful without cramming text into the checkbox column itself.
+            grid.addWidget(self._stats_label, 2, 0, 1, 3)
 
         codes_line = _dossier_code_line(dossier)
         if codes_line:
@@ -1321,9 +1336,7 @@ class _DossierCard(QFrame):
             codes_lbl.setStyleSheet(
                 f"color: {COLOR_TEXT_SECONDARY}; font: 11px '{FONT_UI}';"
             )
-            left.addWidget(codes_lbl)
-
-        h.addLayout(left, 1)
+            grid.addWidget(codes_lbl, 1, 1)
 
         btn_edit = QPushButton("📝")
         btn_edit.setFixedSize(30, 24)
@@ -1340,7 +1353,8 @@ class _DossierCard(QFrame):
         btn_edit.clicked.connect(lambda _checked=False: self.edit_clicked.emit(
             self.dossier.dossier_id
         ))
-        h.addWidget(btn_edit, 0, Qt.AlignmentFlag.AlignTop)
+        grid.addWidget(btn_edit, 0, 2, Qt.AlignmentFlag.AlignTop)
+        grid.setColumnStretch(1, 1)
         self.update_texts()
 
     def update_texts(self) -> None:
@@ -1475,15 +1489,21 @@ class _FileCard(QFrame):
     _REORDER_MIME = _FILE_REORDER_MIME
     _LONG_PRESS_MS = 450
 
-    def __init__(self, file: FileRow, ordinal: int = 0, parent=None):
+    def __init__(self, file: FileRow, ordinal: int = 0,
+                 allow_reorder: bool = True, parent=None):
         super().__init__(parent)
         self.file = file
         self.ordinal = ordinal
+        self._allow_reorder = bool(allow_reorder)
         self.setObjectName("Card")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setStyleSheet(_CARD_QSS)
-        self.setAcceptDrops(True)
-        self.setToolTip("Giữ chuột rồi kéo để sắp xếp thứ tự văn bản")
+        self.setAcceptDrops(self._allow_reorder)
+        self.setToolTip(
+            "Giữ chuột rồi kéo để sắp xếp thứ tự văn bản"
+            if self._allow_reorder else
+            "Chọn sắp xếp theo số thứ tự để kéo thả văn bản"
+        )
         self._press_pos = None
         self._drag_ready = False
         self._drag_started = False
@@ -1491,14 +1511,13 @@ class _FileCard(QFrame):
         self._long_press_timer = QTimer(self)
         self._long_press_timer.setSingleShot(True)
         self._long_press_timer.timeout.connect(self._arm_drag)
-        h = QHBoxLayout(self)
-        h.setContentsMargins(SP[3], SP[2], SP[3], SP[2])
-        h.setSpacing(SP[2])
+        grid = QGridLayout(self)
+        grid.setContentsMargins(SP[3], SP[2], SP[3], SP[2])
+        grid.setHorizontalSpacing(SP[2])
+        grid.setVerticalSpacing(SP[1])
 
-        # Narrow left rail: checkbox on top, ordinal number right below it.
-        # Stacking them vertically (instead of two side-by-side columns)
-        # keeps the rail ~20px wide so the title/meta content gets the
-        # horizontal space back.
+        # Selection stays in its own action cell; the stored document ordinal
+        # is part of the title so it reads naturally as "03. Trích yếu...".
         from PySide6.QtWidgets import QCheckBox
         self._cb = QCheckBox()
         self._cb.setStyleSheet(
@@ -1507,31 +1526,15 @@ class _FileCard(QFrame):
         self._cb.toggled.connect(
             lambda checked: self.selection_changed.emit(self.file.doc_id, checked)
         )
-        self._ord_label = QLabel(str(ordinal) if ordinal else "")
-        self._ord_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._ord_label.setAttribute(
-            Qt.WidgetAttribute.WA_TransparentForMouseEvents
-        )
-        self._ord_label.setStyleSheet(
-            f"color: {COLOR_TEXT_MUTED}; font: 600 12px '{FONT_UI}';"
-        )
-        rail = QVBoxLayout()
-        rail.setSpacing(2)
-        rail.setContentsMargins(0, 0, 0, 0)
-        rail.addWidget(self._cb, 0, Qt.AlignmentFlag.AlignHCenter)
-        rail.addWidget(self._ord_label, 0, Qt.AlignmentFlag.AlignHCenter)
-        rail.addStretch(1)
-        h.addLayout(rail)
+        grid.addWidget(self._cb, 0, 0, Qt.AlignmentFlag.AlignTop)
 
-        v = QVBoxLayout()
-        v.setSpacing(SP[1])
-        title_text = file.subject or file.file_name or translations.localize_text("(không tiêu đề)")
+        title_text = _file_card_title(file, ordinal)
         self._title_label = QLabel(title_text)
         self._title_label.setProperty("_scanindex_i18n_skip", True)
         self._title_label.setWordWrap(True)
         self._title_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self._title_label.setStyleSheet(f"color: {COLOR_TEXT}; font: 600 13px '{FONT_UI}';")
-        v.addWidget(self._title_label)
+        grid.addWidget(self._title_label, 0, 1)
 
         meta_text = _file_summary_text(file, localized=True)
         self._meta_label = None
@@ -1540,7 +1543,7 @@ class _FileCard(QFrame):
             self._meta_label.setWordWrap(True)
             self._meta_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
             self._meta_label.setStyleSheet(f"color: {COLOR_TEXT_SECONDARY}; font: 11px '{FONT_UI}';")
-            v.addWidget(self._meta_label)
+            grid.addWidget(self._meta_label, 1, 0, 1, 2)
 
         if file.file_name:
             fn = QLabel(f"📄 {file.file_name}")
@@ -1550,12 +1553,11 @@ class _FileCard(QFrame):
             fn.setStyleSheet(
                 f"color: {COLOR_GREEN}; font: 600 11px '{FONT_UI}';"
             )
-            v.addWidget(fn)
-        h.addLayout(v, 1)
+            grid.addWidget(fn, 2, 0, 1, 2)
+        grid.setColumnStretch(1, 1)
 
     def update_texts(self) -> None:
-        if not (self.file.subject or self.file.file_name):
-            self._title_label.setText(translations.localize_text("(không tiêu đề)"))
+        self._title_label.setText(_file_card_title(self.file, self.ordinal))
         if self._meta_label is not None:
             self._meta_label.setText(
                 _file_summary_text(self.file, localized=True)
@@ -1567,10 +1569,9 @@ class _FileCard(QFrame):
         self._cb.blockSignals(False)
 
     def set_ordinal(self, ordinal: int) -> None:
-        """Update the left ordinal badge after a reorder without rebuilding
-        the whole card list."""
+        """Update the title prefix after a reorder without rebuilding."""
         self.ordinal = ordinal
-        self._ord_label.setText(str(ordinal) if ordinal else "")
+        self._title_label.setText(_file_card_title(self.file, ordinal))
 
     def set_active(self, active: bool) -> None:
         _set_card_active(self, active)
@@ -1592,7 +1593,7 @@ class _FileCard(QFrame):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
     def _arm_drag(self) -> None:
-        if self._press_pos is None:
+        if self._press_pos is None or not self._allow_reorder:
             return
         self._drag_ready = True
         self._active_reorder_scroll = self._find_reorder_scroll_area()
@@ -1638,7 +1639,8 @@ class _FileCard(QFrame):
                 return
             self._press_pos = e.position().toPoint()
             self._drag_started = False
-            self._long_press_timer.start(self._LONG_PRESS_MS)
+            if self._allow_reorder:
+                self._long_press_timer.start(self._LONG_PRESS_MS)
             e.accept()
             return
         super().mousePressEvent(e)
@@ -1702,6 +1704,7 @@ class _FileCard(QFrame):
 class _SearchHitCard(QFrame):
     """Search-mode card: file with N matching chunks, dedup score badge."""
     clicked = Signal(str)  # doc_id
+    open_dossier = Signal(int)
 
     def __init__(self, hit: FileHit, parent=None):
         super().__init__(parent)
@@ -1739,6 +1742,42 @@ class _SearchHitCard(QFrame):
                 f"color: {COLOR_GREEN}; font: 600 11px '{FONT_UI}';"
             )
             v.addWidget(fn)
+
+        archive_bits = []
+        if f.fonds:
+            archive_bits.append(f"Phông {f.fonds}")
+        if f.catalog:
+            archive_bits.append(f"Mục lục {f.catalog}")
+        if f.dossier_code:
+            archive_bits.append(f"Hồ sơ {f.dossier_code}")
+        if f.dossier_id is not None:
+            archive_row = QHBoxLayout()
+            archive_row.setSpacing(SP[2])
+            if archive_bits:
+                archive_label = QLabel(" · ".join(archive_bits))
+                archive_label.setProperty("_scanindex_i18n_skip", True)
+                archive_label.setWordWrap(True)
+                archive_label.setStyleSheet(
+                    f"color: {COLOR_TEXT_MUTED}; font: 10px '{FONT_UI}';"
+                )
+                archive_row.addWidget(archive_label, 1)
+            else:
+                archive_row.addStretch(1)
+            self._open_dossier_btn = QPushButton("Mở hồ sơ")
+            self._open_dossier_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            self._open_dossier_btn.setFixedHeight(24)
+            self._open_dossier_btn.setStyleSheet(
+                f"QPushButton {{ background: transparent; color: {COLOR_ACCENT};"
+                f" border: 1px solid {COLOR_BORDER}; border-radius: 4px;"
+                f" padding: 0 8px; font: 600 10px '{FONT_UI}'; }}"
+                f"QPushButton:hover {{ background: {COLOR_ELEVATED}; }}"
+            )
+            self._open_dossier_btn.clicked.connect(
+                lambda _checked=False, did=int(f.dossier_id):
+                    self.open_dossier.emit(did)
+            )
+            archive_row.addWidget(self._open_dossier_btn)
+            v.addLayout(archive_row)
 
         # Footer: keep user-facing labels meaningful; raw scores are internal
         # ranking numbers, not percentages.
@@ -1778,6 +1817,10 @@ class _SearchHitCard(QFrame):
 
     def mousePressEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton:
+            child = self.childAt(e.position().toPoint())
+            if isinstance(child, QPushButton):
+                super().mousePressEvent(e)
+                return
             self.clicked.emit(self.hit.file_row.doc_id)
         super().mousePressEvent(e)
 
@@ -1987,7 +2030,7 @@ class _RightPanel(QWidget):
                 rows.append(translations.localize_text(f"<b>Thời gian:</b> {span}"))
         stored = _format_stored_at(getattr(d, "stored_at", None))
         if stored:
-            rows.append(translations.localize_text(f"<b>Ngày lưu kho:</b> {stored}"))
+            rows.append(translations.localize_text(f"<b>Thời điểm:</b> {stored}"))
         self._info_box.setText("<br>".join(rows))
         self._active_chunk_id = 0
         self._snippet_cards_by_id.clear()
@@ -2671,6 +2714,19 @@ class RepositoryScreen(ScreenContent):
         self._metadata_edit_dialog = None
         self._search_hits: List[FileHit] = []
         self._hits_by_doc: dict[str, FileHit] = {}
+        self._search_query = ""
+        self._search_filters: dict = {}
+        self._search_mode = "all"
+        self._search_scroll_value = 0
+        self._search_selected_doc_id = ""
+        self._dossier_scroll_value = 0
+        self._return_to_search = False
+        self._sort_by_mode = {
+            self._MODE_DOSSIERS: "archive",
+            self._MODE_FILES: "ordinal",
+            self._MODE_SEARCH: "relevance",
+        }
+        self._configuring_sort = False
         self._active_doc_id = ""
         self._doc_cards_by_id: dict[str, QFrame] = {}
         # Multi-select state for bulk delete in dossier/file-list modes.
@@ -2783,6 +2839,19 @@ class RepositoryScreen(ScreenContent):
         self._btn_back_to_dossiers.clicked.connect(self._show_dossier_list)
         h.addWidget(self._btn_back_to_dossiers)
 
+        self._btn_back_to_search = QPushButton("← Kết quả")
+        self._btn_back_to_search.setVisible(False)
+        self._btn_back_to_search.setFixedHeight(action_h)
+        self._btn_back_to_search.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_back_to_search.setStyleSheet(
+            f"QPushButton {{ background: transparent; color: {COLOR_ACCENT};"
+            f" border: 1px solid {COLOR_BORDER}; border-radius: 4px;"
+            f" padding: 0 10px; font: 600 12px '{FONT_UI}'; }}"
+            f"QPushButton:hover {{ background: {COLOR_ELEVATED}; color: {COLOR_TEXT}; }}"
+        )
+        self._btn_back_to_search.clicked.connect(self._restore_search_results)
+        h.addWidget(self._btn_back_to_search)
+
         self._list_count_label = QLabel("Đang tải hồ sơ…")
         self._list_count_label.setMinimumHeight(action_h)
         self._list_count_label.setMinimumWidth(72)
@@ -2798,6 +2867,14 @@ class RepositoryScreen(ScreenContent):
             f" padding: 6px 10px; font: 12px '{FONT_UI}';"
         )
         h.addWidget(self._list_count_label, 1)
+
+        self._sort_combo = QComboBox()
+        self._sort_combo.setToolTip("Sắp xếp danh sách hiện tại")
+        self._sort_combo.setFixedHeight(action_h)
+        self._sort_combo.setMinimumWidth(176)
+        self._style_dossier_filter_combo(self._sort_combo)
+        self._sort_combo.currentIndexChanged.connect(self._on_sort_changed)
+        h.addWidget(self._sort_combo)
 
         self._fonds_filter_combo = QComboBox()
         self._fonds_filter_combo.setToolTip("Lọc theo mã phông")
@@ -2909,10 +2986,81 @@ class RepositoryScreen(ScreenContent):
             + COMBOBOX_DROPDOWN_QSS
         )
 
+    def _configure_sort_options(self, mode: str) -> None:
+        options = {
+            self._MODE_DOSSIERS: [
+                ("Phông → Mục lục → Hồ sơ", "archive"),
+                ("Mới lưu gần đây", "stored_desc"),
+                ("Tên hồ sơ A–Z", "title_asc"),
+            ],
+            self._MODE_FILES: [
+                ("Số thứ tự văn bản", "ordinal"),
+                ("Ngày ban hành mới nhất", "date_desc"),
+                ("Tên văn bản A–Z", "title_asc"),
+            ],
+            self._MODE_SEARCH: [
+                ("Phù hợp nhất", "relevance"),
+                ("Ngày ban hành mới nhất", "date_desc"),
+                ("Phông → Mục lục → Hồ sơ", "archive"),
+                ("Tên văn bản A–Z", "title_asc"),
+            ],
+        }.get(mode, [])
+        current = self._sort_by_mode.get(mode, options[0][1] if options else "")
+        self._configuring_sort = True
+        self._sort_combo.blockSignals(True)
+        try:
+            self._sort_combo.clear()
+            for label, value in options:
+                self._sort_combo.addItem(label, value)
+            idx = self._sort_combo.findData(current)
+            self._sort_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        finally:
+            self._sort_combo.blockSignals(False)
+            self._configuring_sort = False
+
+    def _current_sort(self, mode: Optional[str] = None) -> str:
+        target = mode or self._mode
+        if target == self._mode and self._sort_combo.currentIndex() >= 0:
+            value = self._sort_combo.currentData()
+            if value:
+                return str(value)
+        return self._sort_by_mode.get(target, "")
+
+    def _on_sort_changed(self) -> None:
+        if self._configuring_sort or self._sort_combo.currentIndex() < 0:
+            return
+        self._sort_by_mode[self._mode] = str(self._sort_combo.currentData() or "")
+        if self._mode == self._MODE_DOSSIERS:
+            self._show_dossier_list()
+        elif self._mode == self._MODE_FILES and self._current_dossier is not None:
+            self._show_files_in_dossier(
+                self._current_dossier, from_search=self._return_to_search,
+            )
+        elif self._mode == self._MODE_SEARCH:
+            self._render_search_results(restore_scroll=False)
+
+    def _update_view_navigation(self) -> None:
+        self._btn_back_to_dossiers.setVisible(self._mode != self._MODE_DOSSIERS)
+        has_search = bool(self._search_hits)
+        self._btn_back_to_search.setVisible(has_search and self._mode != self._MODE_SEARCH)
+        if has_search:
+            prefix = "← " if self._mode == self._MODE_FILES else ""
+            self._btn_back_to_search.setText(
+                f"{prefix}Kết quả ({len(self._search_hits)})"
+            )
+
+    def _set_splitter_for_mode(self) -> None:
+        if not hasattr(self, "_splitter"):
+            return
+        if self._mode == self._MODE_SEARCH:
+            self._splitter.setSizes([520, 680, 340])
+        else:
+            self._splitter.setSizes([360, 760, 340])
+
     def _build_list_column(self) -> QWidget:
         box = QFrame()
         box.setMinimumWidth(240)
-        box.setMaximumWidth(420)
+        box.setMaximumWidth(560)
         box.setStyleSheet(
             f"background: {COLOR_BG}; border: 1px solid {COLOR_BORDER};"
             f" border-radius: {RADIUS_MD}px;"
@@ -2977,25 +3125,28 @@ class RepositoryScreen(ScreenContent):
         self.btn_search.clicked.connect(self._on_search_clicked)
         h.addWidget(self.btn_search)
 
-        self.btn_clear_search = QPushButton("Hủy")
+        self.btn_clear_search = QPushButton("Xóa tìm kiếm")
         self.btn_clear_search.setVisible(False)
         self.btn_clear_search.setFixedHeight(26)
         self.btn_clear_search.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_clear_search.setStyleSheet(
-            f"QPushButton {{ background: {COLOR_RED}; color: white;"
-            f" border: 1px solid {COLOR_RED}; border-radius: {RADIUS_SM}px;"
+            f"QPushButton {{ background: transparent; color: {COLOR_TEXT_SECONDARY};"
+            f" border: 1px solid {COLOR_BORDER}; border-radius: {RADIUS_SM}px;"
             f" padding: 0 12px; font: 600 12px '{FONT_UI}'; }}"
-            f"QPushButton:hover {{ background: {COLOR_RED_HOVER};"
-            f" border-color: {COLOR_RED_HOVER}; }}"
-            f"QPushButton:pressed {{ background: #991b1b; border-color: #991b1b; }}"
+            f"QPushButton:hover {{ background: {COLOR_ELEVATED};"
+            f" color: {COLOR_TEXT}; border-color: {COLOR_ACCENT}; }}"
         )
         self.btn_clear_search.clicked.connect(self._clear_search)
         h.addWidget(self.btn_clear_search)
 
         self.mode_combo = QComboBox()
-        self.mode_combo.addItem("Trong Nội dung", "content")
-        self.mode_combo.addItem("Trong Metadata", "metadata")
-        h.addWidget(self.mode_combo)
+        self.mode_combo.addItem("Tất cả", "all")
+        self.mode_combo.addItem("Nội dung OCR", "content")
+        self.mode_combo.addItem("Thông tin văn bản", "metadata")
+        self.mode_combo.setToolTip("Phạm vi tìm kiếm")
+        # Scope is chosen before entering the query, so keep it immediately
+        # before the search field in the left-to-right reading order.
+        h.insertWidget(0, self.mode_combo)
 
         # "Import folder…" removed: import path is now Số hóa lưu trữ
         # → Bước 3 → "Chuyển vào Kho". Direct folder import is gone so
@@ -3104,15 +3255,31 @@ class RepositoryScreen(ScreenContent):
             self._filter_inputs["doc_type"] = combo
             self._filter_doc_type_combo = combo
 
+        def _add_archive_combo(row: int, col: int, label: str, key: str):
+            grid.addWidget(QLabel(label), row, col * 2)
+            combo = FuzzyComboBox(sort=False)
+            combo.addItem(f"Tất cả {label.lower()}", "")
+            combo.setCurrentIndex(0)
+            grid.addWidget(combo, row, col * 2 + 1)
+            self._filter_inputs[key] = combo
+            if key == "fonds":
+                self._filter_fonds_combo = combo
+                combo.currentIndexChanged.connect(self._on_search_fonds_changed)
+            else:
+                self._filter_catalog_combo = combo
+
         _add(0, 0, "Số ký hiệu", "doc_number")
         _add(0, 1, "Cơ quan", "issue_org")
         _add(0, 2, "Người ký", "signer_name")
         _add_doc_type(1, 0)
-        _add(1, 1, "Phông", "fonds")
-        _add(1, 2, "Nhiệm kỳ", "term")
+        _add_archive_combo(1, 1, "Phông", "fonds")
+        _add_archive_combo(1, 2, "Mục lục", "catalog")
         _add_date(2, 0, "Ngày từ", "issue_date_from")
         _add_date(2, 1, "Đến", "issue_date_to")
         _add(2, 2, "Trích yếu", "subject")
+        _add(3, 0, "Nhiệm kỳ", "term")
+        _add(3, 1, "Thời hạn", "retention")
+        _add(3, 2, "Độ mật", "confidentiality")
 
         v.addLayout(grid)
 
@@ -3168,6 +3335,7 @@ class RepositoryScreen(ScreenContent):
             self._importer = Importer(self._store, self._index)
             self._engine = SearchEngine(self._store, self._index)
             self._refresh_status()
+            self._populate_search_archive_filters()
         except Exception as e:
             QMessageBox.critical(self, "Kho lưu trữ",
                                  f"Không mở được kho:\n{e}")
@@ -3357,6 +3525,53 @@ class RepositoryScreen(ScreenContent):
         finally:
             self._loading_dossier_filters = False
 
+    def _selected_search_fonds(self) -> str:
+        combo = getattr(self, "_filter_fonds_combo", None)
+        return translations.combo_value(combo).strip() if combo is not None else ""
+
+    def _populate_search_catalog_filter(self, fonds: str = "",
+                                        keep_catalog: str = "") -> None:
+        combo = getattr(self, "_filter_catalog_combo", None)
+        if combo is None:
+            return
+        combo.blockSignals(True)
+        try:
+            combo.clear()
+            combo.addItem("Tất cả mục lục", "")
+            for catalog, catalog_name in self._fetch_catalog_filter_options(fonds):
+                combo.addItem(self._combo_label(catalog, catalog_name), catalog)
+            idx = combo.findData(keep_catalog)
+            combo.setCurrentIndex(idx if idx >= 0 else 0)
+            combo.setEnabled(combo.count() > 1)
+        finally:
+            combo.blockSignals(False)
+
+    def _populate_search_archive_filters(self) -> None:
+        fonds_combo = getattr(self, "_filter_fonds_combo", None)
+        if fonds_combo is None:
+            return
+        keep_fonds = self._selected_search_fonds()
+        catalog_combo = getattr(self, "_filter_catalog_combo", None)
+        keep_catalog = (
+            translations.combo_value(catalog_combo).strip()
+            if catalog_combo is not None else ""
+        )
+        fonds_combo.blockSignals(True)
+        try:
+            fonds_combo.clear()
+            fonds_combo.addItem("Tất cả phông", "")
+            for fonds, fonds_name in self._fetch_fonds_filter_options():
+                fonds_combo.addItem(self._combo_label(fonds, fonds_name), fonds)
+            idx = fonds_combo.findData(keep_fonds)
+            fonds_combo.setCurrentIndex(idx if idx >= 0 else 0)
+            fonds_combo.setEnabled(fonds_combo.count() > 1)
+        finally:
+            fonds_combo.blockSignals(False)
+        self._populate_search_catalog_filter(keep_fonds, keep_catalog)
+
+    def _on_search_fonds_changed(self) -> None:
+        self._populate_search_catalog_filter(self._selected_search_fonds(), "")
+
     def _on_fonds_filter_changed(self) -> None:
         if self._loading_dossier_filters:
             return
@@ -3375,23 +3590,31 @@ class RepositoryScreen(ScreenContent):
             self._show_dossier_list()
 
     def _show_dossier_list(self):
+        previous_mode = self._mode
+        if previous_mode == self._MODE_SEARCH:
+            self._search_scroll_value = self._list_scroll.verticalScrollBar().value()
+        elif previous_mode == self._MODE_DOSSIERS:
+            self._dossier_scroll_value = self._list_scroll.verticalScrollBar().value()
         self._mode = self._MODE_DOSSIERS
         self._current_dossier = None
         self._current_file = None
-        self._search_hits = []
-        self._hits_by_doc = {}
+        self._return_to_search = False
         self._active_doc_id = ""
         self._doc_cards_by_id.clear()
         self._selected_doc_ids.clear()
         self._file_cards_by_id.clear()
         self._selected_dossier_ids.clear()
         self._dossier_cards_by_id.clear()
-        self._btn_back_to_dossiers.setVisible(False)
         self._btn_add_file.setVisible(False)
         self._btn_export_dossier_zip.setVisible(False)
         self._set_dossier_filter_widgets_visible(True)
+        self._configure_sort_options(self._MODE_DOSSIERS)
+        self._update_view_navigation()
+        self._set_splitter_for_mode()
         self._update_selection_toolbar()
-        self.btn_clear_search.setVisible(False)
+        self.btn_clear_search.setVisible(bool(
+            self._search_query or self._search_filters or self.search_input.text().strip()
+        ))
         self._pdf_pane.clear()
         self._right_panel.show_dossier(DossierRow(
             dossier_id=0, title="(chưa chọn)",
@@ -3425,6 +3648,11 @@ class RepositoryScreen(ScreenContent):
             self._dossier_cards_by_id[d.dossier_id] = card
             self._add_card(card)
         self._update_selection_toolbar()
+        QTimer.singleShot(
+            0,
+            lambda value=self._dossier_scroll_value:
+                self._list_scroll.verticalScrollBar().setValue(value),
+        )
 
     def _fetch_dossiers(self) -> List[DossierRow]:
         if self._store is None:
@@ -3443,6 +3671,18 @@ class RepositoryScreen(ScreenContent):
             "WHERE " + " AND ".join(where_parts) + " "
             if where_parts else ""
         )
+        sort_sql = {
+            "stored_desc": "d.created_at DESC, COALESCE(d.title, '') COLLATE NOCASE",
+            "title_asc": (
+                "COALESCE(d.title, '') COLLATE NOCASE, "
+                "COALESCE(d.dossier_code, '') COLLATE NOCASE"
+            ),
+        }.get(
+            self._current_sort(self._MODE_DOSSIERS),
+            "COALESCE(d.ma_dinh_danh, ''), COALESCE(d.fonds, ''), "
+            "COALESCE(d.catalog, ''), COALESCE(d.dossier_code, ''), "
+            "d.created_at DESC",
+        )
         rows = self._store.connect().execute(
             "SELECT d.dossier_id, d.title, d.ma_dinh_danh, d.fonds, d.fonds_name,"
             "       d.catalog, d.catalog_name,"
@@ -3456,9 +3696,7 @@ class RepositoryScreen(ScreenContent):
             "    AND doc.indexed_status != 'deleted' "
             f"{where_sql}"
             "GROUP BY d.dossier_id "
-            "ORDER BY COALESCE(d.ma_dinh_danh, ''), COALESCE(d.fonds, ''), "
-            "         COALESCE(d.catalog, ''), COALESCE(d.dossier_code, ''), "
-            "         d.created_at DESC",
+            f"ORDER BY {sort_sql}",
             params,
         ).fetchall()
         return [
@@ -3489,20 +3727,28 @@ class RepositoryScreen(ScreenContent):
 
     # ------ Mode B: files inside a dossier ------
 
-    def _show_files_in_dossier(self, dossier: DossierRow):
+    def _show_files_in_dossier(self, dossier: DossierRow, *, from_search: bool = False):
+        came_from_search = from_search or self._mode == self._MODE_SEARCH
+        if self._mode == self._MODE_SEARCH:
+            self._search_scroll_value = self._list_scroll.verticalScrollBar().value()
+        elif self._mode == self._MODE_DOSSIERS:
+            self._dossier_scroll_value = self._list_scroll.verticalScrollBar().value()
         self._mode = self._MODE_FILES
         self._current_dossier = dossier
         self._current_file = None
+        self._return_to_search = bool(came_from_search and self._search_hits)
         self._active_doc_id = ""
         self._doc_cards_by_id.clear()
         self._selected_doc_ids.clear()
         self._file_cards_by_id.clear()
         self._selected_dossier_ids.clear()
         self._dossier_cards_by_id.clear()
-        self._btn_back_to_dossiers.setVisible(True)
         self._btn_add_file.setVisible(True)        # only in file-list mode
         self._btn_export_dossier_zip.setVisible(True)
         self._set_dossier_filter_widgets_visible(False)
+        self._configure_sort_options(self._MODE_FILES)
+        self._update_view_navigation()
+        self._set_splitter_for_mode()
         self._update_selection_toolbar()
         self._pdf_pane.clear()
         self._right_panel.show_dossier(dossier)
@@ -3512,7 +3758,12 @@ class RepositoryScreen(ScreenContent):
             dossier, doc_count=len(files), localized=True,
         ))
         for idx, f in enumerate(files, start=1):
-            card = _FileCard(f, ordinal=idx)
+            ordinal = int(f.so_thu_tu or idx)
+            card = _FileCard(
+                f,
+                ordinal=ordinal,
+                allow_reorder=self._current_sort(self._MODE_FILES) == "ordinal",
+            )
             card.clicked.connect(lambda _did, ff=f: self._show_file(ff))
             card.selection_changed.connect(self._on_file_selection_changed)
             card.reorder_requested.connect(self._on_file_reorder_requested)
@@ -3530,14 +3781,33 @@ class RepositoryScreen(ScreenContent):
             "       d.kie_signer_name, d.kie_place_date,"
             "       d.kie_doc_type, d.kie_secrecy_mark, d.page_count,"
             "       d.trang_so, d.so_thu_tu,"
-            "       ds.title AS dossier_title "
+            "       ds.title AS dossier_title, ds.fonds, ds.catalog,"
+            "       ds.dossier_code "
             "FROM documents d "
             "LEFT JOIN dossiers ds ON ds.dossier_id = d.dossier_id "
             "WHERE d.dossier_id = ? AND d.indexed_status != 'deleted' "
-            "ORDER BY d.file_name",
+            "ORDER BY CASE WHEN d.so_thu_tu IS NULL OR d.so_thu_tu <= 0 "
+            "              THEN 1 ELSE 0 END, d.so_thu_tu, d.file_name",
             (dossier_id,),
         ).fetchall()
-        return [self._row_to_file(r) for r in rows]
+        files = [self._row_to_file(r) for r in rows]
+        sort_mode = self._current_sort(self._MODE_FILES)
+        if sort_mode == "date_desc":
+            files.sort(
+                key=lambda f: (
+                    _issue_date_sort_key(f.issue_date),
+                    _single_line(f.subject or f.file_name).casefold(),
+                ),
+                reverse=True,
+            )
+        elif sort_mode == "title_asc":
+            files.sort(
+                key=lambda f: (
+                    _single_line(f.subject or f.file_name).casefold(),
+                    int(f.so_thu_tu or 0),
+                )
+            )
+        return files
 
     @staticmethod
     def _row_to_file(r) -> FileRow:
@@ -3558,13 +3828,52 @@ class RepositoryScreen(ScreenContent):
             dossier_title=r["dossier_title"] or "",
             trang_so=r["trang_so"] if r["trang_so"] is not None else None,
             so_thu_tu=r["so_thu_tu"] if r["so_thu_tu"] is not None else None,
+            fonds=r["fonds"] or "",
+            catalog=r["catalog"] or "",
+            dossier_code=r["dossier_code"] or "",
         )
 
     def _fetch_dossier_by_id(self, dossier_id: int) -> Optional[DossierRow]:
-        for dossier in self._fetch_dossiers():
-            if dossier.dossier_id == dossier_id:
-                return dossier
-        return None
+        if self._store is None:
+            return None
+        r = self._store.connect().execute(
+            "SELECT d.dossier_id, d.title, d.ma_dinh_danh, d.fonds, d.fonds_name,"
+            "       d.catalog, d.catalog_name, d.dossier_code, d.is_unstructured,"
+            "       d.retention, d.term, d.storage_unit, d.physical_state,"
+            "       d.topic, d.note, d.start_date, d.end_date, d.created_at,"
+            "       COUNT(doc.doc_id) AS doc_count,"
+            "       COALESCE(SUM(doc.page_count), 0) AS page_count "
+            "FROM dossiers d "
+            "LEFT JOIN documents doc ON doc.dossier_id = d.dossier_id "
+            "    AND doc.indexed_status != 'deleted' "
+            "WHERE d.dossier_id = ? "
+            "GROUP BY d.dossier_id",
+            (dossier_id,),
+        ).fetchone()
+        if r is None:
+            return None
+        return DossierRow(
+            dossier_id=int(r["dossier_id"]),
+            title=r["title"] or "",
+            ma_dinh_danh=r["ma_dinh_danh"] or "",
+            fonds=r["fonds"] or "",
+            fonds_name=r["fonds_name"] or "",
+            catalog=r["catalog"] or "",
+            catalog_name=r["catalog_name"] or "",
+            dossier_code=r["dossier_code"] or "",
+            doc_count=int(r["doc_count"] or 0),
+            page_count=int(r["page_count"] or 0),
+            start_date=r["start_date"] or "",
+            end_date=r["end_date"] or "",
+            is_unstructured=bool(r["is_unstructured"] or 0),
+            retention=r["retention"] or "",
+            term=r["term"] or "",
+            storage_unit=r["storage_unit"] or "",
+            physical_state=r["physical_state"] or "",
+            topic=r["topic"] or "",
+            note=r["note"] or "",
+            stored_at=int(r["created_at"] or 0),
+        )
 
     @staticmethod
     def _identity_from_dossier(dossier: DossierRow) -> IdentityCodes:
@@ -3814,7 +4123,8 @@ class RepositoryScreen(ScreenContent):
             "       d.kie_signer_name, d.kie_place_date,"
             "       d.kie_doc_type, d.kie_secrecy_mark, d.page_count,"
             "       d.trang_so, d.so_thu_tu,"
-            "       ds.title AS dossier_title "
+            "       ds.title AS dossier_title, ds.fonds, ds.catalog,"
+            "       ds.dossier_code "
             "FROM documents d "
             "LEFT JOIN dossiers ds ON ds.dossier_id = d.dossier_id "
             "WHERE d.doc_id = ?",
@@ -3931,15 +4241,17 @@ class RepositoryScreen(ScreenContent):
         return f
 
     def _reset_filters(self):
-        for widget in self._filter_inputs.values():
+        for key, widget in self._filter_inputs.items():
             if isinstance(widget, QComboBox):
-                widget.setCurrentIndex(-1)
+                widget.setCurrentIndex(0 if key in {"fonds", "catalog"} else -1)
                 if widget.isEditable() and widget.lineEdit() is not None:
-                    widget.lineEdit().clear()
+                    if key not in {"fonds", "catalog"}:
+                        widget.lineEdit().clear()
             elif isinstance(widget, QLineEdit):
                 widget.clear()
             elif hasattr(widget, "clear"):
                 widget.clear()
+        self._populate_search_catalog_filter("", "")
 
     def _refresh_doc_type_filter_choices(self):
         combo = getattr(self, "_filter_doc_type_combo", None)
@@ -3967,42 +4279,43 @@ class RepositoryScreen(ScreenContent):
     def _on_filter_toggle(self, checked: bool):
         if not hasattr(self, "_filter_panel"):
             return
-        is_metadata = (self.mode_combo.currentData() or "content") == "metadata"
-        self._filter_panel.setVisible(bool(checked and is_metadata))
+        self._filter_panel.setVisible(bool(checked))
         if hasattr(self, "btn_filter"):
-            self.btn_filter.setText("▴" if checked and is_metadata else "▾")
+            self.btn_filter.setText("▴" if checked else "▾")
 
     def _on_search_mode_changed(self):
         if not hasattr(self, "_filter_panel"):
             return
-        mode = self.mode_combo.currentData() or "content"
-        is_metadata = mode == "metadata"
-        if is_metadata:
+        mode = self.mode_combo.currentData() or "all"
+        if mode in {"all", "metadata"}:
             self._refresh_doc_type_filter_choices()
         if hasattr(self, "btn_filter"):
-            self.btn_filter.blockSignals(True)
-            self.btn_filter.setChecked(is_metadata)
-            self.btn_filter.setText("▴" if is_metadata else "▾")
-            self.btn_filter.blockSignals(False)
-            self.btn_filter.setVisible(is_metadata)
-        self._filter_panel.setVisible(is_metadata)
-
-        if is_metadata:
-            self.search_input.clear()
-            self.search_input.setEnabled(False)
+            self.btn_filter.setVisible(True)
+            self.btn_filter.setText("▴" if self.btn_filter.isChecked() else "▾")
+        self._filter_panel.setVisible(self.btn_filter.isChecked())
+        self.search_input.setEnabled(True)
+        if mode == "metadata":
             self.search_input.setPlaceholderText(
-                "Vui lòng nhập thông tin vào các trường bên dưới"
+                "Tìm số ký hiệu, người ký, cơ quan, trích yếu..."
             )
+        elif mode == "content":
+            self.search_input.setPlaceholderText("Tìm trong nội dung OCR...")
         else:
-            self.search_input.setEnabled(True)
             self.search_input.setPlaceholderText(
-                "Nhập từ khóa tự nhiên (số văn bản, tên người ký, trích yếu, nội dung...)"
+                "Tìm trong thông tin văn bản và nội dung OCR..."
             )
 
     def _clear_search(self):
         """Drop search state and return to dossier-browse mode."""
         self.search_input.clear()
         self._reset_filters()
+        self._search_query = ""
+        self._search_filters = {}
+        self._search_mode = "all"
+        self._search_hits = []
+        self._hits_by_doc = {}
+        self._search_scroll_value = 0
+        self._search_selected_doc_id = ""
         self._show_dossier_list()
 
     def _on_search_clicked(self):
@@ -4010,22 +4323,10 @@ class RepositoryScreen(ScreenContent):
             return
         if self._busy:
             return
-        mode = self.mode_combo.currentData() or "content"
-        if mode == "metadata":
-            query = ""
-            filters = self._collect_filters()
-        else:
-            query = self.search_input.text().strip()
-            filters = {}
+        mode = self.mode_combo.currentData() or "all"
+        query = self.search_input.text().strip()
+        filters = self._collect_filters()
         if not query and not filters:
-            if mode == "metadata":
-                self._list_count_label.setText(
-                    "Nhập từ khóa metadata hoặc mở lọc nâng cao."
-                )
-                self._right_panel.show_message(
-                    "Có thể tìm số ký hiệu, ngày tháng, người ký, cơ quan, trích yếu trong ô tìm kiếm; hoặc bấm ▾ để lọc cụ thể."
-                )
-                return
             # No query → go back to dossier browse.
             self._show_dossier_list()
             return
@@ -4034,11 +4335,16 @@ class RepositoryScreen(ScreenContent):
         self.btn_clear_search.setEnabled(False)
         self._list_count_label.setText("Đang tìm…")
 
-        if mode == "content":
+        if mode == "all":
+            self._list_count_label.setText("Đang tìm trong toàn bộ văn bản...")
+        elif mode == "content":
             self._list_count_label.setText("Đang tìm trong nội dung...")
         elif mode == "metadata":
-            self._list_count_label.setText("Đang tìm trong metadata...")
+            self._list_count_label.setText("Đang tìm trong thông tin văn bản...")
 
+        self._pending_search_query = query
+        self._pending_search_filters = dict(filters)
+        self._pending_search_mode = mode
         self._search_worker = SearchWorker(self._engine, query, filters, mode)
         self._search_worker.finished_ok.connect(self._on_search_done)
         self._search_worker.failed.connect(self._on_search_failed)
@@ -4047,11 +4353,63 @@ class RepositoryScreen(ScreenContent):
     def _on_search_done(self, results: List[SearchResult]):
         self._busy = False
         self.btn_search.setEnabled(True)
+        self.btn_clear_search.setEnabled(True)
+        self._search_query = getattr(
+            self, "_pending_search_query", self.search_input.text().strip()
+        )
+        self._search_filters = dict(getattr(
+            self, "_pending_search_filters", self._collect_filters()
+        ))
+        self._search_mode = str(getattr(
+            self, "_pending_search_mode", self.mode_combo.currentData() or "all"
+        ))
+        self._search_hits = _group_results_by_file(results)
+        self._hits_by_doc = {h.file_row.doc_id: h for h in self._search_hits}
+        self._search_selected_doc_id = ""
+        self._search_scroll_value = 0
+        self._render_search_results(restore_scroll=False)
+
+    def _sorted_search_hits(self) -> List[FileHit]:
+        hits = list(self._search_hits)
+        sort_mode = self._current_sort(self._MODE_SEARCH)
+        if sort_mode == "relevance":
+            return hits
+        if sort_mode == "date_desc":
+            hits.sort(
+                key=lambda h: (
+                    _issue_date_sort_key(h.file_row.issue_date),
+                    h.match_total,
+                    h.score_total,
+                ),
+                reverse=True,
+            )
+        elif sort_mode == "archive":
+            hits.sort(key=lambda h: (
+                _single_line(h.file_row.fonds).casefold(),
+                _single_line(h.file_row.catalog).casefold(),
+                _single_line(h.file_row.dossier_code).casefold(),
+                _single_line(h.file_row.subject or h.file_row.file_name).casefold(),
+            ))
+        elif sort_mode == "title_asc":
+            hits.sort(key=lambda h: (
+                _single_line(h.file_row.subject or h.file_row.file_name).casefold(),
+                _single_line(h.file_row.file_name).casefold(),
+            ))
+        return hits
+
+    def _render_search_results(self, *, restore_scroll: bool = True) -> None:
+        if self._mode == self._MODE_SEARCH:
+            self._search_scroll_value = self._list_scroll.verticalScrollBar().value()
         self._mode = self._MODE_SEARCH
-        self._btn_back_to_dossiers.setVisible(False)
+        self._current_dossier = None
+        self._current_file = None
+        self._return_to_search = False
         self._btn_add_file.setVisible(False)
         self._btn_export_dossier_zip.setVisible(False)
         self._set_dossier_filter_widgets_visible(False)
+        self._configure_sort_options(self._MODE_SEARCH)
+        self._update_view_navigation()
+        self._set_splitter_for_mode()
         self._selected_doc_ids.clear()
         self._active_doc_id = ""
         self._doc_cards_by_id.clear()
@@ -4061,8 +4419,6 @@ class RepositoryScreen(ScreenContent):
         self._update_selection_toolbar()
         self.btn_clear_search.setVisible(True)
         self.btn_clear_search.setEnabled(True)
-        self._search_hits = _group_results_by_file(results)
-        self._hits_by_doc = {h.file_row.doc_id: h for h in self._search_hits}
         self._clear_list()
         self._pdf_pane.clear()
         if not self._search_hits:
@@ -4071,38 +4427,54 @@ class RepositoryScreen(ScreenContent):
                 dossier_id=0, title="", fonds="", catalog="", dossier_code="",
                 doc_count=0, page_count=0, start_date="", end_date="",
             ))
-            if self.mode_combo.currentData() == "metadata":
-                self._right_panel.show_message(
-                    "Không tìm thấy văn bản khớp metadata."
-                )
-            else:
-                self._right_panel.show_message("Không tìm thấy văn bản phù hợp.")
+            self._right_panel.show_message(
+                "Không có văn bản phù hợp. Hãy rút gọn từ khóa hoặc bớt điều kiện lọc."
+            )
             return
         self._list_count_label.setText(
             f"{len(self._search_hits)} văn bản khớp"
         )
-        mode = self.mode_combo.currentData() or "content"
-        if mode == "metadata":
-            labels = [
-                ("filter", "Metadata khớp điều kiện"),
-                ("exact", "Metadata chứa chính xác từ tìm"),
-                ("fuzzy", "Metadata chứa từ gần giống"),
-            ]
-        else:
-            labels = [
-                ("exact", "Nội dung văn bản chứa chính xác từ tìm"),
-                ("fuzzy", "Nội dung văn bản chứa từ gần giống"),
-            ]
+        labels = [
+            ("filter", "Khớp bộ lọc"),
+            ("exact", "Khớp từ khóa (kể cả không dấu)"),
+            ("fuzzy", "Kết quả gần đúng"),
+        ]
+        sorted_hits = self._sorted_search_hits()
         for kind, label in labels:
-            group = [h for h in self._search_hits if h.match_kind == kind]
+            group = [h for h in sorted_hits if h.match_kind == kind]
             if not group:
                 continue
             self._add_card(_GroupHeader(label, len(group)))
             for hit in group:
                 card = _SearchHitCard(hit)
                 card.clicked.connect(lambda _did, hh=hit: self._show_search_hit(hh))
+                card.open_dossier.connect(self._open_search_hit_dossier)
                 self._doc_cards_by_id[hit.file_row.doc_id] = card
                 self._add_card(card)
+        selected = self._hits_by_doc.get(self._search_selected_doc_id)
+        if selected is None and sorted_hits:
+            selected = sorted_hits[0]
+        if selected is not None:
+            self._show_search_hit(selected)
+        if restore_scroll:
+            QTimer.singleShot(
+                0,
+                lambda value=self._search_scroll_value:
+                    self._list_scroll.verticalScrollBar().setValue(value),
+            )
+
+    def _restore_search_results(self) -> None:
+        if not (self._search_query or self._search_filters or self._search_hits):
+            return
+        self._render_search_results(restore_scroll=True)
+
+    def _open_search_hit_dossier(self, dossier_id: int) -> None:
+        self._search_scroll_value = self._list_scroll.verticalScrollBar().value()
+        dossier = self._fetch_dossier_by_id(int(dossier_id))
+        if dossier is None:
+            self._list_count_label.setText("Không tìm thấy hồ sơ của văn bản.")
+            return
+        self._show_files_in_dossier(dossier, from_search=True)
 
     def _on_search_failed(self, err: str):
         self._busy = False
@@ -4115,6 +4487,7 @@ class RepositoryScreen(ScreenContent):
     def _show_search_hit(self, hit: FileHit):
         """Headline chunk drives initial PDF page; full chunk list goes to
         the right panel as snippet cards (clickable to jump to bbox)."""
+        self._search_selected_doc_id = hit.file_row.doc_id
         full = self._fetch_file_by_doc_id(hit.file_row.doc_id) or hit.file_row
         # Carry over dossier_title from search projection if SQL didn't have one.
         if not full.dossier_title and hit.file_row.dossier_title:
