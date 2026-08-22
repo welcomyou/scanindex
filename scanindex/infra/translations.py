@@ -1,4 +1,11 @@
 
+import re
+from functools import lru_cache
+
+from scanindex.infra.ui_text_catalog import UI_TEXT_PAIRS
+from scanindex.infra.ui_log_text_catalog import UI_LOG_TEXT_PAIRS
+
+
 # Dictionary structure: Key -> {LangCode -> Text}
 # LangCode: "en" (English), "vi" (Vietnamese)
 
@@ -144,6 +151,38 @@ The software prioritizes local processing when models and dependencies are insta
     "chk_translate_vi": {
         "en": "Translate to Vietnamese",
         "vi": "Dịch sang tiếng Việt"
+    },
+    "chk_zip_include_canonical": {
+        "en": "Include OCR/KIE data (.json.zst) inside exported ZIP",
+        "vi": "Kèm dữ liệu OCR/KIE (.json.zst) trong file ZIP xuất ra"
+    },
+    "tooltip_zip_include_canonical": {
+        "en": "When enabled, each exported PDF is bundled with its canonical "
+              ".json.zst sidecar (OCR text + KIE annotations) so the ZIP can "
+              "be re-imported into the Repository without re-running OCR/KIE. "
+              "The receiving PMKhoSohoa importer only scans the .pdf files "
+              "and the workbook, so the extra files are ignored there.",
+        "vi": "Khi bật, mỗi PDF xuất ra sẽ được kèm file .json.zst cạnh nó "
+              "(chữ OCR + kết quả KIE) để file ZIP có thể nhập ngược lại vào "
+              "Kho lưu trữ mà không cần chạy lại OCR/KIE. Phần mềm kho chỉ "
+              "quét file .pdf và file Excel nên các file kèm theo bị bỏ qua.",
+    },
+    "chk_skip_duplicate_docs": {
+        "en": "Skip duplicate documents when importing into the Repository",
+        "vi": "Không lưu văn bản trùng thừa khi nhập vào Kho"
+    },
+    "tooltip_skip_duplicate_docs": {
+        "en": "When enabled (default), a PDF whose content is byte-identical "
+              "to a document already in the same dossier is skipped during "
+              "import (counted as duplicate). When disabled, identical "
+              "copies are still saved — for dossiers that intentionally "
+              "contain e.g. the original and a certified copy — and the "
+              "import summary reports how many duplicates were kept.",
+        "vi": "Khi bật (mặc định), PDF trùng nội dung từng byte với một văn "
+              "bản đã có trong cùng hồ sơ sẽ bị bỏ qua khi nhập (đếm là "
+              "trùng thừa). Khi tắt, các bản trùng vẫn được lưu — dành cho "
+              "hồ sơ có chủ đích chứa cả bản gốc lẫn bản sao y — và tổng "
+              "kết sau nhập sẽ báo đã lưu bao nhiêu bản trùng.",
     },
     "tooltip_translate_vi": {
         "en": "Also export a Vietnamese translation as {name}_vi.docx after the Word export completes.",
@@ -479,14 +518,14 @@ The software prioritizes local processing when models and dependencies are insta
     "arc_field_muc_luc":   { "en": "Catalog",       "vi": "Số mục lục" },
     "arc_field_ho_so":     { "en": "File number",   "vi": "Số hồ sơ" },
     "arc_field_title":     { "en": "Dossier name",  "vi": "Tên hồ sơ" },
-    "arc_ph_ma_dd":        { "en": "VD: A29.123",   "vi": "VD: A29.123" },
+    "arc_ph_ma_dd":        { "en": "E.g. A29.123",   "vi": "VD: A29.123" },
     "arc_ph_ma_phong":     {
-        "en": "VD: 001 hoặc A29.123 nếu không có phông hoặc A29.123.001 nếu kết hợp",
+        "en": "E.g. 001, A29.123 when no fonds is available, or A29.123.001 when combined",
         "vi": "VD: 001 hoặc A29.123 nếu không có phông hoặc A29.123.001 nếu kết hợp",
     },
-    "arc_ph_muc_luc":      { "en": "VD: 01 - nhập 2 chữ số", "vi": "VD: 01 - nhập 2 chữ số" },
-    "arc_ph_ho_so":        { "en": "VD: 0001 hoặc 0001a - nhập 4 chữ số", "vi": "VD: 0001 hoặc 0001a - nhập 4 chữ số" },
-    "arc_ph_title":        { "en": "Tên hồ sơ (tối đa 1000 ký tự)", "vi": "Tên hồ sơ (tối đa 1000 ký tự)" },
+    "arc_ph_muc_luc":      { "en": "E.g. 01 — enter 2 digits", "vi": "VD: 01 - nhập 2 chữ số" },
+    "arc_ph_ho_so":        { "en": "E.g. 0001 or 0001a — enter 4 digits", "vi": "VD: 0001 hoặc 0001a - nhập 4 chữ số" },
+    "arc_ph_title":        { "en": "Dossier name (maximum 1000 characters)", "vi": "Tên hồ sơ (tối đa 1000 ký tự)" },
     "arc_err_ma_dd_empty":     { "en": "Identity code is required", "vi": "Mã định danh không được để trống" },
     "arc_err_ma_phong_empty":  { "en": "Fonds code is required",    "vi": "Mã phông không được để trống" },
     "arc_err_muc_luc_format":  { "en": "Catalog must be ≤2 chars",  "vi": "Số mục lục tối đa 2 ký tự" },
@@ -582,7 +621,7 @@ class Localization:
         self.lang = lang
 
     def set_language(self, lang):
-        self.lang = lang
+        self.lang = lang if lang in {"en", "vi"} else "en"
 
     def get(self, key, *args):
         # Default to key if not found
@@ -607,3 +646,474 @@ def get_text(key, *args):
 
 def set_lang(lang):
     current_locale.set_language(lang)
+
+
+# ---------------------------------------------------------------------------
+# Source-text localization for legacy/new PySide screens
+# ---------------------------------------------------------------------------
+
+_PLACEHOLDER_RE = re.compile(r"\{[^{}]*\}")
+
+
+def _normalise_ui_text(value: str) -> str:
+    """Normalize layout whitespace without changing punctuation or accents."""
+    return " ".join(str(value or "").split())
+
+
+def _all_ui_pairs():
+    """Yield keyed translations and source-catalog pairs exactly once."""
+    seen = set()
+    # Source catalog comes first because it gives legacy hard-coded words
+    # their UI-context meaning (for example, source "Xóa" means Delete,
+    # while the keyed PDF toolbar deliberately uses the same Vietnamese word
+    # for Clear and is refreshed explicitly by its update_texts method).
+    for en, vi in (*UI_TEXT_PAIRS, *UI_LOG_TEXT_PAIRS):
+        marker = (str(en), str(vi))
+        if marker[0] and marker[1] and marker not in seen:
+            seen.add(marker)
+            yield marker
+    for values in TRANSLATIONS.values():
+        if not isinstance(values, dict):
+            continue
+        en = str(values.get("en", ""))
+        vi = str(values.get("vi", ""))
+        marker = (en, vi)
+        if en and vi and marker not in seen:
+            seen.add(marker)
+            yield marker
+
+
+def _template_regex(template: str):
+    """Compile a source template and return it with its capture count."""
+    template = str(template)
+    matches = list(_PLACEHOLDER_RE.finditer(template))
+    if not matches:
+        return None, 0
+
+    def literal_pattern(value: str) -> str:
+        # UI messages are often assembled with line breaks while their
+        # catalog form is kept on one line. Match whitespace flexibly, but
+        # capture placeholder values from the original string so filenames
+        # and multi-line previews are not flattened during translation.
+        return "".join(
+            r"\s+" if part.isspace() else re.escape(part)
+            for part in re.split(r"(\s+)", value)
+            if part
+        )
+
+    pieces = []
+    cursor = 0
+    for match in matches:
+        pieces.append(literal_pattern(template[cursor:match.start()]))
+        pieces.append("(.*?)")
+        cursor = match.end()
+    pieces.append(literal_pattern(template[cursor:]))
+    return re.compile("^" + "".join(pieces) + "$", re.DOTALL), len(matches)
+
+
+def _fill_template(template: str, values: tuple[str, ...]) -> str:
+    iterator = iter(values)
+    return _PLACEHOLDER_RE.sub(lambda _match: next(iterator, ""), template)
+
+
+def _build_ui_indexes():
+    exact = {"en": {}, "vi": {}}
+    templates = {"en": [], "vi": []}
+    for en, vi in _all_ui_pairs():
+        en_key = _normalise_ui_text(en)
+        vi_key = _normalise_ui_text(vi)
+        en_pattern, en_fields = _template_regex(en)
+        vi_pattern, vi_fields = _template_regex(vi)
+        if en_pattern or vi_pattern:
+            # Only valid pairs can be rendered safely in both directions.
+            if en_fields == vi_fields and en_pattern and vi_pattern:
+                templates["en"].append((vi_pattern, en))
+                templates["vi"].append((en_pattern, vi))
+            continue
+        exact["en"].setdefault(vi_key, en)
+        exact["vi"].setdefault(en_key, vi)
+    # Match more specific templates first so a short generic pattern cannot
+    # consume text intended for a longer message.
+    templates["en"].sort(key=lambda item: len(item[0].pattern), reverse=True)
+    templates["vi"].sort(key=lambda item: len(item[0].pattern), reverse=True)
+    return exact, templates
+
+
+_UI_EXACT, _UI_TEMPLATES = _build_ui_indexes()
+
+
+@lru_cache(maxsize=8192)
+def _localize_cached(value: str, target: str) -> str:
+    normalised = _normalise_ui_text(value)
+    translated = _UI_EXACT[target].get(normalised)
+    if translated is not None:
+        return translated
+    for pattern, output_template in _UI_TEMPLATES[target]:
+        match = pattern.fullmatch(value)
+        if match:
+            return _fill_template(output_template, match.groups())
+    return value
+
+
+def localize_text(text, lang: str | None = None):
+    """Translate known UI source text while leaving user/document data alone.
+
+    Exact pairs are preferred. Template pairs support runtime values in
+    progress labels and dialog messages. Unknown input is returned unchanged.
+    Results are cached because Qt may repaint an unchanged label frequently.
+    """
+    if text is None:
+        return text
+    value = str(text)
+    target = lang if lang in {"en", "vi"} else current_locale.lang
+    return _localize_cached(value, target)
+
+
+def format_import_summary(
+    *, dossiers: int, imported: int, duplicates: int, failed: int,
+    duplicate_skipped: int = 0, duplicate_kept: int = 0,
+) -> str:
+    """Build a localized repository-import summary from atomic UI lines."""
+    duplicate_line = localize_text(f"Duplicates: {duplicates}")
+    if duplicate_kept:
+        duplicate_line += " " + localize_text(
+            f"(skipped {duplicate_skipped}, kept {duplicate_kept})"
+        )
+    return "\n".join((
+        localize_text(f"Dossiers: {dossiers}"),
+        localize_text(f"Documents imported: {imported}"),
+        duplicate_line,
+        localize_text(f"Errors: {failed}"),
+        "",
+        localize_text("You can search immediately."),
+    ))
+
+
+_DOCUMENT_TYPE_EN = {
+    "Nghị quyết": "Resolution",
+    "Quyết định": "Decision",
+    "Chỉ thị": "Directive",
+    "Kết luận": "Conclusion",
+    "Quy chế": "Regulation",
+    "Quy định": "Rules",
+    "Thông cáo": "Press release",
+    "Thông báo": "Notice",
+    "Hướng dẫn": "Guidance",
+    "Chương trình": "Program",
+    "Kế hoạch": "Plan",
+    "Phương án": "Implementation plan",
+    "Đề án": "Scheme",
+    "Dự án": "Project",
+    "Báo cáo": "Report",
+    "Biên bản": "Minutes",
+    "Tờ trình": "Submission",
+    "Hợp đồng": "Contract",
+    "Công điện": "Official telegram",
+    "Bản ghi nhớ": "Memorandum",
+    "Bản thỏa thuận": "Agreement",
+    "Giấy ủy quyền": "Power of attorney",
+    "Giấy mời": "Invitation",
+    "Giấy giới thiệu": "Letter of introduction",
+    "Giấy nghỉ phép": "Leave request",
+    "Phiếu gửi": "Dispatch slip",
+    "Phiếu chuyển": "Transfer slip",
+    "Phiếu báo": "Notification slip",
+    "Bản sao y": "Certified true copy",
+    "Bản trích sao": "Extract copy",
+    "Bản sao lục": "Duplicate copy",
+    "Công văn": "Official dispatch",
+    "Khác": "Other",
+}
+
+
+def localize_document_type(value) -> str:
+    """Translate a built-in document type without guessing user catalog data."""
+    canonical = str(value or "")
+    if current_locale.lang == "en":
+        return _DOCUMENT_TYPE_EN.get(canonical, canonical)
+    # A translated built-in label may be supplied while switching back.
+    reverse = {en: vi for vi, en in _DOCUMENT_TYPE_EN.items()}
+    return reverse.get(canonical, canonical)
+
+
+def add_localized_combo_items(combo, values, *, context: str = "") -> None:
+    """Add translated combo labels while retaining each canonical value.
+
+    Business forms historically read ``currentText()`` and therefore tied
+    presentation to persisted metadata.  Keeping the canonical value in
+    ``Qt.UserRole`` lets callers display English without changing the value
+    written to an archive or used in a repository query.
+    """
+    combo.setProperty("_scanindex_i18n_items", True)
+    combo.setProperty("_scanindex_i18n_context", context)
+    for value in values:
+        canonical = str(value)
+        display = (
+            localize_document_type(canonical)
+            if context == "document_type"
+            else localize_text(canonical)
+        )
+        combo.addItem(display, canonical)
+
+
+def combo_value(combo) -> str:
+    """Return a combo's canonical value, or typed text for editable combos."""
+    try:
+        index = combo.currentIndex()
+        if index >= 0:
+            data = combo.itemData(index)
+            if data is not None:
+                return str(data)
+        return str(combo.currentText())
+    except Exception:
+        return ""
+
+
+def set_combo_value(combo, value) -> None:
+    """Select a canonical value without depending on its translated label."""
+    canonical = str(value or "")
+    try:
+        index = combo.findData(canonical)
+        if index >= 0:
+            combo.setCurrentIndex(index)
+            return
+        combo.setCurrentText(canonical)
+    except Exception:
+        pass
+
+
+def _localize_item_text(source: str, context: str = "") -> str:
+    if context == "secret_note":
+        return "; ".join(localize_text(part) for part in source.split("; "))
+    return localize_text(source)
+
+
+def set_translatable_item_text(
+    item, source_text, *, context: str = "", sync_tooltip: bool = False,
+) -> None:
+    """Set a table/tree item's UI text while retaining its canonical source."""
+    try:
+        from PySide6.QtCore import Qt
+        role = int(Qt.ItemDataRole.UserRole) + 197
+        source = str(source_text or "")
+        item.setData(role, source)
+        item.setData(role + 1, context)
+        item.setData(role + 2, bool(sync_tooltip))
+        translated = _localize_item_text(source, context)
+        item.setText(translated)
+        if sync_tooltip:
+            item.setToolTip(translated)
+    except Exception:
+        pass
+
+
+def retranslate_widget_tree(root, *, include_children: bool = True) -> None:
+    """Apply the selected language to translatable properties below *root*.
+
+    The function intentionally translates only strings present in the source
+    catalog.  Filenames, OCR text, metadata, and other user/document content
+    therefore pass through unchanged even when they live in the same widgets.
+    """
+    if root is None:
+        return
+    try:
+        from PySide6.QtCore import Qt
+        from PySide6.QtGui import QAction
+        from PySide6.QtWidgets import (
+            QAbstractButton, QComboBox, QDialogButtonBox, QGroupBox,
+            QInputDialog, QLabel, QDoubleSpinBox, QLineEdit, QListWidget,
+            QMessageBox, QPlainTextEdit, QProgressDialog, QSpinBox,
+            QTabWidget, QTableWidget, QTextEdit, QTreeWidget, QWidget,
+        )
+    except Exception:
+        return
+
+    objects = [root]
+    if include_children:
+        try:
+            objects.extend(root.findChildren(QWidget))
+            objects.extend(root.findChildren(QAction))
+        except Exception:
+            pass
+
+    def apply_property(obj, getter_name: str, setter_name: str) -> None:
+        getter = getattr(obj, getter_name, None)
+        setter = getattr(obj, setter_name, None)
+        if not callable(getter) or not callable(setter):
+            return
+        try:
+            current = getter()
+            updated = localize_text(current)
+            if updated != current:
+                setter(updated)
+        except Exception:
+            pass
+
+    for obj in objects:
+        if isinstance(obj, QWidget) and obj.property("_scanindex_i18n_skip"):
+            continue
+        if isinstance(obj, (QLabel, QAbstractButton, QAction, QMessageBox)):
+            apply_property(obj, "text", "setText")
+        if isinstance(obj, QMessageBox):
+            apply_property(obj, "informativeText", "setInformativeText")
+            apply_property(obj, "detailedText", "setDetailedText")
+            standard_sources = (
+                (QMessageBox.StandardButton.Ok, "OK"),
+                (QMessageBox.StandardButton.Save, "Save"),
+                (QMessageBox.StandardButton.Discard, "Discard"),
+                (QMessageBox.StandardButton.Cancel, "Cancel"),
+                (QMessageBox.StandardButton.Close, "Close"),
+                (QMessageBox.StandardButton.Yes, "Yes"),
+                (QMessageBox.StandardButton.No, "No"),
+                (QMessageBox.StandardButton.Retry, "Retry"),
+                (QMessageBox.StandardButton.Apply, "Apply"),
+                (QMessageBox.StandardButton.Reset, "Reset"),
+                (QMessageBox.StandardButton.RestoreDefaults,
+                 "Restore defaults"),
+            )
+            for standard, source in standard_sources:
+                button = obj.button(standard)
+                if button is not None:
+                    button.setText(localize_text(source))
+        if isinstance(obj, QDialogButtonBox):
+            standard_sources = (
+                (QDialogButtonBox.StandardButton.Ok, "OK"),
+                (QDialogButtonBox.StandardButton.Save, "Save"),
+                (QDialogButtonBox.StandardButton.Discard, "Discard"),
+                (QDialogButtonBox.StandardButton.Cancel, "Cancel"),
+                (QDialogButtonBox.StandardButton.Close, "Close"),
+                (QDialogButtonBox.StandardButton.Yes, "Yes"),
+                (QDialogButtonBox.StandardButton.No, "No"),
+                (QDialogButtonBox.StandardButton.Retry, "Retry"),
+                (QDialogButtonBox.StandardButton.Apply, "Apply"),
+                (QDialogButtonBox.StandardButton.Reset, "Reset"),
+                (QDialogButtonBox.StandardButton.RestoreDefaults,
+                 "Restore defaults"),
+            )
+            for standard, source in standard_sources:
+                button = obj.button(standard)
+                if button is not None:
+                    button.setText(localize_text(source))
+        if isinstance(obj, QGroupBox):
+            apply_property(obj, "title", "setTitle")
+        if isinstance(obj, (QLineEdit, QTextEdit, QPlainTextEdit)):
+            apply_property(obj, "placeholderText", "setPlaceholderText")
+        if isinstance(obj, (QSpinBox, QDoubleSpinBox)):
+            apply_property(obj, "prefix", "setPrefix")
+            apply_property(obj, "suffix", "setSuffix")
+        if isinstance(obj, QProgressDialog):
+            apply_property(obj, "labelText", "setLabelText")
+        if isinstance(obj, QInputDialog):
+            apply_property(obj, "labelText", "setLabelText")
+        if isinstance(obj, QWidget):
+            apply_property(obj, "windowTitle", "setWindowTitle")
+            apply_property(obj, "toolTip", "setToolTip")
+            apply_property(obj, "statusTip", "setStatusTip")
+            apply_property(obj, "whatsThis", "setWhatsThis")
+        if isinstance(obj, QComboBox):
+            for index in range(obj.count()):
+                # Only translate items with a separate canonical value. This
+                # prevents display translation from mutating model names,
+                # certificate names, filenames, and other user data.
+                if obj.itemData(index, Qt.ItemDataRole.UserRole) is None:
+                    continue
+                current = obj.itemText(index)
+                if obj.property("_scanindex_i18n_items"):
+                    canonical = obj.itemData(index, Qt.ItemDataRole.UserRole)
+                    if obj.property("_scanindex_i18n_context") == "document_type":
+                        updated = localize_document_type(canonical)
+                    else:
+                        updated = localize_text(canonical)
+                else:
+                    updated = localize_text(current)
+                if updated != current:
+                    obj.setItemText(index, updated)
+        if isinstance(obj, QTabWidget):
+            for index in range(obj.count()):
+                current = obj.tabText(index)
+                updated = localize_text(current)
+                if updated != current:
+                    obj.setTabText(index, updated)
+        if isinstance(obj, QTableWidget):
+            for col in range(obj.columnCount()):
+                item = obj.horizontalHeaderItem(col)
+                if item is not None:
+                    item.setText(localize_text(item.text()))
+            for row in range(obj.rowCount()):
+                for col in range(obj.columnCount()):
+                    item = obj.item(row, col)
+                    if item is None:
+                        continue
+                    source = item.data(int(Qt.ItemDataRole.UserRole) + 197)
+                    if source is not None:
+                        context = item.data(
+                            int(Qt.ItemDataRole.UserRole) + 198
+                        ) or ""
+                        translated = _localize_item_text(
+                            str(source), str(context)
+                        )
+                        item.setText(translated)
+                        if item.data(int(Qt.ItemDataRole.UserRole) + 199):
+                            item.setToolTip(translated)
+            for row in range(obj.rowCount()):
+                item = obj.verticalHeaderItem(row)
+                if item is not None:
+                    item.setText(localize_text(item.text()))
+        if isinstance(obj, QTreeWidget):
+            header = obj.headerItem()
+            if header is not None:
+                for col in range(header.columnCount()):
+                    header.setText(col, localize_text(header.text(col)))
+
+
+def install_event_filter(app) -> None:
+    """Translate newly shown dialogs/widgets, including static QMessageBoxes."""
+    try:
+        from PySide6.QtCore import QEvent, QObject
+        from PySide6.QtWidgets import (
+            QListWidget, QTableWidget, QTreeWidget, QWidget,
+        )
+    except Exception:
+        return
+    if getattr(app, "_scanindex_i18n_filter", None) is not None:
+        return
+
+    class _UiTranslationFilter(QObject):
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self._busy = False
+
+        def eventFilter(self, watched, event):
+            event_type = event.type()
+            if (not self._busy and isinstance(watched, QWidget)
+                    and event_type in (
+                        QEvent.Type.Show,
+                        QEvent.Type.Polish,
+                        QEvent.Type.Paint,
+                    )):
+                self._busy = True
+                try:
+                    # Show/Polish translates the complete new dialog or
+                    # screen. Paint handles labels/statuses whose source text
+                    # changes later while the widget is already visible.
+                    retranslate_widget_tree(
+                        watched,
+                        include_children=event_type != QEvent.Type.Paint,
+                    )
+                    # Item views paint their contents on a viewport child;
+                    # translate their model/header items through the parent.
+                    if event_type == QEvent.Type.Paint:
+                        parent = watched.parentWidget()
+                        if parent is not None and isinstance(
+                            parent, (QTableWidget, QListWidget, QTreeWidget)
+                        ):
+                            retranslate_widget_tree(
+                                parent, include_children=False
+                            )
+                finally:
+                    self._busy = False
+            return False
+
+    event_filter = _UiTranslationFilter(app)
+    app.installEventFilter(event_filter)
+    app._scanindex_i18n_filter = event_filter

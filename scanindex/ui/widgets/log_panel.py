@@ -20,7 +20,8 @@ class LogPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._verbose = True
-        self._pending_logs: list[tuple[str, str]] = []
+        self._history: list[tuple[str, str, str]] = []
+        self._pending_logs: list[tuple[str, str, str]] = []
         self._setup_ui()
         self._setup_formats()
         self._flush_timer = QTimer(self)
@@ -92,7 +93,10 @@ class LogPanel(QWidget):
             return
 
         ts = time.strftime("[%H:%M:%S] ")
-        self._pending_logs.append((ts + msg + "\n", level))
+        entry = (ts, str(msg), level)
+        self._history.append(entry)
+        del self._history[:-2000]
+        self._pending_logs.append(entry)
         if not self._flush_timer.isActive():
             self._flush_timer.start()
 
@@ -105,12 +109,22 @@ class LogPanel(QWidget):
         cursor.movePosition(QTextCursor.MoveOperation.End)
         self.text_edit.setUpdatesEnabled(False)
         try:
-            for text, level in batch:
+            for timestamp, message, level in batch:
                 fmt = self._formats.get(level, self._formats[LOG_INFO])
-                cursor.insertText(text, fmt)
+                cursor.insertText(
+                    timestamp + translations.localize_text(message) + "\n",
+                    fmt,
+                )
             self.text_edit.setTextCursor(cursor)
         finally:
             self.text_edit.setUpdatesEnabled(True)
         self.text_edit.ensureCursorVisible()
         if self._pending_logs:
             self._flush_timer.start(0)
+
+    def update_texts(self) -> None:
+        """Retranslate retained log entries after a language change."""
+        self._flush_timer.stop()
+        self.text_edit.clear()
+        self._pending_logs = list(self._history)
+        self._flush_pending_logs()

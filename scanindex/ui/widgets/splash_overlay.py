@@ -15,6 +15,7 @@ from scanindex.ui.theme import (
     COLOR_ACCENT, COLOR_BORDER_DEFAULT, COLOR_HOVER, COLOR_SURFACE,
     COLOR_TEXT, COLOR_TEXT_MUTED, FONT_UI, RADIUS_LG, SP,
 )
+from scanindex.infra import translations
 
 
 class SplashOverlay(QWidget):
@@ -95,14 +96,14 @@ class SplashOverlay(QWidget):
     # ── public API ──────────────────────────────────────────────────────
 
     def show_loading(self, title: str, initial_status: str = "..."):
-        self._title_lbl.setText(title)
-        self._status_lbl.setText(initial_status)
+        self._title_lbl.setText(translations.localize_text(title))
+        self._status_lbl.setText(translations.localize_text(initial_status))
         self._resize_to_host()
         self.show()
         self.raise_()
 
     def set_status(self, text: str):
-        self._status_lbl.setText(text)
+        self._status_lbl.setText(translations.localize_text(text))
 
     # ── geometry ────────────────────────────────────────────────────────
 

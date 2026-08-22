@@ -16,6 +16,8 @@ import logging
 import threading
 from typing import Callable, Iterable
 
+from scanindex.infra import translations
+
 logger = logging.getLogger(__name__)
 
 
@@ -71,7 +73,8 @@ class ModelManager:
             log_cb(f"[ModelManager] No loader registered for '{group}'")
             return False
         try:
-            log_cb(f"Đang tải {GROUP_LABELS.get(group, group)}...")
+            label = translations.localize_text(GROUP_LABELS.get(group, group))
+            log_cb(translations.localize_text(f"Loading library {label}..."))
             loader(log_cb)
         except Exception as e:
             log_cb(f"[ModelManager] Load '{group}' failed: {e}")
@@ -90,7 +93,8 @@ class ModelManager:
         if releaser is None:
             return
         try:
-            log_cb(f"Đang giải phóng {GROUP_LABELS.get(group, group)}...")
+            label = translations.localize_text(GROUP_LABELS.get(group, group))
+            log_cb(translations.localize_text(f"Releasing {label}..."))
             releaser(log_cb)
         except Exception as e:
             log_cb(f"[ModelManager] Release '{group}' failed: {e}")

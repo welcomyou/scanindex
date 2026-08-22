@@ -258,6 +258,13 @@ class _KhoImportWorker(QThread):
             from scanindex.core.repository.indexer import HybridIndex
             from scanindex.core.repository.importer import Importer
             from scanindex.infra.data_versioning import get_active_db_filename
+            from scanindex.ui.repository.screen import (
+                _read_skip_duplicate_docs_setting,
+            )
+
+            # Honour the "Không lưu văn bản trùng thừa" setting (default
+            # ON): duplicates are skipped; OFF keeps them (still reported).
+            skip_duplicates = _read_skip_duplicate_docs_setting()
 
             res = None
             store = ArchiveStore(
@@ -272,6 +279,7 @@ class _KhoImportWorker(QThread):
                         self._codes, self._docs,
                         progress_cb=lambda p: self.progress.emit(p),
                         cancel_check=lambda: self._cancel,
+                        skip_duplicates=skip_duplicates,
                     )
                 finally:
                     idx.close()
@@ -663,7 +671,7 @@ class MainWindow(QMainWindow):
             try:
                 self.repository_screen.refresh_after_import()
             except Exception as e:
-                self.log(f"Kho refresh failed: {e}", LOG_ERROR)
+                self.log(f"Repository refresh failed: {e}", LOG_ERROR)
 
         # Passive screens (Settings, About, Kho lưu trữ — required=[]) MUST
         # NOT touch the loaded set: keep whatever a previous feature loaded
@@ -729,7 +737,7 @@ class MainWindow(QMainWindow):
             self._background_model_loading.add(group)
             label = GROUP_LABELS.get(group, group)
             self.signals.background_model_status.emit(
-                group, f"Loading thư viện {label}..."
+                group, f"Đang tải thư viện {label}..."
             )
 
             def worker(g=group):
@@ -770,7 +778,7 @@ class MainWindow(QMainWindow):
         self._background_model_loading.add(GROUP_ARCHIVE_SPLITTER)
         self.signals.background_model_status.emit(
             GROUP_ARCHIVE_SPLITTER,
-            "Loading LightGBM splitter...",
+            translations.localize_text("Loading LightGBM splitter..."),
         )
         self._refresh_digitization_model_status()
 
@@ -807,9 +815,9 @@ class MainWindow(QMainWindow):
             if self.model_manager.is_loaded(group) or group in self._background_model_loading:
                 continue
             self._background_model_loading.add(group)
-            label = GROUP_LABELS.get(group, group)
+            label = translations.localize_text(GROUP_LABELS.get(group, group))
             self.signals.background_model_status.emit(
-                group, f"Loading library {label}..."
+                group, translations.localize_text(f"Loading library {label}...")
             )
 
             def worker(g=group):
@@ -1056,6 +1064,8 @@ class MainWindow(QMainWindow):
             "model": "", "gpu": "CPU", "verbose": True,
             "correct": False, "export": True,
             "translate_vi": False,
+            "zip_include_canonical": True,
+            "skip_duplicate_docs": True,
             "show_log_panel": False,
             "kie_mode": None,
             "doc_types": doc_type_defaults,
@@ -1096,6 +1106,16 @@ class MainWindow(QMainWindow):
 
                 if "Correction" in self.config:
                     self._saved["model"] = self.config["Correction"].get("Model", "")
+
+                if "Export" in self.config:
+                    self._saved["zip_include_canonical"] = self.config["Export"].getboolean(
+                        "IncludeCanonicalZip", True
+                    )
+
+                if "Repository" in self.config:
+                    self._saved["skip_duplicate_docs"] = self.config["Repository"].getboolean(
+                        "SkipDuplicateDocs", True
+                    )
 
                 if "KIE" in self.config:
                     self._saved["kie_mode"] = self._normalize_kie_mode_setting(
@@ -1169,6 +1189,8 @@ class MainWindow(QMainWindow):
             catalogs=s.get("catalogs"),
             theme=s.get("theme", ACTIVE_THEME),
             translate_vi=s.get("translate_vi", False),
+            zip_include_canonical=s.get("zip_include_canonical", True),
+            skip_duplicate_docs=s.get("skip_duplicate_docs", True),
         )
 
         # Sync the visible PDF→Word toolbar checkbox with the persisted value.
@@ -1218,6 +1240,19 @@ class MainWindow(QMainWindow):
         }
         self._saved["correct"] = bool(vals.get("correct", False))
         self._saved["translate_vi"] = bool(vals.get("translate_vi", False))
+        self._saved["zip_include_canonical"] = bool(vals.get("zip_include_canonical", True))
+        self.config["Export"] = {
+            "IncludeCanonicalZip": str(self._saved["zip_include_canonical"]),
+        }
+        # [Repository] also carries the user's Kho `path` (written by the
+        # Kho screen); merge the option instead of replacing the section so
+        # saving settings never wipes the configured archive location.
+        self._saved["skip_duplicate_docs"] = bool(vals.get("skip_duplicate_docs", True))
+        if "Repository" not in self.config:
+            self.config["Repository"] = {}
+        self.config["Repository"]["SkipDuplicateDocs"] = str(
+            self._saved["skip_duplicate_docs"]
+        )
         self.config["Correction"] = {
             "Model": vals["model"],
             "Acceleration": "CPU",
@@ -1264,6 +1299,21 @@ class MainWindow(QMainWindow):
             self.config.remove_option("Meta", "auto_seeded")
             if not self.config.options("Meta"):
                 self.config.remove_section("Meta")
+        # The Kho screen can rewrite [Repository] path directly on disk while
+        # the app runs; refresh it from the file so this full rewrite never
+        # reverts the user's chosen archive location.
+        try:
+            if os.path.exists(settings_path):
+                _fresh = configparser.ConfigParser()
+                _fresh.read(settings_path, encoding="utf-8")
+                if _fresh.has_option("Repository", "path"):
+                    if "Repository" not in self.config:
+                        self.config["Repository"] = {}
+                    self.config["Repository"]["path"] = _fresh.get(
+                        "Repository", "path"
+                    )
+        except Exception:
+            pass
         try:
             with open(settings_path, "w", encoding="utf-8") as f:
                 self.config.write(f)
@@ -1360,6 +1410,14 @@ class MainWindow(QMainWindow):
         self.archive_tab.update_texts()
         self.settings_tab.update_texts()
         self.about_tab.update_texts()
+        self.support_tools_screen.update_texts()
+
+        # Newer/legacy screens use a gettext-style source catalog instead of
+        # keyed labels. Retranslate the complete live widget tree so changing
+        # language does not require rebuilding screens or losing their state.
+        translations.retranslate_widget_tree(self)
+        self.log_panel.update_texts()
+        self.repository_screen.update_texts()
 
         # Refresh file lists to update status translations
         self.refresh_file_list()
@@ -1548,9 +1606,12 @@ class MainWindow(QMainWindow):
     def add_files_dialog(self):
         files, _ = QFileDialog.getOpenFileNames(
             self,
-            "Select PDF or Image Files",
+            translations.localize_text("Select PDF or Image Files"),
             "",
-            "Documents (*.pdf *.png *.bmp *.jpeg *.jpg *.tif *.tiff);;PDF Files (*.pdf);;Image Files (*.png *.bmp *.jpeg *.jpg *.tif *.tiff)",
+            translations.localize_text(
+                "Documents (*.pdf *.png *.bmp *.jpeg *.jpg *.tif *.tiff);;"
+                "PDF Files (*.pdf);;Image Files (*.png *.bmp *.jpeg *.jpg *.tif *.tiff)"
+            ),
         )
         count = 0
         existing = {item["path"] for item in self.dnd_files}
@@ -1992,7 +2053,9 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
             self.archive_tab.set_documents([])
-        d = QFileDialog.getExistingDirectory(self, "Chọn thư mục chứa PDF")
+        d = QFileDialog.getExistingDirectory(
+            self, translations.localize_text("Chọn thư mục chứa PDF")
+        )
         if not d:
             return
 
@@ -2780,7 +2843,13 @@ class MainWindow(QMainWindow):
               └── METADATA/
                     ├── MetaDuLieu.xlsx     # 4 sheets: Hồ sơ / Văn bản / Ảnh / Video
                     ├── <stem-1>.pdf
+                    ├── <stem-1>.pdf.json.zst   # optional (setting, default on)
                     └── <stem-N>.pdf
+
+        When the "kèm .json.zst" setting is on (default), each PDF travels
+        with its canonical sidecar (OCR + KIE) so the ZIP can be re-imported
+        into Kho lưu trữ without re-running OCR/KIE; the receiving
+        PMKhoSohoa importer ignores the extra files.
 
         After success, offer to import the dossier into Kho."""
         # Flush pending form edits (Độ mật, Ngôn ngữ, …) into doc["metadata"]
@@ -2797,7 +2866,7 @@ class MainWindow(QMainWindow):
                                      "Chưa có hồ sơ để xuất. Hãy chạy Bước 2 trước.")
             return
         out_dir = QFileDialog.getExistingDirectory(
-            self, "Chọn thư mục để lưu file ZIP"
+            self, translations.localize_text("Chọn thư mục để lưu file ZIP")
         )
         if not out_dir:
             return
@@ -2808,6 +2877,9 @@ class MainWindow(QMainWindow):
             from scanindex.core.digitization.runner import write_aggregated_excel
 
             identity = self.archive_tab.session.identity
+            include_canonical = bool(self._saved.get("zip_include_canonical", True))
+            from scanindex.core.canonical_io import companion_for_pdf, resolve_companion
+
             export_docs = []
             skipped = 0
             for doc in documents:
@@ -2819,9 +2891,24 @@ class MainWindow(QMainWindow):
                 export_name = self._arc_export_pdf_name(
                     identity, stt, src
                 )
+                # Canonical sidecar (OCR + KIE) to bundle next to the PDF so
+                # the ZIP can re-enter Kho lưu trữ without re-running
+                # OCR/KIE. Resolved the same way `_arc_import_to_kho` does:
+                # the companion belongs to the Step-2 KIE PDF even when the
+                # exported PDF is the signed variant (established pairing).
+                canonical_path = ""
+                if include_canonical:
+                    kie_pdf = doc.get("output_path") or ""
+                    json_path = doc.get("json_path") or ""
+                    if not json_path and kie_pdf:
+                        json_path = str(companion_for_pdf(kie_pdf))
+                    if json_path:
+                        resolved = resolve_companion(json_path)
+                        canonical_path = str(resolved) if resolved is not None else ""
                 doc_for_export = dict(doc)
                 doc_for_export["export_source_path"] = src
                 doc_for_export["export_file_name"] = export_name
+                doc_for_export["canonical_path"] = canonical_path
                 export_docs.append(doc_for_export)
 
             if not export_docs:
@@ -2853,6 +2940,7 @@ class MainWindow(QMainWindow):
                         break
 
             copied = 0
+            companions = 0
             try:
                 with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
                     zf.write(excel_tmp_path, "HSLTCQ/METADATA/MetaDuLieu.xlsx")
@@ -2861,17 +2949,33 @@ class MainWindow(QMainWindow):
                         dst_name = doc["export_file_name"]
                         zf.write(src, f"HSLTCQ/METADATA/{dst_name}")
                         copied += 1
+                        # `<pdf>.json.zst` sits next to its PDF so re-import
+                        # resolves it via `companion_for_pdf`. PMKhoSohoa only
+                        # scans *.pdf + the workbook and ignores these.
+                        canonical = doc.get("canonical_path") or ""
+                        if canonical and os.path.isfile(canonical):
+                            zf.write(
+                                canonical,
+                                f"HSLTCQ/METADATA/{dst_name}.json.zst",
+                            )
+                            companions += 1
             finally:
                 try:
                     os.unlink(excel_tmp_path)
                 except Exception:
                     pass
 
-            self.log(
-                f"Archive: ZIP exported — {copied} PDF + Excel → {zip_path}"
-                + (f" ({skipped} skipped without source)" if skipped else ""),
-                LOG_SUCCESS,
+            zip_log = translations.localize_text(
+                f"Archive: ZIP exported — {copied} PDF + Excel"
             )
+            if include_canonical:
+                zip_log += f" + {companions} .json.zst"
+            zip_log += f" → {zip_path}"
+            if skipped:
+                zip_log += " " + translations.localize_text(
+                    f"({skipped} skipped without source)"
+                )
+            self.log(zip_log, LOG_SUCCESS)
         except Exception as e:
             self.log(f"Archive: Export failed: {e}", LOG_ERROR)
             QMessageBox.critical(self, "Lỗi", f"Xuất thất bại: {e}")
@@ -2976,6 +3080,17 @@ class MainWindow(QMainWindow):
             note=identity.chu_thich,
         )
 
+        self._run_kho_import(codes, docs_to_import)
+
+    def _run_kho_import(self, codes, docs_to_import: list[dict],
+                        *, offer_temp_cleanup: bool = True,
+                        progress_title: str = "Chuyển vào Kho"):
+        """Shared back-end for pushing a prepared dossier into Kho lưu trữ:
+        progress dialog + `_KhoImportWorker` + the Tantivy index hand-off.
+        Callers hand over fully-resolved entries (`pdf_path` +
+        `canonical_json_path`), so this serves both Step 3's "Chuyển vào Kho"
+        and the ZIP re-import paths (pre-extracted PDFs + bundled `.json.zst`
+        companions — no OCR/KIE re-run)."""
         from scanindex.ui.repository.screen import _read_archive_path_setting
         archive_path = _read_archive_path_setting()
 
@@ -2983,7 +3098,7 @@ class MainWindow(QMainWindow):
             "Đang chuyển vào Kho lưu trữ…", "Hủy",
             0, len(docs_to_import), self,
         )
-        progress.setWindowTitle("Chuyển vào Kho")
+        progress.setWindowTitle(progress_title)
         progress.setWindowModality(Qt.WindowModality.WindowModal)
         progress.setMinimumDuration(0)
         progress.setAutoClose(False)
@@ -3002,7 +3117,10 @@ class MainWindow(QMainWindow):
         try:
             self.repository_screen.release_index_for_writer()
         except Exception as e:
-            self.log(f"Archive: could not release Kho index: {e}", LOG_ERROR)
+            self.log(
+                f"Archive: could not release Repository index: {e}",
+                LOG_ERROR,
+            )
 
         def on_progress(p):
             done = p.imported + p.skipped + p.failed
@@ -3018,21 +3136,40 @@ class MainWindow(QMainWindow):
             try:
                 self.repository_screen.reopen_index_after_writer()
             except Exception as e:
-                self.log(f"Archive: could not reopen Kho index: {e}", LOG_ERROR)
+                self.log(
+                    f"Archive: could not reopen Repository index: {e}",
+                    LOG_ERROR,
+                )
 
         def on_finished_ok(result):
             progress.close()
             _reopen_kho()
-            msg = (f"Đã chuyển: {result.imported}\n"
-                   f"Bỏ qua (đã có trong Kho): {result.skipped}\n"
-                   f"Lỗi: {result.failed}\n\n"
-                   "Có thể tìm kiếm ngay.")
-            QMessageBox.information(self, "Chuyển vào Kho hoàn tất", msg)
-            self.log(
-                f"Archive: imported to Kho — {result.imported}/{result.total}",
-                LOG_SUCCESS,
+            # Snapshot for the summary: with dedup ON duplicates were
+            # skipped; with OFF they were kept (inside `imported`).
+            skip_duplicates_hint = bool(
+                self._saved.get("skip_duplicate_docs", True)
             )
-            if result.failed == 0 and result.imported > 0:
+            dup_kept = result.duplicates if not skip_duplicates_hint else 0
+            dup_skipped = result.duplicates - dup_kept
+            msg = translations.format_import_summary(
+                dossiers=1,
+                imported=result.imported,
+                duplicates=result.duplicates,
+                failed=result.failed,
+                duplicate_skipped=dup_skipped,
+                duplicate_kept=dup_kept,
+            )
+            QMessageBox.information(self, "Chuyển vào Kho hoàn tất", msg)
+            import_log = translations.localize_text(
+                f"Archive: imported into Repository — {result.imported}/{result.total}"
+            )
+            if result.duplicates:
+                import_log += translations.localize_text(
+                    f", {result.duplicates} duplicates"
+                )
+            self.log(import_log, LOG_SUCCESS)
+            if (offer_temp_cleanup
+                    and result.failed == 0 and result.imported > 0):
                 ask = QMessageBox.question(
                     self, "Xóa file tạm?",
                     "Hồ sơ đã được chuyển vào Kho an toàn.\n"
@@ -3043,14 +3180,17 @@ class MainWindow(QMainWindow):
                         self.archive_tab.reset_workflow()
                     except Exception as e:
                         self.log(
-                            f"Archive: cleanup after Kho import failed: {e}",
+                            f"Archive: cleanup after Repository import failed: {e}",
                             LOG_ERROR,
                         )
 
         def on_failed(error_msg):
             progress.close()
             _reopen_kho()
-            self.log(f"Archive: import to Kho failed: {error_msg}", LOG_ERROR)
+            self.log(
+                f"Archive: import to Repository failed: {error_msg}",
+                LOG_ERROR,
+            )
             QMessageBox.critical(
                 self, "Lỗi",
                 f"Chuyển vào Kho thất bại:\n{error_msg}",
@@ -3071,11 +3211,15 @@ class MainWindow(QMainWindow):
         worker.start()
 
     def _on_zip_dropped(self, zip_path: str):
-        """Reopen an exported archive ZIP (`<dossier>.zip`) into Step 2 so the
-        operator can fix metadata and re-export. The ZIP's MetaDuLieu.xlsx is
-        parsed back into identity + per-doc `metadata`; the PDFs are extracted
-        into the session temp dir so the viewer and Step 3 export both work
-        unchanged. The ZIP format itself is not modified."""
+        """Reopen an exported archive ZIP (`<dossier>.zip`). When the ZIP
+        bundles `.json.zst` sidecars (the "kèm .json.zst" export setting),
+        first offer to push the dossier straight into Kho lưu trữ — no
+        OCR/KIE re-run. Otherwise (or if declined) reopen it into Step 2 so
+        the operator can fix metadata and re-export: the ZIP's
+        MetaDuLieu.xlsx is parsed back into identity + per-doc `metadata`;
+        the PDFs are extracted into the session temp dir so the viewer and
+        Step 3 export both work unchanged. The ZIP format itself is not
+        modified."""
         from scanindex.core.digitization.zip_roundtrip import (
             parse_export_zip, ZipRoundtripError,
         )
@@ -3131,6 +3275,33 @@ class MainWindow(QMainWindow):
             self.log(f"Archive: ZIP load failed — {e}", LOG_ERROR)
             return
 
+        # Fast path: the ZIP carries canonical sidecars → offer a direct Kho
+        # import that skips OCR/KIE entirely. Everything `import_dossier`
+        # needs is already on the extracted docs (pdf_path + json_path +
+        # metadata), so no second extraction is required.
+        with_companion = [d for d in documents if d.get("json_path")]
+        if (with_companion and identity is not None
+                and identity.is_complete()):
+            ask = QMessageBox(self)
+            ask.setWindowTitle("Nhập vào Kho lưu trữ?")
+            ask.setIcon(QMessageBox.Icon.Question)
+            ask.setText(
+                "ZIP này có sẵn dữ liệu OCR/KIE ({n} văn bản).".format(
+                    n=len(with_companion)
+                )
+            )
+            ask.setInformativeText(
+                "Nhập thẳng vào Kho lưu trữ (không chạy lại OCR/KIE)?\n\n"
+                "Chọn “No” nếu muốn mở vào Bước 2 để chỉnh sửa thông tin."
+            )
+            ask.setStandardButtons(
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            ask.setDefaultButton(QMessageBox.StandardButton.Yes)
+            if ask.exec() == QMessageBox.StandardButton.Yes:
+                self._import_zip_documents_to_kho(identity, documents)
+                return
+
         session.identity = identity
 
         # Step 2 is the editing surface: switch to folder mode so the file
@@ -3167,6 +3338,74 @@ class MainWindow(QMainWindow):
         QMessageBox.information(
             self, get_text("arc_workflow_reset_title"),
             get_text("arc_step2_zip_loaded").format(n=len(documents)),
+        )
+
+    def _import_zip_documents_to_kho(self, identity, documents: list[dict]):
+        """Direct ZIP → Kho import (no OCR/KIE re-run) for docs already
+        extracted + parsed by `parse_export_zip`. Only docs carrying a
+        canonical `.json.zst` companion are importable on this path; the
+        rest are reported and skipped. Reuses the Step 3 worker flow via
+        `_run_kho_import`."""
+        from scanindex.core.repository.importer import DossierCodes
+
+        docs_to_import = []
+        skipped_no_data = 0
+        for doc in documents:
+            pdf_path = doc.get("pdf_path") or doc.get("output_path") or ""
+            json_path = doc.get("json_path") or ""
+            if not (pdf_path and os.path.exists(pdf_path)
+                    and json_path and os.path.exists(json_path)):
+                skipped_no_data += 1
+                continue
+            docs_to_import.append({
+                "pdf_path": pdf_path,
+                "canonical_json_path": json_path,
+                # Export PDFs are already `<identity>-NNN.pdf` — keep the
+                # name so Kho entries match the workbook's "Tên tệp".
+                "target_file_name": os.path.basename(pdf_path),
+                "metadata": dict(doc.get("metadata") or {}),
+            })
+
+        if not docs_to_import:
+            QMessageBox.warning(
+                self, "Nhập vào Kho lưu trữ",
+                "Không có văn bản hợp lệ để nhập (thiếu PDF hoặc dữ liệu "
+                "OCR/KIE kèm theo).",
+            )
+            return
+        if skipped_no_data:
+            self.log(
+                f"Archive: ZIP→Repository import — {skipped_no_data} doc(s) skipped "
+                "without .json.zst companion",
+                LOG_INFO,
+            )
+
+        codes = DossierCodes(
+            ma_dinh_danh=identity.ma_dinh_danh,
+            fonds=identity.ma_phong,
+            catalog=identity.muc_luc,
+            dossier_code=identity.ho_so,
+            fonds_name=getattr(identity, "ten_phong", ""),
+            catalog_name=getattr(identity, "ten_muc_luc", ""),
+            title=identity.title or f"Hồ sơ {identity.ho_so}",
+            is_unstructured=bool(getattr(identity, "is_unstructured", False)),
+            retention=identity.thoi_han_bao_quan,
+            term=(identity.nhiem_ky or "")[:10],
+            storage_unit=identity.ho_so,            # Đơn vị bảo quản số = ho_so
+            physical_state=identity.tinh_trang_vat_ly,
+            topic=identity.chuyen_de,
+            note=identity.chu_thich,
+        )
+        self.log(
+            f"Archive: ZIP→Repository import started — {len(docs_to_import)} doc(s)",
+            LOG_INFO,
+        )
+        # The ZIP extraction lives in the session temp dir; after a
+        # successful import offer to reset the workflow, which cleans it.
+        self._run_kho_import(
+            codes, docs_to_import,
+            offer_temp_cleanup=True,
+            progress_title="Nhập ZIP vào Kho",
         )
 
     # ================================================================

@@ -120,11 +120,11 @@ class SplashScreen(QDialog):
 
     def set_status(self, text: str):
         """Update the status line shown beneath the app name."""
-        self.lbl_status.setText(text)
+        self.lbl_status.setText(translations.localize_text(text))
 
     def _on_thread_done(self):
         self._on_done()
 
     def _on_error(self, msg):
-        self.lbl_status.setText(f"Error: {msg}")
+        self.lbl_status.setText(translations.localize_text(f"Error: {msg}"))
         self.lbl_status.setStyleSheet(f"color: red; background: transparent;")

@@ -852,7 +852,9 @@ class ArchiveStep2Kie(QWidget):
                 # type-to-filter (diacritic-insensitive) on top.
                 from scanindex.core.digitization.doctype import all_display_names
                 w = FuzzyComboBox()
-                w.addItems(all_display_names())
+                translations.add_localized_combo_items(
+                    w, all_display_names(), context="document_type"
+                )
                 w.setCurrentIndex(-1)             # blank by default
                 w.setFixedHeight(_H)
                 w.setStyleSheet(self._field_qss("QComboBox", invalid=True))
@@ -868,7 +870,7 @@ class ArchiveStep2Kie(QWidget):
                 # `sort=False` keeps the severity order (Thường → Tuyệt
                 # mật) instead of A-Z which would put Mật first.
                 w = FuzzyComboBox(sort=False)
-                w.addItems(_DO_MAT_OPTIONS)
+                translations.add_localized_combo_items(w, _DO_MAT_OPTIONS)
                 w.setCurrentIndex(0)              # default "Thường"
                 w.setFixedHeight(_H)
                 w.currentTextChanged.connect(
@@ -1023,6 +1025,7 @@ class ArchiveStep2Kie(QWidget):
         # Body: extracted text (set later by _refresh_raw_kie_panel)
         text_lbl = QLabel("—")
         text_lbl.setObjectName("RawKieText")
+        text_lbl.setProperty("_scanindex_i18n_skip", True)
         text_lbl.setWordWrap(True)
         text_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         text_lbl.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1246,7 +1249,7 @@ class ArchiveStep2Kie(QWidget):
         from PySide6.QtWidgets import QFileDialog
         path, _ = QFileDialog.getOpenFileName(
             self, translations.get_text("arc_step2_open_zip_title"),
-            "", "ZIP Files (*.zip)",
+            "", translations.localize_text("ZIP Files (*.zip)"),
         )
         if path:
             self.zip_dropped.emit(path)
@@ -1853,7 +1856,7 @@ class ArchiveStep2Kie(QWidget):
         elif key == "loai_van_ban":
             if not isinstance(widget, QComboBox):
                 return
-            text = widget.currentText().strip()
+            text = translations.combo_value(widget).strip()
             try:
                 from scanindex.core.digitization.doctype import all_display_names
                 valid = bool(text) and text in set(all_display_names())
@@ -1883,7 +1886,7 @@ class ArchiveStep2Kie(QWidget):
         old_block = widget.blockSignals(block_signals)
         try:
             if isinstance(widget, QComboBox):
-                widget.setCurrentText(str(value or ""))
+                translations.set_combo_value(widget, value)
             elif isinstance(widget, QTextEdit):
                 widget.setPlainText(str(value or ""))
             else:
@@ -1900,7 +1903,7 @@ class ArchiveStep2Kie(QWidget):
         if widget is None:
             return ""
         if isinstance(widget, QComboBox):
-            return widget.currentText().strip()
+            return translations.combo_value(widget).strip()
         if isinstance(widget, QTextEdit):
             value = widget.toPlainText().strip()
             if key == "co_quan_ban_hanh":
@@ -2674,7 +2677,7 @@ class ArchiveStep2Kie(QWidget):
         elif key == "loai_van_ban" and isinstance(widget, QComboBox):
             try:
                 from scanindex.core.digitization.doctype import all_display_names
-                invalid = widget.currentText().strip() not in set(all_display_names())
+                invalid = translations.combo_value(widget).strip() not in set(all_display_names())
             except Exception:
                 invalid = False
         selected = (key == self._active_form_field)

@@ -25,6 +25,7 @@ from scanindex.ui.theme import (
     COLOR_PANEL, COLOR_SURFACE, COLOR_TEXT, COLOR_TEXT_SECONDARY,
     FONT_MONO, FONT_UI, RADIUS_MD, SP,
 )
+from scanindex.infra import translations
 
 
 class _PdfDropZone(QFrame):
@@ -122,7 +123,10 @@ class _PdfDropZone(QFrame):
     def mousePressEvent(self, event: QMouseEvent):
         if event.button() == Qt.MouseButton.LeftButton:
             path, _ = QFileDialog.getOpenFileName(
-                self, "Chọn PDF đã OCR", "", "PDF (*.pdf)"
+                self,
+                translations.localize_text("Chọn PDF đã OCR"),
+                "",
+                translations.localize_text("PDF (*.pdf)"),
             )
             if path:
                 self.set_path(path)
@@ -145,12 +149,13 @@ class AccuracyScreen(ScreenContent):
     """So sánh OCR của phần mềm khác với phần mềm này (cùng đo bằng GT chung)."""
 
     log_message = Signal(str, str)  # (message, level)
-    _result_ready = Signal(str)     # report text (or error message)
+    _result_ready = Signal(object)  # ComparisonResult or localized error text
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self.setStyleSheet(f"background: {COLOR_BG};")
         self._user_pdf: str | None = None
+        self._last_result = None
         self._busy = False
         self._cancel_event = threading.Event()
         self._build_ui()
@@ -290,9 +295,9 @@ class AccuracyScreen(ScreenContent):
 
         target_dir = self._default_download_dir()
         dest, _ = QFileDialog.getSaveFileName(
-            self, "Lưu file mẫu",
+            self, translations.localize_text("Lưu file mẫu"),
             os.path.join(target_dir, accuracy_baseline.GT_PDF_NAME),
-            "PDF (*.pdf)",
+            translations.localize_text("PDF (*.pdf)"),
         )
         if not dest:
             return
@@ -349,20 +354,34 @@ class AccuracyScreen(ScreenContent):
 
     def _run_worker(self):
         try:
-            from scanindex.core.ocr.accuracy_metrics import compare_against_baseline, format_report
+            from scanindex.core.ocr.accuracy_metrics import compare_against_baseline
             result = compare_against_baseline(
                 self._user_pdf,
                 cancel_event=self._cancel_event,
                 log_cb=lambda m: self.log_message.emit(m, "info"),
             )
-            self._result_ready.emit(format_report(result))
+            self._result_ready.emit(result)
         except Exception as e:
             self.log_message.emit(f"Accuracy: {e}", "error")
-            self._result_ready.emit(f"Lỗi: {e}")
+            self._result_ready.emit(
+                translations.localize_text(f"Error: {e}")
+            )
 
-    def _on_result_ready(self, text: str):
+    def _on_result_ready(self, payload):
         # Slot chạy trên GUI thread (signal được auto-queue từ worker thread).
-        self.result.setPlainText(text)
+        if isinstance(payload, str):
+            self._last_result = None
+            self.result.setPlainText(payload)
+        else:
+            from scanindex.core.ocr.accuracy_metrics import format_report
+            self._last_result = payload
+            self.result.setPlainText(format_report(payload))
         self._busy = False
         self.btn_run.setEnabled(True)
         self.btn_download.setEnabled(True)
+
+    def update_texts(self) -> None:
+        """Refresh a retained comparison report after a language switch."""
+        if self._last_result is not None:
+            from scanindex.core.ocr.accuracy_metrics import format_report
+            self.result.setPlainText(format_report(self._last_result))

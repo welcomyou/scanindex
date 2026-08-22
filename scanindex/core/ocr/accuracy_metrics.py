@@ -116,18 +116,23 @@ def compare_against_baseline(
 
     from scanindex.core.ocr import accuracy_baseline
 
-    log_cb("Đọc text gốc (groundtruth.txt nếu có, không thì docx)...")
+    log_cb(
+        "Reading ground-truth text (groundtruth.txt when available, "
+        "otherwise DOCX)..."
+    )
     gt_text = accuracy_baseline.load_ground_truth_text()
 
-    log_cb("Lấy text OCR của phần mềm này (sẽ chạy lần đầu, cache về sau)...")
+    log_cb(
+        "Obtaining this application's OCR text (runs once, then uses cache)..."
+    )
     ours_text = accuracy_baseline.get_or_compute_our_ocr_text(log_cb, cancel_event)
     if cancel_event and cancel_event.is_set():
         raise RuntimeError("Đã hủy")
 
-    log_cb("Trích text từ PDF bạn tải lên...")
+    log_cb("Extracting text from the PDF you provided...")
     theirs_text = extract_text_from_pdf_layer(user_pdf_path)
 
-    log_cb("Tính CER/WER cho cả hai phía...")
+    log_cb("Calculating CER/WER for both results...")
     ours = compute_side_metrics(ours_text, gt_text)
     theirs = compute_side_metrics(theirs_text, gt_text)
 
@@ -152,6 +157,8 @@ def format_report(result: ComparisonResult) -> str:
 
     Bảng chỉ gồm CER và WER (theo yêu cầu hiển thị tinh gọn).
     """
+    from scanindex.infra import translations
+
     o, t = result.ours, result.theirs
 
     LABEL_W = 18   # chiều rộng cột nhãn (giữa hai dấu │)
@@ -175,17 +182,22 @@ def format_report(result: ComparisonResult) -> str:
         + "│" + "WER".center(NUM_W) + "│"
     )
     row1 = (
-        "│" + cell_label("Phần mềm này")
+        "│" + cell_label(translations.localize_text("This software"))
         + "│" + cell_pct(o.cer) + "│" + cell_pct(o.wer) + "│"
     )
     row2 = (
-        "│" + cell_label("Phần mềm của bạn")
+        "│" + cell_label(translations.localize_text("Your software"))
         + "│" + cell_pct(t.cer) + "│" + cell_pct(t.wer) + "│"
     )
 
     lines = [
-        "=== KẾT QUẢ SO SÁNH ĐỘ CHÍNH XÁC OCR ===",
-        f"Văn bản gốc: {result.gt_chars:,} ký tự / {result.gt_words:,} từ",
+        translations.localize_text(
+            "=== OCR ACCURACY COMPARISON RESULTS ==="
+        ),
+        translations.localize_text(
+            f"Ground truth: {result.gt_chars:,} characters / "
+            f"{result.gt_words:,} words"
+        ),
         "",
         top, header, sep, row1, row2, bottom,
         "",
@@ -194,23 +206,31 @@ def format_report(result: ComparisonResult) -> str:
     delta_pct = result.delta_char_acc * 100
     if result.verdict == "praise":
         lines.append(
-            f"✓ Tuyệt vời! OCR của bạn tốt hơn phần mềm này khoảng "
-            f"{abs(delta_pct):.2f} điểm (theo CER)."
+            translations.localize_text(
+                f"✓ Excellent! Your OCR is about {abs(delta_pct):.2f} "
+                "points better than this software (by CER)."
+            )
         )
     elif result.verdict == "tie":
         lines.append(
-            f"✓ Tốt. Chênh lệch chỉ {abs(delta_pct):.2f} điểm — "
-            f"hai bên ngang ngửa."
+            translations.localize_text(
+                f"✓ Good. The difference is only {abs(delta_pct):.2f} "
+                "points — the two results are comparable."
+            )
         )
     else:
         lines.append(
-            f"⚠ Cảnh báo: CER của OCR bạn cao hơn {abs(delta_pct):.2f} điểm "
-            f"so với phần mềm này. Nên kiểm tra lại cấu hình OCR."
+            translations.localize_text(
+                f"⚠ Warning: Your OCR CER is {abs(delta_pct):.2f} points "
+                "higher than this software. Check the OCR configuration."
+            )
         )
 
     lines.append("")
     lines.append(
-        "Ghi chú: CER = tỉ lệ lỗi ký tự, WER = tỉ lệ lỗi từ. "
-        "Càng thấp càng chính xác hơn."
+        translations.localize_text(
+            "Note: CER is the character error rate and WER is the word "
+            "error rate. Lower values are more accurate."
+        )
     )
     return "\n".join(lines)

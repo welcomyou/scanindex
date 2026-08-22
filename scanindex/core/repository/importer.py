@@ -487,6 +487,11 @@ class ImportProgress:
     imported: int = 0
     skipped: int = 0
     failed: int = 0
+    # Docs whose bytes duplicate another doc in the SAME dossier. When
+    # `skip_duplicates` is on (default) they are also counted in `skipped`;
+    # when off they are imported anyway but still counted here so the
+    # result dialog can report "trùng thừa".
+    duplicates: int = 0
     current_file: str = ""
     message: str = ""
 
@@ -550,6 +555,7 @@ class Importer:
                        documents: List[dict],
                        progress_cb: Optional[ProgressCallback] = None,
                        cancel_check: Optional[Callable[[], bool]] = None,
+                       skip_duplicates: bool = True,
                        ) -> ImportProgress:
         """Import one dossier whose docs are already OCRed.
 
@@ -558,6 +564,12 @@ class Importer:
         final artefact (signed > KIE-overlay) and the JSON is the canonical
         text+annotations file from Step 2. Caller is responsible for picking
         signed-vs-unsigned PDF.
+
+        `skip_duplicates=True` (default) drops PDFs whose bytes duplicate a
+        doc already in the SAME dossier (sha256 check); each dropped file is
+        counted in both `skipped` and `duplicates`. With False the duplicate
+        is still imported (unique suffixed doc_id) but remains counted in
+        `duplicates` for reporting.
         """
         prog = ImportProgress(total=len(documents))
         if not codes.ma_dinh_danh or not codes.fonds:
@@ -574,11 +586,14 @@ class Importer:
                 canonical = Path(entry["canonical_json_path"])
                 prog.current_file = pdf.name
                 try:
-                    inserted = self._import_one_with_canonical(
+                    inserted, duplicate = self._import_one_with_canonical(
                         pdf, canonical, codes, dossier_id,
                         target_file_name=entry.get("target_file_name") or "",
                         metadata=entry.get("metadata") or None,
+                        skip_duplicates=skip_duplicates,
                     )
+                    if duplicate:
+                        prog.duplicates += 1
                     if inserted:
                         prog.imported += 1
                     else:
@@ -655,7 +670,7 @@ class Importer:
                     continue
                 try:
                     kie_fields = _xlsx_meta_to_kie_fields(doc_meta)
-                    inserted = self._import_one_pdf(
+                    inserted, _duplicate = self._import_one_pdf(
                         pdf, kie_fields, kie_annotation_json="",
                         codes=codes, dossier_id=dossier_id,
                         rename_strip_ocr=False,
@@ -770,7 +785,9 @@ class Importer:
                                    codes: DossierCodes,
                                    dossier_id: int,
                                    target_file_name: str = "",
-                                   metadata: Optional[dict] = None) -> bool:
+                                   metadata: Optional[dict] = None,
+                                   skip_duplicates: bool = True) -> tuple[bool, bool]:
+        """Returns `(inserted, is_duplicate)` — see `import_dossier`."""
         canonical = self._load_canonical(canonical_path)
         kie_fields = _extract_raw_kie_fields(canonical)
         kie_fields = _apply_step2_metadata_overrides(kie_fields, metadata)
@@ -784,6 +801,7 @@ class Importer:
             target_file_name=target_file_name,
             body_blocks=canonical_blocks,
             canonical_path=canonical_path,
+            skip_duplicates=skip_duplicates,
         )
 
     @staticmethod
@@ -801,17 +819,34 @@ class Importer:
                         rename_strip_ocr: bool,
                         target_file_name: str = "",
                         body_blocks: Optional[List[Block]] = None,
-                        canonical_path: Optional[Path] = None) -> bool:
+                        canonical_path: Optional[Path] = None,
+                        skip_duplicates: bool = True) -> tuple[bool, bool]:
+        """Insert one document. Returns `(inserted, is_duplicate)`.
+
+        `skip_duplicates=True`: a PDF whose sha256 already exists in the
+        same dossier is NOT inserted (returns `(False, True)`). With False
+        it is inserted anyway under a suffixed doc_id (returns
+        `(True, True)`). Duplicates in OTHER dossiers are always allowed —
+        the archive standard keeps per-dossier copies."""
         sha = _file_sha256(pdf)
+        duplicate = False
         conn = self.store.connect()
-        existing_same_dossier = conn.execute(
-            "SELECT doc_id FROM documents "
-            "WHERE sha256 = ? AND dossier_id = ? AND indexed_status != 'deleted' "
-            "LIMIT 1",
-            (sha, dossier_id),
-        ).fetchone()
-        if existing_same_dossier is not None:
-            return False
+        if skip_duplicates:
+            existing_same_dossier = conn.execute(
+                "SELECT doc_id FROM documents "
+                "WHERE sha256 = ? AND dossier_id = ? AND indexed_status != 'deleted' "
+                "LIMIT 1",
+                (sha, dossier_id),
+            ).fetchone()
+            if existing_same_dossier is not None:
+                return False, True
+        else:
+            duplicate = conn.execute(
+                "SELECT doc_id FROM documents "
+                "WHERE sha256 = ? AND dossier_id = ? AND indexed_status != 'deleted' "
+                "LIMIT 1",
+                (sha, dossier_id),
+            ).fetchone() is not None
         doc_id = _allocate_document_instance_id(conn, sha, dossier_id)
 
         # Files inside Kho live under per-dossier subfolder using canonical
@@ -826,6 +861,18 @@ class Importer:
             / codes.dossier_code
         )
         target_pdf = target_subdir / target_name
+        if duplicate and target_pdf.exists():
+            # Keeping a duplicate copy (skip_duplicates=False): the first
+            # copy already occupies `target_name`. Suffix the kept copy so
+            # each DB row owns a distinct physical file (deleting one row
+            # must never orphan the other).
+            for n in range(2, 1000):
+                alt = f"{target_pdf.stem}-{n}{target_pdf.suffix}"
+                candidate = target_subdir / alt
+                if not candidate.exists():
+                    target_name = alt
+                    target_pdf = candidate
+                    break
         _replace_pdf_file(pdf, target_pdf)
         _copy_companion_if_present(canonical_path or pdf, target_pdf)
 
@@ -881,7 +928,7 @@ class Importer:
             "UPDATE chunks SET indexed_status = 'indexed' WHERE doc_id = ?",
             (doc_id,),
         )
-        return True
+        return True, duplicate
 
     # ---------- Per-chunk insert helpers (v2) ----------
 

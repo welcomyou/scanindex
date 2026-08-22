@@ -201,6 +201,33 @@ class SettingsTab(QWidget):
     def _build_archive_data_section(self):
         card = SectionCard("Dữ liệu Kho lưu trữ")
 
+        # Bundle the canonical .json.zst sidecar next to each PDF inside the
+        # exported HSLTCQ.zip. Default ON: the sidecar lets the ZIP be
+        # re-imported into Kho lưu trữ without re-running OCR/KIE.
+        # PMKhoSohoa only scans HSLTCQ/METADATA/*.pdf + the workbook, so the
+        # extra files are inert on the receiving system.
+        self.chk_zip_include_canonical = QCheckBox(
+            translations.get_text("chk_zip_include_canonical")
+        )
+        self.chk_zip_include_canonical.setChecked(True)
+        self.chk_zip_include_canonical.setToolTip(
+            translations.get_text("tooltip_zip_include_canonical")
+        )
+        card.content_layout().addWidget(self.chk_zip_include_canonical)
+
+        # Skip byte-identical PDFs when importing into Kho (sha256 per
+        # dossier). Default ON — the historic behaviour. Turning it off
+        # keeps duplicate copies (e.g. bản gốc + bản sao y) with the
+        # import summary still reporting how many were duplicates.
+        self.chk_skip_duplicate_docs = QCheckBox(
+            translations.get_text("chk_skip_duplicate_docs")
+        )
+        self.chk_skip_duplicate_docs.setChecked(True)
+        self.chk_skip_duplicate_docs.setToolTip(
+            translations.get_text("tooltip_skip_duplicate_docs")
+        )
+        card.content_layout().addWidget(self.chk_skip_duplicate_docs)
+
         desc = QLabel(
             "Reset dữ liệu kho sẽ xóa toàn bộ hồ sơ, PDF, chỉ mục tìm kiếm và cơ sở dữ liệu trong Kho hiện tại."
         )
@@ -532,7 +559,9 @@ class SettingsTab(QWidget):
                    doc_types: list[str] | None = None,
                    catalogs: dict | None = None,
                    theme: str = "dark",
-                   translate_vi: bool = False):
+                   translate_vi: bool = False,
+                   zip_include_canonical: bool = True,
+                   skip_duplicate_docs: bool = True):
         self._wait_page_value = wait_page
         self._compare_value = compare_int
         self.entry_concurrency.setText(concurrency)
@@ -544,6 +573,8 @@ class SettingsTab(QWidget):
         self.combo_model.blockSignals(False)
         self.chk_correct_enabled.setChecked(bool(correct))
         self.chk_translate_vi.setChecked(bool(translate_vi))
+        self.chk_zip_include_canonical.setChecked(bool(zip_include_canonical))
+        self.chk_skip_duplicate_docs.setChecked(bool(skip_duplicate_docs))
         self.chk_verbose.setChecked(verbose)
         self.chk_show_log_panel.setChecked(show_log_panel)
         # Map config key → display index
@@ -578,6 +609,8 @@ class SettingsTab(QWidget):
             "model": self.combo_model.currentText(),
             "correct": self.chk_correct_enabled.isChecked(),
             "translate_vi": self.chk_translate_vi.isChecked(),
+            "zip_include_canonical": self.chk_zip_include_canonical.isChecked(),
+            "skip_duplicate_docs": self.chk_skip_duplicate_docs.isChecked(),
             "verbose": self.chk_verbose.isChecked(),
             "show_log_panel": self.chk_show_log_panel.isChecked(),
             "kie_mode": kie_mode,
@@ -599,6 +632,18 @@ class SettingsTab(QWidget):
         self.btn_save.setText(translations.get_text("btn_save_settings"))
         self.chk_correct_enabled.setText(translations.get_text("chk_correct_enabled"))
         self.chk_translate_vi.setText(translations.get_text("chk_translate_vi"))
+        self.chk_zip_include_canonical.setText(
+            translations.get_text("chk_zip_include_canonical")
+        )
+        self.chk_zip_include_canonical.setToolTip(
+            translations.get_text("tooltip_zip_include_canonical")
+        )
+        self.chk_skip_duplicate_docs.setText(
+            translations.get_text("chk_skip_duplicate_docs")
+        )
+        self.chk_skip_duplicate_docs.setToolTip(
+            translations.get_text("tooltip_skip_duplicate_docs")
+        )
         self.chk_show_log_panel.setText(translations.get_text("chk_show_log_panel"))
         self.chk_verbose.setText(translations.get_text("chk_verbose_log"))
         self.lbl_desc.setText(translations.get_text("lbl_settings_desc"))

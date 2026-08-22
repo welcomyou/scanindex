@@ -154,6 +154,12 @@ class SupportToolsScreen(ScreenContent):
             if tool.is_busy():
                 tool.request_cancel()
 
+    def update_texts(self) -> None:
+        for tool in self._tools.values():
+            updater = getattr(tool, "update_texts", None)
+            if callable(updater):
+                updater()
+
     def cleanup(self) -> None:
         """Persist each tool's state on exit (e.g. the bulk-signing tool's
         stamp image / OCR option). Tools without ``cleanup`` are skipped."""

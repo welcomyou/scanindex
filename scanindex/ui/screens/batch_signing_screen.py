@@ -40,6 +40,7 @@ from scanindex.ui.theme import (
     COLOR_TEXT, COLOR_TEXT_MUTED, COLOR_TEXT_SECONDARY, FONT_UI,
 )
 from scanindex.ui.widgets.signing_config_panel import SigningConfigPanel
+from scanindex.infra import translations
 
 # Reuse the archive Step 3 signing primitives — no duplication.
 from scanindex.ui.digitization.signing_step import (
@@ -729,7 +730,10 @@ class BatchSigningScreen(ScreenContent):
     def _pick_input_dir(self):
         if self._worker and self._worker.isRunning():
             return
-        folder = QFileDialog.getExistingDirectory(self, "Chọn thư mục đầu vào (chứa PDF)")
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            translations.localize_text("Chọn thư mục đầu vào (chứa PDF)"),
+        )
         if not folder:
             return
         self._input_dir = os.path.abspath(folder)
@@ -743,7 +747,10 @@ class BatchSigningScreen(ScreenContent):
         self._load_files()
 
     def _pick_output_dir(self):
-        folder = QFileDialog.getExistingDirectory(self, "Chọn thư mục đầu ra (PDF đã ký)")
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            translations.localize_text("Chọn thư mục đầu ra (PDF đã ký)"),
+        )
         if not folder:
             return
         self._output_dir = os.path.abspath(folder)
@@ -810,8 +817,12 @@ class BatchSigningScreen(ScreenContent):
 
     def _set_table_item(self, row: int, col: int, text: str, tooltip: str = "", status: str = ""):
         cell = QTableWidgetItem(text or "")
+        if status:
+            translations.set_translatable_item_text(cell, text)
         if tooltip:
-            cell.setToolTip(tooltip)
+            cell.setToolTip(
+                translations.localize_text(tooltip) if status else tooltip
+            )
         if status:
             color = (
                 COLOR_GREEN if status.startswith("Đã ký")

@@ -464,7 +464,7 @@ class ArchiveStep1Split(QWidget):
             return
         path, _ = QFileDialog.getOpenFileName(
             self, translations.get_text("arc_step1_pick_pdf_title"),
-            "", "PDF Files (*.pdf)",
+            "", translations.localize_text("PDF Files (*.pdf)"),
         )
         if path:
             self._load_pdf(path)

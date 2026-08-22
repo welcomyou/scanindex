@@ -107,14 +107,14 @@ def get_or_compute_our_ocr_text(
     if not os.path.exists(pdf):
         raise FileNotFoundError(f"Không tìm thấy {pdf}")
 
-    log_cb("Lần đầu chạy: đang OCR file mẫu để làm cơ sở so sánh...")
+    log_cb("First run: OCRing the sample file to create a comparison baseline...")
     text = _ocr_groundtruth_pdf(pdf, log_cb, cancel_event)
 
     cache = get_ours_cache_path()
     os.makedirs(os.path.dirname(cache), exist_ok=True)
     with open(cache, "w", encoding="utf-8") as f:
         f.write(text)
-    log_cb(f"Đã lưu cache: {cache}")
+    log_cb(f"Cache saved: {cache}")
     return text
 
 

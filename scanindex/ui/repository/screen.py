@@ -64,6 +64,7 @@ from scanindex.ui.theme import (
 from scanindex.ui.widgets.fuzzy_combobox import FuzzyComboBox
 from scanindex.ui.widgets.pdf_viewer_widget import PdfViewerWidget
 from scanindex.infra.paths import get_base_dir
+from scanindex.infra import translations
 
 from scanindex.core.repository import constants as C
 from scanindex.core.repository.store import ArchiveStore
@@ -231,6 +232,94 @@ class _AddFilesWorker(QThread):
         except Exception as e:
             import traceback
             self.failed.emit(f"{e}\n{traceback.format_exc()}")
+
+
+class _ZipKhoImportWorker(QThread):
+    """Import dossiers parsed from exported ZIPs (PDFs + canonical
+    `.json.zst` sidecars) into Kho — no OCR/KIE re-run. Handles one or many
+    ZIP jobs with a single store/index session; emits an aggregate
+    ImportProgress across all jobs. Best-effort deletes every job's ZIP
+    extraction temp dir when done (each imported doc is copied into the
+    repo first)."""
+
+    progress = Signal(object)        # aggregate ImportProgress
+    finished_ok = Signal(object)     # aggregate ImportProgress
+    failed = Signal(str)
+
+    def __init__(self, archive_path, jobs: list[dict]):
+        """`jobs` — one entry per ZIP: {"codes", "docs", "temp_root"}."""
+        super().__init__()
+        self._archive_path = archive_path
+        self._jobs = list(jobs or [])
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
+
+    def run(self):
+        temp_roots = [
+            str(j.get("temp_root") or "") for j in self._jobs
+        ]
+        try:
+            from scanindex.core.repository.store import ArchiveStore
+            from scanindex.core.repository.indexer import HybridIndex
+            from scanindex.core.repository.importer import (
+                ImportProgress, Importer,
+            )
+            from scanindex.infra.data_versioning import get_active_db_filename
+
+            # Honour the "Không lưu văn bản trùng thừa" setting (default
+            # ON): duplicates are skipped; OFF keeps them (still reported).
+            skip_duplicates = _read_skip_duplicate_docs_setting()
+
+            total = sum(len(j.get("docs") or []) for j in self._jobs)
+            agg = ImportProgress(total=total)
+            store = ArchiveStore(
+                self._archive_path, db_filename=get_active_db_filename()
+            )
+            with store:
+                idx = HybridIndex(self._archive_path)
+                idx.open()
+                try:
+                    importer = Importer(store, idx)
+                    for job in self._jobs:
+                        # Per-job progress is re-based onto the aggregate so
+                        # the dialog shows one continuous counter.
+                        base = (agg.imported, agg.skipped, agg.failed)
+
+                        def _cb(p, base=base):
+                            self.progress.emit(ImportProgress(
+                                total=total,
+                                imported=base[0] + p.imported,
+                                skipped=base[1] + p.skipped,
+                                failed=base[2] + p.failed,
+                                current_file=p.current_file,
+                                message=p.message,
+                            ))
+
+                        res = importer.import_dossier(
+                            job["codes"], job["docs"],
+                            progress_cb=_cb,
+                            cancel_check=lambda: self._cancel,
+                            skip_duplicates=skip_duplicates,
+                        )
+                        if res is not None:
+                            agg.imported += res.imported
+                            agg.skipped += res.skipped
+                            agg.failed += res.failed
+                            agg.duplicates += res.duplicates
+                        if self._cancel:
+                            break
+                finally:
+                    idx.close()
+            self.finished_ok.emit(agg)
+        except Exception as e:
+            import traceback
+            self.failed.emit(f"{e}\n{traceback.format_exc()}")
+        finally:
+            for root in temp_roots:
+                if root:
+                    shutil.rmtree(root, ignore_errors=True)
 
 
 class _PrepareAddFileWorker(QThread):
@@ -405,6 +494,46 @@ def _read_repository_path_setting() -> Path:
 
 def _read_archive_path_setting() -> Path:
     return _read_repository_path_setting()
+
+
+def _read_zip_include_canonical_setting() -> bool:
+    """Whether dossier-ZIP exports should bundle each PDF's canonical
+    `.json.zst` sidecar (OCR + KIE) so the ZIP can be re-imported into Kho
+    without re-running OCR/KIE. Mirrors the Settings-tab checkbox; default
+    ON. Kept in sync with MainWindow's `[Export] IncludeCanonicalZip`."""
+    try:
+        from scanindex.infra.data_versioning import get_active_settings_path
+        cfg_path = Path(get_active_settings_path())
+        if cfg_path.exists():
+            cfg = configparser.ConfigParser()
+            cfg.read(cfg_path, encoding="utf-8")
+            if cfg.has_section("Export"):
+                return cfg.getboolean(
+                    "Export", "IncludeCanonicalZip", fallback=True
+                )
+    except Exception:
+        pass
+    return True
+
+
+def _read_skip_duplicate_docs_setting() -> bool:
+    """Whether Kho imports should skip byte-identical PDFs within one
+    dossier (sha256 dedup). Mirrors the Settings-tab checkbox; default ON
+    (historic behaviour). Kept in sync with MainWindow's
+    `[Repository] SkipDuplicateDocs`."""
+    try:
+        from scanindex.infra.data_versioning import get_active_settings_path
+        cfg_path = Path(get_active_settings_path())
+        if cfg_path.exists():
+            cfg = configparser.ConfigParser()
+            cfg.read(cfg_path, encoding="utf-8")
+            if cfg.has_section("Repository"):
+                return cfg.getboolean(
+                    "Repository", "SkipDuplicateDocs", fallback=True
+                )
+    except Exception:
+        pass
+    return True
 
 
 def _write_repository_path_setting(path: Path) -> None:
@@ -813,7 +942,7 @@ def _format_issue_org(issue_org: str | None,
     return name or superior
 
 
-def _file_summary_parts(file: "FileRow") -> list[str]:
+def _file_summary_parts(file: "FileRow", *, localized: bool = False) -> list[str]:
     parts: list[str] = []
     doc_number = _format_doc_number(file.doc_number)
     date = _format_issue_date(file.issue_date)
@@ -822,7 +951,10 @@ def _file_summary_parts(file: "FileRow") -> list[str]:
     if doc_number:
         parts.append(doc_number)
     if date:
-        parts.append(f"ngày {date}")
+        date_text = f"ngày {date}"
+        parts.append(
+            translations.localize_text(date_text) if localized else date_text
+        )
     if org:
         parts.append(org)
     if signer:
@@ -830,8 +962,9 @@ def _file_summary_parts(file: "FileRow") -> list[str]:
     return parts
 
 
-def _file_summary_text(file: "FileRow") -> str:
-    return ", ".join(_file_summary_parts(file))
+def _file_summary_text(file: "FileRow", *, localized: bool = False) -> str:
+    """Return the stable Vietnamese summary contract unless rendering UI."""
+    return ", ".join(_file_summary_parts(file, localized=localized))
 
 
 def _is_unstructured_dossier(dossier: "DossierRow") -> bool:
@@ -863,34 +996,41 @@ def _dossier_display_title(dossier: "DossierRow") -> str:
     if title:
         return title
     if _is_unstructured_dossier(dossier):
-        return "Hồ sơ chưa phân loại"
-    return _dossier_code_line(dossier) or "Hồ sơ"
+        return translations.localize_text("Hồ sơ chưa phân loại")
+    return _dossier_code_line(dossier) or translations.localize_text("Hồ sơ")
 
 
 def _dossier_stats_text(dossier: "DossierRow",
                         *,
                         doc_count: Optional[int] = None,
-                        page_count: Optional[int] = None) -> str:
+                        page_count: Optional[int] = None,
+                        localized: bool = False) -> str:
     docs = int(doc_count if doc_count is not None else (dossier.doc_count or 0))
     pages = int(page_count if page_count is not None else (dossier.page_count or 0))
     bits = []
     if docs:
-        bits.append(f"{docs} tài liệu")
+        value = f"{docs} tài liệu"
+        bits.append(translations.localize_text(value) if localized else value)
     if pages:
-        bits.append(f"{pages} trang")
+        value = f"{pages} trang"
+        bits.append(translations.localize_text(value) if localized else value)
     if dossier.start_date or dossier.end_date:
         span = " - ".join(filter(None, (dossier.start_date, dossier.end_date)))
         if span:
             bits.append(span)
     stored = _format_stored_at(getattr(dossier, "stored_at", None))
     if stored:
-        bits.append(f"Lưu kho: {stored}")
+        value = f"Lưu kho: {stored}"
+        bits.append(translations.localize_text(value) if localized else value)
     return " · ".join(bits)
 
 
-def _dossier_status_html(dossier: "DossierRow", *, doc_count: Optional[int] = None) -> str:
+def _dossier_status_html(dossier: "DossierRow", *, doc_count: Optional[int] = None,
+                         localized: bool = False) -> str:
     title = html.escape(_dossier_display_title(dossier))
-    stats = html.escape(_dossier_stats_text(dossier, doc_count=doc_count))
+    stats = html.escape(_dossier_stats_text(
+        dossier, doc_count=doc_count, localized=localized,
+    ))
     if not stats:
         return f"<span style='color:{COLOR_TEXT};font-weight:600'>{title}</span>"
     return (
@@ -902,13 +1042,15 @@ def _dossier_status_html(dossier: "DossierRow", *, doc_count: Optional[int] = No
 def _format_repo_stats(dossier_count: int,
                        doc_count: int,
                        page_count: int,
-                       chunk_count: int) -> str:
-    return (
+                       chunk_count: int,
+                       *, localized: bool = False) -> str:
+    value = (
         f"{int(dossier_count or 0)} hồ sơ · "
         f"{int(doc_count or 0)} tài liệu · "
         f"{int(page_count or 0)} trang · "
         f"{int(chunk_count or 0)} đoạn"
     )
+    return translations.localize_text(value) if localized else value
 
 
 def _reordered_doc_ids(doc_ids: List[str], dragged_doc_id: str,
@@ -1112,13 +1254,20 @@ def _set_card_active(card: QWidget, active: bool) -> None:
 
 
 class _GroupHeader(QLabel):
-    def __init__(self, text: str, parent=None):
-        super().__init__(text, parent)
+    def __init__(self, text: str, count: int, parent=None):
+        self._source_text = text
+        self._count = count
+        super().__init__(parent)
         self.setStyleSheet(
             f"color: {COLOR_TEXT_SECONDARY}; font: 700 11px '{FONT_UI}';"
             f" padding: 6px 4px 2px 4px; text-transform: uppercase;"
             " background: transparent; border: none;"
         )
+        self.update_texts()
+
+    def update_texts(self) -> None:
+        label = translations.localize_text(self._source_text)
+        self.setText(f"{label} ({self._count})")
 
 
 class _DossierCard(QFrame):
@@ -1153,17 +1302,18 @@ class _DossierCard(QFrame):
         # Left side: title + sub-info column (clickable area)
         left = QVBoxLayout()
         left.setSpacing(SP[1])
-        title = QLabel("📁 " + _dossier_display_title(dossier))
-        title.setWordWrap(True)
-        title.setStyleSheet(f"color: {COLOR_TEXT}; font: 600 13px '{FONT_UI}';")
-        left.addWidget(title)
+        self._title_label = QLabel()
+        self._title_label.setWordWrap(True)
+        self._title_label.setStyleSheet(f"color: {COLOR_TEXT}; font: 600 13px '{FONT_UI}';")
+        left.addWidget(self._title_label)
 
-        stats_text = _dossier_stats_text(dossier)
+        stats_text = _dossier_stats_text(dossier, localized=True)
+        self._stats_label = None
         if stats_text:
-            sub = QLabel(stats_text)
-            sub.setWordWrap(True)
-            sub.setStyleSheet(f"color: {COLOR_TEXT_MUTED}; font: 11px '{FONT_UI}';")
-            left.addWidget(sub)
+            self._stats_label = QLabel(stats_text)
+            self._stats_label.setWordWrap(True)
+            self._stats_label.setStyleSheet(f"color: {COLOR_TEXT_MUTED}; font: 11px '{FONT_UI}';")
+            left.addWidget(self._stats_label)
 
         codes_line = _dossier_code_line(dossier)
         if codes_line:
@@ -1191,6 +1341,14 @@ class _DossierCard(QFrame):
             self.dossier.dossier_id
         ))
         h.addWidget(btn_edit, 0, Qt.AlignmentFlag.AlignTop)
+        self.update_texts()
+
+    def update_texts(self) -> None:
+        self._title_label.setText("📁 " + _dossier_display_title(self.dossier))
+        if self._stats_label is not None:
+            self._stats_label.setText(
+                _dossier_stats_text(self.dossier, localized=True)
+            )
 
     def set_checked(self, checked: bool) -> None:
         self._cb.blockSignals(True)
@@ -1367,23 +1525,26 @@ class _FileCard(QFrame):
 
         v = QVBoxLayout()
         v.setSpacing(SP[1])
-        title_text = file.subject or file.file_name or "(không tiêu đề)"
-        title = QLabel(title_text)
-        title.setWordWrap(True)
-        title.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-        title.setStyleSheet(f"color: {COLOR_TEXT}; font: 600 13px '{FONT_UI}';")
-        v.addWidget(title)
+        title_text = file.subject or file.file_name or translations.localize_text("(không tiêu đề)")
+        self._title_label = QLabel(title_text)
+        self._title_label.setProperty("_scanindex_i18n_skip", True)
+        self._title_label.setWordWrap(True)
+        self._title_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._title_label.setStyleSheet(f"color: {COLOR_TEXT}; font: 600 13px '{FONT_UI}';")
+        v.addWidget(self._title_label)
 
-        meta_text = _file_summary_text(file)
+        meta_text = _file_summary_text(file, localized=True)
+        self._meta_label = None
         if meta_text:
-            meta = QLabel(meta_text)
-            meta.setWordWrap(True)
-            meta.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-            meta.setStyleSheet(f"color: {COLOR_TEXT_SECONDARY}; font: 11px '{FONT_UI}';")
-            v.addWidget(meta)
+            self._meta_label = QLabel(meta_text)
+            self._meta_label.setWordWrap(True)
+            self._meta_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+            self._meta_label.setStyleSheet(f"color: {COLOR_TEXT_SECONDARY}; font: 11px '{FONT_UI}';")
+            v.addWidget(self._meta_label)
 
         if file.file_name:
             fn = QLabel(f"📄 {file.file_name}")
+            fn.setProperty("_scanindex_i18n_skip", True)
             fn.setWordWrap(True)
             fn.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
             fn.setStyleSheet(
@@ -1391,6 +1552,14 @@ class _FileCard(QFrame):
             )
             v.addWidget(fn)
         h.addLayout(v, 1)
+
+    def update_texts(self) -> None:
+        if not (self.file.subject or self.file.file_name):
+            self._title_label.setText(translations.localize_text("(không tiêu đề)"))
+        if self._meta_label is not None:
+            self._meta_label.setText(
+                _file_summary_text(self.file, localized=True)
+            )
 
     def set_checked(self, checked: bool) -> None:
         self._cb.blockSignals(True)
@@ -1545,23 +1714,26 @@ class _SearchHitCard(QFrame):
         v.setSpacing(SP[1])
 
         f = hit.file_row
-        title_text = f.subject or f.file_name or "(không tiêu đề)"
-        title = QLabel(title_text)
-        title.setWordWrap(True)
-        title.setStyleSheet(f"color: {COLOR_TEXT}; font: 600 13px '{FONT_UI}';")
-        v.addWidget(title)
+        title_text = f.subject or f.file_name or translations.localize_text("(không tiêu đề)")
+        self._title_label = QLabel(title_text)
+        self._title_label.setProperty("_scanindex_i18n_skip", True)
+        self._title_label.setWordWrap(True)
+        self._title_label.setStyleSheet(f"color: {COLOR_TEXT}; font: 600 13px '{FONT_UI}';")
+        v.addWidget(self._title_label)
 
-        meta_text = _file_summary_text(f)
+        meta_text = _file_summary_text(f, localized=True)
+        self._meta_label = None
         if meta_text:
-            meta = QLabel(meta_text)
-            meta.setWordWrap(True)
-            meta.setStyleSheet(f"color: {COLOR_TEXT_SECONDARY}; font: 11px '{FONT_UI}';")
-            v.addWidget(meta)
+            self._meta_label = QLabel(meta_text)
+            self._meta_label.setWordWrap(True)
+            self._meta_label.setStyleSheet(f"color: {COLOR_TEXT_SECONDARY}; font: 11px '{FONT_UI}';")
+            v.addWidget(self._meta_label)
 
         # File name — segments split from the same long source PDF often
         # share KIE metadata; only the file name distinguishes them.
         if f.file_name:
             fn = QLabel(f"📄 {f.file_name}")
+            fn.setProperty("_scanindex_i18n_skip", True)
             fn.setWordWrap(True)
             fn.setStyleSheet(
                 f"color: {COLOR_GREEN}; font: 600 11px '{FONT_UI}';"
@@ -1570,22 +1742,39 @@ class _SearchHitCard(QFrame):
 
         # Footer: keep user-facing labels meaningful; raw scores are internal
         # ranking numbers, not percentages.
-        n = len(hit.chunks)
-        unit = "thông tin" if all(
+        self._footer = QLabel()
+        self._footer.setStyleSheet(f"color: {COLOR_TEXT_MUTED}; font: 10px '{FONT_UI}';")
+        v.addWidget(self._footer)
+        self.update_texts()
+
+    def update_texts(self) -> None:
+        f = self.hit.file_row
+        if not (f.subject or f.file_name):
+            self._title_label.setText(translations.localize_text("(không tiêu đề)"))
+        if self._meta_label is not None:
+            self._meta_label.setText(
+                _file_summary_text(self.hit.file_row, localized=True)
+            )
+        n = len(self.hit.chunks)
+        is_metadata = all(
             (getattr(c, "chunk_type", "body") or "body") == "metadata"
-            for c in hit.chunks
-        ) else "đoạn"
-        if hit.match_kind == "fuzzy":
-            count = int(hit.match_total or 0)
-            suffix = f" · {count} lần gần giống" if count > 0 else ""
-            footer_text = f"<span style='color:{COLOR_ACCENT}'>{n} {unit} gần giống</span>{suffix}"
+            for c in self.hit.chunks
+        )
+        if self.hit.match_kind == "fuzzy":
+            source = f"{n} thông tin gần giống" if is_metadata else f"{n} đoạn gần giống"
+            suffix_source = "{} lần gần giống"
         else:
-            count = int(hit.match_total or 0)
-            suffix = f" · {count} lần xuất hiện" if count > 0 else ""
-            footer_text = f"<span style='color:{COLOR_ACCENT}'>{n} {unit} khớp</span>{suffix}"
-        footer = QLabel(footer_text)
-        footer.setStyleSheet(f"color: {COLOR_TEXT_MUTED}; font: 10px '{FONT_UI}';")
-        v.addWidget(footer)
+            source = f"{n} thông tin khớp" if is_metadata else f"{n} đoạn khớp"
+            suffix_source = "{} lần xuất hiện"
+        count = int(self.hit.match_total or 0)
+        suffix = (
+            " · " + translations.localize_text(suffix_source.format(count))
+            if count > 0 else ""
+        )
+        self._footer.setText(
+            f"<span style='color:{COLOR_ACCENT}'>"
+            f"{translations.localize_text(source)}</span>{suffix}"
+        )
 
     def mousePressEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton:
@@ -1612,19 +1801,9 @@ class _SnippetCard(QFrame):
         v.setSpacing(SP[1])
 
         is_meta = (getattr(result, "chunk_type", "body") == "metadata")
-        if is_meta:
-            badge = "📋 Tóm tắt văn bản"
-        else:
-            badge = f"Trang {result.page or '?'}"
-        kind = getattr(result, "match_kind", "") or ""
-        if kind == "fuzzy":
-            suffix = " · gần giống"
-        else:
-            count = int(getattr(result, "match_count", 0) or 0)
-            suffix = f" · {count} lần" if count > 0 else ""
-        head = QLabel(f"<b style='color:{COLOR_ACCENT}'>{badge}</b>{suffix}")
-        head.setStyleSheet(f"color: {COLOR_TEXT_SECONDARY}; font: 11px '{FONT_UI}';")
-        v.addWidget(head)
+        self._head = QLabel()
+        self._head.setStyleSheet(f"color: {COLOR_TEXT_SECONDARY}; font: 11px '{FONT_UI}';")
+        v.addWidget(self._head)
 
         is_fuzzy = (getattr(result, "match_kind", "") or "") == "fuzzy"
         text = _snippet_context_text(
@@ -1637,11 +1816,37 @@ class _SnippetCard(QFrame):
             getattr(result, "query", "") or "",
             fuzzy=is_fuzzy,
         )
-        body = QLabel(body_html or "(không có nội dung)")
+        self._has_body_content = bool(body_html)
+        body = QLabel(
+            body_html or translations.localize_text("(không có nội dung)")
+        )
+        self._body = body
+        body.setProperty("_scanindex_i18n_skip", True)
         body.setTextFormat(Qt.TextFormat.RichText)
         body.setWordWrap(True)
         body.setStyleSheet(f"color: {COLOR_TEXT}; font: 12px '{FONT_UI}';")
         v.addWidget(body)
+        self.update_texts()
+
+    def update_texts(self) -> None:
+        is_meta = (getattr(self.result, "chunk_type", "body") == "metadata")
+        badge = (
+            "📋 " + translations.localize_text("Tóm tắt văn bản")
+            if is_meta
+            else translations.localize_text(f"Trang {self.result.page or '?'}")
+        )
+        kind = getattr(self.result, "match_kind", "") or ""
+        if kind == "fuzzy":
+            suffix = " · " + translations.localize_text("gần giống")
+        else:
+            count = int(getattr(self.result, "match_count", 0) or 0)
+            suffix = (
+                " · " + translations.localize_text(f"{count} lần")
+                if count > 0 else ""
+            )
+        self._head.setText(f"<b style='color:{COLOR_ACCENT}'>{badge}</b>{suffix}")
+        if not self._has_body_content:
+            self._body.setText(translations.localize_text("(không có nội dung)"))
 
     def mousePressEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton:
@@ -1666,6 +1871,11 @@ class _RightPanel(QWidget):
         super().__init__(parent)
         self.setStyleSheet(f"background: {COLOR_BG};")
         self._current_pdf: Optional[Path] = None
+        self._display_dossier: Optional[DossierRow] = None
+        self._display_file: Optional[FileRow] = None
+        self._display_chunks: list[SearchResult] = []
+        self._display_archive_path = Path()
+        self._display_message_source = ""
         self._snippet_cards_by_id: dict[int, _SnippetCard] = {}
         self._active_chunk_id = 0
         self._build_ui()
@@ -1676,7 +1886,10 @@ class _RightPanel(QWidget):
         v.setSpacing(SP[2])
 
         # File info card (always visible)
-        self._info_box = QLabel("Chọn 1 hồ sơ hoặc văn bản để xem chi tiết")
+        self._info_box = QLabel(
+            translations.localize_text("Chọn 1 hồ sơ hoặc văn bản để xem chi tiết")
+        )
+        self._info_box.setProperty("_scanindex_i18n_skip", True)
         self._info_box.setWordWrap(True)
         self._info_box.setTextFormat(Qt.TextFormat.RichText)
         self._info_box.setStyleSheet(
@@ -1748,27 +1961,33 @@ class _RightPanel(QWidget):
     # ------ public API ------
 
     def show_dossier(self, d: DossierRow):
+        self._display_message_source = ""
+        self._display_dossier = d
+        self._display_file = None
+        self._display_chunks = []
         display_fonds = d.fonds_name or d.fonds
         display_catalog = d.catalog_name or d.catalog
         rows = [
-            f"<b>📁 Hồ sơ:</b> {d.title or '(chưa đặt tên)'}",
+            translations.localize_text(
+                f"<b>📁 Hồ sơ:</b> {d.title or translations.localize_text('(chưa đặt tên)')}"
+            ),
         ]
         if not _is_unstructured_dossier(d):
-            rows.append(
+            rows.append(translations.localize_text(
                 f"<b>Phông / Mục lục / Hồ sơ:</b> "
                 f"{display_fonds} / {display_catalog} / {d.dossier_code}"
-            )
+            ))
         if d.doc_count:
-            rows.append(f"<b>Số văn bản:</b> {d.doc_count}")
+            rows.append(translations.localize_text(f"<b>Số văn bản:</b> {d.doc_count}"))
         if d.page_count:
-            rows.append(f"<b>Tổng số trang:</b> {d.page_count}")
+            rows.append(translations.localize_text(f"<b>Tổng số trang:</b> {d.page_count}"))
         if d.start_date or d.end_date:
             span = " – ".join(filter(None, (d.start_date, d.end_date)))
             if span:
-                rows.append(f"<b>Thời gian:</b> {span}")
+                rows.append(translations.localize_text(f"<b>Thời gian:</b> {span}"))
         stored = _format_stored_at(getattr(d, "stored_at", None))
         if stored:
-            rows.append(f"<b>Ngày lưu kho:</b> {stored}")
+            rows.append(translations.localize_text(f"<b>Ngày lưu kho:</b> {stored}"))
         self._info_box.setText("<br>".join(rows))
         self._active_chunk_id = 0
         self._snippet_cards_by_id.clear()
@@ -1777,27 +1996,35 @@ class _RightPanel(QWidget):
 
     def show_file(self, f: FileRow, archive_path: Path,
                   chunks: Optional[List[SearchResult]] = None):
+        self._display_message_source = ""
+        self._display_file = f
+        self._display_dossier = None
+        self._display_chunks = list(chunks or [])
+        self._display_archive_path = Path(archive_path)
         rows = []
         if f.dossier_title:
-            rows.append(f"<b>Hồ sơ:</b> {f.dossier_title}")
+            rows.append(translations.localize_text(f"<b>Hồ sơ:</b> {f.dossier_title}"))
         if f.subject:
-            rows.append(f"<b>Trích yếu:</b> {f.subject}")
-        meta_text = _file_summary_text(f)
+            rows.append(translations.localize_text(f"<b>Trích yếu:</b> {f.subject}"))
+        meta_text = _file_summary_text(f, localized=True)
         if meta_text:
-            rows.append(f"<b>Thông tin:</b> {meta_text}")
+            rows.append(translations.localize_text(f"<b>Thông tin:</b> {meta_text}"))
         if f.doc_type:
-            rows.append(f"<b>Loại văn bản:</b> {f.doc_type}")
+            doc_type = translations.localize_document_type(f.doc_type)
+            rows.append(translations.localize_text(f"<b>Loại văn bản:</b> {doc_type}"))
         if f.secrecy_mark:
             color = _secrecy_mark_color(f.secrecy_mark)
-            rows.append(
+            rows.append(translations.localize_text(
                 f"<b>Độ mật:</b> <span style='color:{color}'>{html.escape(f.secrecy_mark)}</span>"
-            )
+            ))
         if f.file_name:
-            rows.append(
+            rows.append(translations.localize_text(
                 f"<b>Tệp:</b> <span style='color:{COLOR_GREEN};"
                 f" font-weight:600'>{f.file_name}</span>"
-            )
-        self._info_box.setText("<br>".join(rows) or "(không có metadata)")
+            ))
+        self._info_box.setText(
+            "<br>".join(rows) or translations.localize_text("(không có metadata)")
+        )
 
         if f.file_path:
             pdf_abs = (archive_path / f.file_path).resolve()
@@ -1810,6 +2037,33 @@ class _RightPanel(QWidget):
         self.btn_edit_metadata.setEnabled(bool(f.doc_id))
 
         self._set_snippets(chunks or [])
+
+    def show_message(self, source_text: str) -> None:
+        self._display_dossier = None
+        self._display_file = None
+        self._display_chunks = []
+        self._display_message_source = str(source_text or "")
+        self._info_box.setText(
+            translations.localize_text(self._display_message_source)
+        )
+
+    def update_texts(self) -> None:
+        if self._display_message_source:
+            self.show_message(self._display_message_source)
+        elif self._display_file is not None:
+            self.show_file(
+                self._display_file,
+                self._display_archive_path,
+                self._display_chunks,
+            )
+        elif self._display_dossier is not None:
+            self.show_dossier(self._display_dossier)
+        else:
+            self._info_box.setText(
+                translations.localize_text(
+                    "Chọn 1 hồ sơ hoặc văn bản để xem chi tiết"
+                )
+            )
 
     # ------ internals ------
 
@@ -2278,10 +2532,12 @@ class _AddFileMetadataDialog(QWidget):
             if kind == "combo":
                 w = QComboBox()
                 w.setEditable(True)
-                w.addItems(all_display_names())
+                translations.add_localized_combo_items(
+                    w, all_display_names(), context="document_type"
+                )
                 current_text = initial_fields.get(col) or initial_doc_type
                 if current_text:
-                    w.setCurrentText(current_text)
+                    translations.set_combo_value(w, current_text)
                 w.setStyleSheet(
                     f"QComboBox {{ background: {COLOR_INPUT};"
                     f" border: 1px solid {COLOR_BORDER};"
@@ -2339,7 +2595,7 @@ class _AddFileMetadataDialog(QWidget):
             out = {}
             for col, w in widgets.items():
                 if isinstance(w, _QC):
-                    out[col] = w.currentText().strip()
+                    out[col] = translations.combo_value(w).strip()
                 elif isinstance(w, QTextEdit):
                     out[col] = w.toPlainText().strip()
                 else:
@@ -2402,7 +2658,12 @@ class RepositoryScreen(ScreenContent):
         self._prepare_add_worker: Optional[_PrepareAddFileWorker] = None
         self._add_worker: Optional[QThread] = None
         self._search_worker: Optional[SearchWorker] = None
+        self._zip_kho_worker: Optional[QThread] = None
         self._busy = False
+
+        # Accept dropping exported HSLTCQ ZIPs anywhere on this screen →
+        # direct Kho import (see dragEnterEvent / _import_zip_paths).
+        self.setAcceptDrops(True)
 
         self._mode = self._MODE_DOSSIERS
         self._current_dossier: Optional[DossierRow] = None
@@ -2739,6 +3000,21 @@ class RepositoryScreen(ScreenContent):
         # "Import folder…" removed: import path is now Số hóa lưu trữ
         # → Bước 3 → "Chuyển vào Kho". Direct folder import is gone so
         # there's exactly ONE place to ingest data into Kho.
+        # Exception: "Nhập từ ZIP" below — it does not create new data, it
+        # re-ingests a dossier this app itself exported (with its canonical
+        # sidecars), so no OCR/KIE is involved.
+
+        self.btn_import_zip = QPushButton("Nhập từ ZIP")
+        self.btn_import_zip.setToolTip(
+            "Nhập một hoặc nhiều file ZIP hồ sơ đã xuất (kèm .json.zst) vào "
+            "Kho — không chạy lại OCR/KIE. Có thể kéo thả trực tiếp các file "
+            "ZIP vào màn hình này."
+        )
+        self.btn_import_zip.setFixedHeight(26)
+        self.btn_import_zip.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_import_zip.setStyleSheet(BUTTON_PRIMARY_QSS)
+        self.btn_import_zip.clicked.connect(self._on_import_zip_clicked)
+        h.addWidget(self.btn_import_zip)
 
         self.btn_settings = QPushButton("⚙ Vị trí kho")
         self.btn_settings.clicked.connect(self._pick_archive_path)
@@ -2814,9 +3090,15 @@ class RepositoryScreen(ScreenContent):
             combo = FuzzyComboBox()
             try:
                 from scanindex.core.digitization.doctype import all_display_names
-                combo.addItems(all_display_names())
+                translations.add_localized_combo_items(
+                    combo, all_display_names(), context="document_type"
+                )
             except Exception:
-                combo.addItems(["Nghị quyết", "Quyết định", "Báo cáo", "Công văn", "Khác"])
+                translations.add_localized_combo_items(
+                    combo,
+                    ["Nghị quyết", "Quyết định", "Báo cáo", "Công văn", "Khác"],
+                    context="document_type",
+                )
             combo.setCurrentIndex(-1)
             grid.addWidget(combo, row, col * 2 + 1)
             self._filter_inputs["doc_type"] = combo
@@ -2917,12 +3199,26 @@ class RepositoryScreen(ScreenContent):
             n_chunks = int(self._store.get_meta("total_chunks") or "0")
         self._path_label.setText(f"📂 {self._archive_path}")
         self._path_label.setToolTip(str(self._archive_path))
-        stats = _format_repo_stats(n_dossiers, n_docs, n_pages, n_chunks)
+        stats = _format_repo_stats(
+            n_dossiers, n_docs, n_pages, n_chunks, localized=True,
+        )
         self._stats_label.setText(stats)
         self._stats_label.setToolTip(stats)
+
+    def update_texts(self) -> None:
+        """Refresh dynamic repository labels after an EN/VI switch."""
+        self._refresh_status()
+        for card_type in (
+            _DossierCard, _FileCard, _SearchHitCard, _SnippetCard, _GroupHeader,
+        ):
+            for card in self.findChildren(card_type):
+                card.update_texts()
+        self._right_panel.update_texts()
+        self._update_selection_toolbar()
+
     def _pick_archive_path(self):
         new_path = QFileDialog.getExistingDirectory(
-            self, "Chọn vị trí kho lưu trữ",
+            self, translations.localize_text("Chọn vị trí kho lưu trữ"),
             str(self._archive_path),
         )
         if not new_path:
@@ -3102,7 +3398,7 @@ class RepositoryScreen(ScreenContent):
             fonds="", catalog="", dossier_code="",
             doc_count=0, page_count=0, start_date="", end_date="",
         ))
-        self._right_panel._info_box.setText(
+        self._right_panel.show_message(
             "Chọn một hồ sơ ở cột trái để xem các văn bản bên trong."
         )
         self._clear_list()
@@ -3212,7 +3508,9 @@ class RepositoryScreen(ScreenContent):
         self._right_panel.show_dossier(dossier)
         self._clear_list()
         files = self._fetch_files_for_dossier(dossier.dossier_id)
-        self._list_count_label.setText(_dossier_status_html(dossier, doc_count=len(files)))
+        self._list_count_label.setText(_dossier_status_html(
+            dossier, doc_count=len(files), localized=True,
+        ))
         for idx, f in enumerate(files, start=1):
             card = _FileCard(f, ordinal=idx)
             card.clicked.connect(lambda _did, ff=f: self._show_file(ff))
@@ -3452,6 +3750,7 @@ class RepositoryScreen(ScreenContent):
                                 out_dir: str) -> tuple[str, int, int]:
         import tempfile
         import zipfile
+        from scanindex.core.canonical_io import companion_for_pdf
         from scanindex.core.digitization.runner import write_aggregated_excel
 
         identity = self._identity_from_dossier(dossier)
@@ -3460,6 +3759,13 @@ class RepositoryScreen(ScreenContent):
             raise ValueError(
                 f"Hồ sơ {self._dossier_code_text(dossier)} không có PDF hợp lệ để xuất"
             )
+
+        # When the "kèm .json.zst" setting is on (default), each PDF travels
+        # with its canonical sidecar (OCR + KIE) under `<pdf>.json.zst` so
+        # the ZIP can be re-imported into Kho lưu trữ without re-running
+        # OCR/KIE. Companions live next to the stored PDFs in the repo (the
+        # importer copies them there); PMKhoSohoa ignores the extra files.
+        include_canonical = _read_zip_include_canonical_setting()
 
         tmp_xlsx = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False)
         tmp_xlsx.close()
@@ -3477,6 +3783,13 @@ class RepositoryScreen(ScreenContent):
                         f"HSLTCQ/METADATA/{doc['export_file_name']}",
                     )
                     copied += 1
+                    if include_canonical:
+                        companion = companion_for_pdf(doc["export_source_path"])
+                        if companion.is_file():
+                            zf.write(
+                                str(companion),
+                                f"HSLTCQ/METADATA/{doc['export_file_name']}.json.zst",
+                            )
             return zip_path, copied, skipped
         finally:
             try:
@@ -3606,7 +3919,7 @@ class RepositoryScreen(ScreenContent):
         f: dict = {}
         for key, widget in self._filter_inputs.items():
             if isinstance(widget, QComboBox):
-                v = widget.currentText().strip()
+                v = translations.combo_value(widget).strip()
             elif isinstance(widget, QLineEdit):
                 v = widget.text().strip()
             elif hasattr(widget, "text"):
@@ -3632,7 +3945,7 @@ class RepositoryScreen(ScreenContent):
         combo = getattr(self, "_filter_doc_type_combo", None)
         if not isinstance(combo, QComboBox):
             return
-        current = combo.currentText().strip()
+        current = translations.combo_value(combo).strip()
         try:
             from scanindex.core.digitization.doctype import all_display_names
             values = all_display_names()
@@ -3641,9 +3954,11 @@ class RepositoryScreen(ScreenContent):
         combo.blockSignals(True)
         try:
             combo.clear()
-            combo.addItems(values)
+            translations.add_localized_combo_items(
+                combo, values, context="document_type"
+            )
             if current:
-                combo.setCurrentText(current)
+                translations.set_combo_value(combo, current)
             else:
                 combo.setCurrentIndex(-1)
         finally:
@@ -3707,7 +4022,7 @@ class RepositoryScreen(ScreenContent):
                 self._list_count_label.setText(
                     "Nhập từ khóa metadata hoặc mở lọc nâng cao."
                 )
-                self._right_panel._info_box.setText(
+                self._right_panel.show_message(
                     "Có thể tìm số ký hiệu, ngày tháng, người ký, cơ quan, trích yếu trong ô tìm kiếm; hoặc bấm ▾ để lọc cụ thể."
                 )
                 return
@@ -3757,11 +4072,11 @@ class RepositoryScreen(ScreenContent):
                 doc_count=0, page_count=0, start_date="", end_date="",
             ))
             if self.mode_combo.currentData() == "metadata":
-                self._right_panel._info_box.setText(
+                self._right_panel.show_message(
                     "Không tìm thấy văn bản khớp metadata."
                 )
             else:
-                self._right_panel._info_box.setText("Không tìm thấy văn bản phù hợp.")
+                self._right_panel.show_message("Không tìm thấy văn bản phù hợp.")
             return
         self._list_count_label.setText(
             f"{len(self._search_hits)} văn bản khớp"
@@ -3782,7 +4097,7 @@ class RepositoryScreen(ScreenContent):
             group = [h for h in self._search_hits if h.match_kind == kind]
             if not group:
                 continue
-            self._add_card(_GroupHeader(f"{label} ({len(group)})"))
+            self._add_card(_GroupHeader(label, len(group)))
             for hit in group:
                 card = _SearchHitCard(hit)
                 card.clicked.connect(lambda _did, hh=hit: self._show_search_hit(hh))
@@ -3903,7 +4218,7 @@ class RepositoryScreen(ScreenContent):
             return
 
         out_dir = QFileDialog.getExistingDirectory(
-            self, "Chọn thư mục để lưu file ZIP"
+            self, translations.localize_text("Chọn thư mục để lưu file ZIP")
         )
         if not out_dir:
             return
@@ -3959,17 +4274,271 @@ class RepositoryScreen(ScreenContent):
             QMessageBox.critical(
                 self,
                 "Xuất hồ sơ nén",
-                "Không xuất được hồ sơ nào.\n" + "\n".join(errors[:8]),
+                translations.localize_text("Không xuất được hồ sơ nào.")
+                + "\n" + "\n".join(errors[:8]),
             )
             return
 
-        msg = (
-            f"Đã xuất {len(exported)} file ZIP với {copied_total} PDF.\n"
-            f"Thư mục: {out_dir}"
-        )
+        msg = "\n".join((
+            translations.localize_text(
+                f"Đã xuất {len(exported)} file ZIP với {copied_total} PDF."
+            ),
+            translations.localize_text(f"Thư mục: {out_dir}"),
+        ))
         if errors:
-            msg += f"\n\nCó {len(errors)} hồ sơ lỗi, xem nhật ký để biết chi tiết."
+            msg += "\n\n" + translations.localize_text(
+                f"Có {len(errors)} hồ sơ lỗi, xem nhật ký để biết chi tiết."
+            )
         QMessageBox.information(self, "Xuất hồ sơ nén", msg)
+
+    # ------ ZIP → Kho direct import (no OCR/KIE re-run) ------
+
+    def _on_import_zip_clicked(self):
+        """Pick one or many exported HSLTCQ ZIPs (with bundled `.json.zst`
+        sidecars) and import their dossiers straight into Kho lưu trữ.
+        Blocks, KIE fields and annotations all come from the sidecars —
+        nothing is re-OCRed."""
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            translations.localize_text("Chọn các file ZIP hồ sơ để nhập vào Kho"),
+            "",
+            translations.localize_text("ZIP Files (*.zip)"),
+        )
+        if paths:
+            self._import_zip_paths(paths)
+
+    def _import_zip_paths(self, zip_paths: list[str]):
+        """Shared back-end for the "Nhập từ ZIP" button and ZIP drag&drop:
+        parse every ZIP into an import job, confirm once, then push all
+        dossiers into Kho via one `_ZipKhoImportWorker` (no OCR/KIE
+        re-run). ZIPs are extracted under `temp/zip_kho_<ts>_<n>/` and
+        cleaned up by the worker once every doc is copied into the repo."""
+        from PySide6.QtWidgets import QProgressDialog
+        from scanindex.core.digitization.zip_roundtrip import (
+            parse_export_zip_for_kho, ZipRoundtripError,
+        )
+
+        if getattr(self, "_zip_kho_worker", None) is not None:
+            QMessageBox.information(
+                self, "Nhập từ ZIP",
+                "Một lệnh nhập ZIP khác đang chạy. Vui lòng đợi hoàn tất.",
+            )
+            return
+
+        zip_paths = [
+            str(p) for p in zip_paths
+            if str(p).lower().endswith(".zip") and os.path.isfile(str(p))
+        ]
+        if not zip_paths:
+            return
+
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        jobs: list[dict] = []
+        problems: list[str] = []
+        for i, path in enumerate(zip_paths, start=1):
+            name = os.path.basename(path)
+            temp_root = os.path.join(
+                os.getcwd(), "temp", f"zip_kho_{stamp}_{i:02d}",
+            )
+            try:
+                codes, docs, skipped, _out_dir = parse_export_zip_for_kho(
+                    path, temp_root
+                )
+            except ZipRoundtripError as e:
+                problems.append(f"{name}: ZIP hồ sơ không hợp lệ — {e}")
+                shutil.rmtree(temp_root, ignore_errors=True)
+                continue
+            except Exception as e:
+                problems.append(f"{name}: không đọc được — {e}")
+                shutil.rmtree(temp_root, ignore_errors=True)
+                continue
+            if not (codes.ma_dinh_danh and codes.fonds):
+                problems.append(
+                    f"{name}: thiếu mã định danh / mã phông trong tên ZIP"
+                )
+                shutil.rmtree(temp_root, ignore_errors=True)
+                continue
+            if not docs:
+                problems.append(
+                    f"{name}: không có dữ liệu OCR/KIE (.json.zst) kèm theo"
+                )
+                shutil.rmtree(temp_root, ignore_errors=True)
+                continue
+            jobs.append({
+                "codes": codes,
+                "docs": docs,
+                "temp_root": temp_root,
+                "zip_name": name,
+                "skipped_no_companion": skipped,
+            })
+
+        if problems:
+            self.log_message.emit(
+                "Kho: ZIP bỏ qua khi nhập — " + " | ".join(problems[:5]),
+                "info",
+            )
+        if not jobs:
+            QMessageBox.warning(
+                self, "Nhập từ ZIP",
+                "Không nhập được hồ sơ nào:\n"
+                + "\n".join(problems[:8]),
+            )
+            return
+
+        total = sum(len(j["docs"]) for j in jobs)
+        skipped_total = sum(j["skipped_no_companion"] for j in jobs)
+        lines = []
+        for job in jobs:
+            c = job["codes"]
+            lines.append(
+                f"• {c.ma_dinh_danh}-{c.fonds}-{c.catalog}-{c.dossier_code}"
+                f" — {len(job['docs'])} văn bản ({job['zip_name']})"
+            )
+        text = (
+            translations.localize_text(
+                f"Nhập {total} văn bản từ {len(jobs)} hồ sơ ZIP vào Kho lưu trữ?"
+            )
+            + "\n"
+            + "\n".join(translations.localize_text(line) for line in lines)
+        )
+        if skipped_total:
+            text += "\n\n" + translations.localize_text(
+                f"({skipped_total} văn bản thiếu .json.zst sẽ bỏ qua)"
+            )
+        if problems:
+            text += "\n\n" + translations.localize_text(
+                f"{len(problems)} file ZIP bị bỏ qua, xem nhật ký."
+            )
+        confirm = QMessageBox.question(
+            self, "Nhập vào Kho lưu trữ?", text
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            for job in jobs:
+                shutil.rmtree(job["temp_root"], ignore_errors=True)
+            return
+
+        progress = QProgressDialog(
+            "Đang nhập ZIP vào Kho lưu trữ…", "Hủy",
+            0, total, self,
+        )
+        progress.setWindowTitle("Nhập từ ZIP")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setValue(0)
+        progress.show()
+
+        worker = _ZipKhoImportWorker(self._archive_path, jobs)
+        # Snapshot for the result dialog: when dedup is OFF, duplicates are
+        # kept (already inside `imported`); when ON they were skipped.
+        skip_duplicates_hint = _read_skip_duplicate_docs_setting()
+
+        # Same Windows mmap constraint as the Step 3 import: release the
+        # screen's Tantivy handles so the writer can take the lock.
+        self.release_index_for_writer()
+
+        def on_progress(p):
+            done = p.imported + p.skipped + p.failed
+            progress.setLabelText(
+                f"{p.current_file or ''}  ({done}/{p.total})"
+            )
+            progress.setValue(done)
+
+        def on_cancelled():
+            worker.cancel()
+
+        def _reopen_kho():
+            try:
+                self.reopen_index_after_writer()
+            except Exception as e:
+                self.log_message.emit(
+                    f"Repository: could not reopen index: {e}", "err",
+                )
+
+        def on_finished_ok(result):
+            progress.close()
+            _reopen_kho()
+            import_log = translations.localize_text(
+                f"Repository: ZIP imported — {result.imported}/{result.total}"
+                f" from {len(jobs)} dossier ZIPs"
+            )
+            if result.duplicates:
+                import_log += translations.localize_text(
+                    f", {result.duplicates} trùng"
+                )
+            self.log_message.emit(import_log, "success")
+            # Duplicate docs that were KEPT (setting off) are part of
+            # `imported`; skipped ones are separate. Surface both counts.
+            dup_kept = result.duplicates if not skip_duplicates_hint else 0
+            dup_skipped = result.duplicates - dup_kept
+            msg = translations.format_import_summary(
+                dossiers=len(jobs),
+                imported=result.imported,
+                duplicates=result.duplicates,
+                failed=result.failed,
+                duplicate_skipped=dup_skipped,
+                duplicate_kept=dup_kept,
+            )
+            QMessageBox.information(self, "Nhập từ ZIP hoàn tất", msg)
+
+        def on_failed(error_msg):
+            progress.close()
+            _reopen_kho()
+            self.log_message.emit(f"Repository: ZIP import failed — {error_msg}", "err")
+            QMessageBox.critical(self, "Lỗi", f"Nhập ZIP thất bại:\n{error_msg}")
+
+        def on_thread_finished():
+            if getattr(self, "_zip_kho_worker", None) is worker:
+                self._zip_kho_worker = None
+            worker.deleteLater()
+
+        worker.progress.connect(on_progress)
+        worker.finished_ok.connect(on_finished_ok)
+        worker.failed.connect(on_failed)
+        worker.finished.connect(on_thread_finished)
+        progress.canceled.connect(on_cancelled)
+        # Hold a reference so Python doesn't GC the QThread mid-run.
+        self._zip_kho_worker = worker
+        worker.start()
+
+    # ------ ZIP drag & drop → Kho import ------
+
+    def dragEnterEvent(self, event):
+        """Accept file drags carrying at least one .zip (exported HSLTCQ
+        dossier). Internal card-reorder drags use a custom mime type and
+        are ignored here (see `_FileCard.dragEnterEvent`)."""
+        if self._zip_paths_from_mime(event.mimeData()):
+            event.acceptProposedAction()
+            return
+        event.ignore()
+
+    def dragMoveEvent(self, event):
+        # Keep the drop target armed while hovering (Qt only delivers
+        # dropEvent to widgets that accepted the preceding move).
+        if self._zip_paths_from_mime(event.mimeData()):
+            event.acceptProposedAction()
+            return
+        event.ignore()
+
+    def dropEvent(self, event):
+        paths = self._zip_paths_from_mime(event.mimeData())
+        if paths:
+            event.acceptProposedAction()
+            self._import_zip_paths(paths)
+            return
+        event.ignore()
+
+    @staticmethod
+    def _zip_paths_from_mime(md) -> list[str]:
+        """Local .zip file paths carried by a drag/drop mime payload."""
+        if md is None or not md.hasUrls():
+            return []
+        return [
+            url.toLocalFile() for url in md.urls()
+            if url.isLocalFile()
+            and url.toLocalFile().lower().endswith(".zip")
+        ]
 
     # ------ CRUD: dossier edit / delete ------
 
@@ -4611,8 +5180,10 @@ class RepositoryScreen(ScreenContent):
             return
         target_dossier_id = self._current_dossier.dossier_id
         paths, _ = QFileDialog.getOpenFileNames(
-            self, "Chọn file PDF cần thêm", "",
-            "PDF (*.pdf)",
+            self,
+            translations.localize_text("Chọn file PDF cần thêm"),
+            "",
+            translations.localize_text("PDF (*.pdf)"),
         )
         if not paths:
             return
@@ -4870,7 +5441,7 @@ class RepositoryScreen(ScreenContent):
             import fitz
             from scanindex.core.repository.chunker import Block, chunk_blocks
         except Exception as e:
-            self.log_message.emit(f"Kho: chunker import failed: {e}", "err")
+            self.log_message.emit(f"Repository: chunker import failed: {e}", "err")
             return []
         if canonical_json_path:
             try:
@@ -4903,7 +5474,7 @@ class RepositoryScreen(ScreenContent):
                             font_size=fs,
                         ))
         except Exception as e:
-            self.log_message.emit(f"Kho: extract blocks failed: {e}", "err")
+            self.log_message.emit(f"Repository: extract blocks failed: {e}", "err")
             return []
         return chunk_blocks(blocks)
 
@@ -4942,7 +5513,7 @@ class RepositoryScreen(ScreenContent):
                     self._index.close()
                     self._index.open()
             except Exception as e:
-                self.log_message.emit(f"Kho: reload index failed: {e}", "err")
+                self.log_message.emit(f"Repository: reload index failed: {e}", "err")
             self._refresh_status()
         if self._mode == self._MODE_DOSSIERS:
             self._show_dossier_list()
@@ -4992,7 +5563,7 @@ class RepositoryScreen(ScreenContent):
                 self._index.close()
             return True
         except Exception as e:
-            self.log_message.emit(f"Kho: release index failed: {e}", "err")
+            self.log_message.emit(f"Repository: release index failed: {e}", "err")
             return False
 
     def reopen_index_after_writer(self) -> None:
@@ -5001,7 +5572,7 @@ class RepositoryScreen(ScreenContent):
             if self._index is not None:
                 self._index.open()
         except Exception as e:
-            self.log_message.emit(f"Kho: reopen index failed: {e}", "err")
+            self.log_message.emit(f"Repository: reopen index failed: {e}", "err")
         self._refresh_status()
         if self._mode == self._MODE_DOSSIERS:
             self._show_dossier_list()

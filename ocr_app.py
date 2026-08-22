@@ -132,6 +132,21 @@ def main():
     _ver = get_version_short()
 
     app = QApplication(sys.argv)
+    # Translate both keyed strings and legacy source-text UI as widgets and
+    # dialogs are shown. Installed before the splash so the configured
+    # language is respected from the first visible frame.
+    from scanindex.infra import translations
+    try:
+        import configparser
+        from scanindex.infra.data_versioning import get_active_settings_path
+        _language_cfg = configparser.ConfigParser()
+        _language_cfg.read(get_active_settings_path(), encoding="utf-8")
+        translations.set_lang(
+            _language_cfg.get("General", "Language", fallback="en")
+        )
+    except Exception:
+        translations.set_lang("en")
+    translations.install_event_filter(app)
     app.setApplicationName("ScanIndex")
     app.setApplicationDisplayName(f"ScanIndex {_ver}")
     app.setApplicationVersion(_ver)

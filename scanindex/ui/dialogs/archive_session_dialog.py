@@ -147,8 +147,8 @@ class DossierInfoDialog(QDialog):
         # Three HSLTCQ Hồ-sơ-sheet fields the dialog now collects.
         self._cb_retention = self._mk_combobox(_RETENTION_OPTIONS, allow_blank=True)
         self._cb_physical = self._mk_combobox(_PHYSICAL_STATE_OPTIONS, allow_blank=True)
-        self._cb_retention.setCurrentText(_DEFAULT_RETENTION)
-        self._cb_physical.setCurrentText(_DEFAULT_PHYSICAL_STATE)
+        translations.set_combo_value(self._cb_retention, _DEFAULT_RETENTION)
+        translations.set_combo_value(self._cb_physical, _DEFAULT_PHYSICAL_STATE)
         self._ed_term = self._mk_input(placeholder="VD: 2021–2026")
         self._ed_term.setToolTip(f"Nhiệm kỳ tối đa {_TERM_MAX} ký tự.")
         self._term_hint = QLabel(f"Nhiệm kỳ tối đa {_TERM_MAX} ký tự.")
@@ -288,8 +288,8 @@ class DossierInfoDialog(QDialog):
         # bare here.
         w = FuzzyComboBox()
         if allow_blank:
-            w.addItem("")               # blank = field unset (kept first)
-        w.addItems(options)
+            w.addItem("", "")           # blank = field unset (kept first)
+        translations.add_localized_combo_items(w, options)
         w.setFixedHeight(32)
         return w
 
@@ -365,10 +365,10 @@ class DossierInfoDialog(QDialog):
         # Combobox widgets fall through to the blank entry when the stored
         # value isn't in the option list.
         ret = (initial.thoi_han_bao_quan or "").strip() or _DEFAULT_RETENTION
-        idx = self._cb_retention.findText(ret)
+        idx = self._cb_retention.findData(ret)
         self._cb_retention.setCurrentIndex(max(0, idx))
         ph = (initial.tinh_trang_vat_ly or "").strip() or _DEFAULT_PHYSICAL_STATE
-        idx2 = self._cb_physical.findText(ph)
+        idx2 = self._cb_physical.findData(ph)
         self._cb_physical.setCurrentIndex(max(0, idx2))
         self._ed_term.setText(initial.nhiem_ky or "")
         self._ed_so_luong_to.setText(
@@ -439,8 +439,8 @@ class DossierInfoDialog(QDialog):
     def _on_ok(self):
         unstructured = self._cb_unstructured.isChecked()
         title = self._ed_title.toPlainText().strip()
-        retention = self._cb_retention.currentText().strip()
-        physical = self._cb_physical.currentText().strip()
+        retention = translations.combo_value(self._cb_retention).strip()
+        physical = translations.combo_value(self._cb_physical).strip()
         term = self._ed_term.text().strip()
         topic = self._ed_topic.toPlainText().strip()[:_TITLE_MAX]
         note = self._ed_note.toPlainText().strip()[:_TITLE_MAX]

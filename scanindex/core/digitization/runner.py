@@ -559,19 +559,24 @@ class ArchiveRunner:
             self.log("Warming OCR pool...")
             direct_ocr_engine._get_pool()
         else:
-            self.log("Dùng OCR cache từ Bước 1 — không khởi động OCR lại")
+            self.log("Using Step 1 OCR cache — OCR pool startup skipped")
         if self.enable_correction:
             if hasattr(correction_engine, "proton_ct2_available") and not correction_engine.proton_ct2_available():
-                self.log("Sửa chính tả Proton CT2 không có trong bản portable — bỏ qua correction")
+                self.log(
+                    "Proton CT2 correction is unavailable in the portable "
+                    "build — correction skipped"
+                )
                 self.enable_correction = False
             else:
                 self.log("Warming correction model...")
                 ok = correction_engine.init_client(log_callback=lambda *a: self.log(" ".join(str(x) for x in a)))
                 if ok is False:
-                    self.log("Sửa chính tả: không tải được model — bỏ qua correction")
+                    self.log(
+                        "Correction model could not be loaded — correction skipped"
+                    )
                     self.enable_correction = False
         else:
-            self.log("Sửa chính tả: TẮT (theo cấu hình) — bỏ qua warmup correction")
+            self.log("Correction: OFF (configuration) — warmup skipped")
         self.log(f"Warming KIE ({self.kie_mode})...")
         if not kie_engine.warmup_kie(self.kie_mode, log_cb=self.log):
             raise RuntimeError(f"KIE warmup failed for mode={self.kie_mode}")
@@ -594,7 +599,10 @@ class ArchiveRunner:
                     raise RuntimeError(
                         f"[{file_id}] Step 1 OCR cache is empty; refusing to OCR again in Step 2"
                     )
-                self.log(f"[{file_id}] Dùng OCR cache từ Bước 1; bỏ qua preprocess/OCR")
+                self.log(
+                    f"[{file_id}] Using Step 1 OCR cache; "
+                    "preprocess/OCR skipped"
+                )
             else:
                 pre_pdf = _unique_preprocessed_pdf_path(self.output_dir, stem)
                 self.log(f"[{file_id}] Preprocess geometry before OCR...")
@@ -732,7 +740,7 @@ class ArchiveRunner:
                 if n_fields == 0:
                     self.log(
                         f"[{task.file_id}] KIE WARN: 0 field_instances returned. "
-                        f"Form sẽ trống. Model loaded={model_ready}, "
+                        f"The form will be empty. Model loaded={model_ready}, "
                         f"selected_pages={task.selected_pages}"
                     )
                 else:

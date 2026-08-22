@@ -36,6 +36,7 @@ from scanindex.ui.theme import (
     COLOR_ELEVATED, COLOR_HOVER, COLOR_SURFACE, COLOR_TEXT, COLOR_TEXT_MUTED,
     COLOR_TEXT_SECONDARY, FONT_UI, RADIUS_MD,
 )
+from scanindex.infra import translations
 
 
 # ── Per-label colour palette (dark fill / light border) ────────────────
@@ -84,12 +85,14 @@ FIELD_DISPLAY_NAMES = {
 }
 
 
-def _field_display_name(label: str) -> str:
-    return FIELD_DISPLAY_NAMES.get(label, label)
+def _field_display_name(label: str, *, localized: bool = False) -> str:
+    """Keep the metadata-label helper stable; localize only at render sites."""
+    name = FIELD_DISPLAY_NAMES.get(label, label)
+    return translations.localize_text(name) if localized else name
 
 
-def _field_menu_text(label: str) -> str:
-    name = _field_display_name(label)
+def _field_menu_text(label: str, *, localized: bool = False) -> str:
+    name = _field_display_name(label, localized=localized)
     return f"{name} ({label})" if name != label else label
 
 
@@ -1736,7 +1739,10 @@ class KieArchiveViewer(QWidget):
         if self._canonical and self._active_field_id:
             for f in (self._canonical.get("annotations") or {}).get("field_instances") or []:
                 if f.get("field_id") == self._active_field_id:
-                    label_txt = f"Đang sửa: {_field_menu_text(f.get('label', '?'))}"
+                    label_txt = (
+                        f"{translations.localize_text('Đang sửa:')} "
+                        f"{_field_menu_text(f.get('label', '?'), localized=True)}"
+                    )
                     break
         if self._edit_mode and not label_txt:
             label_txt = "Chọn field bên metadata để sửa bbox"
@@ -1999,7 +2005,7 @@ class KieArchiveViewer(QWidget):
         pass
 
     def update_texts(self):
-        pass
+        self._update_active_label()
 
     # ---- zoom ------------------------------------------------------
 
@@ -2267,7 +2273,8 @@ class KieArchiveViewer(QWidget):
         labels = list(FIELD_NUMBER_MAP.keys())
         for label in labels:
             act = QAction(
-                f"{FIELD_NUMBER_MAP.get(label, '?')} • {_field_menu_text(label)}",
+                f"{FIELD_NUMBER_MAP.get(label, '?')} • "
+                f"{_field_menu_text(label, localized=True)}",
                 menu,
             )
             act.triggered.connect(
@@ -2330,7 +2337,9 @@ class KieArchiveViewer(QWidget):
             text_preview = text_preview[:40] + "..."
 
         # Header (non-clickable info row)
-        info = QAction(f"{_field_menu_text(label)} • {text_preview}", menu)
+        info = QAction(
+            f"{_field_menu_text(label, localized=True)} • {text_preview}", menu
+        )
         info.setEnabled(False)
         menu.addAction(info)
         menu.addSeparator()
@@ -2771,7 +2780,9 @@ class KieArchiveViewer(QWidget):
         if errors:
             body_lines.append("LỖI:")
             for e in errors[:10]:
-                body_lines.append(f"  • {e}")
+                body_lines.append(
+                    f"  • {translations.localize_text(str(e))}"
+                )
             if len(errors) > 10:
                 body_lines.append(f"  … và {len(errors)-10} lỗi khác")
         if warnings:
@@ -2780,12 +2791,17 @@ class KieArchiveViewer(QWidget):
             body_lines.append("CẢNH BÁO:")
             for w in warnings[:10]:
                 if isinstance(w, dict):
-                    body_lines.append(f"  • {w.get('message', str(w))}")
+                    message = w.get("message", str(w))
                 else:
-                    body_lines.append(f"  • {w}")
+                    message = w
+                body_lines.append(
+                    f"  • {translations.localize_text(str(message))}"
+                )
             if len(warnings) > 10:
                 body_lines.append(f"  … và {len(warnings)-10} cảnh báo khác")
-        dlg.setDetailedText("\n".join(body_lines))
+        dlg.setDetailedText("\n".join(
+            translations.localize_text(line) for line in body_lines
+        ))
         if blocking:
             dlg.setStandardButtons(QMessageBox.StandardButton.Ok)
             dlg.exec()

@@ -51,6 +51,7 @@ from scanindex.ui.theme import (
     RADIUS_MD,
     SP,
 )
+from scanindex.infra import translations
 
 
 SUPPORTED_EXTS = {".pdf", ".png", ".jpg", ".jpeg", ".doc", ".docx"}
@@ -1607,7 +1608,9 @@ class SecretFileScanScreen(ScreenContent):
         )
 
     def _browse_folder(self) -> None:
-        folder = QFileDialog.getExistingDirectory(self, "Chọn thư mục cần quét")
+        folder = QFileDialog.getExistingDirectory(
+            self, translations.localize_text("Chọn thư mục cần quét")
+        )
         if folder:
             self.folder_edit.setText(folder)
 
@@ -1764,8 +1767,17 @@ class SecretFileScanScreen(ScreenContent):
         ]
         for col, value in enumerate(values):
             item = QTableWidgetItem(value)
+            if col == 3:
+                translations.set_translatable_item_text(
+                    item, value, sync_tooltip=True
+                )
+            elif col == 4:
+                translations.set_translatable_item_text(
+                    item, value, context="secret_note", sync_tooltip=True
+                )
             item.setData(Qt.ItemDataRole.UserRole, match.source_path)
-            item.setToolTip(match.source_path if col == 1 else value)
+            if col not in (3, 4):
+                item.setToolTip(match.source_path if col == 1 else value)
             if col == 0:
                 item.setForeground(QColor(COLOR_RED))
             self.table.setItem(row, col, item)

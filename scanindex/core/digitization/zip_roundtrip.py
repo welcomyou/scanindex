@@ -1,37 +1,46 @@
-"""Round-trip import of an exported archive ZIP back into Step 2.
+"""Round-trip import of an exported archive ZIP back into Step 2 / Kho.
 
 A ZIP produced by the external export path (see `main_window._arc_export_external`)
 bundles the final PDFs plus the aggregated `MetaDuLieu.xlsx` under
-`HSLTCQ/METADATA/`:
+`HSLTCQ/METADATA/` — and, when the "kèm .json.zst" setting is on (default),
+each PDF's canonical `.json.zst` sidecar (OCR text + KIE annotations) next
+to it:
 
     <dossier>.zip
     └── HSLTCQ/
         └── METADATA/
-            ├── MetaDuLieu.xlsx      # Hồ sơ + Văn bản sheets
+            ├── MetaDuLieu.xlsx            # Hồ sơ + Văn bản sheets
             ├── <stem>-001.pdf
+            ├── <stem>-001.pdf.json.zst    # canonical sidecar (optional)
             └── <stem>-NNN.pdf
 
-This module reverses that: it extracts the PDFs to a dedicated `_zip_input/`
-temp folder and reads the workbook, reconstructing an `IdentityCodes` + a list
-of document dicts that Step 2 (`ArchiveStep2Kie`) can show for editing. The
-input folder is then the `_zip_input/` path, so the operator can click
-"Xử lý" to re-run OCR + KIE on the extracted PDFs (recovering bbox overlays
-that were not bundled in the ZIP) before exporting again.
+This module reverses that. Two entry points share one extraction core:
 
-Because the export is a lossy, one-way projection (raw KIE annotation blocks
-and several in-app-only fields are deliberately dropped), the reconstruction is
+  * `parse_export_zip` — reopen the ZIP into Step 2 (`ArchiveStep2Kie`) for
+    editing. PDFs land in a dedicated `_zip_input/` temp folder; each doc's
+    `json_path` points at the extracted sidecar when one was bundled, so the
+    viewer shows bbox/field overlays immediately. The operator can still
+    click "Xử lý" to re-run OCR + KIE from scratch (fresh overlays into
+    `_step2_kie/`).
+  * `parse_export_zip_for_kho` — feed the ZIP straight into Kho lưu trữ via
+    `Importer.import_dossier` **without re-running OCR/KIE**: blocks, KIE
+    fields and annotations all come from the bundled sidecars. Docs without
+    a sidecar are skipped and reported.
+
+Because the workbook is a lossy, one-way projection, the reconstruction is
 *not* byte-for-byte:
 
-  - Bbox highlighting on the viewer is unavailable (no `.json.zst` companion).
-    The PDF text layer itself is intact, so the operator can still read it.
+  - ZIPs exported with the sidecars disabled (or by older versions) have no
+    `.json.zst` companions: bbox highlighting is unavailable on the Step 2
+    viewer and the Kho-direct import path has nothing to work with.
   - `chuyen_de`, `chu_thich`, `is_unstructured` are not in the workbook and
     default to empty / False.
   - `ma_dinh_danh` is not stored as a workbook column; it is parsed from the
     ZIP file name (`<MãĐD>-<MãPhông>-<MụcLục>-<HồSơ>.zip`). For the generic
     `HSLTCQ.zip` name we fall back to the other identity codes where possible.
 
-These limitations are intentional and were confirmed acceptable for the
-"reopen a ZIP to fix a few fields, then re-export" workflow.
+These limitations were confirmed acceptable for the "reopen a ZIP to fix a
+few fields, then re-export" workflow.
 """
 from __future__ import annotations
 
@@ -40,6 +49,7 @@ import re
 import zipfile
 from typing import Optional
 
+from scanindex.core.canonical_io import companion_for_pdf, resolve_companion
 from scanindex.core.digitization.session import IdentityCodes
 
 
@@ -255,23 +265,18 @@ def _pdf_ordinal(name: str) -> int:
     return int(m.group(1)) if m else 999999
 
 
-def parse_export_zip(zip_path: str,
-                     dest_dir: str) -> tuple[IdentityCodes, list[dict], str]:
-    """Unpack an archive-export ZIP and rebuild (identity, documents, input_dir).
+def _extract_export_zip(zip_path: str, out_dir: str) -> tuple[list[str], str]:
+    """Extract an archive-export ZIP's `HSLTCQ/METADATA/` contents into
+    `out_dir`: the workbook (as `_MetaDuLieu.xlsx`), every PDF, and every
+    bundled `.json.zst` sidecar (named `<pdf>.json.zst` by the exporter, so
+    `companion_for_pdf` finds it next to each extracted PDF).
 
-    `dest_dir` is the session temp root (e.g. `session.temp_dir()`). PDFs are
-    extracted into a dedicated `<dest_dir>/_zip_input/` folder — **not** the
-    KIE output dir — so that when the user clicks "Xử lý", the folder-scan
-    pipeline re-runs OCR + KIE on them and writes fresh overlays into
-    `_step2_kie/`. Returns `(identity, documents, input_dir)` where
-    `input_dir` is the `_zip_input/` path the caller should set as the Step 2
-    input folder. Raises `ZipRoundtripError` if the ZIP is not a recognized
-    archive export.
-    """
+    Returns `(pdf_names, xlsx_path)`. Only base names are used when writing
+    (no zip-slip). Raises `ZipRoundtripError` if the ZIP is not a recognized
+    archive export or has no PDFs."""
     if not os.path.isfile(zip_path):
         raise ZipRoundtripError(f"File not found: {zip_path}")
 
-    out_dir = os.path.join(dest_dir, "_zip_input")
     os.makedirs(out_dir, exist_ok=True)
 
     pdf_names: list[str] = []
@@ -293,7 +298,7 @@ def parse_export_zip(zip_path: str,
                 if not base:
                     continue
                 low = base.lower()
-                if low.endswith(".xlsx") and base.lower().startswith("metadulieu"):
+                if low.endswith(".xlsx") and low.startswith("metadulieu"):
                     target = os.path.join(out_dir, "_MetaDuLieu.xlsx")
                     with zf.open(entry) as src, open(target, "wb") as dst:
                         dst.write(src.read())
@@ -303,6 +308,11 @@ def parse_export_zip(zip_path: str,
                     with zf.open(entry) as src, open(target, "wb") as dst:
                         dst.write(src.read())
                     pdf_names.append(base)
+                elif low.endswith(".json.zst"):
+                    # Canonical sidecar bundled by the exporter (optional).
+                    target = os.path.join(out_dir, base)
+                    with zf.open(entry) as src, open(target, "wb") as dst:
+                        dst.write(src.read())
     except ZipRoundtripError:
         raise
     except Exception as e:  # noqa: BLE001 — surface a readable message
@@ -314,8 +324,13 @@ def parse_export_zip(zip_path: str,
         raise ZipRoundtripError("No PDF documents found inside the ZIP.")
 
     pdf_names.sort(key=_pdf_ordinal)
+    return pdf_names, xlsx_tmp_path
 
-    # ── identity ────────────────────────────────────────────────────
+
+def _identity_and_rows(zip_path: str,
+                       xlsx_tmp_path: str) -> tuple[IdentityCodes, list[dict]]:
+    """Rebuild the dossier identity (ZIP name + "Hồ sơ" sheet) and the raw
+    "Văn bản" sheet rows from an extracted workbook."""
     codes = _parse_zip_name(zip_path)
     identity = IdentityCodes(
         ma_dinh_danh=codes.get("ma_dinh_danh", ""),
@@ -329,32 +344,65 @@ def parse_export_zip(zip_path: str,
     except Exception:
         pass
 
-    # ── documents ───────────────────────────────────────────────────
     vanban_rows: list[dict] = []
     try:
         vanban_rows = _read_sheet_rows(xlsx_tmp_path, "Văn bản")
     except Exception:
         vanban_rows = []
+    return identity, vanban_rows
 
-    # Index Văn bản rows by "Tên tệp" so we can match each extracted PDF to its
-    # metadata regardless of listing order inside the workbook.
-    row_by_filename = {}
+
+def _row_by_filename(vanban_rows: list[dict]) -> dict:
+    """Index Văn bản rows by "Tên tệp" so each PDF can find its metadata
+    regardless of listing order inside the workbook."""
+    idx = {}
     for r in vanban_rows:
         fn = (r.get("Tên tệp") or "").strip()
         if fn:
-            row_by_filename[fn] = r
+            idx[fn] = r
+    return idx
+
+
+def _match_row(name: str, position: int, by_filename: dict,
+               vanban_rows: list[dict]) -> dict:
+    """Workbook row for the PDF at `position` (0-based). Falls back to
+    ordinal matching if the filename column was empty or the names drifted
+    (e.g. the operator renamed a file before export)."""
+    row = by_filename.get(name)
+    if row is None and position < len(vanban_rows):
+        row = vanban_rows[position]
+    return row or {}
+
+
+def parse_export_zip(zip_path: str,
+                     dest_dir: str) -> tuple[IdentityCodes, list[dict], str]:
+    """Unpack an archive-export ZIP and rebuild (identity, documents, input_dir).
+
+    `dest_dir` is the session temp root (e.g. `session.temp_dir()`). PDFs are
+    extracted into a dedicated `<dest_dir>/_zip_input/` folder — **not** the
+    KIE output dir — so that when the user clicks "Xử lý", the folder-scan
+    pipeline re-runs OCR + KIE on them and writes fresh overlays into
+    `_step2_kie/`. When the ZIP bundled `.json.zst` sidecars, each doc's
+    `json_path` points at the extracted companion so the Step 2 viewer shows
+    bbox/field overlays right away (no "Xử lý" needed just to review).
+    Returns `(identity, documents, input_dir)` where `input_dir` is the
+    `_zip_input/` path the caller should set as the Step 2 input folder.
+    Raises `ZipRoundtripError` if the ZIP is not a recognized archive export.
+    """
+    out_dir = os.path.join(dest_dir, "_zip_input")
+    pdf_names, xlsx_tmp_path = _extract_export_zip(zip_path, out_dir)
+
+    identity, vanban_rows = _identity_and_rows(zip_path, xlsx_tmp_path)
+    by_filename = _row_by_filename(vanban_rows)
 
     documents: list[dict] = []
-    for name in pdf_names:
+    for i, name in enumerate(pdf_names):
         full_path = os.path.join(out_dir, name)
-        row = row_by_filename.get(name)
-        # Fall back to ordinal matching if the filename column was empty or
-        # the names drifted (e.g. the operator renamed a file before export).
-        if row is None:
-            idx = documents.__len__()
-            if idx < len(vanban_rows):
-                row = vanban_rows[idx]
-        meta = _row_to_metadata(row or {})
+        meta = _row_to_metadata(_match_row(name, i, by_filename, vanban_rows))
+        # Companion bundled by the exporter → viewer overlays work without
+        # re-running KIE. Legacy ZIPs (no sidecars) keep json_path empty and
+        # behave exactly like before.
+        companion = resolve_companion(companion_for_pdf(full_path))
         documents.append({
             "pdf_path": full_path,
             "path": full_path,
@@ -363,7 +411,7 @@ def parse_export_zip(zip_path: str,
             # overwrites this with the KIE-overlay output in _step2_kie/.
             "output_path": full_path,
             "ocr_path": None,
-            "json_path": "",          # no KIE companion inside the ZIP yet
+            "json_path": str(companion) if companion is not None else "",
             "metadata": meta,
             "zones": {},
             # "Corrected" = reopened from an exported ZIP. Treated as
@@ -381,3 +429,82 @@ def parse_export_zip(zip_path: str,
     _backfill_trang_so_and_stt(documents)
 
     return identity, documents, out_dir
+
+
+def _codes_from_identity(identity: IdentityCodes):
+    """Project a reconstructed `IdentityCodes` onto `DossierCodes` for
+    `Importer.import_dossier` — mirrors Step 3's "Chuyển vào Kho" mapping.
+    Fields the workbook never carried (`chuyen_de`, `chu_thich`,
+    `is_unstructured`) default to empty, matching the lossy round-trip
+    documented at module level."""
+    from scanindex.core.repository.importer import DossierCodes
+
+    return DossierCodes(
+        ma_dinh_danh=identity.ma_dinh_danh,
+        fonds=identity.ma_phong,
+        catalog=identity.muc_luc,
+        dossier_code=identity.ho_so,
+        fonds_name=getattr(identity, "ten_phong", ""),
+        catalog_name=getattr(identity, "ten_muc_luc", ""),
+        title=identity.title or f"Hồ sơ {identity.ho_so}",
+        is_unstructured=bool(getattr(identity, "is_unstructured", False)),
+        retention=identity.thoi_han_bao_quan,
+        term=(identity.nhiem_ky or "")[:10],
+        storage_unit=identity.ho_so,            # Đơn vị bảo quản số = ho_so
+        physical_state=identity.tinh_trang_vat_ly,
+        topic=identity.chuyen_de,
+        note=identity.chu_thich,
+    )
+
+
+def parse_export_zip_for_kho(zip_path: str,
+                             dest_dir: str) -> tuple[object, list[dict], int, str]:
+    """Unpack an exported ZIP for direct import into Kho lưu trữ.
+
+    Unlike `parse_export_zip` (Step 2 editing surface, expects a re-run of
+    OCR/KIE), this projection feeds `Importer.import_dossier` directly:
+    blocks, KIE fields and annotations all come from the bundled `.json.zst`
+    sidecars, so **no OCR or KIE is re-run**. Files are extracted into
+    `<dest_dir>/_zip_kho/` (a separate folder so it never collides with a
+    Step 2 `_zip_input/` reopening of the same ZIP).
+
+    Returns `(codes, documents, skipped_no_companion, out_dir)`:
+
+      * `codes` — `DossierCodes` for `import_dossier` (from the ZIP name +
+        the workbook's "Hồ sơ" sheet).
+      * `documents` — `[{"pdf_path", "canonical_json_path",
+        "target_file_name", "metadata"}]` entries (metadata from the
+        "Văn bản" sheet, same keys Step 2 uses).
+      * `skipped_no_companion` — PDFs without a bundled sidecar; they are
+        *not* included because importing them would require OCR, which this
+        path never runs.
+
+    Raises `ZipRoundtripError` if the ZIP is not a recognized archive export.
+    """
+    out_dir = os.path.join(dest_dir, "_zip_kho")
+    pdf_names, xlsx_tmp_path = _extract_export_zip(zip_path, out_dir)
+
+    identity, vanban_rows = _identity_and_rows(zip_path, xlsx_tmp_path)
+    codes = _codes_from_identity(identity)
+    by_filename = _row_by_filename(vanban_rows)
+
+    documents: list[dict] = []
+    skipped_no_companion = 0
+    for i, name in enumerate(pdf_names):
+        full_path = os.path.join(out_dir, name)
+        companion = resolve_companion(companion_for_pdf(full_path))
+        if companion is None:
+            skipped_no_companion += 1
+            continue
+        documents.append({
+            "pdf_path": full_path,
+            "canonical_json_path": str(companion),
+            # The export PDF is already named `<identity>-NNN.pdf`; keep it
+            # as the in-Kho file name so re-imports are stable.
+            "target_file_name": name,
+            "metadata": _row_to_metadata(
+                _match_row(name, i, by_filename, vanban_rows)
+            ),
+        })
+
+    return codes, documents, skipped_no_companion, out_dir

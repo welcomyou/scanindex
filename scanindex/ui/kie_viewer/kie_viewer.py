@@ -13,6 +13,7 @@ import os
 import sys
 import threading
 import time
+import configparser
 from collections import OrderedDict, deque
 from functools import partial
 from pathlib import Path
@@ -89,6 +90,8 @@ from PySide6.QtWidgets import (
     QMessageBox, QCheckBox, QDialog, QLineEdit, QFileDialog,
     QDialogButtonBox, QInputDialog, QTextEdit, QMenu,
 )
+
+from scanindex.infra import translations
 
 
 class PrefetchEmitter(QObject):
@@ -320,7 +323,8 @@ def label_display(label: str) -> str:
     Falls back to just the code if no Vietnamese translation exists.
     """
     vi = LABEL_VI.get(label)
-    return f"{vi} ({label})" if vi else label
+    display = translations.localize_text(vi) if vi else ""
+    return f"{display} ({label})" if display else label
 
 def extract_stem(filename):
     name = Path(filename).stem
@@ -942,7 +946,7 @@ class KieViewer(QMainWindow):
     def _browse_for_directory(self, line_edit: QLineEdit):
         chosen = QFileDialog.getExistingDirectory(
             self,
-            "Chọn thư mục",
+            translations.localize_text("Chọn thư mục"),
             line_edit.text().strip() or str(Path.home()),
         )
         if chosen:
@@ -1350,7 +1354,7 @@ class KieViewer(QMainWindow):
         fields_l.addWidget(self.edit_banner)
 
         self.fields_tree = QTreeWidget()
-        self.fields_tree.setHeaderLabels(["Nhãn / Văn bản", "Conf"])
+        self.fields_tree.setHeaderLabels(["Nhãn / Văn bản", "Độ tin cậy"])
         self.fields_tree.setColumnCount(2)
         self.fields_tree.header().setStretchLastSection(False)
         self.fields_tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
@@ -3910,19 +3914,30 @@ class KieViewer(QMainWindow):
             post = self._run_validator_after_save(path)
             toast_kind = "success"
             empty_suffix = (
-                f" (đã bỏ {n_dropped} field trống)" if n_dropped else ""
+                " " + translations.localize_text(
+                    f"(dropped {n_dropped} empty fields)"
+                )
+                if n_dropped else ""
             )
             if post is None:
-                msg = f"✓ Đã lưu {Path(path).name}{empty_suffix}"
+                msg = translations.localize_text(
+                    f"✓ Saved {Path(path).name}"
+                ) + empty_suffix
             else:
                 n_err, n_warn = post
                 if n_err:
-                    msg = f"⚠ Đã lưu nhưng reload validate còn {n_err} lỗi{empty_suffix}"
+                    msg = translations.localize_text(
+                        f"⚠ Saved, but reload validation still reports {n_err} errors"
+                    ) + empty_suffix
                     toast_kind = "error"
                 elif n_warn:
-                    msg = f"✓ Đã lưu ({n_warn} warning){empty_suffix}"
+                    msg = translations.localize_text(
+                        f"✓ Saved ({n_warn} warnings)"
+                    ) + empty_suffix
                 else:
-                    msg = f"✓ Đã lưu + validate OK{empty_suffix}"
+                    msg = translations.localize_text(
+                        "✓ Saved and validation passed"
+                    ) + empty_suffix
             # After save: dirty = False already hides btn_save via the
             # property setter (retainSizeWhenHidden keeps neighbours put).
             # Feedback is delivered via a toast so nothing in the toolbar
@@ -4053,19 +4068,25 @@ class KieViewer(QMainWindow):
         txt.setReadOnly(True)
         lines = []
         if errors:
-            lines.append("ERRORS:")
+            lines.append(translations.localize_text("ERRORS:"))
             for e in errors:
-                lines.append(f"  • {e}")
+                lines.append(
+                    f"  • {translations.localize_text(str(e))}"
+                )
             lines.append("")
         if warnings:
-            lines.append("WARNINGS:")
+            lines.append(translations.localize_text("WARNINGS:"))
             for w in warnings:
                 if isinstance(w, dict):
                     msg = w.get("message") or w.get("code", "")
                     code = w.get("code", "")
-                    lines.append(f"  • [{code}] {msg}")
+                    lines.append(
+                        f"  • [{code}] {translations.localize_text(str(msg))}"
+                    )
                 else:
-                    lines.append(f"  • {w}")
+                    lines.append(
+                        f"  • {translations.localize_text(str(w))}"
+                    )
         txt.setPlainText("\n".join(lines))
         layout.addWidget(txt, 1)
 
@@ -4171,6 +4192,7 @@ class KieViewer(QMainWindow):
                 bbox = w.get("bbox", [])
                 tooltip = f"{wid}: [{', '.join(f'{v:.1f}' for v in bbox)}]" if bbox else wid
                 chip = QLabel(text)
+                chip.setProperty("_scanindex_i18n_skip", True)
                 chip.setToolTip(tooltip)
                 chip.setStyleSheet(
                     f"background-color: {ELEVATED}; border: 1px solid {BORDER}; "
@@ -4201,7 +4223,7 @@ class KieViewer(QMainWindow):
                     target += f": {other.get('text', '')}"
                 if self.edit_mode and rid:
                     self._add_detail_with_action(
-                        desc, target, action_text="Xoá",
+                        desc, target, action_text="Xóa",
                         on_click=partial(self._delete_relation, rid),
                     )
                 else:
@@ -4231,6 +4253,7 @@ class KieViewer(QMainWindow):
         else:
             row.addSpacing(80)
         val = QLabel(value_text)
+        val.setProperty("_scanindex_i18n_skip", True)
         val.setObjectName("detail_value_mono" if mono else "detail_value")
         val.setWordWrap(True)
         val.setTextInteractionFlags(Qt.TextSelectableByMouse)
@@ -4253,6 +4276,7 @@ class KieViewer(QMainWindow):
         else:
             row.addSpacing(80)
         val = QLabel(value_text)
+        val.setProperty("_scanindex_i18n_skip", True)
         val.setObjectName("detail_value")
         val.setWordWrap(True)
         val.setTextInteractionFlags(Qt.TextSelectableByMouse)
@@ -4273,12 +4297,12 @@ class KieViewer(QMainWindow):
         if self.current_stem:
             parts.append(self.current_stem)
         if self.fitz_doc:
-            parts.append(f"{len(self.fitz_doc)} trang")
+            parts.append(translations.localize_text(f"{len(self.fitz_doc)} trang"))
         fields = self._get_fields()
         if fields:
-            parts.append(f"{len(fields)} trường KIE")
+            parts.append(translations.localize_text(f"{len(fields)} trường KIE"))
         if self.dirty:
-            parts.append("* chưa lưu")
+            parts.append(translations.localize_text("* chưa lưu"))
         self.status_left.setText(" | ".join(parts) if parts else "--")
 
     def closeEvent(self, event):
@@ -4297,6 +4321,17 @@ def main():
     """Launch the KIE Viewer. Used by both ``python -m kie_viewer`` (via
     :mod:`kie_viewer.__main__`) and direct script invocation below."""
     app = QApplication(sys.argv)
+    # The standalone viewer follows the same saved language as ScanIndex and
+    # uses the shared source-text catalog for its legacy labels/dialogs.
+    from scanindex.infra import translations
+    try:
+        from scanindex.infra.data_versioning import get_active_settings_path
+        cfg = configparser.ConfigParser()
+        cfg.read(get_active_settings_path(), encoding="utf-8")
+        translations.set_lang(cfg.get("General", "Language", fallback="en"))
+    except Exception:
+        translations.set_lang("en")
+    translations.install_event_filter(app)
     app.setStyle("Fusion")
     viewer = KieViewer()
     viewer.showMaximized()

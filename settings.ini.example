@@ -36,10 +36,23 @@ maxexportworkers = 1
 ; Full-field LightGBM KIE is disabled; LightGBM is kept only for the archive splitter.
 mode = layoutlmv3
 
+[Export]
+; IncludeCanonicalZip = True (mặc định): kèm file .json.zst (chữ OCR + kết quả KIE)
+; cạnh mỗi PDF trong HSLTCQ.zip khi "Xuất hồ sơ nén". File ZIP khi đó nhập
+; ngược lại vào Kho lưu trữ được ngay, không cần chạy lại OCR/KIE.
+; Phần mềm kho (PMKhoSohoa) chỉ quét file .pdf và MetaDuLieu.xlsx nên bỏ qua
+; các file kèm theo; nếu hệ thống nhận từ chối ZIP có file lạ thì đặt False.
+includecanonicalzip = True
+
 [Repository]
 ; Đường dẫn kho tra cứu (relative dùng base dir của app, hoặc absolute path).
 ; Mặc định ./repository. Đổi để dùng ổ khác hoặc shared drive.
 path = repository
+; SkipDuplicateDocs = True (mặc định): khi nhập vào Kho (nhập ZIP, thả ZIP,
+; "Chuyển vào Kho"), PDF trùng nội dung từng byte với văn bản đã có trong
+; CÙNG hồ sơ sẽ bị bỏ qua (đếm là trùng thừa). Đặt False nếu hồ sơ có chủ đích
+; chứa bản trùng (vd bản gốc + bản sao y) — khi đó các bản trùng vẫn được lưu.
+skipduplicatedocs = True
 ; Toggle "Convert PDF/A-2b trước khi ký" ở step 3 lưu trong config/sign_settings.json
 ; (key: convert_pdfa). Cần Ghostscript (gswin64c) trong PATH; auto-detect ở
 ; C:\Program Files\gs\<version>\bin. PassThroughJPEGImages=true giữ nguyên ảnh

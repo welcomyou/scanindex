@@ -60,6 +60,7 @@ except Exception as exc:  # pyHanko/Pillow may be missing on dev machines.
 # identical and share one config file. The signing engine (sign_single_pdf)
 # and the _SignWorker thread remain here; callers reuse them.
 from scanindex.ui.widgets.signing_config_panel import SigningConfigPanel
+from scanindex.infra import translations
 
 
 _H = 26
@@ -600,13 +601,20 @@ class ArchiveStep3Sign(QWidget):
         self._items.append(_SignItem(source_path=path, display_name=os.path.basename(path)))
 
     def _add_files(self):
-        paths, _ = QFileDialog.getOpenFileNames(self, "Chọn file PDF", "", "PDF (*.pdf)")
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            translations.localize_text("Chọn file PDF"),
+            "",
+            translations.localize_text("PDF (*.pdf)"),
+        )
         for path in paths:
             self._add_item_path(path)
         self._refresh_table()
 
     def _add_folder(self):
-        folder = QFileDialog.getExistingDirectory(self, "Chọn thư mục chứa PDF")
+        folder = QFileDialog.getExistingDirectory(
+            self, translations.localize_text("Chọn thư mục chứa PDF")
+        )
         if not folder:
             return
         for root, _, files in os.walk(folder):
@@ -639,8 +647,12 @@ class ArchiveStep3Sign(QWidget):
 
     def _set_table_item(self, row: int, col: int, text: str, tooltip: str = "", status: str = ""):
         cell = QTableWidgetItem(text or "")
+        if status:
+            translations.set_translatable_item_text(cell, text)
         if tooltip:
-            cell.setToolTip(tooltip)
+            cell.setToolTip(
+                translations.localize_text(tooltip) if status else tooltip
+            )
         if status:
             color = COLOR_GREEN if status.startswith("Đã ký") else COLOR_RED if status.startswith("Lỗi") else COLOR_TEXT_SECONDARY
             cell.setForeground(QBrush(QColor(color)))
@@ -698,7 +710,7 @@ class ArchiveStep3Sign(QWidget):
             return
         self._session.identity = codes
         moved = self._refresh_identity_file_names(rename_signed=True)
-        msg = "Archive Step 3: dossier info updated"
+        msg = "Archive Step 3: dossier information updated"
         if moved:
             msg += f"; renamed {moved} signed PDF file(s)"
         self.log_message.emit(msg)
@@ -876,9 +888,7 @@ class ArchiveStep3Sign(QWidget):
     # ------------------------------------------------------------- lifecycle
 
     def update_texts(self):
-        # Step 3 currently keeps explicit Vietnamese labels because certificate
-        # stores and signing errors come from the Windows/token driver.
-        pass
+        self._refresh_table()
 
     def cleanup(self):
         try:

@@ -37,6 +37,7 @@ from scanindex.ui.theme import (
     COLOR_INPUT, COLOR_SURFACE, COLOR_TEXT, COLOR_TEXT_MUTED,
     COLOR_TEXT_SECONDARY, COMBOBOX_DROPDOWN_QSS, FONT_MONO_FALLBACK, FONT_UI,
 )
+from scanindex.infra import translations
 
 try:
     from scanindex.infra.paths import get_base_dir
@@ -727,9 +728,11 @@ class SigningConfigPanel(QWidget):
     def _choose_stamp_image(self):
         path, _ = QFileDialog.getOpenFileName(
             self,
-            "Chọn hình dấu",
+            translations.localize_text("Chọn hình dấu"),
             "",
-            "Ảnh (*.png *.jpg *.jpeg *.bmp *.webp *.tif *.tiff)",
+            translations.localize_text(
+                "Ảnh (*.png *.jpg *.jpeg *.bmp *.webp *.tif *.tiff)"
+            ),
         )
         if not path:
             return
@@ -1276,7 +1279,9 @@ class SigningConfigPanel(QWidget):
     def _set_deps_state(self):
         if _DEPS_OK:
             return
-        self.combo_cert.addItem("Thiếu thư viện ký số")
+        translations.add_localized_combo_items(
+            self.combo_cert, ["Thiếu thư viện ký số"]
+        )
         self.lbl_cert_detail.setText(_IMPORT_ERR)
         if hasattr(self, "_btn_fit"):
             self._btn_fit.setEnabled(False)
@@ -1299,7 +1304,10 @@ class SigningConfigPanel(QWidget):
                     )
                 self.combo_cert.setCurrentIndex(0)
             else:
-                self.combo_cert.addItem("Không tìm thấy chứng thư có khóa bí mật")
+                translations.add_localized_combo_items(
+                    self.combo_cert,
+                    ["Không tìm thấy chứng thư có khóa bí mật"],
+                )
             self.combo_cert.blockSignals(False)
             self._on_cert_change()
         except Exception as exc:
