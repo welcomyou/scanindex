@@ -2735,6 +2735,13 @@ class RepositoryScreen(ScreenContent):
         self._search_scroll_value = 0
         self._search_selected_doc_id = ""
         self._search_rank_by_doc: dict[str, int] = {}
+        # Search result cards are considerably more expensive to construct
+        # than dossier/file cards because they contain match summaries and
+        # per-result actions.  Keep them detached-but-alive while the user
+        # briefly opens a dossier, then put the same widgets back when the
+        # Kết quả tìm kiếm tab is selected again.
+        self._search_list_cache: list[QWidget] = []
+        self._search_list_cache_sort = ""
         self._dossier_scroll_value = 0
         self._return_to_search = False
         self._sort_by_mode = {
@@ -2856,7 +2863,10 @@ class RepositoryScreen(ScreenContent):
             QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
         )
         self._btn_back_to_dossiers.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._btn_back_to_dossiers.setStyleSheet(tab_qss)
+        self._btn_back_to_dossiers.setStyleSheet(
+            tab_qss
+            + f"QPushButton {{ font: 700 13px '{FONT_UI}'; }}"
+        )
         self._btn_back_to_dossiers.clicked.connect(self._show_dossier_list)
         h.addWidget(self._btn_back_to_dossiers)
 
@@ -3074,6 +3084,12 @@ class RepositoryScreen(ScreenContent):
             button.blockSignals(False)
         self._btn_back_to_dossiers.setVisible(True)
         self._btn_back_to_dossiers.setEnabled(self._mode != self._MODE_DOSSIERS)
+        # In a dossier this control is a true parent-level navigation action;
+        # elsewhere it is simply the Hồ sơ tab.  The contextual arrow avoids
+        # showing two arrow-like tabs at the same time.
+        self._btn_back_to_dossiers.setText(
+            "← Hồ sơ" if self._mode == self._MODE_FILES else "Hồ sơ"
+        )
         self._btn_back_to_search.setVisible(has_search_state)
         self._btn_back_to_search.setEnabled(self._mode != self._MODE_SEARCH)
         self._btn_back_to_search.setText(
@@ -3180,16 +3196,27 @@ class RepositoryScreen(ScreenContent):
         return bar
 
     def _build_status_bar(self) -> QWidget:
-        bar = QFrame()
-        bar.setObjectName("repositoryHeaderInfo")
-        bar.setFixedHeight(30)
-        bar.setMinimumWidth(220)
-        bar.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        bar.setStyleSheet(
+        # Only path + statistics belong to the bordered information frame.
+        # Header actions are siblings of that frame so their outlines are not
+        # visually clipped by the frame border/radius.
+        host = QWidget()
+        host.setFixedHeight(30)
+        host.setMinimumWidth(420)
+        host.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        outer = QHBoxLayout(host)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(SP[2])
+
+        info_bar = QFrame()
+        info_bar.setObjectName("repositoryHeaderInfo")
+        info_bar.setFixedHeight(30)
+        info_bar.setMinimumWidth(220)
+        info_bar.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        info_bar.setStyleSheet(
             f"QFrame#repositoryHeaderInfo {{ background: {COLOR_PANEL}; border: 1px solid {COLOR_BORDER};"
             f" border-radius: {RADIUS_MD}px; }}"
         )
-        h = QHBoxLayout(bar)
+        h = QHBoxLayout(info_bar)
         h.setContentsMargins(SP[2], 2, SP[2], 2)
         h.setSpacing(SP[2])
 
@@ -3210,9 +3237,10 @@ class RepositoryScreen(ScreenContent):
             f"color: {COLOR_TEXT_MUTED}; font: 11px '{FONT_UI}';"
         )
         h.addWidget(self._stats_label)
+        outer.addWidget(info_bar, 1)
 
-        # Repository-level actions use the otherwise empty header space and
-        # no longer compete with the primary search controls.
+        # Repository-level actions use the otherwise empty header space while
+        # remaining outside the bordered path/statistics frame.
         self.btn_import_zip = QPushButton("Nhập từ ZIP")
         self.btn_import_zip.setToolTip(
             "Nhập một hoặc nhiều file ZIP hồ sơ đã xuất (kèm .json.zst) vào "
@@ -3223,14 +3251,14 @@ class RepositoryScreen(ScreenContent):
         self.btn_import_zip.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_import_zip.setStyleSheet(BUTTON_PRIMARY_QSS)
         self.btn_import_zip.clicked.connect(self._on_import_zip_clicked)
-        h.addWidget(self.btn_import_zip)
+        outer.addWidget(self.btn_import_zip)
 
         self.btn_settings = QPushButton("⚙ Vị trí kho")
         self.btn_settings.setFixedHeight(24)
         self.btn_settings.clicked.connect(self._pick_archive_path)
-        h.addWidget(self.btn_settings)
+        outer.addWidget(self.btn_settings)
 
-        return bar
+        return host
 
     def _build_filter_panel(self) -> QWidget:
         panel = QFrame()
@@ -3442,6 +3470,31 @@ class RepositoryScreen(ScreenContent):
             if w is not None:
                 w.deleteLater()
 
+    def _discard_search_list_cache(self) -> None:
+        cached, self._search_list_cache = self._search_list_cache, []
+        self._search_list_cache_sort = ""
+        for widget in cached:
+            widget.deleteLater()
+
+    def _stash_search_list(self) -> None:
+        """Detach the current search cards without destroying them."""
+        self._discard_search_list_cache()
+        cached: list[QWidget] = []
+        while self._list_layout.count() > 1:
+            item = self._list_layout.takeAt(0)
+            if item is None:
+                continue
+            widget = item.widget()
+            if widget is None:
+                continue
+            widget.hide()
+            # Keep ownership under the screen while the widget is outside the
+            # scroll layout; this also lets language refreshes still find it.
+            widget.setParent(self)
+            cached.append(widget)
+        self._search_list_cache = cached
+        self._search_list_cache_sort = self._current_sort(self._MODE_SEARCH)
+
     def _add_card(self, card: QWidget):
         self._list_layout.insertWidget(self._list_layout.count() - 1, card)
 
@@ -3621,6 +3674,7 @@ class RepositoryScreen(ScreenContent):
         previous_mode = self._mode
         if previous_mode == self._MODE_SEARCH:
             self._search_scroll_value = self._list_scroll.verticalScrollBar().value()
+            self._stash_search_list()
         elif previous_mode == self._MODE_DOSSIERS:
             self._dossier_scroll_value = self._list_scroll.verticalScrollBar().value()
         self._mode = self._MODE_DOSSIERS
@@ -3759,6 +3813,7 @@ class RepositoryScreen(ScreenContent):
         came_from_search = from_search or self._mode == self._MODE_SEARCH
         if self._mode == self._MODE_SEARCH:
             self._search_scroll_value = self._list_scroll.verticalScrollBar().value()
+            self._stash_search_list()
         elif self._mode == self._MODE_DOSSIERS:
             self._dossier_scroll_value = self._list_scroll.verticalScrollBar().value()
         self._mode = self._MODE_FILES
@@ -4337,6 +4392,7 @@ class RepositoryScreen(ScreenContent):
         self._search_selected_doc_id = ""
         self._search_rank_by_doc = {}
         self._show_dossier_list()
+        self._discard_search_list_cache()
 
     def _on_search_clicked(self):
         if self._engine is None:
@@ -4385,6 +4441,7 @@ class RepositoryScreen(ScreenContent):
         self._search_mode = str(getattr(
             self, "_pending_search_mode", "content"
         ))
+        self._discard_search_list_cache()
         self._search_hits = _group_results_by_file(results)
         self._hits_by_doc = {h.file_row.doc_id: h for h in self._search_hits}
         self._search_selected_doc_id = ""
@@ -4420,7 +4477,16 @@ class RepositoryScreen(ScreenContent):
         return hits
 
     def _render_search_results(self, *, restore_scroll: bool = True) -> None:
-        if self._mode == self._MODE_SEARCH:
+        was_search = self._mode == self._MODE_SEARCH
+        requested_sort = self._current_sort(self._MODE_SEARCH)
+        use_cached_list = bool(
+            not was_search
+            and self._search_list_cache
+            and self._search_list_cache_sort == requested_sort
+        )
+        if not use_cached_list and self._search_list_cache:
+            self._discard_search_list_cache()
+        if was_search:
             self._search_scroll_value = self._list_scroll.verticalScrollBar().value()
         self._mode = self._MODE_SEARCH
         self._current_dossier = None
@@ -4465,21 +4531,32 @@ class RepositoryScreen(ScreenContent):
         sorted_hits = self._sorted_search_hits()
         rank = 0
         rank_width = max(2, len(str(len(sorted_hits))))
-        for kind, label in labels:
-            group = [h for h in sorted_hits if h.match_kind == kind]
-            if not group:
-                continue
-            self._add_card(_GroupHeader(label, len(group)))
-            for hit in group:
-                rank += 1
-                self._search_rank_by_doc[hit.file_row.doc_id] = rank
-                card = _SearchHitCard(
-                    hit, rank=rank, rank_width=rank_width,
-                )
-                card.clicked.connect(lambda _did, hh=hit: self._show_search_hit(hh))
-                card.open_dossier.connect(self._open_search_hit_dossier)
-                self._doc_cards_by_id[hit.file_row.doc_id] = card
-                self._add_card(card)
+        if use_cached_list:
+            cached, self._search_list_cache = self._search_list_cache, []
+            self._search_list_cache_sort = ""
+            for widget in cached:
+                self._add_card(widget)
+                widget.show()
+                if isinstance(widget, _SearchHitCard):
+                    doc_id = widget.hit.file_row.doc_id
+                    self._search_rank_by_doc[doc_id] = widget.rank
+                    self._doc_cards_by_id[doc_id] = widget
+        else:
+            for kind, label in labels:
+                group = [h for h in sorted_hits if h.match_kind == kind]
+                if not group:
+                    continue
+                self._add_card(_GroupHeader(label, len(group)))
+                for hit in group:
+                    rank += 1
+                    self._search_rank_by_doc[hit.file_row.doc_id] = rank
+                    card = _SearchHitCard(
+                        hit, rank=rank, rank_width=rank_width,
+                    )
+                    card.clicked.connect(lambda _did, hh=hit: self._show_search_hit(hh))
+                    card.open_dossier.connect(self._open_search_hit_dossier)
+                    self._doc_cards_by_id[hit.file_row.doc_id] = card
+                    self._add_card(card)
         selected = self._hits_by_doc.get(self._search_selected_doc_id)
         if selected is None and sorted_hits:
             selected = sorted_hits[0]
@@ -5891,6 +5968,7 @@ class RepositoryScreen(ScreenContent):
 
     def closeEvent(self, e):
         try:
+            self._discard_search_list_cache()
             if self._prepare_add_worker and self._prepare_add_worker.isRunning():
                 self._prepare_add_worker.cancel()
                 self._prepare_add_worker.wait(3000)
@@ -5913,6 +5991,7 @@ class RepositoryScreen(ScreenContent):
         SQLite WAL + autocommit means the existing connection sees rows
         committed by Step 3's import without reopen. Tantivy needs an
         explicit reopen to see writes from a different writer instance."""
+        self._discard_search_list_cache()
         if self._store is None:
             self._open_store()
         else:
@@ -5945,6 +6024,7 @@ class RepositoryScreen(ScreenContent):
         self._store = None
         self._engine = None
         self._importer = None
+        self._discard_search_list_cache()
         self._search_hits = []
         self._hits_by_doc = {}
         self._active_doc_id = ""
@@ -5960,6 +6040,7 @@ class RepositoryScreen(ScreenContent):
 
         self._open_store()
         self._show_dossier_list()
+        self._discard_search_list_cache()
         return self._archive_path
 
     def release_index_for_writer(self) -> bool:
