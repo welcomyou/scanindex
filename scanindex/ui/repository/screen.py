@@ -3103,31 +3103,6 @@ class RepositoryScreen(ScreenContent):
         self._set_action_bar_narrow(
             event.size().width() < self._ACTION_BAR_BREAKPOINT
         )
-        filter_columns = 6 if event.size().width() >= 1280 else 4
-        self._set_filter_grid_columns(filter_columns)
-
-    def _set_filter_grid_columns(self, columns: int) -> None:
-        """Reflow advanced-search fields without recreating their inputs."""
-        grid = getattr(self, "_filter_grid", None)
-        groups = getattr(self, "_filter_field_groups", None)
-        if grid is None or not groups:
-            return
-        columns = max(1, int(columns))
-        if getattr(self, "_filter_grid_columns", None) == columns:
-            return
-
-        self._filter_grid_columns = columns
-        for group in groups:
-            grid.removeWidget(group)
-        for index, group in enumerate(groups):
-            grid.addWidget(group, index // columns, index % columns)
-        for column in range(6):
-            grid.setColumnStretch(column, 1 if column < columns else 0)
-
-        grid.invalidate()
-        panel = getattr(self, "_filter_panel", None)
-        if panel is not None:
-            panel.updateGeometry()
 
     def _style_dossier_filter_combo(self, combo: QComboBox) -> None:
         combo.setStyleSheet(
@@ -3401,73 +3376,43 @@ class RepositoryScreen(ScreenContent):
 
     def _build_filter_panel(self) -> QWidget:
         panel = QFrame()
-        panel.setObjectName("repositoryAdvancedFilters")
         panel.setStyleSheet(
-            f"QFrame#repositoryAdvancedFilters {{ background: {COLOR_SURFACE};"
-            f" border: 1px solid {COLOR_BORDER};"
+            f"QFrame {{ background: {COLOR_SURFACE}; border: 1px solid {COLOR_BORDER};"
             f" border-radius: {RADIUS_MD}px; }}"
-            f"QFrame#repositoryAdvancedFilters QLabel {{ color: {COLOR_TEXT_SECONDARY};"
-            f" font: 11px '{FONT_UI}'; border: none; background: transparent; }}"
+            f"QLabel {{ color: {COLOR_TEXT_SECONDARY}; font: 11px '{FONT_UI}'; }}"
         )
         v = QVBoxLayout(panel)
-        v.setContentsMargins(SP[2], SP[1], SP[2], SP[2])
-        v.setSpacing(SP[1])
+        v.setContentsMargins(SP[3], SP[2], SP[3], SP[2])
+        v.setSpacing(SP[2])
 
-        header = QHBoxLayout()
-        header.setContentsMargins(0, 0, 0, 0)
-        header.setSpacing(SP[2])
         filter_hint = QLabel(
             "Các điều kiện dưới đây được kết hợp AND với nội dung cần tìm."
         )
         filter_hint.setStyleSheet(
             f"color: {COLOR_TEXT_MUTED}; font: 11px '{FONT_UI}'; border: none;"
         )
-        header.addWidget(filter_hint, 1)
-        btn_reset = QPushButton("Đặt lại")
-        btn_reset.setFixedHeight(24)
-        btn_reset.clicked.connect(self._reset_filters)
-        header.addWidget(btn_reset)
-        v.addLayout(header)
+        v.addWidget(filter_hint)
 
         grid = QGridLayout()
-        grid.setContentsMargins(0, 0, 0, 0)
-        grid.setHorizontalSpacing(SP[2])
-        grid.setVerticalSpacing(SP[1])
-        self._filter_grid = grid
+        grid.setHorizontalSpacing(SP[3])
+        grid.setVerticalSpacing(SP[2])
 
         self._filter_inputs: dict[str, QWidget] = {}
-        self._filter_field_groups: list[QWidget] = []
-        self._filter_grid_columns: Optional[int] = None
 
-        def _add_field(label_text: str, key: str, widget: QWidget) -> None:
-            group = QWidget()
-            group.setStyleSheet("background: transparent; border: none;")
-            group.setSizePolicy(
-                QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed
-            )
-            field_layout = QVBoxLayout(group)
-            field_layout.setContentsMargins(0, 0, 0, 0)
-            field_layout.setSpacing(2)
-            label = QLabel(label_text)
-            field_layout.addWidget(label)
-            widget.setMinimumWidth(0)
-            widget.setFixedHeight(28)
-            widget.setSizePolicy(
-                QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed
-            )
-            field_layout.addWidget(widget)
-            self._filter_inputs[key] = widget
-            self._filter_field_groups.append(group)
-
-        def _add(label: str, key: str):
+        def _add(row: int, col: int, label: str, key: str, width: int = 1):
+            grid.addWidget(QLabel(label), row, col * 2)
             le = QLineEdit()
-            _add_field(label, key, le)
+            grid.addWidget(le, row, col * 2 + 1, 1, width)
+            self._filter_inputs[key] = le
 
-        def _add_date(label: str, key: str):
+        def _add_date(row: int, col: int, label: str, key: str):
+            grid.addWidget(QLabel(label), row, col * 2)
             w = _DateFilterInput()
-            _add_field(label, key, w)
+            grid.addWidget(w, row, col * 2 + 1)
+            self._filter_inputs[key] = w
 
-        def _add_doc_type():
+        def _add_doc_type(row: int, col: int):
+            grid.addWidget(QLabel("Loại VB"), row, col * 2)
             combo = FuzzyComboBox()
             try:
                 from scanindex.core.digitization.doctype import all_display_names
@@ -3481,35 +3426,44 @@ class RepositoryScreen(ScreenContent):
                     context="document_type",
                 )
             combo.setCurrentIndex(-1)
-            _add_field("Loại VB", "doc_type", combo)
+            grid.addWidget(combo, row, col * 2 + 1)
+            self._filter_inputs["doc_type"] = combo
             self._filter_doc_type_combo = combo
 
-        def _add_archive_combo(label: str, key: str):
+        def _add_archive_combo(row: int, col: int, label: str, key: str):
+            grid.addWidget(QLabel(label), row, col * 2)
             combo = FuzzyComboBox(sort=False)
             combo.addItem(f"Tất cả {label.lower()}", "")
             combo.setCurrentIndex(0)
-            _add_field(label, key, combo)
+            grid.addWidget(combo, row, col * 2 + 1)
+            self._filter_inputs[key] = combo
             if key == "fonds":
                 self._filter_fonds_combo = combo
                 combo.currentIndexChanged.connect(self._on_search_fonds_changed)
             else:
                 self._filter_catalog_combo = combo
 
-        _add("Số ký hiệu", "doc_number")
-        _add("Cơ quan", "issue_org")
-        _add("Người ký", "signer_name")
-        _add_doc_type()
-        _add_archive_combo("Phông", "fonds")
-        _add_archive_combo("Mục lục", "catalog")
-        _add_date("Ngày từ", "issue_date_from")
-        _add_date("Đến", "issue_date_to")
-        _add("Trích yếu", "subject")
-        _add("Nhiệm kỳ", "term")
-        _add("Thời hạn", "retention")
-        _add("Độ mật", "confidentiality")
+        _add(0, 0, "Số ký hiệu", "doc_number")
+        _add(0, 1, "Cơ quan", "issue_org")
+        _add(0, 2, "Người ký", "signer_name")
+        _add_doc_type(1, 0)
+        _add_archive_combo(1, 1, "Phông", "fonds")
+        _add_archive_combo(1, 2, "Mục lục", "catalog")
+        _add_date(2, 0, "Ngày từ", "issue_date_from")
+        _add_date(2, 1, "Đến", "issue_date_to")
+        _add(2, 2, "Trích yếu", "subject")
+        _add(3, 0, "Nhiệm kỳ", "term")
+        _add(3, 1, "Thời hạn", "retention")
+        _add(3, 2, "Độ mật", "confidentiality")
 
         v.addLayout(grid)
-        self._set_filter_grid_columns(4)
+
+        actions = QHBoxLayout()
+        actions.addStretch(1)
+        btn_reset = QPushButton("Đặt lại")
+        btn_reset.clicked.connect(self._reset_filters)
+        actions.addWidget(btn_reset)
+        v.addLayout(actions)
         return panel
 
     # ------ Store/Index lifecycle ------
