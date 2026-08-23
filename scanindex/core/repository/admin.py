@@ -38,6 +38,7 @@ from .importer import (
     _replace_pdf_file, _copy_companion_if_present,
 )
 from .indexer import HybridIndex
+from .reindex import note_index_write
 from .store import ArchiveStore
 from .tokenizer import segment, to_no_diacritic
 from scanindex.core.canonical_io import companion_for_pdf, resolve_companion
@@ -261,6 +262,7 @@ def delete_document(store: ArchiveStore, index: HybridIndex,
         index.begin_writer()  # no-op if already open
         index.commit()
         store.refresh_counters()
+        note_index_write(store)
     return stats
 
 
@@ -278,6 +280,7 @@ def delete_documents_bulk(store: ArchiveStore, index: HybridIndex,
             total.errors.extend(s.errors)
     index.commit()
     store.refresh_counters()
+    note_index_write(store)
     return total
 
 
@@ -327,6 +330,7 @@ def delete_dossier(store: ArchiveStore, index: HybridIndex,
     except Exception:
         pass
     store.refresh_counters()
+    note_index_write(store)
     return stats
 
 
@@ -492,6 +496,7 @@ def update_document_metadata(store: ArchiveStore, index: HybridIndex,
                 body_segmented=tseg or "",
             )
     index.commit()
+    note_index_write(store)
 
 
 def update_dossier_metadata(store: ArchiveStore, dossier_id: int,
@@ -1040,4 +1045,5 @@ def add_document(store: ArchiveStore, index: HybridIndex, *,
     )
     index.commit()
     store.refresh_counters()
+    note_index_write(store)
     return doc_id

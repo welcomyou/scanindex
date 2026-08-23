@@ -15,13 +15,33 @@ TOKENIZER_VERSION    = "1.x"           # filled at runtime if available
 DEFAULT_REPOSITORY_DIRNAME = "repository"   # relative to app base dir
 DEFAULT_ARCHIVE_DIRNAME    = DEFAULT_REPOSITORY_DIRNAME
 PDF_SUBDIR              = "pdf"
-TANTIVY_SUBDIR          = "tantivy_index"
+# The Tantivy folder is versioned like the SQLite file (version-per-file):
+# bumping INDEXER_VERSION must bump this name so a new index is built
+# alongside the old one. Older app releases keep reading their own folder,
+# which makes downgrading safe (worst case: stale search until re-import).
+TANTIVY_SUBDIR          = "tantivy_index-v2"
+LEGACY_TANTIVY_SUBDIRS  = ("tantivy_index",)   # v1; wiped only by explicit reset
 SQLITE_FILE             = "repository.db"
 IMPORT_LOG_FILE         = "import_log.json"
 
 # ---------- Search parameters ----------
 TANTIVY_TOP_K          = 100
 MIN_RESULTS            = 5              # below this -> fallback
+
+# ---------- Indexer schema ----------
+# v2: every searchable field gains a no-diacritic twin (default tokenizer) and
+# a character-trigram twin (substring/typo recall), so queries typed without
+# Vietnamese diacritics and OCR slips are served by the index instead of the
+# linear SQLite fallbacks. Bump + change TANTIVY_SUBDIR when fields change.
+INDEXER_VERSION        = "2"
+TRIGRAM_TOKENIZER_NAME = "scanindex_trigram"
+TRIGRAM_MIN_GRAM       = 3
+TRIGRAM_MAX_GRAM       = 3
+# Query-time weight scales for the derived fields (relative to the base
+# TANTIVY_FIELD_WEIGHTS entry): a diacritic-stripped hit is worth slightly
+# less than the exact one; a substring hit less still.
+NODIAC_WEIGHT_SCALE    = 0.9
+TRIGRAM_WEIGHT_SCALE   = 0.6
 
 # ---------- Per-field weights for Tantivy hybrid scoring ----------
 # Higher = more important. Chunker v2 splits chunks by type:

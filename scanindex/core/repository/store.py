@@ -135,7 +135,6 @@ class ArchiveStore:
             except OSError:
                 pass
         for sub in (
-            self.archive_path / C.TANTIVY_SUBDIR,
             self.archive_path / C.PDF_SUBDIR,
         ):
             try:
@@ -143,6 +142,15 @@ class ArchiveStore:
                     shutil.rmtree(sub, ignore_errors=True)
             except OSError:
                 pass
+        # Wipe every tantivy generation (current + legacy) — reset is the
+        # one explicitly destructive path, so stale v1 folders must go too.
+        if self.archive_path.exists():
+            for entry in self.archive_path.iterdir():
+                if not entry.is_dir():
+                    continue
+                if entry.name == C.TANTIVY_SUBDIR or entry.name in C.LEGACY_TANTIVY_SUBDIRS \
+                        or entry.name.startswith(C.TANTIVY_SUBDIR + "."):
+                    shutil.rmtree(entry, ignore_errors=True)
         self.ensure_folders()
 
     def reset_archive_data(self) -> None:
@@ -163,6 +171,7 @@ class ArchiveStore:
             "chunker_version":     C.CHUNKER_VERSION,
             "tokenizer_name":      C.TOKENIZER_NAME,
             "tokenizer_version":   C.TOKENIZER_VERSION,
+            "indexer_version":     C.INDEXER_VERSION,
             "total_documents":     "0",
             "total_chunks":        "0",
             "created_at":          str(int(time.time())),

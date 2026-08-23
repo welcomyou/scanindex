@@ -137,6 +137,40 @@ class SearchWorker(QThread):
             self.failed.emit(str(e))
 
 
+class _IndexRebuildWorker(QThread):
+    """Off-thread rebuild of the derived Tantivy index from SQLite.
+
+    Used at open time when the on-disk index predates this indexer
+    generation (schema upgrade, missing folder, stale watermark). SQLite is
+    never touched; a cancel leaves the previous generation in place.
+    """
+    progress = Signal(int, int)      # done, total chunks
+    finished_ok = Signal(object)     # rebuild summary dict
+    failed = Signal(str)
+
+    def __init__(self, store, archive_path):
+        super().__init__()
+        self._store = store
+        self._archive_path = archive_path
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
+
+    def run(self):
+        try:
+            from scanindex.core.repository.reindex import rebuild_search_index
+            res = rebuild_search_index(
+                self._store, self._archive_path,
+                progress_cb=lambda done, total: self.progress.emit(done, total),
+                cancel_check=lambda: self._cancel,
+            )
+            self.finished_ok.emit(res)
+        except Exception as e:
+            import traceback
+            self.failed.emit(f"{e}\n{traceback.format_exc()}")
+
+
 class _AddFileWorker(QThread):
     """Off-thread index write for the "Thêm văn bản" flow."""
     finished_ok = Signal(str)     # doc_id
@@ -3905,6 +3939,24 @@ class RepositoryScreen(ScreenContent):
                     f"Kho cần migration/rebuild chỉ mục nhưng dữ liệu không bị xóa: {details}",
                     "info",
                 )
+            # Derived-index generation check: when the on-disk Tantivy
+            # predates this indexer version (schema upgrade / missing /
+            # stale), rebuild it from SQLite in a sibling folder. SQLite is
+            # the source of truth, so user data is never at risk.
+            from scanindex.core.repository.reindex import index_needs_rebuild
+            reason = index_needs_rebuild(self._store, self._archive_path)
+            if reason:
+                self._rebuild_index_interactive(reason)
+                return
+            self._finish_index_init()
+        except Exception as e:
+            QMessageBox.critical(self, "Kho lưu trữ",
+                                 f"Không mở được kho:\n{e}")
+
+    def _finish_index_init(self):
+        """Open the derived index and finish Kho initialization. Called both
+        directly and after an interactive index rebuild."""
+        try:
             self._index = HybridIndex(self._archive_path)
             self._index.open()
             run_startup_repair(
@@ -3918,6 +3970,72 @@ class RepositoryScreen(ScreenContent):
         except Exception as e:
             QMessageBox.critical(self, "Kho lưu trữ",
                                  f"Không mở được kho:\n{e}")
+
+    def _rebuild_index_interactive(self, reason: str):
+        """Rebuild the Tantivy index with a cancellable progress dialog.
+
+        The rebuild stages a complete index in a sibling folder and only
+        swaps it in when finished, so a crash or cancel mid-way leaves the
+        previous generation usable (an older-generation folder simply gets
+        rebuilt again on the next open).
+        """
+        from PySide6.QtWidgets import QProgressDialog
+        labels = {
+            "indexer_version": "Nâng cấp chỉ mục tìm kiếm lên phiên bản mới…",
+            "missing_dir": "Thiếu chỉ mục tìm kiếm — đang dựng lại từ dữ liệu…",
+            "stale": "Chỉ mục tìm kiếm lệch với dữ liệu — đang dựng lại…",
+        }
+        progress = QProgressDialog(
+            labels.get(reason, labels["stale"]), "Hủy", 0, 1, self
+        )
+        progress.setWindowTitle("Kho lưu trữ")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+
+        worker = _IndexRebuildWorker(self._store, self._archive_path)
+        # Keep references alive for the duration of the rebuild.
+        self._index_rebuild_worker = worker
+        self._index_rebuild_dialog = progress
+
+        def _on_progress(done: int, total: int):
+            progress.setMaximum(max(1, int(total)))
+            progress.setValue(int(done))
+            progress.setLabelText(f"Đang dựng chỉ mục: {done}/{total} đoạn văn")
+
+        def _on_done(res):
+            progress.close()
+            self._index_rebuild_dialog = None
+            res = res or {}
+            if res.get("cancelled"):
+                self.log_message.emit(
+                    "Kho: đã hủy dựng chỉ mục — tìm kiếm có thể thiếu kết quả "
+                    "đến lần dựng lại kế tiếp.", "warning",
+                )
+            else:
+                self.log_message.emit(
+                    "Kho: đã dựng lại chỉ mục tìm kiếm "
+                    f"({res.get('chunks', 0)} đoạn, {res.get('elapsed', 0):.1f}s).",
+                    "success",
+                )
+            self._finish_index_init()
+
+        def _on_fail(msg):
+            progress.close()
+            self._index_rebuild_dialog = None
+            self.log_message.emit(
+                f"Kho: dựng lại chỉ mục thất bại — {msg}", "error",
+            )
+            # Still finish init: the screen stays usable with an empty/
+            # previous index; the next open retries the rebuild.
+            self._finish_index_init()
+
+        worker.progress.connect(_on_progress)
+        worker.finished_ok.connect(_on_done)
+        worker.failed.connect(_on_fail)
+        progress.canceled.connect(worker.cancel)
+        worker.start()
 
     def _refresh_status(self):
         if self._store is None:

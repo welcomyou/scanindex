@@ -35,6 +35,31 @@ _BODY_TEXT_FIELDS: Tuple[str, ...] = (
     "body_original", "body_no_diacritic", "body_segmented",
 )
 
+# ---- Indexer v2 derived fields -------------------------------------------
+# Every base field gets recall twins, fed with `to_no_diacritic(text).lower()`:
+#   <f>_nodiac — default tokenizer; recovers "nguyen van a" ↔ "Nguyễn Văn A"
+#                typed without diacritics (metadata previously had no twin).
+#   <f>_tri    — 3-gram tokenizer; substring + typo recall served by the
+#                index instead of the linear SQLite fallbacks.
+# body_segmented gets no twins: its underscore-joined tokens would pollute
+# the grams, and body_no_diacritic already covers the stripped body text.
+_METADATA_NODIAC_FIELDS: Tuple[str, ...] = tuple(
+    f + "_nodiac" for f in _METADATA_TEXT_FIELDS
+)
+_TRI_FIELDS: Tuple[str, ...] = tuple(
+    f + "_tri" for f in _METADATA_TEXT_FIELDS
+) + ("body_tri",)
+_TRI_SOURCE_FIELD = {
+    # trigram field -> base field whose (normalized) text feeds it
+    **{f + "_tri": f for f in _METADATA_TEXT_FIELDS},
+    "body_tri": "body_original",
+}
+
+
+def _normalized_index_text(text: str) -> str:
+    """Canonical text for the _nodiac/_tri twins: diacritic-stripped + folded."""
+    return to_no_diacritic(text or "").lower()
+
 
 def metadata_text_fields() -> Tuple[str, ...]:
     return _METADATA_TEXT_FIELDS
@@ -52,6 +77,14 @@ def _normalize_fields(fields: Optional[Iterable[str]]) -> Tuple[str, ...]:
     return out or _TEXT_FIELDS
 
 
+def _trigram_analyzer() -> "tantivy.TextAnalyzer":
+    return tantivy.TextAnalyzerBuilder(
+        tantivy.Tokenizer.ngram(
+            C.TRIGRAM_MIN_GRAM, C.TRIGRAM_MAX_GRAM, prefix_only=False
+        )
+    ).build()
+
+
 def _build_schema() -> tantivy.Schema:
     sb = tantivy.SchemaBuilder()
     # Stored identifier fields — used for filtering and result lookup.
@@ -63,6 +96,13 @@ def _build_schema() -> tantivy.Schema:
     # multi-syllable terms with underscore in body_segmented.
     for fname in _TEXT_FIELDS:
         sb.add_text_field(fname, stored=False, tokenizer_name="default")
+    # Indexer v2 recall twins.
+    for fname in _METADATA_NODIAC_FIELDS:
+        sb.add_text_field(fname, stored=False, tokenizer_name="default")
+    for fname in _TRI_FIELDS:
+        sb.add_text_field(
+            fname, stored=False, tokenizer_name=C.TRIGRAM_TOKENIZER_NAME
+        )
     return sb.build()
 
 
@@ -89,12 +129,18 @@ def _build_boosted_query(query: str,
 
     Returns syntax like:
       doc_number:(query)^5.0 OR signer_name:(query)^3.0 OR ...
+
+    Indexer v2 also queries the _nodiac/_tri twins with a diacritic-stripped
+    query, so "nguyen van a" typed without accents still hits metadata, and
+    substring matches surface without the linear SQL fallback.
     """
     safe = _escape_query(query)
     if not safe:
         return ""
     segmented = _segment_query_if_enabled(query)
     safe_segmented = _escape_query(segmented)
+    # One canonical normalized form feeds every _nodiac/_tri twin.
+    safe_norm = _escape_query(_normalized_index_text(query))
     parts = []
     for fname in _normalize_fields(fields):
         weight = C.TANTIVY_FIELD_WEIGHTS.get(fname, 1.0)
@@ -102,6 +148,18 @@ def _build_boosted_query(query: str,
         parts.append(f"{fname}:({field_query})^{weight}")
         if fname == "body_segmented" and safe_segmented and safe_segmented != safe:
             parts.append(f"{fname}:({safe})^{weight * 0.4}")
+        if fname in _METADATA_TEXT_FIELDS:
+            if safe_norm:
+                parts.append(
+                    f"{fname}_nodiac:({safe_norm})^{weight * C.NODIAC_WEIGHT_SCALE}"
+                )
+                parts.append(
+                    f"{fname}_tri:({safe_norm})^{weight * C.TRIGRAM_WEIGHT_SCALE}"
+                )
+        elif fname == "body_original":
+            # body_no_diacritic already IS the body's normalized twin.
+            if safe_norm:
+                parts.append(f"body_tri:({safe_norm})^{weight * C.TRIGRAM_WEIGHT_SCALE}")
     return " OR ".join(parts)
 
 
@@ -153,6 +211,14 @@ def _fuzzy_tokens(query: str, *, allow_numeric: bool = False) -> List[str]:
     return out
 
 
+def _base_field_of(field: str) -> str:
+    """Map a derived field (doc_number_nodiac / body_tri / ...) back to its
+    base field so weight lookups hit TANTIVY_FIELD_WEIGHTS correctly."""
+    if field.endswith("_nodiac"):
+        return field[: -len("_nodiac")]
+    return _TRI_SOURCE_FIELD.get(field, field)
+
+
 def _build_structured_fuzzy_query(index: tantivy.Index,
                                   query: str,
                                   fields: Optional[Iterable[str]] = None):
@@ -167,12 +233,25 @@ def _build_structured_fuzzy_query(index: tantivy.Index,
     if not tokens:
         return None
     schema = index.schema
+    # Fuzzy over each base field plus its _nodiac twin (the trigram twins
+    # are the fuzzy mechanism for substrings, so they are not fuzzy-queried).
+    fuzzy_fields = []
+    for fname in norm_fields:
+        fuzzy_fields.append((fname, 1.0))
+        if fname in _METADATA_TEXT_FIELDS:
+            fuzzy_fields.append(
+                (fname + "_nodiac", C.NODIAC_WEIGHT_SCALE)
+            )
+        elif fname == "body_original":
+            fuzzy_fields.append(("body_no_diacritic", C.NODIAC_WEIGHT_SCALE))
     token_queries = []
     for tok in tokens:
         distance = 1 if len(tok) <= 5 else 2
         field_queries = []
-        for fname in norm_fields:
-            weight = C.TANTIVY_FIELD_WEIGHTS.get(fname, 1.0) * 0.7
+        for fname, scale in fuzzy_fields:
+            weight = C.TANTIVY_FIELD_WEIGHTS.get(
+                _base_field_of(fname), 1.0
+            ) * 0.7 * scale
             try:
                 q = tantivy.Query.fuzzy_term_query(
                     schema,
@@ -206,10 +285,22 @@ def _build_structured_fuzzy_query(index: tantivy.Index,
     )
 
 
+class IndexSchemaMismatch(RuntimeError):
+    """Raised when the on-disk Tantivy index predates the current indexer
+    schema (e.g. an index written by a newer release). Callers should offer
+    a rebuild; SQLite remains the source of truth, so rebuilding is safe."""
+
+
 class HybridIndex:
-    def __init__(self, archive_path: Path):
+    def __init__(self, archive_path: Path,
+                 tantivy_dir: Optional[Path] = None):
         self.archive_path = Path(archive_path)
-        self.tantivy_dir = self.archive_path / C.TANTIVY_SUBDIR
+        # `tantivy_dir` override lets the rebuild routine stage a fresh index
+        # in a sibling folder before swapping it into place.
+        self.tantivy_dir = (
+            Path(tantivy_dir) if tantivy_dir is not None
+            else self.archive_path / C.TANTIVY_SUBDIR
+        )
         self._tan_index: Optional[tantivy.Index] = None
         self._tan_writer: Optional[tantivy.IndexWriter] = None
 
@@ -229,10 +320,22 @@ class HybridIndex:
         # If the directory has no Tantivy meta yet, create_in initializes it;
         # otherwise we attach to the existing index. tantivy-py auto-detects.
         meta = self.tantivy_dir / "meta.json"
-        if meta.exists():
-            self._tan_index = tantivy.Index.open(str(self.tantivy_dir))
-        else:
-            self._tan_index = tantivy.Index(schema, path=str(self.tantivy_dir))
+        try:
+            if meta.exists():
+                self._tan_index = tantivy.Index.open(str(self.tantivy_dir))
+            else:
+                self._tan_index = tantivy.Index(schema, path=str(self.tantivy_dir))
+        except Exception as exc:
+            raise IndexSchemaMismatch(
+                f"Chỉ mục Tantivy tại {self.tantivy_dir} không mở được "
+                f"(có thể do schema phiên bản khác): {exc}"
+            ) from exc
+        # Custom analyzers are not persisted across sessions — the trigram
+        # tokenizer must be re-registered on every open (name first, then
+        # the analyzer), or writers/queries against the *_tri fields fail.
+        self._tan_index.register_tokenizer(
+            C.TRIGRAM_TOKENIZER_NAME, _trigram_analyzer()
+        )
 
     # ---------- Writer (batch) ----------
 
@@ -252,24 +355,37 @@ class HybridIndex:
                             metadata_text: str) -> None:
         """Index a metadata chunk in Tantivy.
         Per-field metadata fields are populated so per-field boosts in
-        TANTIVY_FIELD_WEIGHTS hit *just this* chunk for queries like
-        "số 218" or "Nguyễn Văn A". The body_* fields stay blank."""
+        TANTIVY_FIELD_WEIGHTS hit *just this chunk* for queries like
+        "số 218" or "Nguyễn Văn A". The body_* fields stay blank.
+        Indexer v2 also fills the _nodiac/_tri twins for accent-free and
+        substring recall; all writers (importer/admin/rebuild) go through
+        here, so the normalization can never drift from the schema."""
         if self._tan_writer is None:
             self.begin_writer()
-        self._tan_writer.add_document(tantivy.Document(
-            doc_id=doc_id,
-            chunk_id=str(chunk_id),
-            dossier_id=str(dossier_id) if dossier_id is not None else "",
-            doc_number=doc_number or "",
-            signer_name=signer_name or "",
-            issue_org=issue_org or "",
-            subject=subject or "",
-            recipients=recipients or "",
-            metadata_text=metadata_text or "",
-            body_original="",
-            body_no_diacritic="",
-            body_segmented="",
-        ))
+        per_field = {
+            "doc_number": doc_number,
+            "signer_name": signer_name,
+            "issue_org": issue_org,
+            "subject": subject,
+            "recipients": recipients,
+            "metadata_text": metadata_text,
+        }
+        doc: dict = {
+            "doc_id": doc_id,
+            "chunk_id": str(chunk_id),
+            "dossier_id": str(dossier_id) if dossier_id is not None else "",
+            "body_original": "",
+            "body_no_diacritic": "",
+            "body_segmented": "",
+        }
+        for fname, raw in per_field.items():
+            text = raw or ""
+            doc[fname] = text
+            norm = _normalized_index_text(text)
+            doc[fname + "_nodiac"] = norm
+            doc[fname + "_tri"] = norm
+        doc["body_tri"] = ""
+        self._tan_writer.add_document(tantivy.Document(**doc))
 
     def add_body_text_chunk(self, *,
                              doc_id: str,
@@ -281,6 +397,7 @@ class HybridIndex:
         """Index a body chunk in Tantivy only."""
         if self._tan_writer is None:
             self.begin_writer()
+        norm = _normalized_index_text(body_original)
         self._tan_writer.add_document(tantivy.Document(
             doc_id=doc_id,
             chunk_id=str(chunk_id),
@@ -291,9 +408,22 @@ class HybridIndex:
             subject="",
             recipients="",
             metadata_text="",
+            doc_number_nodiac="",
+            signer_name_nodiac="",
+            issue_org_nodiac="",
+            subject_nodiac="",
+            recipients_nodiac="",
+            metadata_text_nodiac="",
+            doc_number_tri="",
+            signer_name_tri="",
+            issue_org_tri="",
+            subject_tri="",
+            recipients_tri="",
+            metadata_text_tri="",
             body_original=body_original or "",
             body_no_diacritic=body_no_diacritic or "",
             body_segmented=body_segmented or "",
+            body_tri=norm,
         ))
 
     def delete_tantivy_by_doc(self, doc_id: str) -> None:

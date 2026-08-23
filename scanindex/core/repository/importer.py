@@ -48,6 +48,7 @@ import openpyxl
 from . import constants as C
 from .chunker import Block, Chunk, chunk_blocks, synthesize_metadata_chunk
 from .indexer import HybridIndex
+from .reindex import note_index_write
 from .store import ArchiveStore
 from .tokenizer import segment, segment_many, to_no_diacritic
 from scanindex.core.canonical_io import companion_for_pdf, resolve_companion
@@ -631,6 +632,7 @@ class Importer:
                     progress_cb(prog)
             self.index.commit()
             self.store.refresh_counters()
+            note_index_write(self.store)
             self._end_import(import_id, "completed", prog)
         except Exception as e:
             try:
@@ -712,6 +714,7 @@ class Importer:
                     progress_cb(prog)
             self.index.commit()
             self.store.refresh_counters()
+            note_index_write(self.store)
             self._end_import(import_id, "completed", prog)
         except Exception as e:
             try:
