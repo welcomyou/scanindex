@@ -3109,7 +3109,7 @@ class RepositoryScreen(ScreenContent):
         box.setMinimumWidth(240)
         box.setMaximumWidth(560)
         box.setStyleSheet(
-            f"background: {COLOR_BG}; border: 1px solid {COLOR_BORDER};"
+            f"background: {COLOR_BG}; border: none;"
             f" border-radius: {RADIUS_MD}px;"
         )
         v = QVBoxLayout(box)
@@ -3135,7 +3135,7 @@ class RepositoryScreen(ScreenContent):
     def _build_toolbar(self) -> QWidget:
         bar = QFrame()
         bar.setStyleSheet(
-            f"QFrame {{ background: {COLOR_SURFACE}; border: 1px solid {COLOR_BORDER};"
+            f"QFrame {{ background: {COLOR_SURFACE}; border: none;"
             f" border-radius: {RADIUS_MD}px; }}"
         )
         h = QHBoxLayout(bar)
@@ -3196,9 +3196,9 @@ class RepositoryScreen(ScreenContent):
         return bar
 
     def _build_status_bar(self) -> QWidget:
-        # Only path + statistics belong to the bordered information frame.
+        # Only path + statistics belong to the information area.
         # Header actions are siblings of that frame so their outlines are not
-        # visually clipped by the frame border/radius.
+        # visually grouped with the read-only repository status.
         host = QWidget()
         host.setFixedHeight(30)
         host.setMinimumWidth(420)
@@ -3213,7 +3213,7 @@ class RepositoryScreen(ScreenContent):
         info_bar.setMinimumWidth(220)
         info_bar.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         info_bar.setStyleSheet(
-            f"QFrame#repositoryHeaderInfo {{ background: {COLOR_PANEL}; border: 1px solid {COLOR_BORDER};"
+            f"QFrame#repositoryHeaderInfo {{ background: {COLOR_PANEL}; border: none;"
             f" border-radius: {RADIUS_MD}px; }}"
         )
         h = QHBoxLayout(info_bar)
