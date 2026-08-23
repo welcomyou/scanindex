@@ -21,6 +21,15 @@ Per-PDF workflow either path:
 5. tokenizer.to_no_diacritic + tokenizer.segment for each chunk.
 6. SQLite + Tantivy write in 1 logical operation. Status field on
    `documents` and `chunks` lets repair.py recover from a crash.
+
+Legacy ZIP entries (`canonical_json_path` empty, exported without
+`.json.zst` sidecars): step 0 synthesizes a canonical companion from the
+PDF's invisible text layer (`text_extractor.write_canonical_from_text_layer`),
+then the normal per-PDF workflow runs unchanged. Body text comes from the
+text layer; KIE fields come from the workbook metadata via
+`_apply_step2_metadata_overrides`; `kie_annotation_json` stays `{}`
+(no bbox-carrying KIE annotations). The synthesized companion is copied
+into Kho next to the PDF like any other sidecar.
 """
 from __future__ import annotations
 
@@ -201,6 +210,9 @@ def _apply_step2_metadata_overrides(kie_fields: Dict[str, str],
     secrecy = " ".join(str(metadata.get("do_mat") or "").split())
     if secrecy:
         out["kie_secrecy_mark"] = secrecy
+    circulation = " ".join(str(metadata.get("che_do_su_dung") or "").split())
+    if circulation:
+        out["kie_circulation_mark"] = circulation
     # Dossier-sequencing fields (not KIE labels): store as ints so the
     # archive ZIP export reproduces the operator's exact numbering.
     for seq_key in ("trang_so", "so_thu_tu"):
@@ -492,6 +504,9 @@ class ImportProgress:
     # when off they are imported anyway but still counted here so the
     # result dialog can report "trùng thừa".
     duplicates: int = 0
+    # Docs imported without a bundled canonical sidecar (legacy ZIPs): the
+    # canonical companion was synthesized from the PDF text layer.
+    text_layer_imports: int = 0
     current_file: str = ""
     message: str = ""
 
@@ -565,6 +580,11 @@ class Importer:
         text+annotations file from Step 2. Caller is responsible for picking
         signed-vs-unsigned PDF.
 
+        `canonical_json_path` may be empty (or point at a missing file) for
+        legacy ZIP docs exported without sidecars: a canonical companion is
+        synthesized from the PDF's text layer and counted in
+        `ImportProgress.text_layer_imports` (no OCR/KIE re-run).
+
         `skip_duplicates=True` (default) drops PDFs whose bytes duplicate a
         doc already in the SAME dossier (sha256 check); each dropped file is
         counted in both `skipped` and `duplicates`. With False the duplicate
@@ -583,21 +603,27 @@ class Importer:
                     self._end_import(import_id, "cancelled", prog)
                     return prog
                 pdf = Path(entry["pdf_path"])
-                canonical = Path(entry["canonical_json_path"])
+                canonical = Path(entry.get("canonical_json_path") or "")
                 prog.current_file = pdf.name
                 try:
-                    inserted, duplicate = self._import_one_with_canonical(
-                        pdf, canonical, codes, dossier_id,
-                        target_file_name=entry.get("target_file_name") or "",
-                        metadata=entry.get("metadata") or None,
-                        skip_duplicates=skip_duplicates,
+                    inserted, duplicate, text_layer, warning = (
+                        self._import_one_with_canonical(
+                            pdf, canonical, codes, dossier_id,
+                            target_file_name=entry.get("target_file_name") or "",
+                            metadata=entry.get("metadata") or None,
+                            skip_duplicates=skip_duplicates,
+                        )
                     )
                     if duplicate:
                         prog.duplicates += 1
+                    if text_layer and inserted:
+                        prog.text_layer_imports += 1
                     if inserted:
                         prog.imported += 1
                     else:
                         prog.skipped += 1
+                    if warning and inserted:
+                        prog.message = f"{pdf.name}: {warning}"
                 except Exception as e:
                     prog.failed += 1
                     prog.message = f"{pdf.name}: {e}"
@@ -786,15 +812,50 @@ class Importer:
                                    dossier_id: int,
                                    target_file_name: str = "",
                                    metadata: Optional[dict] = None,
-                                   skip_duplicates: bool = True) -> tuple[bool, bool]:
-        """Returns `(inserted, is_duplicate)` — see `import_dossier`."""
+                                   skip_duplicates: bool = True) -> tuple[bool, bool, bool, str]:
+        """Returns `(inserted, is_duplicate, text_layer_synth, warning)`.
+
+        `text_layer_synth` — True when no canonical sidecar existed and one
+        was synthesized from the PDF's invisible text layer (legacy ZIPs).
+        `warning` — non-empty when the doc has no text layer AND no usable
+        metadata (imported browse-only, invisible to text search)."""
+        raw_canonical = str(canonical_path or "").strip()
+        # Path("") renders as "." — treat empty/`.` as "no sidecar" and
+        # fall through to the text-layer synthesis below.
+        canonical_path = Path(raw_canonical) if raw_canonical not in ("", ".") else None
+        text_layer_synth = False
+        warning = ""
+        if canonical_path is None or not canonical_path.is_file():
+            # Legacy ZIP entry: no `.json.zst` sidecar. Synthesize one from
+            # the PDF's text layer (written by the OCR engine at export
+            # time) so blocks/bboxes flow through the normal path. Runs in
+            # the import worker thread — never the UI thread.
+            from scanindex.core.pdf.text_extractor import (
+                write_canonical_from_text_layer,
+            )
+            ok, err, word_count = write_canonical_from_text_layer(str(pdf))
+            if not ok:
+                raise RuntimeError(
+                    f"không tổng hợp được dữ liệu từ lớp text PDF: {err}"
+                )
+            text_layer_synth = True
+            canonical_path = Path(str(pdf) + ".json.zst")
+            if word_count == 0:
+                meta_empty = not any(
+                    str(v or "").strip() for v in (metadata or {}).values()
+                )
+                if meta_empty:
+                    warning = (
+                        "PDF không có lớp text và Excel không có metadata — "
+                        "văn bản chỉ xem được trong hồ sơ, không tra cứu được"
+                    )
         canonical = self._load_canonical(canonical_path)
         kie_fields = _extract_raw_kie_fields(canonical)
         kie_fields = _apply_step2_metadata_overrides(kie_fields, metadata)
         ann_block = canonical.get("annotations") or {}
         kie_annotation_json = json.dumps(ann_block, ensure_ascii=False)
         canonical_blocks = extract_blocks_from_canonical(canonical)
-        return self._import_one_pdf(
+        inserted, duplicate = self._import_one_pdf(
             pdf, kie_fields, kie_annotation_json,
             codes=codes, dossier_id=dossier_id,
             rename_strip_ocr=True,
@@ -803,6 +864,7 @@ class Importer:
             canonical_path=canonical_path,
             skip_duplicates=skip_duplicates,
         )
+        return inserted, duplicate, text_layer_synth, warning
 
     @staticmethod
     def _load_canonical(path: Path) -> dict:

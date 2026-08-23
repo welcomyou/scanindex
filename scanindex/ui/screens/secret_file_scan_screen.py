@@ -1573,7 +1573,7 @@ class SecretFileScanScreen(ScreenContent):
         self.table.setStyleSheet(
             f"QTableWidget {{ background-color: {COLOR_SURFACE}; color: {COLOR_TEXT};"
             f" border: 1px solid {COLOR_BORDER}; border-radius: {RADIUS_MD}px;"
-            " gridline-color: #555555; }}"
+            f" gridline-color: #555555; }}"
             f"QHeaderView::section {{ background-color: {COLOR_PANEL}; color: {COLOR_TEXT};"
             f" border: 1px solid {COLOR_BORDER}; padding: 6px;"
             f" font-size: 12px; font-weight: 600; font-family: '{FONT_UI}'; }}"

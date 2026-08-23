@@ -712,6 +712,27 @@ class PdfViewerWidget(QWidget):
         self._btn_fit.clicked.connect(self._zoom_fit)
         toolbar.addWidget(self._btn_fit)
 
+        # Page indicator ("Trang x / y")
+        toolbar.addSpacing(4)
+        self._lbl_page = QLabel()
+        self._lbl_page.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._lbl_page.setMinimumWidth(60)
+        self._lbl_page.setStyleSheet(_LABEL_STYLE)
+        toolbar.addWidget(self._lbl_page)
+
+        toolbar.addStretch()
+
+        # Print + text-selection controls hug the right edge of the toolbar.
+        self._btn_print = QPushButton("🖨")
+        self._btn_print.setStyleSheet(_ICON_BTN + (
+            "QPushButton { font-family: 'Segoe UI Emoji'; }"
+        ))
+        self._btn_print.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_print.setToolTip("In tài liệu đang xem (Ctrl+P)")
+        self._btn_print.clicked.connect(self._print_document)
+        self._btn_print.setEnabled(False)
+        toolbar.addWidget(self._btn_print)
+
         self._btn_select_text = QPushButton("Chọn chữ")
         self._btn_select_text.setCheckable(True)
         self._btn_select_text.setStyleSheet(_TOGGLE_TEXT_BTN)
@@ -721,15 +742,11 @@ class PdfViewerWidget(QWidget):
         self._btn_select_text.setVisible(self._text_selection_available)
         toolbar.addWidget(self._btn_select_text)
 
-        # Page indicator
-        toolbar.addSpacing(4)
-        self._lbl_page = QLabel()
-        self._lbl_page.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._lbl_page.setMinimumWidth(60)
-        self._lbl_page.setStyleSheet(_LABEL_STYLE)
-        toolbar.addWidget(self._lbl_page)
+        # Ctrl+P prints the loaded document while focus is inside the viewer.
+        self._print_shortcut = QShortcut(QKeySequence("Ctrl+P"), self)
+        self._print_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self._print_shortcut.activated.connect(self._print_document)
 
-        toolbar.addStretch()
         layout.addWidget(tb_frame)
 
         # --- Scroll area with pan + zoom ---
@@ -1651,7 +1668,9 @@ class PdfViewerWidget(QWidget):
             return
         for i in range(self._pages_widget.page_count() - 1, -1, -1):
             if value >= self._pages_widget.page_y_offset(i) - 20:
-                self._lbl_page.setText(f"{i + 1} / {self._page_count}")
+                self._lbl_page.setText(
+                    f"Trang {i + 1} / {self._page_count}"
+                )
                 break
         self._scroll_timer.start()
 
@@ -1801,4 +1820,63 @@ class PdfViewerWidget(QWidget):
 
     def _update_nav_state(self):
         has = self._doc is not None
-        self._lbl_page.setText(f"1 / {self._page_count}" if has else "")
+        self._lbl_page.setText(
+            f"Trang 1 / {self._page_count}" if has else ""
+        )
+        if hasattr(self, "_btn_print"):
+            self._btn_print.setEnabled(has)
+
+    # ------ Printing ------
+
+    def _print_document(self):
+        """Print the loaded PDF via the system print dialog. Pages are
+        rendered by MuPDF at ~150 dpi and painted onto the QPrinter page,
+        so no external viewer is involved."""
+        doc = getattr(self, "_doc", None)
+        if doc is None:
+            return
+        try:
+            from PySide6.QtPrintSupport import QPrintDialog, QPrinter
+            from PySide6.QtWidgets import QDialog
+        except Exception:
+            return
+        printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+        dialog = QPrintDialog(printer, self)
+        dialog.setWindowTitle("In tài liệu")
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        painter = QPainter()
+        if not painter.begin(printer):
+            return
+        try:
+            dpi = 150
+            for i in range(len(doc)):
+                if i > 0:
+                    printer.newPage()
+                try:
+                    pix = doc.load_page(i).get_pixmap(dpi=dpi)
+                    image = QImage(
+                        pix.samples, pix.width, pix.height, pix.stride,
+                        QImage.Format.Format_RGB888,
+                    )
+                except Exception:
+                    continue
+                if image.isNull():
+                    continue
+                # Fit each page into the printable area, keep aspect ratio
+                # and centre it (classic viewport/window painter pattern).
+                rect = painter.viewport()
+                size = image.size()
+                size.scale(
+                    rect.width(), rect.height(),
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                )
+                painter.setViewport(
+                    rect.x() + (rect.width() - size.width()) // 2,
+                    rect.y() + (rect.height() - size.height()) // 2,
+                    size.width(), size.height(),
+                )
+                painter.setWindow(image.rect())
+                painter.drawImage(0, 0, image)
+        finally:
+            painter.end()

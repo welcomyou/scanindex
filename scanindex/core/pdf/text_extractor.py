@@ -737,6 +737,63 @@ def merge_native_text_layer_into_canonical_json(
     return {"pages": details}
 
 
+def write_canonical_from_text_layer(
+    pdf_path: str,
+    *,
+    canonical_profile: str | None = "layoutlmv3_runtime",
+) -> tuple[bool, str | None, int]:
+    """Synthesize a canonical `.json.zst` companion from the PDF's existing
+    text layer — no OCR, no PDF copy.
+
+    Used by the Kho import path for legacy archive ZIPs (exported without
+    `.json.zst` sidecars): the exported PDFs already carry the invisible
+    word-level text layer written by the OCR engine (see
+    `direct_engine._build_text_page_words`), so the same native-word
+    machinery as `extract_digital_pdf_as_ocr` can rebuild a full canonical
+    document (pages → lines + words, bbox, reading order, two-column
+    splitting) without re-running anything.
+
+    Writes `<pdf_path>.json.zst` next to the PDF (matching the companion
+    layout `resolve_companion` expects).
+
+    Returns `(ok, error, word_count)` — `word_count` is the total number of
+    extracted words; 0 means the PDF has no usable text layer (pure scan).
+    """
+    try:
+        doc = fitz.open(pdf_path)
+        try:
+            ocr_data = make_document_stub(
+                input_path=pdf_path,
+                engine=DIGITAL_TEXT_ENGINE,
+                ocr_dpi=OCR_DPI,
+                source_path=pdf_path,
+                text_normalization=OCR_TEXT_NORMALIZATION,
+                raw_text_preserved=True,
+                source_mode="digital",
+            )
+            word_count = 0
+            for page_index in range(len(doc)):
+                page = doc[page_index]
+                render_width, render_height = _page_render_size(page)
+                page_record = _build_page_record_from_line_groups(
+                    page_index,
+                    page,
+                    render_width,
+                    render_height,
+                    _extract_page_words(page),
+                )
+                page_record["coord_origin"] = "top-left"
+                page_record["source_mode"] = "digital"
+                word_count += len(page_record.get("words") or [])
+                ocr_data["pages"].append(page_record)
+        finally:
+            doc.close()
+        save_canonical(pdf_path + ".json.zst", ocr_data, profile=canonical_profile)
+        return True, None, word_count
+    except Exception as exc:
+        return False, str(exc), 0
+
+
 def extract_digital_pdf_as_ocr(
     input_path: str,
     output_path: str,

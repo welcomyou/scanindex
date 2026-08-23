@@ -528,6 +528,23 @@ _ADVANCED_FILTER_FIELDS: dict[str, Tuple[str, ...]] = {
 _FUZZY_METADATA_FILTER_KEYS = {"issue_org", "signer_name", "subject"}
 
 
+def _confidentiality_level(mark) -> str:
+    """Canonical Độ mật level of one raw secrecy/confidentiality value:
+    one of Thường / Mật / Tối mật / Tuyệt mật. An absent (or unrecognized)
+    mark means "Thường" — same convention as the digitization screen, where
+    the KIE mark is one of {Mật, Tối mật, Tuyệt mật} and no mark means
+    unclassified. Longer names are tested first so "Tối mật" is never read
+    as "Mật"."""
+    text = to_no_diacritic(str(mark or "")).lower()
+    if "tuyet mat" in text:
+        return "Tuyệt mật"
+    if "toi mat" in text:
+        return "Tối mật"
+    if "mat" in text:
+        return "Mật"
+    return "Thường"
+
+
 def _date_key(value: Any) -> Optional[str]:
     text = to_no_diacritic(str(value or "").strip()).lower()
     if not text:
@@ -816,6 +833,20 @@ class SearchEngine:
                 haystack = " ".join(str(row[f] or "") for f in fields)
                 if key == "doc_number":
                     matched = _doc_number_match(val, haystack)
+                elif key == "confidentiality":
+                    # The UI offers the four canonical levels as a combo, so
+                    # match the exact level rather than substring-contains —
+                    # otherwise "Mật" would also swallow "Tối mật"/"Tuyệt mật".
+                    # The document's own mark wins; only when it is absent do
+                    # we fall back to the dossier-level confidentiality.
+                    want = _confidentiality_level(val)
+                    doc_mark = str(row["kie_secrecy_mark"] or "").strip()
+                    if doc_mark:
+                        matched = _confidentiality_level(doc_mark) == want
+                    else:
+                        matched = (
+                            _confidentiality_level(row["confidentiality"]) == want
+                        )
                 else:
                     matched = _advanced_text_match(
                         val,

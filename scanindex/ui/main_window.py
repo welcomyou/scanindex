@@ -3342,21 +3342,28 @@ class MainWindow(QMainWindow):
 
     def _import_zip_documents_to_kho(self, identity, documents: list[dict]):
         """Direct ZIP → Kho import (no OCR/KIE re-run) for docs already
-        extracted + parsed by `parse_export_zip`. Only docs carrying a
-        canonical `.json.zst` companion are importable on this path; the
-        rest are reported and skipped. Reuses the Step 3 worker flow via
-        `_run_kho_import`."""
+        extracted + parsed by `parse_export_zip`. Docs carrying a canonical
+        `.json.zst` companion use it as-is; docs without one (legacy ZIPs)
+        import with an empty `canonical_json_path` — the importer
+        synthesizes a companion from the PDF text layer (docs with no PDF
+        at all are still reported and skipped). Reuses the Step 3 worker
+        flow via `_run_kho_import`."""
         from scanindex.core.repository.importer import DossierCodes
 
         docs_to_import = []
         skipped_no_data = 0
+        text_layer_docs = 0
         for doc in documents:
             pdf_path = doc.get("pdf_path") or doc.get("output_path") or ""
             json_path = doc.get("json_path") or ""
-            if not (pdf_path and os.path.exists(pdf_path)
-                    and json_path and os.path.exists(json_path)):
+            if not (pdf_path and os.path.exists(pdf_path)):
                 skipped_no_data += 1
                 continue
+            if not (json_path and os.path.exists(json_path)):
+                # Legacy ZIP doc: no sidecar. The importer synthesizes a
+                # canonical companion from the PDF's text layer.
+                json_path = ""
+                text_layer_docs += 1
             docs_to_import.append({
                 "pdf_path": pdf_path,
                 "canonical_json_path": json_path,
@@ -3369,14 +3376,19 @@ class MainWindow(QMainWindow):
         if not docs_to_import:
             QMessageBox.warning(
                 self, "Nhập vào Kho lưu trữ",
-                "Không có văn bản hợp lệ để nhập (thiếu PDF hoặc dữ liệu "
-                "OCR/KIE kèm theo).",
+                "Không có văn bản hợp lệ để nhập (thiếu PDF).",
             )
             return
         if skipped_no_data:
             self.log(
                 f"Archive: ZIP→Repository import — {skipped_no_data} doc(s) skipped "
-                "without .json.zst companion",
+                "without a source PDF",
+                LOG_INFO,
+            )
+        if text_layer_docs:
+            self.log(
+                f"Archive: ZIP→Repository import — {text_layer_docs} doc(s) without "
+                ".json.zst will import from the PDF text layer",
                 LOG_INFO,
             )
 

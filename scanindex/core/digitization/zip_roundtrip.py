@@ -32,12 +32,16 @@ Because the workbook is a lossy, one-way projection, the reconstruction is
 
   - ZIPs exported with the sidecars disabled (or by older versions) have no
     `.json.zst` companions: bbox highlighting is unavailable on the Step 2
-    viewer and the Kho-direct import path has nothing to work with.
+    viewer until "Xử lý" re-runs KIE. The Kho-direct import path now handles
+    these too — `parse_export_zip_for_kho` emits entries with an empty
+    `canonical_json_path` and the importer synthesizes a canonical companion
+    from the PDF's invisible text layer (no OCR re-run).
   - `chuyen_de`, `chu_thich`, `is_unstructured` are not in the workbook and
     default to empty / False.
   - `ma_dinh_danh` is not stored as a workbook column; it is parsed from the
     ZIP file name (`<MãĐD>-<MãPhông>-<MụcLục>-<HồSơ>.zip`). For the generic
-    `HSLTCQ.zip` name we fall back to the other identity codes where possible.
+    `HSLTCQ.zip` name we fall back to the other identity codes where possible
+    (the Kho screen prompts the operator for the missing codes).
 
 These limitations were confirmed acceptable for the "reopen a ZIP to fix a
 few fields, then re-export" workflow.
@@ -56,7 +60,9 @@ from scanindex.core.digitization.session import IdentityCodes
 # ── Reverse of `runner._FORM_TO_COLUMN` ──────────────────────────────
 # The aggregated "Văn bản" sheet column → Step-2 section-1 form key. Used to
 # reconstruct `doc["metadata"]` when reading a workbook back in. Note the
-# NBSP in "Số của văn\xa0bản" matches the official template verbatim.
+# NBSP in "Số của văn\xa0bản" matches the official template verbatim;
+# `_read_sheet_rows` normalizes headers so the plain-space variant matches
+# the same key.
 _COLUMN_TO_FORM = {
     "Tên cơ quan, tổ chức ban hành văn bản": "co_quan_ban_hanh",
     "Tên loại văn bản":                     "loai_van_ban",
@@ -67,6 +73,7 @@ _COLUMN_TO_FORM = {
     "Ngôn ngữ":                             "ngon_ngu",
     "Người ký":                             "nguoi_ky",
     "Độ mật":                               "do_mat",
+    "Chế độ sử dụng":                       "che_do_su_dung",
     "Tờ số trang số":                       "trang_so",
     "Số thứ tự văn bản trong hồ sơ":        "so_thu_tu",
 }
@@ -109,8 +116,13 @@ def _parse_zip_name(zip_path: str) -> dict:
 
     Returns an empty dict for the generic `HSLTCQ.zip` fallback so the caller
     can fill the codes from the workbook's "Đơn vị bảo quản số" column instead.
+    A trailing collision suffix (`_2`, `_3`, … added when the export target
+    already exists) is stripped first — identity codes are `[A-Za-z0-9]+`
+    (punctuation-free by `_arc_export_zip_name`), so no legitimate code ends
+    in `_<digits>`.
     """
     name = os.path.basename(zip_path)
+    name = re.sub(r"_\d+\.zip$", ".zip", name, flags=re.IGNORECASE)
     m = _ZIP_NAME_PARTS_RE.match(name)
     if not m:
         return {}
@@ -122,11 +134,22 @@ def _parse_zip_name(zip_path: str) -> dict:
     }
 
 
+def _normalize_sheet_header(value) -> str:
+    """Collapse whitespace + NBSP so header lookup is robust to template
+    drift. The official template writes "Số của văn\xa0bản" with an NBSP
+    while some revisions use a plain space — both forms must map to the
+    same column key (mirrors `repository/importer._normalize_header`)."""
+    if value is None:
+        return ""
+    return " ".join(str(value).replace("\xa0", " ").split())
+
+
 def _read_sheet_rows(xlsx_path: str, sheet_name: str) -> list[dict]:
     """Read one sheet of the workbook into a list of `{header: value}` dicts.
 
     Uses openpyxl read-only mode (same pattern as `repository/importer.py`).
     Empty rows and rows without a "Tên tệp" (Văn bản) value are skipped.
+    Headers are NBSP/whitespace-normalized; lookups with either variant hit.
     """
     import openpyxl
     wb = openpyxl.load_workbook(xlsx_path, read_only=True, data_only=True)
@@ -139,7 +162,10 @@ def _read_sheet_rows(xlsx_path: str, sheet_name: str) -> list[dict]:
             headers = next(rows_iter)
         except StopIteration:
             return []
-        headers = [str(h).strip() if h is not None else "" for h in headers]
+        raw_headers = [
+            str(h) if h is not None else "" for h in headers
+        ]
+        headers = [_normalize_sheet_header(h) for h in raw_headers]
         out: list[dict] = []
         for row in rows_iter:
             if row is None or all(c is None or str(c).strip() == "" for c in row):
@@ -160,11 +186,11 @@ def _row_to_metadata(row: dict) -> dict:
 
     `do_mat` empty cell → "Thường" (the UI default; the export path collapses
     "Thường" to blank, so we restore it here so the dropdown shows the right
-    value).
+    value). Column keys are NBSP-normalized to match `_read_sheet_rows`.
     """
     meta = {}
     for col, form_key in _COLUMN_TO_FORM.items():
-        v = (row.get(col) or "").strip()
+        v = (row.get(_normalize_sheet_header(col)) or "").strip()
         if form_key == "do_mat" and not v:
             v = "Thường"
         meta[form_key] = v
@@ -468,16 +494,22 @@ def parse_export_zip_for_kho(zip_path: str,
     `<dest_dir>/_zip_kho/` (a separate folder so it never collides with a
     Step 2 `_zip_input/` reopening of the same ZIP).
 
-    Returns `(codes, documents, skipped_no_companion, out_dir)`:
+    PDFs **without** a bundled sidecar (ZIPs exported by older versions or
+    with the sidecar setting off) are still returned, with
+    `canonical_json_path=""` and `legacy_text_layer=True`: the importer
+    synthesizes a canonical companion from the PDF's invisible text layer
+    and projects the workbook metadata onto the KIE fields.
+
+    Returns `(codes, documents, no_companion, out_dir)`:
 
       * `codes` — `DossierCodes` for `import_dossier` (from the ZIP name +
         the workbook's "Hồ sơ" sheet).
       * `documents` — `[{"pdf_path", "canonical_json_path",
         "target_file_name", "metadata"}]` entries (metadata from the
         "Văn bản" sheet, same keys Step 2 uses).
-      * `skipped_no_companion` — PDFs without a bundled sidecar; they are
-        *not* included because importing them would require OCR, which this
-        path never runs.
+      * `no_companion` — PDFs without a bundled sidecar; these import via
+        the PDF text layer (blocks) + workbook metadata (KIE fields), with
+        no bbox-carrying KIE annotations.
 
     Raises `ZipRoundtripError` if the ZIP is not a recognized archive export.
     """
@@ -489,22 +521,31 @@ def parse_export_zip_for_kho(zip_path: str,
     by_filename = _row_by_filename(vanban_rows)
 
     documents: list[dict] = []
-    skipped_no_companion = 0
+    no_companion = 0
     for i, name in enumerate(pdf_names):
         full_path = os.path.join(out_dir, name)
         companion = resolve_companion(companion_for_pdf(full_path))
-        if companion is None:
-            skipped_no_companion += 1
-            continue
+        legacy = companion is None
+        if legacy:
+            no_companion += 1
         documents.append({
             "pdf_path": full_path,
-            "canonical_json_path": str(companion),
+            # Empty for legacy PDFs: the importer synthesizes a companion
+            # from the PDF's text layer (see Importer._import_one_with_canonical).
+            "canonical_json_path": str(companion) if companion is not None else "",
             # The export PDF is already named `<identity>-NNN.pdf`; keep it
             # as the in-Kho file name so re-imports are stable.
             "target_file_name": name,
             "metadata": _row_to_metadata(
                 _match_row(name, i, by_filename, vanban_rows)
             ),
+            "legacy_text_layer": legacy,
         })
 
-    return codes, documents, skipped_no_companion, out_dir
+    # Back-compat: archives exported by 1.1.3 (and earlier) lack the
+    # "Tờ số trang số" / "Số thứ tự văn bản trong hồ sơ" columns — seed the
+    # running numbering from the extracted PDFs' page counts (same guard as
+    # the Step 2 path: only when ALL docs lack the value).
+    _backfill_trang_so_and_stt(documents)
+
+    return codes, documents, no_companion, out_dir

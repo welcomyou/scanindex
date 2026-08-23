@@ -48,7 +48,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
     QComboBox, QFrame, QScrollArea, QSplitter,
     QFileDialog, QMessageBox, QProgressBar, QGridLayout,
-    QToolButton, QApplication, QCheckBox, QSizePolicy,
+    QToolButton, QApplication, QCheckBox, QSizePolicy, QDialog, QDialogButtonBox,
 )
 
 from scanindex.ui.screens.screen_base import ScreenContent
@@ -81,6 +81,12 @@ from scanindex.core.repository.search_engine import (
 )
 from scanindex.core.repository.repair import run_startup_repair
 from scanindex.core.repository.tokenizer import to_no_diacritic
+
+
+# Độ mật levels for the Tra cứu tài liệu criteria combo. Same canonical
+# order/labels as the digitization screen's "Độ mật" dropdown; an absent
+# secrecy mark means "Thường".
+_CONFIDENTIALITY_OPTIONS = ("Thường", "Mật", "Tối mật", "Tuyệt mật")
 
 
 # ---------------------------------------------------------------- Workers
@@ -235,12 +241,13 @@ class _AddFilesWorker(QThread):
 
 
 class _ZipKhoImportWorker(QThread):
-    """Import dossiers parsed from exported ZIPs (PDFs + canonical
-    `.json.zst` sidecars) into Kho — no OCR/KIE re-run. Handles one or many
-    ZIP jobs with a single store/index session; emits an aggregate
-    ImportProgress across all jobs. Best-effort deletes every job's ZIP
-    extraction temp dir when done (each imported doc is copied into the
-    repo first)."""
+    """Import dossiers parsed from exported ZIPs into Kho — no OCR/KIE
+    re-run. Docs with canonical `.json.zst` sidecars use them as-is; docs
+    without (legacy ZIPs) get a companion synthesized from the PDF text
+    layer inside `Importer.import_dossier`. Handles one or many ZIP jobs
+    with a single store/index session; emits an aggregate ImportProgress
+    across all jobs. Best-effort deletes every job's ZIP extraction temp
+    dir when done (each imported doc is copied into the repo first)."""
 
     progress = Signal(object)        # aggregate ImportProgress
     finished_ok = Signal(object)     # aggregate ImportProgress
@@ -285,7 +292,8 @@ class _ZipKhoImportWorker(QThread):
                     for job in self._jobs:
                         # Per-job progress is re-based onto the aggregate so
                         # the dialog shows one continuous counter.
-                        base = (agg.imported, agg.skipped, agg.failed)
+                        base = (agg.imported, agg.skipped, agg.failed,
+                                agg.text_layer_imports)
 
                         def _cb(p, base=base):
                             self.progress.emit(ImportProgress(
@@ -293,6 +301,7 @@ class _ZipKhoImportWorker(QThread):
                                 imported=base[0] + p.imported,
                                 skipped=base[1] + p.skipped,
                                 failed=base[2] + p.failed,
+                                text_layer_imports=base[3] + p.text_layer_imports,
                                 current_file=p.current_file,
                                 message=p.message,
                             ))
@@ -308,6 +317,7 @@ class _ZipKhoImportWorker(QThread):
                             agg.skipped += res.skipped
                             agg.failed += res.failed
                             agg.duplicates += res.duplicates
+                            agg.text_layer_imports += res.text_layer_imports
                         if self._cancel:
                             break
                 finally:
@@ -320,6 +330,83 @@ class _ZipKhoImportWorker(QThread):
             for root in temp_roots:
                 if root:
                     shutil.rmtree(root, ignore_errors=True)
+
+
+class _LegacyZipCodesDialog(QDialog):
+    """Prompt for the 4 identity codes when a ZIP carries a generic name.
+
+    ZIPs exported as `HSLTCQ.zip` (one of the 4 codes was blank at export
+    time) have no identity in the file name and the workbook only carries
+    "Đơn vị bảo quản số" (= số hồ sơ). Without the codes the Kho import
+    gate (`ma_dinh_danh` + `fonds`) would reject the whole ZIP, so the
+    operator types the missing values once here; they are stored on the
+    parsed `DossierCodes` for this import only.
+    """
+
+    def __init__(self, zip_name: str, codes, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Nhập mã hồ sơ cho ZIP")
+        self.setMinimumWidth(420)
+        self.setModal(True)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+
+        intro = QLabel(
+            f"File ZIP \"{zip_name}\" không chứa mã định danh / mã phông trong "
+            "tên file. Hãy nhập 4 mã hồ sơ để nhập ZIP này vào Kho lưu trữ:"
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(8)
+        self._edits: dict[str, QLineEdit] = {}
+        fields = [
+            ("ma_dinh_danh", "Mã định danh"),
+            ("fonds", "Mã phông"),
+            ("catalog", "Mục lục"),
+            ("dossier_code", "Số hồ sơ"),
+        ]
+        for row, (key, label) in enumerate(fields):
+            grid.addWidget(QLabel(label), row, 0)
+            edit = QLineEdit(getattr(codes, key, "") or "")
+            edit.setPlaceholderText(label)
+            grid.addWidget(edit, row, 1)
+            self._edits[key] = edit
+        layout.addLayout(grid)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Nhập ZIP")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("Bỏ qua")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def apply_to(self, codes) -> None:
+        """Copy the entered values onto a `DossierCodes` instance."""
+        for key, edit in self._edits.items():
+            setattr(codes, key, edit.text().strip())
+
+    def is_complete(self) -> bool:
+        return all(
+            e.text().strip() for e in (
+                self._edits["ma_dinh_danh"], self._edits["fonds"],
+            )
+        )
+
+    def accept(self):
+        if not self.is_complete():
+            QMessageBox.warning(
+                self, "Nhập mã hồ sơ cho ZIP",
+                "Cần nhập tối thiểu Mã định danh và Mã phông.",
+            )
+            return
+        super().accept()
 
 
 class _PrepareAddFileWorker(QThread):
@@ -584,6 +671,59 @@ class DossierRow:
     fonds_name: str = ""
     catalog_name: str = ""
     stored_at: Optional[int] = None  # epoch of when the dossier entered the repo (dossiers.created_at)
+
+
+def _norm_tokens(text: str) -> list[str]:
+    """Word tokens, diacritic-stripped + lowercased, for dossier matching."""
+    return re.findall(r"\w+", to_no_diacritic(str(text or "")).lower())
+
+
+def _dossier_matches_title(title: str, query: str) -> bool:
+    """Dossier-title keyword match: every query token (diacritic-stripped,
+    lowercased) must appear as a SUBSTRING of the normalized title, so a
+    partial word still matches (gõ "z" ra "zXcXC", "zst" ra "…Kèm ZST").
+    Empty query matches everything, so the unfiltered browse stays the
+    empty state."""
+    tokens = _norm_tokens(query)
+    if not tokens:
+        return True
+    hay = " ".join(_norm_tokens(title))
+    return all(t in hay for t in tokens)
+
+
+def _dossier_matches_text(value: str, filter_text: str) -> bool:
+    """Diacritic-insensitive contains-match for one free-text dossier field
+    (chuyên đề / nhiệm kỳ / thời hạn). Empty filter matches everything."""
+    needle = to_no_diacritic(str(filter_text or "").strip()).lower()
+    if not needle:
+        return True
+    return needle in to_no_diacritic(str(value or "")).lower()
+
+
+_DOSSIER_SQL_CODE_FILTERS: tuple[tuple[str, str], ...] = (
+    # (filter key, dossiers column) — ASCII code columns matched with a
+    # case-insensitive SQL LIKE so gõ "777" ra cả "7777".
+    ("ma_dinh_danh", "ma_dinh_danh"),
+    ("dossier_code", "dossier_code"),
+)
+
+
+def _dossier_sql_filters(filters: dict) -> tuple[list[str], list[str]]:
+    """WHERE fragments + params for the dossier browse/search SQL: exact
+    equality on phông/mục lục, contains-LIKE on the code columns."""
+    where_parts: list[str] = []
+    params: list[str] = []
+    for key, column in (("fonds", "fonds"), ("catalog", "catalog")):
+        value = str((filters or {}).get(key) or "").strip()
+        if value:
+            where_parts.append(f"COALESCE(d.{column}, '') = ?")
+            params.append(value)
+    for key, column in _DOSSIER_SQL_CODE_FILTERS:
+        value = str((filters or {}).get(key) or "").strip()
+        if value:
+            where_parts.append(f"COALESCE(d.{column}, '') LIKE ?")
+            params.append(f"%{value}%")
+    return where_parts, params
 
 
 @dataclass
@@ -1286,10 +1426,14 @@ class _GroupHeader(QLabel):
 
 
 class _DossierCard(QFrame):
-    """Browse-mode card for one dossier. Body click → emit `clicked`
-    (open file list); the small ✏ button on the right → emit `edit_clicked`
-    so the host can pop a DossierInfoDialog without losing the body click."""
+    """Browse-mode card for one dossier. Body click → emit `clicked` (show
+    the dossier's info in the right panel only); the ☰ list button /
+    double-click → emit `open_clicked` (jump to the Tài liệu tab with this
+    dossier's file list); the small ✏ button on the right → emit
+    `edit_clicked` so the host can pop a DossierInfoDialog without losing
+    the body click."""
     clicked = Signal(int)
+    open_clicked = Signal(int)
     edit_clicked = Signal(int)
     selection_changed = Signal(int, bool)
 
@@ -1354,6 +1498,24 @@ class _DossierCard(QFrame):
             self.dossier.dossier_id
         ))
         grid.addWidget(btn_edit, 0, 2, Qt.AlignmentFlag.AlignTop)
+
+        btn_open = QPushButton("☰")
+        btn_open.setFixedSize(30, 24)
+        btn_open.setToolTip(
+            "Xem danh sách tài liệu trong hồ sơ này (hoặc nhấp đúp vào thẻ)"
+        )
+        btn_open.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_open.setStyleSheet(
+            f"QPushButton {{ background: transparent; color: {COLOR_ACCENT};"
+            f" border: 1px solid {COLOR_BORDER}; border-radius: 4px;"
+            f" font: 600 14px 'Segoe UI Symbol'; padding: 0; }}"
+            f"QPushButton:hover {{ background: {COLOR_ELEVATED};"
+            f" border-color: {COLOR_ACCENT}; }}"
+        )
+        btn_open.clicked.connect(lambda _checked=False: self.open_clicked.emit(
+            self.dossier.dossier_id
+        ))
+        grid.addWidget(btn_open, 0, 3, Qt.AlignmentFlag.AlignTop)
         grid.setColumnStretch(1, 1)
         self.update_texts()
 
@@ -1374,7 +1536,7 @@ class _DossierCard(QFrame):
 
     def mousePressEvent(self, e):
         # Only emit `clicked` when the press lands on the body, not the
-        # checkbox/select gutter/edit button.
+        # checkbox/select gutter/edit/open buttons.
         if e.button() == Qt.MouseButton.LeftButton:
             pos = e.position().toPoint()
             child = self.childAt(pos)
@@ -1392,6 +1554,24 @@ class _DossierCard(QFrame):
                 return
             self.clicked.emit(self.dossier.dossier_id)
         super().mousePressEvent(e)
+
+    def mouseDoubleClickEvent(self, e):
+        # Double-click on the body is the keyboard-free shortcut for the
+        # "Xem tài liệu" button: enter the dossier's document list.
+        if e.button() == Qt.MouseButton.LeftButton:
+            pos = e.position().toPoint()
+            child = self.childAt(pos)
+            if isinstance(child, (QPushButton, QCheckBox)):
+                super().mouseDoubleClickEvent(e)
+                return
+            cb_geo = self._cb.geometry()
+            gutter_right = max(cb_geo.right() + SP[2] + SP[3], 56)
+            if pos.x() <= gutter_right:
+                super().mouseDoubleClickEvent(e)
+                return
+            self.open_clicked.emit(self.dossier.dossier_id)
+            return
+        super().mouseDoubleClickEvent(e)
 
 
 _FILE_REORDER_MIME = "application/x-scanindex-repository-doc-id"
@@ -2021,19 +2201,25 @@ class _RightPanel(QWidget):
         self._display_dossier = d
         self._display_file = None
         self._display_chunks = []
-        def display(value: str) -> str:
-            return html.escape(_single_line(value) or "—")
 
         # Keep codes and names on separate rows. Combining them made the
         # right panel compact but difficult to scan and impossible to copy as
-        # distinct archival fields.
+        # distinct archival fields. Rows with no value are hidden entirely.
+        def row(label: str, value) -> Optional[str]:
+            text = _single_line(value)
+            if not text:
+                return None
+            return translations.localize_text(
+                f"<b>{label}:</b> {html.escape(text)}"
+            )
+
         rows = [
-            translations.localize_text(f"<b>Mã phông:</b> {display(d.fonds)}"),
-            translations.localize_text(f"<b>Tên phông:</b> {display(d.fonds_name)}"),
-            translations.localize_text(f"<b>Số mục lục:</b> {display(d.catalog)}"),
-            translations.localize_text(f"<b>Tên mục lục:</b> {display(d.catalog_name)}"),
-            translations.localize_text(f"<b>Số hồ sơ:</b> {display(d.dossier_code)}"),
-            translations.localize_text(f"<b>Tên hồ sơ:</b> {display(d.title)}"),
+            row("Mã phông", d.fonds),
+            row("Tên phông", d.fonds_name),
+            row("Số mục lục", d.catalog),
+            row("Tên mục lục", d.catalog_name),
+            row("Số hồ sơ", d.dossier_code),
+            row("Tên hồ sơ", d.title),
         ]
         if d.doc_count:
             rows.append(translations.localize_text(f"<b>Số văn bản:</b> {d.doc_count}"))
@@ -2045,8 +2231,14 @@ class _RightPanel(QWidget):
                 rows.append(translations.localize_text(f"<b>Thời gian:</b> {span}"))
         stored = _format_stored_at(getattr(d, "stored_at", None))
         if stored:
-            rows.append(translations.localize_text(f"<b>Thời điểm:</b> {stored}"))
-        self._info_box.setText("<br>".join(rows))
+            rows.append(translations.localize_text(f"<b>Thời điểm lưu:</b> {stored}"))
+        rows = [r for r in rows if r]
+        if rows:
+            self._info_box.setText("<br>".join(rows))
+        else:
+            self._info_box.setText(
+                translations.localize_text("(không có thông tin hồ sơ)")
+            )
         self._active_chunk_id = 0
         self._snippet_cards_by_id.clear()
         self._set_snippets_visible(False)
@@ -2067,6 +2259,16 @@ class _RightPanel(QWidget):
         meta_text = _file_summary_text(f, localized=True)
         if meta_text:
             rows.append(translations.localize_text(f"<b>Thông tin:</b> {meta_text}"))
+        # Same pair the digitization screen shows: Trang số = trang đầu tiên
+        # của văn bản trong hồ sơ (ToSoTrangSo), Số trang = số trang PDF.
+        if f.trang_so:
+            rows.append(translations.localize_text(
+                f"<b>Trang số:</b> {int(f.trang_so)}"
+            ))
+        if f.page_count:
+            rows.append(translations.localize_text(
+                f"<b>Số trang:</b> {int(f.page_count)}"
+            ))
         if f.doc_type:
             doc_type = translations.localize_document_type(f.doc_type)
             rows.append(translations.localize_text(f"<b>Loại văn bản:</b> {doc_type}"))
@@ -2577,7 +2779,7 @@ class _AddFileMetadataDialog(QWidget):
             ("kie_signer_role",         "Chức vụ người ký",    "line"),
             ("kie_signer_name",         "Người ký",            "line"),
             ("kie_urgency_mark",        "Độ khẩn",             "line"),
-            ("kie_secrecy_mark",        "Độ mật",              "line"),
+            ("kie_secrecy_mark",        "Độ mật",              "secrecy"),
             ("kie_circulation_mark",    "Hình thức lưu hành",  "line"),
             ("kie_regime_header",       "Header chế độ",       "area2"),
         ]
@@ -2603,13 +2805,44 @@ class _AddFileMetadataDialog(QWidget):
                     f" padding: 4px 28px 4px 8px; font: 12px '{FONT_UI}'; }}"
                     + COMBOBOX_DROPDOWN_QSS
                 )
+            elif kind == "secrecy":
+                # Độ mật is a closed 4-level set (same options as the
+                # advance-search filter and Digitization Step 2), so a
+                # combo beats free text. sort=False keeps the severity
+                # order Thường → Tuyệt mật instead of A-Z.
+                w = FuzzyComboBox(sort=False)
+                translations.add_localized_combo_items(w, _CONFIDENTIALITY_OPTIONS)
+                current = str(initial_fields.get(col) or "").strip()
+                lower = current.lower()
+                if not lower or lower == "thường":
+                    w.setCurrentIndex(0)  # blank ≡ Thường (HSLTCQ convention)
+                else:
+                    match = next(
+                        (o for o in _CONFIDENTIALITY_OPTIONS if o.lower() == lower),
+                        None,
+                    )
+                    if match is not None:
+                        current = match  # case-insensitive hit (e.g. MẬT → Mật)
+                    else:
+                        # Legacy/odd value (e.g. KIE-detected free text):
+                        # append it so it stays selectable instead of
+                        # silently falling back to item 0 on read-back.
+                        w.addItem(current, current)
+                    translations.set_combo_value(w, current)
+                w.setStyleSheet(
+                    f"QComboBox {{ background: {COLOR_INPUT};"
+                    f" border: 1px solid {COLOR_BORDER};"
+                    f" border-radius: 4px; color: {COLOR_TEXT};"
+                    f" padding: 4px 28px 4px 8px; font: 12px '{FONT_UI}'; }}"
+                    + COMBOBOX_DROPDOWN_QSS
+                )
             elif kind == "line":
                 w = _styled_line()
             elif kind == "area2":
                 w = _styled_area(2)
             else:
                 w = _styled_area(3)
-            if col in initial_fields and kind != "combo":
+            if col in initial_fields and kind not in ("combo", "secrecy"):
                 value = str(initial_fields.get(col) or "")
                 if isinstance(w, QTextEdit):
                     w.setPlainText(value)
@@ -2658,6 +2891,11 @@ class _AddFileMetadataDialog(QWidget):
                     out[col] = w.toPlainText().strip()
                 else:
                     out[col] = w.text().strip()
+            # "Thường" is the UI default for non-secret docs — the HSLTCQ
+            # convention is an empty cell, so collapse it back to blank
+            # (same rule as the digitization runner).
+            if out.get("kie_secrecy_mark", "").lower() == "thường":
+                out["kie_secrecy_mark"] = ""
             return out
         dlg.get_fields = get_fields
         return dlg
@@ -2733,6 +2971,16 @@ class RepositoryScreen(ScreenContent):
         self._search_query = ""
         self._search_filters: dict = {}
         self._search_mode = "content"
+        # "Tra cứu hồ sơ" scope state — committed keyword + filters that drive
+        # the dossier list (re-applied on sort change / re-render).
+        self._dossier_query = ""
+        self._dossier_filters: dict = {}
+        # Per-scope toolbar memory: switching tabs must not lose the keyword
+        # or the ▾ panel state of the tab the user is leaving.
+        self._scope_states: dict[str, dict] = {
+            "dossiers": {"query": "", "panel_open": False},
+            "search":   {"query": "", "panel_open": False},
+        }
         self._search_scroll_value = 0
         self._search_selected_doc_id = ""
         self._search_rank_by_doc: dict[str, int] = {}
@@ -2755,10 +3003,13 @@ class RepositoryScreen(ScreenContent):
         self._doc_cards_by_id: dict[str, QFrame] = {}
         # Multi-select state for bulk delete in dossier/file-list modes.
         self._selected_doc_ids: set[str] = set()
+        # Selected dossier/file cards for bulk actions in browse modes.
         self._file_cards_by_id: dict[str, "_FileCard"] = {}
         self._selected_dossier_ids: set[int] = set()
         self._dossier_cards_by_id: dict[int, "_DossierCard"] = {}
-        self._loading_dossier_filters = False
+        # Dossier whose info is shown in the right panel (body-click target);
+        # entering its file list is a separate explicit action.
+        self._active_dossier_view_id = 0
 
         self._build_ui()
         self._open_store()
@@ -2791,14 +3042,19 @@ class RepositoryScreen(ScreenContent):
         outer.setSpacing(SP[2])
 
         self._header_info_widget = self._build_status_bar()
+        # Tab row (Hồ sơ / Tài liệu) sits ABOVE the search box because the
+        # search box's meaning (tên hồ sơ vs nội dung OCR) follows the
+        # active tab. Criteria panels sit under the search bar, next to the
+        # "Tìm" button; the list/export actions live in the same top row as
+        # the tabs.
+        outer.addWidget(self._build_action_bar())
         outer.addWidget(self._build_toolbar())
-        # Metadata filter sits directly under the search bar so the user
-        # can fill the criteria fields next to the "Tìm" button. The
-        # dossier-context action bar (Back / Add / Export) lives below.
         self._filter_panel = self._build_filter_panel()
         self._filter_panel.setVisible(False)
         outer.addWidget(self._filter_panel)
-        outer.addWidget(self._build_action_bar())
+        self._dossier_filter_panel = self._build_dossier_filter_panel()
+        self._dossier_filter_panel.setVisible(False)
+        outer.addWidget(self._dossier_filter_panel)
         self._on_search_mode_changed()
 
         # 3-column splitter
@@ -2808,7 +3064,8 @@ class RepositoryScreen(ScreenContent):
             f"QSplitter::handle {{ background: {COLOR_BORDER}; width: 3px; }}"
         )
         # Column 1: list
-        self._splitter.addWidget(self._build_list_column())
+        self._list_column = self._build_list_column()
+        self._splitter.addWidget(self._list_column)
         # Column 2: PDF
         self._pdf_pane = _PdfPane()
         self._splitter.addWidget(self._pdf_pane)
@@ -2865,7 +3122,7 @@ class RepositoryScreen(ScreenContent):
         tab_qss = (
             f"QPushButton {{ background: transparent; color: {COLOR_TEXT_SECONDARY};"
             f" border: 1px solid {COLOR_BORDER}; border-radius: 4px;"
-            f" padding: 0 12px; font: 600 12px '{FONT_UI}'; }}"
+            f" padding: 0 10px; font: 600 12px '{FONT_UI}'; }}"
             f"QPushButton:hover {{ background: {COLOR_ELEVATED}; color: {COLOR_TEXT};"
             f" border-color: {COLOR_ACCENT}; }}"
             f"QPushButton:checked {{ background: {COLOR_ELEVATED}; color: {COLOR_ACCENT};"
@@ -2877,7 +3134,7 @@ class RepositoryScreen(ScreenContent):
         self._btn_back_to_dossiers = QPushButton("Hồ sơ")
         self._btn_back_to_dossiers.setCheckable(True)
         self._btn_back_to_dossiers.setFixedHeight(action_h)
-        self._btn_back_to_dossiers.setMinimumWidth(82)
+        self._btn_back_to_dossiers.setMinimumWidth(64)
         self._btn_back_to_dossiers.setSizePolicy(
             QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
         )
@@ -2889,15 +3146,26 @@ class RepositoryScreen(ScreenContent):
         self._btn_back_to_dossiers.clicked.connect(self._show_dossier_list)
         h.addWidget(self._btn_back_to_dossiers)
 
-        self._btn_back_to_search = QPushButton("Kết quả tìm kiếm")
+        self._btn_back_to_search = QPushButton("Tài liệu")
         self._btn_back_to_search.setCheckable(True)
-        self._btn_back_to_search.setVisible(False)
+        self._btn_back_to_search.setVisible(True)
         self._btn_back_to_search.setFixedHeight(action_h)
-        self._btn_back_to_search.setMinimumWidth(150)
+        self._btn_back_to_search.setMinimumWidth(92)
         self._btn_back_to_search.setCursor(Qt.CursorShape.PointingHandCursor)
         self._btn_back_to_search.setStyleSheet(tab_qss)
-        self._btn_back_to_search.clicked.connect(self._restore_search_results)
+        self._btn_back_to_search.clicked.connect(self._show_search_tab)
         h.addWidget(self._btn_back_to_search)
+
+        # Contextual back button: while the Tài liệu tab shows a dossier's
+        # file list, this returns to the preserved search results.
+        self._btn_back_to_results = QPushButton("← Kết quả tra cứu")
+        self._btn_back_to_results.setVisible(False)
+        self._btn_back_to_results.setFixedHeight(action_h)
+        self._btn_back_to_results.setMinimumWidth(140)
+        self._btn_back_to_results.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_back_to_results.setStyleSheet(tab_qss)
+        self._btn_back_to_results.clicked.connect(self._restore_search_results)
+        h.addWidget(self._btn_back_to_results)
 
         self._list_count_label = QLabel("Đang tải hồ sơ…")
         self._list_count_label.setFixedHeight(action_h)
@@ -2930,41 +3198,23 @@ class RepositoryScreen(ScreenContent):
         self._sort_combo = QComboBox()
         self._sort_combo.setToolTip("Sắp xếp danh sách hiện tại")
         self._sort_combo.setFixedHeight(action_h)
-        self._sort_combo.setMinimumWidth(220)
+        self._sort_combo.setMinimumWidth(120)
+        # Size to the current option set instead of a fixed wide minimum, so
+        # the freed space goes to the dossier-title row. The cap keeps the
+        # "Phông → Mục lục → Hồ sơ"-style longest option from hogging the row.
+        self._sort_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToContents
+        )
+        self._sort_combo.setMaximumWidth(250)
         self._style_dossier_filter_combo(self._sort_combo)
         self._sort_combo.currentIndexChanged.connect(self._on_sort_changed)
         h.addWidget(self._sort_combo)
 
-        self._fonds_filter_combo = QComboBox()
-        self._fonds_filter_combo.setToolTip("Lọc theo mã phông")
-        self._fonds_filter_combo.setFixedHeight(action_h)
-        self._fonds_filter_combo.setMinimumWidth(220)
-        self._fonds_filter_combo.setSizePolicy(
-            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed
-        )
-        self._style_dossier_filter_combo(self._fonds_filter_combo)
-        self._fonds_filter_combo.currentIndexChanged.connect(
-            self._on_fonds_filter_changed
-        )
-        h.addWidget(self._fonds_filter_combo)
-
-        self._catalog_filter_combo = QComboBox()
-        self._catalog_filter_combo.setToolTip("Lọc theo số mục lục")
-        self._catalog_filter_combo.setFixedHeight(action_h)
-        self._catalog_filter_combo.setMinimumWidth(220)
-        self._catalog_filter_combo.setSizePolicy(
-            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed
-        )
-        self._style_dossier_filter_combo(self._catalog_filter_combo)
-        self._catalog_filter_combo.currentIndexChanged.connect(
-            self._on_catalog_filter_changed
-        )
-        h.addWidget(self._catalog_filter_combo)
-
-        self._btn_add_file = QPushButton("+ Thêm văn bản")
+        self._btn_add_file = QPushButton("+ Thêm VB")
+        self._btn_add_file.setToolTip("Thêm văn bản vào hồ sơ này")
         self._btn_add_file.setVisible(False)
         self._btn_add_file.setFixedHeight(action_h)
-        self._btn_add_file.setMinimumWidth(118)
+        self._btn_add_file.setMinimumWidth(84)
         self._btn_add_file.setSizePolicy(
             QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed
         )
@@ -2978,10 +3228,13 @@ class RepositoryScreen(ScreenContent):
         self._btn_add_file.clicked.connect(self._on_add_file_clicked)
         h.addWidget(self._btn_add_file)
 
-        self._btn_export_dossier_zip = QPushButton("Xuất hồ sơ nén")
+        self._btn_export_dossier_zip = QPushButton("Xuất ZIP")
+        self._btn_export_dossier_zip.setToolTip(
+            "Xuất hồ sơ nén (ZIP kèm .json.zst)"
+        )
         self._btn_export_dossier_zip.setVisible(False)
         self._btn_export_dossier_zip.setFixedHeight(action_h)
-        self._btn_export_dossier_zip.setMinimumWidth(128)
+        self._btn_export_dossier_zip.setMinimumWidth(80)
         self._btn_export_dossier_zip.setSizePolicy(
             QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed
         )
@@ -3033,11 +3286,10 @@ class RepositoryScreen(ScreenContent):
         self._action_all_widgets = [
             self._btn_back_to_dossiers,
             self._btn_back_to_search,
+            self._btn_back_to_results,
             self._list_count_label,
             self._sort_label,
             self._sort_combo,
-            self._fonds_filter_combo,
-            self._catalog_filter_combo,
             self._btn_add_file,
             self._btn_export_dossier_zip,
             self._btn_clear_selection,
@@ -3046,6 +3298,7 @@ class RepositoryScreen(ScreenContent):
         self._action_main_widgets = [
             self._btn_back_to_dossiers,
             self._btn_back_to_search,
+            self._btn_back_to_results,
             self._list_count_label,
             self._btn_add_file,
             self._btn_export_dossier_zip,
@@ -3055,8 +3308,6 @@ class RepositoryScreen(ScreenContent):
         self._action_secondary_widgets = [
             self._sort_label,
             self._sort_combo,
-            self._fonds_filter_combo,
-            self._catalog_filter_combo,
         ]
         self._action_bar_narrow: Optional[bool] = None
         # Start with the compact arrangement so the layout itself does not
@@ -3099,11 +3350,58 @@ class RepositoryScreen(ScreenContent):
         if hasattr(self, "_splitter"):
             self._set_splitter_for_mode()
 
+    # Content-driven reflow: keep everything on ONE row for as long as the
+    # controls genuinely fit, instead of switching to the two-row arrangement
+    # at a fixed window width (which wasted the free space to the right of
+    # the tabs on medium-wide windows).
+    def _action_bar_single_row_width(self) -> int:
+        """Width the tab row would need to show every visible control on a
+        single line: sum of per-widget hints + spacing + bar margins."""
+        layout = getattr(self, "_action_primary_layout", None)
+        spacing = layout.spacing() if layout is not None else SP[2]
+        total = 0
+        count = 0
+        for widget in self._action_all_widgets:
+            if widget.isHidden():
+                continue
+            if widget is self._list_count_label:
+                # The only stretchy item. Its rich-text minimumSizeHint
+                # (dossier title + stats) is far wider than the space it
+                # actually needs — it has always squeezed/clipped when the
+                # row is tight, so count a sane floor..cap instead.
+                total += min(
+                    max(72, widget.minimumSizeHint().width()), 280
+                )
+            else:
+                # Layouts clamp hints to maximumWidth (e.g. the sort combo
+                # cap), so the estimate must clamp the same way.
+                hint = max(
+                    widget.sizeHint().width(), widget.minimumWidth() or 0
+                )
+                max_w = widget.maximumWidth()
+                if 0 < max_w < 16777215:  # QWIDGETSIZE_MAX
+                    hint = min(hint, max_w)
+                total += hint
+            count += 1
+        if count:
+            total += spacing * (count - 1)
+        # Action-bar inner margins + the screen's outer layout margins +
+        # a little slack so borderline widths stay on one row.
+        total += 2 * (SP[2] + SP[3]) + 8
+        return total
+
+    def _reflow_action_bar(self, available_width: Optional[int] = None) -> None:
+        if not hasattr(self, "_action_primary_layout"):
+            return
+        if available_width is None:
+            available_width = self.width()
+        self._set_action_bar_narrow(
+            self._action_bar_single_row_width() > int(available_width)
+        )
+
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
-        self._set_action_bar_narrow(
-            event.size().width() < self._ACTION_BAR_BREAKPOINT
-        )
+        self._reflow_action_bar(event.size().width())
 
     def _style_dossier_filter_combo(self, combo: QComboBox) -> None:
         combo.setStyleSheet(
@@ -3150,6 +3448,8 @@ class RepositoryScreen(ScreenContent):
         finally:
             self._sort_combo.blockSignals(False)
             self._configuring_sort = False
+        # Option labels differ per mode → the combo's width changed.
+        self._reflow_action_bar()
 
     def _current_sort(self, mode: Optional[str] = None) -> str:
         target = mode or self._mode
@@ -3173,39 +3473,57 @@ class RepositoryScreen(ScreenContent):
             self._render_search_results(restore_scroll=False)
 
     def _update_view_navigation(self) -> None:
-        # These are top-level tabs, not two competing "back" buttons. Files
-        # inside a dossier remain part of the Hồ sơ tab; the other tab returns
-        # to the preserved search result list.
-        has_search_state = bool(
-            self._search_query or self._search_filters or self._search_hits
-        )
-        browsing = self._mode != self._MODE_SEARCH
+        # The Hồ sơ tab is dossier search + info only. The Tài liệu tab hosts
+        # both the document-search results and a dossier's file list (the ☰
+        # button / "Mở hồ sơ" jump here); the dedicated "← Kết quả tra cứu"
+        # button returns from a file list to the preserved results.
+        on_search_tab = self._mode in (self._MODE_SEARCH, self._MODE_FILES)
         for button, checked in (
-            (self._btn_back_to_dossiers, browsing),
-            (self._btn_back_to_search, not browsing),
+            (self._btn_back_to_dossiers, not on_search_tab),
+            (self._btn_back_to_search, on_search_tab),
         ):
             button.blockSignals(True)
             button.setChecked(checked)
             button.blockSignals(False)
         self._btn_back_to_dossiers.setVisible(True)
         self._btn_back_to_dossiers.setEnabled(self._mode != self._MODE_DOSSIERS)
-        # In a dossier this control is a true parent-level navigation action;
-        # elsewhere it is simply the Hồ sơ tab.  The contextual arrow avoids
-        # showing two arrow-like tabs at the same time.
-        self._btn_back_to_dossiers.setText(
-            "← Hồ sơ" if self._mode == self._MODE_FILES else "Hồ sơ"
-        )
-        self._btn_back_to_search.setVisible(has_search_state)
-        self._btn_back_to_search.setEnabled(self._mode != self._MODE_SEARCH)
+        self._btn_back_to_dossiers.setText("Hồ sơ")
+        self._btn_back_to_search.setVisible(True)
+        self._btn_back_to_search.setEnabled(not on_search_tab)
+        n_hits = len(self._search_hits)
         self._btn_back_to_search.setText(
-            f"Kết quả tìm kiếm ({len(self._search_hits)})"
+            f"Tài liệu ({n_hits})" if n_hits else "Tài liệu"
         )
+        has_search_state = bool(
+            self._search_query or self._search_filters or self._search_hits
+        )
+        self._btn_back_to_results.setVisible(
+            self._mode == self._MODE_FILES and has_search_state
+        )
+        self._btn_back_to_results.setText(
+            f"← Kết quả tra cứu ({n_hits})" if n_hits else "← Kết quả tra cứu"
+        )
+        # Tab/result labels change width (e.g. the hit count suffix) —
+        # re-decide whether the row still fits on one line.
+        self._reflow_action_bar()
 
     def _set_splitter_for_mode(self) -> None:
         if not hasattr(self, "_splitter"):
             return
         narrow = self.width() < self._ACTION_BAR_BREAKPOINT
-        if narrow and self._mode == self._MODE_SEARCH:
+        # The dossier-list view has no PDF to show, so the middle column is
+        # hidden and the long dossier titles get its full width. The PDF pane
+        # returns for the dossier's file list and for document search.
+        show_pdf = self._mode != self._MODE_DOSSIERS
+        self._pdf_pane.setVisible(show_pdf)
+        list_column = getattr(self, "_list_column", None)
+        if list_column is not None:
+            list_column.setMaximumWidth(
+                560 if show_pdf else 16777215  # QWIDGETSIZE_MAX
+            )
+        if not show_pdf:
+            self._splitter.setSizes([1400, 0, 340])
+        elif narrow and self._mode == self._MODE_SEARCH:
             self._splitter.setSizes([360, 680, 260])
         elif narrow:
             self._splitter.setSizes([300, 760, 260])
@@ -3256,15 +3574,17 @@ class RepositoryScreen(ScreenContent):
         h.setSpacing(SP[2])
 
         self.search_input = QLineEdit()
+        # Placeholder/tooltip are re-applied per active tra cứu tab in
+        # _apply_scope_ui(); these are just the initial (hồ sơ) values.
         self.search_input.setPlaceholderText(
-            "Tìm trong nội dung OCR; mở ▾ để lọc thêm thông tin văn bản"
+            "Tìm theo tên hồ sơ; mở ▾ để lọc thêm"
         )
         self.search_input.returnPressed.connect(self._on_search_clicked)
         h.addWidget(self.search_input, 1)
 
         self.btn_filter = QToolButton()
         self.btn_filter.setText("▾")
-        self.btn_filter.setToolTip("Lọc thông tin văn bản (kết hợp AND)")
+        self.btn_filter.setToolTip("Lọc hồ sơ (kết hợp AND)")
         self.btn_filter.setCheckable(True)
         self.btn_filter.setFixedSize(28, 26)
         self.btn_filter.toggled.connect(self._on_filter_toggle)
@@ -3358,9 +3678,11 @@ class RepositoryScreen(ScreenContent):
         # remaining separate from the read-only path/statistics area.
         self.btn_import_zip = QPushButton("Nhập từ ZIP")
         self.btn_import_zip.setToolTip(
-            "Nhập một hoặc nhiều file ZIP hồ sơ đã xuất (kèm .json.zst) vào "
-            "Kho — không chạy lại OCR/KIE. Có thể kéo thả trực tiếp các file "
-            "ZIP vào màn hình này."
+            "Nhập một hoặc nhiều file ZIP hồ sơ đã xuất vào Kho lưu trữ. "
+            "ZIP kèm .json.zst: dùng dữ liệu OCR/KIE sẵn có (không chạy lại). "
+            "ZIP cũ không kèm .json.zst: lấy nội dung từ lớp text PDF và "
+            "metadata từ MetaDuLieu.xlsx. Có thể kéo-thả trực tiếp ZIP vào "
+            "màn hình này."
         )
         self.btn_import_zip.setFixedHeight(24)
         self.btn_import_zip.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -3376,6 +3698,9 @@ class RepositoryScreen(ScreenContent):
         return host
 
     def _build_filter_panel(self) -> QWidget:
+        """Filter criteria for the Tra cứu tài liệu tab. Phông / Mục lục are
+        deliberately absent: they are hồ sơ-level conditions and belong to
+        the dossier search panel instead."""
         panel = QFrame()
         panel.setStyleSheet(
             f"QFrame {{ background: {COLOR_SURFACE}; border: 1px solid {COLOR_BORDER};"
@@ -3447,6 +3772,81 @@ class RepositoryScreen(ScreenContent):
             self._filter_inputs["doc_type"] = combo
             self._filter_doc_type_combo = combo
 
+        def _add_confidentiality(row: int, col: int):
+            grid.addWidget(QLabel("Độ mật"), row, col * 2)
+            combo = FuzzyComboBox(sort=False)
+            for option in _CONFIDENTIALITY_OPTIONS:
+                combo.addItem(option, option)
+            combo.setCurrentIndex(-1)
+            combo.setToolTip("Chọn mức độ mật: Thường / Mật / Tối mật / Tuyệt mật")
+            _prepare_input(combo)
+            grid.addWidget(combo, row, col * 2 + 1)
+            self._filter_inputs["confidentiality"] = combo
+
+        _add(0, 0, "Số ký hiệu", "doc_number")
+        _add(0, 1, "Cơ quan", "issue_org")
+        _add(0, 2, "Người ký", "signer_name")
+        _add_doc_type(0, 3)
+        _add_date(1, 0, "Ngày từ", "issue_date_from")
+        _add_date(1, 1, "Đến", "issue_date_to")
+        _add(1, 2, "Trích yếu", "subject")
+        _add(1, 3, "Nhiệm kỳ", "term")
+        _add(2, 0, "Thời hạn", "retention")
+        _add_confidentiality(2, 1)
+
+        for col in range(4):
+            grid.setColumnStretch(col * 2 + 1, 1)
+
+        v.addLayout(grid)
+        return panel
+
+    def _build_dossier_filter_panel(self) -> QWidget:
+        """Filter criteria for the Tra cứu hồ sơ tab, combined AND with the
+        toolbar keyword (tên hồ sơ)."""
+        panel = QFrame()
+        panel.setStyleSheet(
+            f"QFrame {{ background: {COLOR_SURFACE}; border: 1px solid {COLOR_BORDER};"
+            f" border-radius: {RADIUS_MD}px; }}"
+            f"QLabel {{ color: {COLOR_TEXT_SECONDARY}; font: 11px '{FONT_UI}'; }}"
+        )
+        v = QVBoxLayout(panel)
+        v.setContentsMargins(SP[3], SP[1], SP[3], SP[1])
+        v.setSpacing(SP[1])
+
+        filter_hint = QLabel(
+            "Các điều kiện dưới đây được kết hợp AND với từ khóa tên hồ sơ."
+        )
+        filter_hint.setStyleSheet(
+            f"color: {COLOR_TEXT_MUTED}; font: 11px '{FONT_UI}'; border: none;"
+        )
+        hint_row = QHBoxLayout()
+        hint_row.setContentsMargins(0, 0, 0, 0)
+        hint_row.addWidget(filter_hint, 1)
+        btn_reset = QPushButton("Đặt lại")
+        btn_reset.setFixedHeight(24)
+        btn_reset.clicked.connect(self._reset_dossier_filters)
+        hint_row.addWidget(btn_reset)
+        v.addLayout(hint_row)
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(SP[3])
+        grid.setVerticalSpacing(SP[2])
+
+        self._dossier_filter_inputs: dict[str, QWidget] = {}
+
+        def _prepare_input(widget: QWidget) -> None:
+            widget.setMinimumWidth(0)
+            policy = widget.sizePolicy()
+            policy.setHorizontalPolicy(QSizePolicy.Policy.Ignored)
+            widget.setSizePolicy(policy)
+
+        def _add(row: int, col: int, label: str, key: str):
+            grid.addWidget(QLabel(label), row, col * 2)
+            le = QLineEdit()
+            _prepare_input(le)
+            grid.addWidget(le, row, col * 2 + 1)
+            self._dossier_filter_inputs[key] = le
+
         def _add_archive_combo(row: int, col: int, label: str, key: str):
             grid.addWidget(QLabel(label), row, col * 2)
             combo = FuzzyComboBox(sort=False)
@@ -3454,25 +3854,20 @@ class RepositoryScreen(ScreenContent):
             combo.setCurrentIndex(0)
             _prepare_input(combo)
             grid.addWidget(combo, row, col * 2 + 1)
-            self._filter_inputs[key] = combo
+            self._dossier_filter_inputs[key] = combo
             if key == "fonds":
-                self._filter_fonds_combo = combo
-                combo.currentIndexChanged.connect(self._on_search_fonds_changed)
+                self._dossier_fonds_combo = combo
+                combo.currentIndexChanged.connect(self._on_dossier_fonds_changed)
             else:
-                self._filter_catalog_combo = combo
+                self._dossier_catalog_combo = combo
 
-        _add(0, 0, "Số ký hiệu", "doc_number")
-        _add(0, 1, "Cơ quan", "issue_org")
-        _add(0, 2, "Người ký", "signer_name")
-        _add_doc_type(0, 3)
-        _add_archive_combo(1, 0, "Phông", "fonds")
-        _add_archive_combo(1, 1, "Mục lục", "catalog")
-        _add_date(1, 2, "Ngày từ", "issue_date_from")
-        _add_date(1, 3, "Đến", "issue_date_to")
-        _add(2, 0, "Trích yếu", "subject")
-        _add(2, 1, "Nhiệm kỳ", "term")
-        _add(2, 2, "Thời hạn", "retention")
-        _add(2, 3, "Độ mật", "confidentiality")
+        _add_archive_combo(0, 0, "Phông", "fonds")
+        _add_archive_combo(0, 1, "Mục lục", "catalog")
+        _add(0, 2, "Mã định danh", "ma_dinh_danh")
+        _add(0, 3, "Số hồ sơ", "dossier_code")
+        _add(1, 0, "Chuyên đề", "topic")
+        _add(1, 1, "Nhiệm kỳ", "term")
+        _add(1, 2, "Thời hạn", "retention")
 
         for col in range(4):
             grid.setColumnStretch(col * 2 + 1, 1)
@@ -3519,7 +3914,7 @@ class RepositoryScreen(ScreenContent):
             self._importer = Importer(self._store, self._index)
             self._engine = SearchEngine(self._store, self._index)
             self._refresh_status()
-            self._populate_search_archive_filters()
+            self._populate_dossier_filter_combos()
         except Exception as e:
             QMessageBox.critical(self, "Kho lưu trữ",
                                  f"Không mở được kho:\n{e}")
@@ -3634,29 +4029,6 @@ class RepositoryScreen(ScreenContent):
 
     # ------ Mode A: dossier list ------
 
-    def _set_dossier_filter_widgets_visible(self, visible: bool) -> None:
-        for widget in (
-            getattr(self, "_fonds_filter_combo", None),
-            getattr(self, "_catalog_filter_combo", None),
-        ):
-            if widget is not None:
-                widget.setVisible(visible)
-
-    def _selected_fonds_filter(self) -> str:
-        combo = getattr(self, "_fonds_filter_combo", None)
-        if combo is None:
-            return ""
-        return str(combo.currentData() or "").strip()
-
-    def _selected_catalog_filter(self) -> str:
-        combo = getattr(self, "_catalog_filter_combo", None)
-        if combo is None:
-            return ""
-        return str(combo.currentData() or "").strip()
-
-    def _has_active_dossier_filter(self) -> bool:
-        return bool(self._selected_fonds_filter() or self._selected_catalog_filter())
-
     @staticmethod
     def _combo_label(code: str, name: str) -> str:
         code = (code or "").strip()
@@ -3697,50 +4069,15 @@ class RepositoryScreen(ScreenContent):
         ).fetchall()
         return [(r["catalog"] or "", r["catalog_name"] or "") for r in rows]
 
-    def _populate_catalog_filter(self, fonds: str, keep_catalog: str = "") -> None:
-        combo = self._catalog_filter_combo
-        combo.blockSignals(True)
-        try:
-            combo.clear()
-            combo.addItem("Tất cả mục lục", "")
-            for catalog, catalog_name in self._fetch_catalog_filter_options(fonds):
-                combo.addItem(self._combo_label(catalog, catalog_name), catalog)
-            idx = combo.findData(keep_catalog)
-            combo.setCurrentIndex(idx if idx >= 0 else 0)
-            combo.setEnabled(combo.count() > 1)
-        finally:
-            combo.blockSignals(False)
+    def _selected_dossier_fonds(self) -> str:
+        combo = getattr(self, "_dossier_fonds_combo", None)
+        if combo is None:
+            return ""
+        return str(combo.currentData() or "").strip()
 
-    def _populate_dossier_filters(self) -> None:
-        if self._loading_dossier_filters:
-            return
-        self._loading_dossier_filters = True
-        try:
-            keep_fonds = self._selected_fonds_filter()
-            keep_catalog = self._selected_catalog_filter()
-            combo = self._fonds_filter_combo
-            combo.blockSignals(True)
-            try:
-                combo.clear()
-                combo.addItem("Tất cả phông", "")
-                for fonds, fonds_name in self._fetch_fonds_filter_options():
-                    combo.addItem(self._combo_label(fonds, fonds_name), fonds)
-                idx = combo.findData(keep_fonds)
-                combo.setCurrentIndex(idx if idx >= 0 else 0)
-                combo.setEnabled(combo.count() > 1)
-            finally:
-                combo.blockSignals(False)
-            self._populate_catalog_filter(self._selected_fonds_filter(), keep_catalog)
-        finally:
-            self._loading_dossier_filters = False
-
-    def _selected_search_fonds(self) -> str:
-        combo = getattr(self, "_filter_fonds_combo", None)
-        return translations.combo_value(combo).strip() if combo is not None else ""
-
-    def _populate_search_catalog_filter(self, fonds: str = "",
+    def _populate_dossier_catalog_combo(self, fonds: str = "",
                                         keep_catalog: str = "") -> None:
-        combo = getattr(self, "_filter_catalog_combo", None)
+        combo = getattr(self, "_dossier_catalog_combo", None)
         if combo is None:
             return
         combo.blockSignals(True)
@@ -3755,14 +4092,16 @@ class RepositoryScreen(ScreenContent):
         finally:
             combo.blockSignals(False)
 
-    def _populate_search_archive_filters(self) -> None:
-        fonds_combo = getattr(self, "_filter_fonds_combo", None)
+    def _populate_dossier_filter_combos(self) -> None:
+        """Refresh phông/mục lục choices of the dossier filter panel, keeping
+        the current selections whenever they still exist."""
+        fonds_combo = getattr(self, "_dossier_fonds_combo", None)
         if fonds_combo is None:
             return
-        keep_fonds = self._selected_search_fonds()
-        catalog_combo = getattr(self, "_filter_catalog_combo", None)
+        keep_fonds = self._selected_dossier_fonds()
+        catalog_combo = getattr(self, "_dossier_catalog_combo", None)
         keep_catalog = (
-            translations.combo_value(catalog_combo).strip()
+            str(catalog_combo.currentData() or "").strip()
             if catalog_combo is not None else ""
         )
         fonds_combo.blockSignals(True)
@@ -3776,30 +4115,39 @@ class RepositoryScreen(ScreenContent):
             fonds_combo.setEnabled(fonds_combo.count() > 1)
         finally:
             fonds_combo.blockSignals(False)
-        self._populate_search_catalog_filter(keep_fonds, keep_catalog)
+        self._populate_dossier_catalog_combo(keep_fonds, keep_catalog)
 
-    def _on_search_fonds_changed(self) -> None:
-        self._populate_search_catalog_filter(self._selected_search_fonds(), "")
+    def _on_dossier_fonds_changed(self) -> None:
+        # Cascade the mục lục choices to the selected phông. Results refresh
+        # only when the user presses Tìm — no auto re-query.
+        self._populate_dossier_catalog_combo(self._selected_dossier_fonds(), "")
 
-    def _on_fonds_filter_changed(self) -> None:
-        if self._loading_dossier_filters:
-            return
-        self._loading_dossier_filters = True
-        try:
-            self._populate_catalog_filter(self._selected_fonds_filter(), "")
-        finally:
-            self._loading_dossier_filters = False
-        if self._mode == self._MODE_DOSSIERS:
-            self._show_dossier_list()
+    def _collect_dossier_filters(self) -> dict:
+        f: dict = {}
+        for key, widget in self._dossier_filter_inputs.items():
+            if isinstance(widget, QComboBox):
+                v = str(widget.currentData() or "").strip()
+            elif isinstance(widget, QLineEdit):
+                v = widget.text().strip()
+            else:
+                continue
+            if v:
+                f[key] = v
+        return f
 
-    def _on_catalog_filter_changed(self) -> None:
-        if self._loading_dossier_filters:
-            return
-        if self._mode == self._MODE_DOSSIERS:
-            self._show_dossier_list()
+    def _reset_dossier_filters(self) -> None:
+        for key, widget in self._dossier_filter_inputs.items():
+            if isinstance(widget, QComboBox):
+                widget.setCurrentIndex(0)
+            elif isinstance(widget, QLineEdit):
+                widget.clear()
+            elif hasattr(widget, "clear"):
+                widget.clear()
+        self._populate_dossier_catalog_combo("", "")
 
     def _show_dossier_list(self):
         previous_mode = self._mode
+        self._sync_scope_state()
         if previous_mode == self._MODE_SEARCH:
             self._search_scroll_value = self._list_scroll.verticalScrollBar().value()
             self._stash_search_list()
@@ -3817,14 +4165,11 @@ class RepositoryScreen(ScreenContent):
         self._dossier_cards_by_id.clear()
         self._btn_add_file.setVisible(False)
         self._btn_export_dossier_zip.setVisible(False)
-        self._set_dossier_filter_widgets_visible(True)
         self._configure_sort_options(self._MODE_DOSSIERS)
         self._update_view_navigation()
         self._set_splitter_for_mode()
         self._update_selection_toolbar()
-        self.btn_clear_search.setVisible(bool(
-            self._search_query or self._search_filters or self.search_input.text().strip()
-        ))
+        self._apply_scope_ui()
         self._pdf_pane.clear()
         self._right_panel.show_dossier(DossierRow(
             dossier_id=0, title="(chưa chọn)",
@@ -3832,31 +4177,44 @@ class RepositoryScreen(ScreenContent):
             doc_count=0, page_count=0, start_date="", end_date="",
         ))
         self._right_panel.show_message(
-            "Chọn một hồ sơ ở cột trái để xem các văn bản bên trong."
+            "Chọn một hồ sơ ở cột trái để xem thông tin; nhấn ☰ (hoặc nhấp đúp) "
+            "để mở danh sách tài liệu bên trong ở tab Tài liệu."
         )
         self._clear_list()
         if self._store is None:
             self._list_count_label.setText("Chưa mở được kho")
             return
-        self._populate_dossier_filters()
-        dossiers = self._fetch_dossiers()
+        self._populate_dossier_filter_combos()
+        filtered = bool(self._dossier_query or self._dossier_filters)
+        dossiers = self._fetch_dossiers(
+            query=self._dossier_query, filters=self._dossier_filters,
+        )
         if not dossiers:
-            if self._has_active_dossier_filter():
-                self._list_count_label.setText("Không có hồ sơ theo bộ lọc.")
+            if filtered:
+                self._list_count_label.setText(
+                    "Không có hồ sơ khớp điều kiện tra cứu."
+                )
             else:
                 self._list_count_label.setText(
                     "Kho rỗng. Dùng Bước 3 trong 'Số hóa lưu trữ' để chuyển hồ sơ vào."
                 )
             return
-        self._list_count_label.setText(f"{len(dossiers)} hồ sơ")
+        self._list_count_label.setText(
+            f"{len(dossiers)} hồ sơ khớp điều kiện tra cứu" if filtered
+            else f"{len(dossiers)} hồ sơ"
+        )
         self._btn_export_dossier_zip.setVisible(True)
         for d in dossiers:
             card = _DossierCard(d)
-            card.clicked.connect(lambda _did, dd=d: self._show_files_in_dossier(dd))
+            card.clicked.connect(lambda _did, dd=d: self._select_dossier_view(dd))
+            card.open_clicked.connect(
+                lambda _did, dd=d: self._show_files_in_dossier(dd)
+            )
             card.edit_clicked.connect(lambda _did, dd=d: self._on_edit_dossier(dd))
             card.selection_changed.connect(self._on_dossier_selection_changed)
             self._dossier_cards_by_id[d.dossier_id] = card
             self._add_card(card)
+        self._set_active_dossier_card(self._active_dossier_view_id)
         self._update_selection_toolbar()
         QTimer.singleShot(
             0,
@@ -3864,19 +4222,28 @@ class RepositoryScreen(ScreenContent):
                 self._list_scroll.verticalScrollBar().setValue(value),
         )
 
-    def _fetch_dossiers(self) -> List[DossierRow]:
+    def _select_dossier_view(self, dossier: DossierRow) -> None:
+        """Dossier body click: only show its info in the right panel.
+        Entering the document list is the separate explicit 'Xem tài liệu'
+        action (card button or double-click)."""
+        self._active_dossier_view_id = dossier.dossier_id
+        self._set_active_dossier_card(dossier.dossier_id)
+        self._right_panel.show_dossier(dossier)
+
+    def _set_active_dossier_card(self, dossier_id: int) -> None:
+        for did, card in self._dossier_cards_by_id.items():
+            if hasattr(card, "set_active"):
+                card.set_active(did == int(dossier_id))
+
+    def _fetch_dossiers(self, query: str = "",
+                        filters: Optional[dict] = None) -> List[DossierRow]:
+        """Dossier rows for the Tra cứu hồ sơ tab. Phông/mục lục and the code
+        columns are matched in SQL; tên hồ sơ / chuyên đề / nhiệm kỳ / thời hạn
+        are matched in Python (diacritic-insensitive) via the module-level
+        pure helpers so they stay unit-testable."""
         if self._store is None:
             return []
-        where_parts: list[str] = []
-        params: list[str] = []
-        fonds = self._selected_fonds_filter()
-        catalog = self._selected_catalog_filter()
-        if fonds:
-            where_parts.append("COALESCE(d.fonds, '') = ?")
-            params.append(fonds)
-        if catalog:
-            where_parts.append("COALESCE(d.catalog, '') = ?")
-            params.append(catalog)
+        where_parts, params = _dossier_sql_filters(filters or {})
         where_sql = (
             "WHERE " + " AND ".join(where_parts) + " "
             if where_parts else ""
@@ -3909,7 +4276,7 @@ class RepositoryScreen(ScreenContent):
             f"ORDER BY {sort_sql}",
             params,
         ).fetchall()
-        return [
+        rows_out = [
             DossierRow(
                 dossier_id=int(r["dossier_id"]),
                 title=r["title"] or "",
@@ -3934,11 +4301,25 @@ class RepositoryScreen(ScreenContent):
             )
             for r in rows
         ]
+        filters = filters or {}
+        topic = str(filters.get("topic") or "").strip()
+        term = str(filters.get("term") or "").strip()
+        retention = str(filters.get("retention") or "").strip()
+        if (str(query or "").strip() or topic or term or retention):
+            rows_out = [
+                row for row in rows_out
+                if _dossier_matches_title(row.title, query)
+                and _dossier_matches_text(row.topic, topic)
+                and _dossier_matches_text(row.term, term)
+                and _dossier_matches_text(row.retention, retention)
+            ]
+        return rows_out
 
     # ------ Mode B: files inside a dossier ------
 
     def _show_files_in_dossier(self, dossier: DossierRow, *, from_search: bool = False):
         came_from_search = from_search or self._mode == self._MODE_SEARCH
+        self._sync_scope_state()
         if self._mode == self._MODE_SEARCH:
             self._search_scroll_value = self._list_scroll.verticalScrollBar().value()
             self._stash_search_list()
@@ -3956,11 +4337,11 @@ class RepositoryScreen(ScreenContent):
         self._dossier_cards_by_id.clear()
         self._btn_add_file.setVisible(True)        # only in file-list mode
         self._btn_export_dossier_zip.setVisible(True)
-        self._set_dossier_filter_widgets_visible(False)
         self._configure_sort_options(self._MODE_FILES)
         self._update_view_navigation()
         self._set_splitter_for_mode()
         self._update_selection_toolbar()
+        self._apply_scope_ui()
         self._pdf_pane.clear()
         self._right_panel.show_dossier(dossier)
         self._clear_list()
@@ -4454,15 +4835,13 @@ class RepositoryScreen(ScreenContent):
     def _reset_filters(self):
         for key, widget in self._filter_inputs.items():
             if isinstance(widget, QComboBox):
-                widget.setCurrentIndex(0 if key in {"fonds", "catalog"} else -1)
+                widget.setCurrentIndex(-1)
                 if widget.isEditable() and widget.lineEdit() is not None:
-                    if key not in {"fonds", "catalog"}:
-                        widget.lineEdit().clear()
+                    widget.lineEdit().clear()
             elif isinstance(widget, QLineEdit):
                 widget.clear()
             elif hasattr(widget, "clear"):
                 widget.clear()
-        self._populate_search_catalog_filter("", "")
 
     def _refresh_doc_type_filter_choices(self):
         combo = getattr(self, "_filter_doc_type_combo", None)
@@ -4490,27 +4869,119 @@ class RepositoryScreen(ScreenContent):
     def _on_filter_toggle(self, checked: bool):
         if not hasattr(self, "_filter_panel"):
             return
-        self._filter_panel.setVisible(bool(checked))
+        scope = self._active_scope()
+        # Exactly one criteria panel is visible at a time: the one belonging
+        # to the active tra cứu tab.
+        self._filter_panel.setVisible(checked and scope == "search")
+        self._dossier_filter_panel.setVisible(checked and scope == "dossiers")
         if hasattr(self, "btn_filter"):
             self.btn_filter.setText("▴" if checked else "▾")
+        self._scope_states[scope]["panel_open"] = bool(checked)
+
+    # ------ Per-tab toolbar scope (tra cứu hồ sơ vs tra cứu tài liệu) ------
+
+    def _active_scope(self) -> str:
+        """'dossiers' while on the Hồ sơ tab (search + info), 'search' while
+        on the Tài liệu tab — which hosts BOTH the document-search results
+        and a dossier's file list (mode FILES lives under this scope)."""
+        return (
+            "dossiers"
+            if self._mode == self._MODE_DOSSIERS
+            else "search"
+        )
+
+    def _sync_scope_state(self) -> None:
+        """Persist the shared toolbar widgets into the outgoing scope's
+        memory before the active tab changes."""
+        if not hasattr(self, "search_input"):
+            return
+        state = self._scope_states[self._active_scope()]
+        state["query"] = self.search_input.text()
+        state["panel_open"] = bool(
+            getattr(self, "btn_filter", None) and self.btn_filter.isChecked()
+        )
+
+    def _apply_scope_ui(self, *, restore_query: bool = True) -> None:
+        """Restore the incoming scope's keyword/panel state onto the shared
+        toolbar after the active tab changed. `restore_query=False` keeps the
+        current input text — used when the tab did NOT change (e.g. search
+        finished while the user was already on the tab and may have edited
+        the keyword since)."""
+        scope = self._active_scope()
+        state = self._scope_states[scope]
+        panel_open = bool(state.get("panel_open"))
+        if restore_query:
+            self.search_input.setText(str(state.get("query") or ""))
+        self.btn_filter.blockSignals(True)
+        self.btn_filter.setChecked(panel_open)
+        self.btn_filter.blockSignals(False)
+        self.btn_filter.setText("▴" if panel_open else "▾")
+        self._filter_panel.setVisible(panel_open and scope == "search")
+        self._dossier_filter_panel.setVisible(panel_open and scope == "dossiers")
+        self.search_input.setEnabled(True)
+        if scope == "dossiers":
+            self.search_input.setPlaceholderText(
+                "Tìm theo tên hồ sơ; mở ▾ để lọc thêm"
+            )
+            self.btn_filter.setToolTip("Lọc hồ sơ (kết hợp AND)")
+        else:
+            self.search_input.setPlaceholderText(
+                "Tìm trong nội dung OCR; mở ▾ để lọc thêm thông tin văn bản"
+            )
+            self.btn_filter.setToolTip("Lọc thông tin văn bản (kết hợp AND)")
+        self._update_clear_button()
+
+    def _update_clear_button(self) -> None:
+        """The shared 'Xóa tìm kiếm' button reflects the ACTIVE tab's state."""
+        if not hasattr(self, "btn_clear_search"):
+            return
+        if self._active_scope() == "dossiers":
+            visible = bool(
+                self._dossier_query
+                or self._dossier_filters
+                or self.search_input.text().strip()
+                or self._collect_dossier_filters()
+            )
+        else:
+            visible = bool(
+                self._search_query
+                or self._search_filters
+                or self.search_input.text().strip()
+                or self._collect_filters()
+            )
+        self.btn_clear_search.setVisible(visible)
 
     def _on_search_mode_changed(self):
         if not hasattr(self, "_filter_panel"):
             return
         self._refresh_doc_type_filter_choices()
-        if hasattr(self, "btn_filter"):
-            self.btn_filter.setVisible(True)
-            self.btn_filter.setText("▴" if self.btn_filter.isChecked() else "▾")
-        self._filter_panel.setVisible(self.btn_filter.isChecked())
-        self.search_input.setEnabled(True)
-        self.search_input.setPlaceholderText(
-            "Tìm trong nội dung OCR; mở ▾ để lọc thêm thông tin văn bản"
-        )
+        self._apply_scope_ui()
 
     def _clear_search(self):
-        """Drop search state and return to dossier-browse mode."""
+        """Clear the ACTIVE tab's keyword + filters + results. Each tra cứu
+        tab owns its own search state."""
+        if self._active_scope() == "dossiers":
+            self._clear_dossier_search()
+        else:
+            self._clear_document_search()
+
+    def _clear_dossier_search(self) -> None:
+        self._dossier_query = ""
+        self._dossier_filters = {}
+        self._scope_states["dossiers"]["query"] = ""
+        self._reset_dossier_filters()
+        self._dossier_scroll_value = 0
+        if self._active_scope() == "dossiers":
+            self.search_input.clear()
+        self._show_dossier_list()
+
+    def _clear_document_search(self) -> None:
+        self._scope_states["search"]["query"] = ""
         self.search_input.clear()
         self._reset_filters()
+        self._reset_document_search_state()
+
+    def _reset_document_search_state(self) -> None:
         self._search_query = ""
         self._search_filters = {}
         self._search_mode = "content"
@@ -4519,20 +4990,35 @@ class RepositoryScreen(ScreenContent):
         self._search_scroll_value = 0
         self._search_selected_doc_id = ""
         self._search_rank_by_doc = {}
-        self._show_dossier_list()
         self._discard_search_list_cache()
+        self._render_search_empty_state()
+
+    def _run_dossier_search(self) -> None:
+        """Tìm của tab Tra cứu hồ sơ: commit keyword + filters, then re-render
+        the dossier list (empty both = plain browse-all, as before)."""
+        query = self.search_input.text().strip()
+        filters = self._collect_dossier_filters()
+        self._dossier_query = query
+        self._dossier_filters = dict(filters)
+        if query or filters:
+            self._dossier_scroll_value = 0
+        self._show_dossier_list()
 
     def _on_search_clicked(self):
-        if self._engine is None:
-            return
         if self._busy:
+            return
+        if self._active_scope() == "dossiers":
+            self._run_dossier_search()
+            return
+        if self._engine is None:
             return
         mode = "content"
         query = self.search_input.text().strip()
         filters = self._collect_filters()
         if not query and not filters:
-            # No query → go back to dossier browse.
-            self._show_dossier_list()
+            # No criteria → reset to the tab's waiting state instead of
+            # jumping back to the dossier browse.
+            self._reset_document_search_state()
             return
         self._busy = True
         self.btn_search.setEnabled(False)
@@ -4606,6 +5092,8 @@ class RepositoryScreen(ScreenContent):
 
     def _render_search_results(self, *, restore_scroll: bool = True) -> None:
         was_search = self._mode == self._MODE_SEARCH
+        if not was_search:
+            self._sync_scope_state()
         requested_sort = self._current_sort(self._MODE_SEARCH)
         use_cached_list = bool(
             not was_search
@@ -4622,10 +5110,12 @@ class RepositoryScreen(ScreenContent):
         self._return_to_search = False
         self._btn_add_file.setVisible(False)
         self._btn_export_dossier_zip.setVisible(False)
-        self._set_dossier_filter_widgets_visible(False)
         self._configure_sort_options(self._MODE_SEARCH)
         self._update_view_navigation()
         self._set_splitter_for_mode()
+        # Same-tab re-render (search finished on the tab): do not clobber a
+        # keyword the user may have edited meanwhile.
+        self._apply_scope_ui(restore_query=not was_search)
         self._selected_doc_ids.clear()
         self._active_doc_id = ""
         self._doc_cards_by_id.clear()
@@ -4633,7 +5123,6 @@ class RepositoryScreen(ScreenContent):
         self._selected_dossier_ids.clear()
         self._dossier_cards_by_id.clear()
         self._update_selection_toolbar()
-        self.btn_clear_search.setVisible(True)
         self.btn_clear_search.setEnabled(True)
         self._clear_list()
         self._pdf_pane.clear()
@@ -4697,10 +5186,65 @@ class RepositoryScreen(ScreenContent):
                     self._list_scroll.verticalScrollBar().setValue(value),
             )
 
-    def _restore_search_results(self) -> None:
-        if not (self._search_query or self._search_filters or self._search_hits):
+    def _show_search_tab(self) -> None:
+        """Tài liệu tab click: restore the preserved results, or show the
+        tab's waiting state when no document search has been run yet.
+        Clicking while already on this tab (results or a dossier's file
+        list) is a no-op so nothing gets replaced accidentally."""
+        if self._mode in (self._MODE_SEARCH, self._MODE_FILES):
             return
-        self._render_search_results(restore_scroll=True)
+        if self._search_query or self._search_filters or self._search_hits:
+            self._render_search_results(restore_scroll=True)
+        else:
+            self._render_search_empty_state()
+
+    def _restore_search_results(self) -> None:
+        """'← Kết quả tra cứu' click: leave a dossier's file list and return
+        to the preserved document-search results."""
+        if self._mode != self._MODE_FILES:
+            return
+        if self._search_query or self._search_filters or self._search_hits:
+            self._render_search_results(restore_scroll=True)
+        else:
+            self._render_search_empty_state()
+
+    def _render_search_empty_state(self) -> None:
+        """Waiting state of the Tra cứu tài liệu tab (no keyword, no filters,
+        no results yet)."""
+        if self._mode == self._MODE_DOSSIERS:
+            self._dossier_scroll_value = self._list_scroll.verticalScrollBar().value()
+        self._sync_scope_state()
+        self._mode = self._MODE_SEARCH
+        self._current_dossier = None
+        self._current_file = None
+        self._return_to_search = False
+        self._active_doc_id = ""
+        self._doc_cards_by_id.clear()
+        self._selected_doc_ids.clear()
+        self._file_cards_by_id.clear()
+        self._selected_dossier_ids.clear()
+        self._dossier_cards_by_id.clear()
+        self._btn_add_file.setVisible(False)
+        self._btn_export_dossier_zip.setVisible(False)
+        self._configure_sort_options(self._MODE_SEARCH)
+        self._update_view_navigation()
+        self._set_splitter_for_mode()
+        self._apply_scope_ui()
+        self._update_selection_toolbar()
+        self._clear_list()
+        self._pdf_pane.clear()
+        self._list_count_label.setText(
+            "Nhập từ khóa hoặc mở ▾ để tra cứu tài liệu"
+        )
+        self._right_panel.show_dossier(DossierRow(
+            dossier_id=0, title="(chưa tìm)",
+            fonds="", catalog="", dossier_code="",
+            doc_count=0, page_count=0, start_date="", end_date="",
+        ))
+        self._right_panel.show_message(
+            "Tra cứu tài liệu: nhập từ khóa trong nội dung OCR, hoặc mở ▾ "
+            "để lọc theo thông tin văn bản."
+        )
 
     def _open_search_hit_dossier(self, dossier_id: int) -> None:
         self._search_scroll_value = self._list_scroll.verticalScrollBar().value()
@@ -4908,10 +5452,11 @@ class RepositoryScreen(ScreenContent):
     # ------ ZIP → Kho direct import (no OCR/KIE re-run) ------
 
     def _on_import_zip_clicked(self):
-        """Pick one or many exported HSLTCQ ZIPs (with bundled `.json.zst`
-        sidecars) and import their dossiers straight into Kho lưu trữ.
-        Blocks, KIE fields and annotations all come from the sidecars —
-        nothing is re-OCRed."""
+        """Pick one or many exported HSLTCQ ZIPs and import their dossiers
+        straight into Kho lưu trữ. Docs with a bundled `.json.zst` sidecar
+        use its blocks/KIE fields/annotations as-is; legacy docs (no
+        sidecar) get a canonical synthesized from the PDF text layer and
+        KIE fields from the workbook. Nothing is re-OCRed."""
         paths, _ = QFileDialog.getOpenFileNames(
             self,
             translations.localize_text("Chọn các file ZIP hồ sơ để nhập vào Kho"),
@@ -4955,7 +5500,7 @@ class RepositoryScreen(ScreenContent):
                 os.getcwd(), "temp", f"zip_kho_{stamp}_{i:02d}",
             )
             try:
-                codes, docs, skipped, _out_dir = parse_export_zip_for_kho(
+                codes, docs, no_companion, _out_dir = parse_export_zip_for_kho(
                     path, temp_root
                 )
             except ZipRoundtripError as e:
@@ -4967,15 +5512,20 @@ class RepositoryScreen(ScreenContent):
                 shutil.rmtree(temp_root, ignore_errors=True)
                 continue
             if not (codes.ma_dinh_danh and codes.fonds):
+                # Generic ZIP name (e.g. HSLTCQ.zip): the identity codes are
+                # not in the file name. Ask the operator once — the codes
+                # only live on this import job.
+                dlg = _LegacyZipCodesDialog(name, codes, self)
+                if dlg.exec() == QDialog.DialogCode.Accepted:
+                    dlg.apply_to(codes)
+            if not (codes.ma_dinh_danh and codes.fonds):
                 problems.append(
                     f"{name}: thiếu mã định danh / mã phông trong tên ZIP"
                 )
                 shutil.rmtree(temp_root, ignore_errors=True)
                 continue
             if not docs:
-                problems.append(
-                    f"{name}: không có dữ liệu OCR/KIE (.json.zst) kèm theo"
-                )
+                problems.append(f"{name}: không có văn bản PDF trong ZIP")
                 shutil.rmtree(temp_root, ignore_errors=True)
                 continue
             jobs.append({
@@ -4983,7 +5533,7 @@ class RepositoryScreen(ScreenContent):
                 "docs": docs,
                 "temp_root": temp_root,
                 "zip_name": name,
-                "skipped_no_companion": skipped,
+                "no_companion": no_companion,
             })
 
         if problems:
@@ -5000,7 +5550,7 @@ class RepositoryScreen(ScreenContent):
             return
 
         total = sum(len(j["docs"]) for j in jobs)
-        skipped_total = sum(j["skipped_no_companion"] for j in jobs)
+        text_layer_total = sum(j["no_companion"] for j in jobs)
         lines = []
         for job in jobs:
             c = job["codes"]
@@ -5015,9 +5565,10 @@ class RepositoryScreen(ScreenContent):
             + "\n"
             + "\n".join(translations.localize_text(line) for line in lines)
         )
-        if skipped_total:
+        if text_layer_total:
             text += "\n\n" + translations.localize_text(
-                f"({skipped_total} văn bản thiếu .json.zst sẽ bỏ qua)"
+                f"({text_layer_total} văn bản không kèm .json.zst — nội dung và "
+                "metadata sẽ được lấy từ lớp text PDF)"
             )
         if problems:
             text += "\n\n" + translations.localize_text(
@@ -5077,6 +5628,10 @@ class RepositoryScreen(ScreenContent):
                 f"Repository: ZIP imported — {result.imported}/{result.total}"
                 f" from {len(jobs)} dossier ZIPs"
             )
+            if result.text_layer_imports:
+                import_log += translations.localize_text(
+                    f", {result.text_layer_imports} qua lớp text PDF"
+                )
             if result.duplicates:
                 import_log += translations.localize_text(
                     f", {result.duplicates} trùng"
@@ -5094,6 +5649,13 @@ class RepositoryScreen(ScreenContent):
                 duplicate_skipped=dup_skipped,
                 duplicate_kept=dup_kept,
             )
+            if result.text_layer_imports:
+                msg += "\n" + translations.localize_text(
+                    f"Documents from PDF text layer (no .json.zst): "
+                    f"{result.text_layer_imports}"
+                )
+            if result.message:
+                msg += "\n\n" + translations.localize_text(result.message)
             QMessageBox.information(self, "Nhập từ ZIP hoàn tất", msg)
 
         def on_failed(error_msg):
@@ -5378,7 +5940,7 @@ class RepositoryScreen(ScreenContent):
             self._btn_export_dossier_zip.setVisible(total > 0)
             self._btn_export_dossier_zip.setEnabled(n > 0)
             self._btn_export_dossier_zip.setText(
-                f"Xuất {n} hồ sơ nén" if n > 0 else "Xuất hồ sơ nén"
+                f"Xuất {n} ZIP" if n > 0 else "Xuất ZIP"
             )
             self._btn_clear_selection.setVisible(total > 0)
             self._btn_clear_selection.setText(
@@ -5388,24 +5950,27 @@ class RepositoryScreen(ScreenContent):
             if n > 0:
                 self._btn_bulk_delete.setText("🗑︎")
                 self._btn_bulk_delete.setToolTip(f"Xóa {n} hồ sơ")
+            self._reflow_action_bar()
             return
 
         if self._mode == self._MODE_FILES:
             n = len(self._selected_doc_ids)
             self._btn_export_dossier_zip.setVisible(True)
             self._btn_export_dossier_zip.setEnabled(self._current_dossier is not None)
-            self._btn_export_dossier_zip.setText("Xuất hồ sơ nén")
+            self._btn_export_dossier_zip.setText("Xuất ZIP")
             self._btn_clear_selection.setVisible(n > 0)
             self._btn_clear_selection.setText("Bỏ chọn")
             self._btn_bulk_delete.setVisible(n > 0)
             if n > 0:
                 self._btn_bulk_delete.setText("🗑︎")
                 self._btn_bulk_delete.setToolTip(f"Xóa {n} văn bản")
+            self._reflow_action_bar()
             return
 
         self._btn_export_dossier_zip.setVisible(False)
         self._btn_clear_selection.setVisible(False)
         self._btn_bulk_delete.setVisible(False)
+        self._reflow_action_bar()
 
     def _toggle_select_all_dossiers(self) -> None:
         if self._mode != self._MODE_DOSSIERS:
