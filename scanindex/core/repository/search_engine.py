@@ -19,7 +19,7 @@ from . import constants as C
 from .filter_builder import is_active
 from .indexer import HybridIndex, body_text_fields, metadata_text_fields
 from .store import ArchiveStore
-from .tokenizer import to_no_diacritic
+from .tokenizer import filter_tokens, to_no_diacritic
 
 _log = logging.getLogger(__name__)
 
@@ -527,6 +527,17 @@ _ADVANCED_FILTER_FIELDS: dict[str, Tuple[str, ...]] = {
 
 _FUZZY_METADATA_FILTER_KEYS = {"issue_org", "signer_name", "subject"}
 
+# Keys eligible for the SQL token prefilter (see _scope_doc_ids): their
+# Python match is substring/exact-token based, so unpadded instr() on the
+# normalized doc_filter_text is a valid necessary condition. Fuzzy keys
+# (rapidfuzz) and confidentiality ("Thường" matches empty marks) are
+# excluded — see the comment inside _scope_doc_ids.
+_SQL_PREFILTER_KEYS = (
+    set(_ADVANCED_FILTER_FIELDS)
+    - _FUZZY_METADATA_FILTER_KEYS
+    - {"confidentiality"}
+)
+
 
 def _confidentiality_level(mark) -> str:
     """Canonical Độ mật level of one raw secrecy/confidentiality value:
@@ -812,7 +823,64 @@ class SearchEngine:
     def _scope_doc_ids(self, filters: dict) -> Optional[List[str]]:
         if not is_active(filters):
             return None
-        rows = self.store.connect().execute(
+        # SQL prefilter over the normalized doc_filter_text column (schema
+        # v10). Every clause below is a *necessary* condition of the Python
+        # match that follows — rows SQL drops are rows Python would reject,
+        # so results are identical to the previous full-scan behaviour,
+        # without loading the whole documents table for every filtered
+        # search. Rows whose column is NULL (inserted by an older release
+        # after the upgrade) always pass through to Python.
+        #
+        # Token containment is only pushed for keys whose Python match is
+        # substring/exact-token based. The fuzzy keys (issue_org /
+        # signer_name / subject) use rapidfuzz, which matches non-substring
+        # variants ("tran" ≈ "toan"), and confidentiality's "Thường" level
+        # matches rows with *no* mark at all — neither is expressible as a
+        # necessary instr() condition, so those keys stay Python-only.
+        where = ["d.indexed_status = 'indexed'"]
+        params: List[Any] = []
+        for key in _SQL_PREFILTER_KEYS:
+            val = (filters or {}).get(key)
+            if val in (None, "", [], ()):
+                continue
+            values = val if isinstance(val, (list, tuple, set)) else [val]
+            per_value = []
+            key_params: List[str] = []
+            for v in values:
+                # Pure-digit tokens are skipped: Python matches them with
+                # leading-zero stripping ("08" == "8"), which a plain
+                # instr() cannot express. Unpadded instr mirrors the
+                # Python substring semantics (a needle token may legally
+                # match inside a longer haystack token).
+                toks = [
+                    t for t in filter_tokens(str(v))
+                    if not t.isdigit()
+                ]
+                if not toks:
+                    per_value = None
+                    break
+                conds = [
+                    "(d.doc_filter_text IS NULL OR instr(d.doc_filter_text, ?) > 0)"
+                ] * len(toks)
+                key_params.extend(toks)
+                per_value.append("(" + " AND ".join(conds) + ")")
+            if per_value:
+                where.append("(" + " OR ".join(per_value) + ")")
+                params.extend(key_params)
+        conf = (filters or {}).get("confidentiality")
+        if conf and _confidentiality_level(conf) != "Thường":
+            # A secret level can only match when some mark exists at all.
+            where.append(
+                "(COALESCE(TRIM(d.kie_secrecy_mark), '') != '' "
+                "OR COALESCE(TRIM(ds.confidentiality), '') != '')"
+            )
+        # Mirror the legacy date semantics exactly: an unparseable filter
+        # value is ignored outright (no restriction at all); a parseable
+        # one rejects rows without any issue-date text.
+        if (_date_key((filters or {}).get("issue_date_from"))
+                or _date_key((filters or {}).get("issue_date_to"))):
+            where.append("COALESCE(TRIM(d.kie_place_date), '') != ''")
+        sql = (
             "SELECT d.doc_id,"
             "       d.kie_doc_number_symbol, d.kie_issue_org_superior,"
             "       d.kie_issue_org_name, d.kie_signer_name,"
@@ -822,8 +890,27 @@ class SearchEngine:
             "       ds.term, ds.retention, ds.confidentiality "
             "FROM documents d "
             "LEFT JOIN dossiers ds ON d.dossier_id = ds.dossier_id "
-            "WHERE d.indexed_status = 'indexed'"
-        ).fetchall()
+            f"WHERE {' AND '.join(where)}"
+        )
+        import sqlite3 as _sq
+        try:
+            rows = self.store.connect().execute(sql, params).fetchall()
+        except _sq.OperationalError:
+            # Pre-v10 DB whose converter never ran (e.g. aborted): fall
+            # back to the unfiltered scan — Python verification below is
+            # the correctness backstop either way.
+            rows = self.store.connect().execute(
+                "SELECT d.doc_id,"
+                "       d.kie_doc_number_symbol, d.kie_issue_org_superior,"
+                "       d.kie_issue_org_name, d.kie_signer_name,"
+                "       d.kie_doc_subject, d.kie_doc_type, d.kie_secrecy_mark,"
+                "       d.kie_place_date,"
+                "       ds.fonds, ds.fonds_name, ds.catalog, ds.catalog_name,"
+                "       ds.term, ds.retention, ds.confidentiality "
+                "FROM documents d "
+                "LEFT JOIN dossiers ds ON d.dossier_id = ds.dossier_id "
+                "WHERE d.indexed_status = 'indexed'"
+            ).fetchall()
 
         def row_matches(row) -> bool:
             for key, fields in _ADVANCED_FILTER_FIELDS.items():

@@ -391,6 +391,9 @@ def update_document_metadata(store: ArchiveStore, index: HybridIndex,
         f"UPDATE documents SET {sets}, updated_at = :now WHERE doc_id = :doc_id",
         params,
     )
+    # v10: KIE fields feed the advanced-filter prefilter column.
+    from .filter_builder import refresh_doc_filter_text
+    refresh_doc_filter_text(conn, [doc_id])
 
     # 2. Update kie_annotation_json â€” keep bbox/page/score/source from the
     # original annotation, only override `text` for the 14 labels we know.
@@ -528,6 +531,16 @@ def update_dossier_metadata(store: ArchiveStore, dossier_id: int,
             int(time.time()), dossier_id,
         ),
     )
+    # v10: fonds_name / catalog_name / term / retention fold into every
+    # member document's doc_filter_text — keep those in sync.
+    from .filter_builder import refresh_doc_filter_text
+    member_ids = [
+        r["doc_id"] for r in conn.execute(
+            "SELECT doc_id FROM documents WHERE dossier_id = ?",
+            (dossier_id,),
+        ).fetchall()
+    ]
+    refresh_doc_filter_text(conn, member_ids)
 
 
 def reorder_dossier_documents(store: ArchiveStore, dossier_id: int,
@@ -967,6 +980,19 @@ def add_document(store: ArchiveStore, index: HybridIndex, *,
         "page_count": page_count, "sha256": sha,
         "indexed_status": "pending", "created_at": now,
     }
+    # v10: maintain the advanced-filter prefilter column.
+    from .filter_builder import (
+        DOC_FILTER_DOC_FIELDS, doc_filter_text_from_row,
+    )
+    dsr = conn.execute(
+        "SELECT fonds, fonds_name, catalog, catalog_name, "
+        "term, retention, confidentiality "
+        "FROM dossiers WHERE dossier_id = ?",
+        (dossier_id,),
+    ).fetchone()
+    params["doc_filter_text"] = doc_filter_text_from_row(
+        {f: params.get(f, "") for f in DOC_FILTER_DOC_FIELDS}, dsr,
+    )
     cols_all = list(params.keys())
     placeholders = ", ".join(f":{c}" for c in cols_all)
     conn.execute(

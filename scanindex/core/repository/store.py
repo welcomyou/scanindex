@@ -115,6 +115,13 @@ class ArchiveStore:
             "needs_migration",
             "1" if (has_version_mismatch or self.version_mismatches()) else "0",
         )
+        # v10+: heal rows whose doc_filter_text is NULL (inserted by an
+        # older release after the upgrade). No-op on current data.
+        try:
+            from .filter_builder import backfill_missing_filter_text
+            backfill_missing_filter_text(conn)
+        except sqlite3.OperationalError:
+            pass  # pre-v10 schema — converter not run yet; harmless here
 
     def _wipe_archive_folder(self) -> None:
         """Close the connection, then delete every derived store + the DB

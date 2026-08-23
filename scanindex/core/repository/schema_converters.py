@@ -51,10 +51,35 @@ def _convert_v8_to_v9(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE documents ADD COLUMN so_thu_tu INTEGER")
 
 
+def _convert_v9_to_v10(conn: sqlite3.Connection) -> None:
+    """v9 → v10: add ``documents.doc_filter_text`` + backfill.
+
+    The column stores the normalized (no-diacritic, lowercased, tokenized)
+    concatenation of every advanced-filter field, doc-level and
+    dossier-level, so `_scope_doc_ids` can thin candidates with plain
+    instr() in SQL before the Python fuzzy matcher re-verifies. Rows keep
+    matching semantics: the SQL condition is a *necessary* condition of the
+    Python match, never a stricter one.
+    """
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(documents)")}
+    if "doc_filter_text" not in cols:
+        conn.execute("ALTER TABLE documents ADD COLUMN doc_filter_text TEXT")
+    # Backfill needs the dossiers join; a minimal/legacy DB may not have
+    # that table yet — skip here, ensure_schema creates it and backfills
+    # NULL rows on the next open.
+    has_dossiers = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='dossiers'"
+    ).fetchone()
+    if has_dossiers:
+        from .filter_builder import backfill_missing_filter_text
+        backfill_missing_filter_text(conn)
+
+
 # schema_version (source) -> converter to the next version.
 _CONVERTERS: dict[str, Converter] = {
     # "7": _convert_v7_to_v8,
     "8": _convert_v8_to_v9,
+    "9": _convert_v9_to_v10,
 }
 
 

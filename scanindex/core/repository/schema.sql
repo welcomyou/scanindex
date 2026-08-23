@@ -92,6 +92,10 @@ CREATE TABLE IF NOT EXISTS documents (
     -- rather than falling back to a positional default.
     trang_so                  INTEGER,
     so_thu_tu                 INTEGER,
+    -- v10: normalized token soup of every advanced-filter field (doc-level
+    -- + dossier-level), maintained by the write paths and queried with
+    -- instr() as a SQL prefilter before Python fuzzy matching.
+    doc_filter_text           TEXT,
     -- System
     page_count                INTEGER,
     sha256                    TEXT NOT NULL,

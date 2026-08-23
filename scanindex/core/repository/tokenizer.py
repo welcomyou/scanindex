@@ -4,6 +4,7 @@ Runtime indexing uses one tokenizer only: underthesea.
 """
 from __future__ import annotations
 
+import re
 import unicodedata
 from functools import lru_cache
 from typing import Iterable, List, Optional
@@ -16,6 +17,39 @@ def to_no_diacritic(text: str) -> str:
     nfd = unicodedata.normalize("NFD", text)
     stripped = "".join(c for c in nfd if unicodedata.category(c) != "Mn")
     return stripped.replace("đ", "d").replace("Đ", "D")
+
+
+# Word tokenizer shared by search matching and the filter-text column.
+# Mirrors search_engine._tokens exactly — keep the two in sync via this
+# single implementation (search_engine aliases it).
+_WORD_RE = re.compile(r"\w+", re.UNICODE)
+
+
+def norm_tokens(text: str) -> List[str]:
+    """Diacritic-stripped, lowercased word tokens."""
+    return _WORD_RE.findall(to_no_diacritic(text or "").lower())
+
+
+def filter_tokens(text: str) -> List[str]:
+    """norm_tokens kept for filter matching: >=2 chars, or any digit."""
+    return [
+        t for t in norm_tokens(text)
+        if len(t) >= 2 or any(ch.isdigit() for ch in t)
+    ]
+
+
+def build_filter_text(*field_values: Optional[str]) -> str:
+    """Normalized, space-padded token soup of every filterable field.
+
+    Stored in documents.doc_filter_text (schema v10) and queried with
+    ``instr(doc_filter_text, ' tok ')`` — a cheap necessary condition the
+    SQL prefilter applies before the Python fuzzy matcher re-verifies.
+    Padded with spaces so ' tok ' matches whole tokens only.
+    """
+    toks: List[str] = []
+    for v in field_values:
+        toks.extend(filter_tokens(v or ""))
+    return " " + " ".join(toks) + " " if toks else " "
 
 
 _UNDER_SEGMENTER = None

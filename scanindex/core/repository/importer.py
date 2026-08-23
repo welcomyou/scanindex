@@ -1137,6 +1137,19 @@ class Importer:
             "created_at":          created_at,
         }
         conn = self.store.connect()
+        # v10: keep the advanced-filter prefilter column fresh.
+        from .filter_builder import (
+            DOC_FILTER_DOC_FIELDS, doc_filter_text_from_row,
+        )
+        dsr = conn.execute(
+            "SELECT fonds, fonds_name, catalog, catalog_name, "
+            "term, retention, confidentiality "
+            "FROM dossiers WHERE dossier_id = ?",
+            (dossier_id,),
+        ).fetchone()
+        params["doc_filter_text"] = doc_filter_text_from_row(
+            {f: params.get(f, "") for f in DOC_FILTER_DOC_FIELDS}, dsr,
+        )
         existing = conn.execute(
             "SELECT 1 FROM documents WHERE doc_id = ?", (doc_id,)
         ).fetchone()
