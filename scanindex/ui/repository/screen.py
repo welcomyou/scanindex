@@ -1250,13 +1250,14 @@ def _group_results_by_file(results: List[SearchResult]) -> List[FileHit]:
 
 _CARD_QSS = (
     f"QFrame#Card {{ background: {COLOR_SURFACE}; "
-    f"  border: 1px solid {COLOR_BORDER}; border-radius: {RADIUS_MD}px; }}"
-    f"QFrame#Card:hover {{ border-color: {COLOR_ACCENT}; }}"
+    f"  border: none; border-left: 3px solid transparent;"
+    f"  border-radius: {RADIUS_SM}px; }}"
+    f"QFrame#Card:hover {{ background: {COLOR_ELEVATED}; }}"
     f"QFrame#Card[active=\"true\"] {{ background: {COLOR_ELEVATED}; "
-    f"  border-color: {COLOR_ACCENT}; }}"
+    f"  border-left: 3px solid {COLOR_ACCENT}; }}"
     f"QFrame#Card[dropTarget=\"true\"] {{ background: {COLOR_ELEVATED}; "
-    f"  border: 2px solid {COLOR_GREEN}; }}"
-    f"QFrame#Card[dragReady=\"true\"] {{ border-color: {COLOR_GREEN}; }}"
+    f"  border: 1px solid {COLOR_GREEN}; border-left-width: 3px; }}"
+    f"QFrame#Card[dragReady=\"true\"] {{ border-left-color: {COLOR_GREEN}; }}"
     f"QFrame#Card QLabel {{ background: transparent; border: none; }}"
 )
 
@@ -1344,11 +1345,11 @@ class _DossierCard(QFrame):
         btn_edit.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_edit.setStyleSheet(
             f"QPushButton {{ background: transparent;"
-            f" border: 1px solid {COLOR_BORDER};"
+            f" border: none; color: {COLOR_TEXT_SECONDARY};"
             f" border-radius: 4px;"
             f" font: 13px 'Segoe UI Emoji'; padding: 0; }}"
             f"QPushButton:hover {{ background: {COLOR_ELEVATED};"
-            f" border-color: {COLOR_ACCENT}; }}"
+            f" color: {COLOR_ACCENT}; }}"
         )
         btn_edit.clicked.connect(lambda _checked=False: self.edit_clicked.emit(
             self.dossier.dossier_id
@@ -1771,7 +1772,7 @@ class _SearchHitCard(QFrame):
             self._open_dossier_btn.setFixedHeight(24)
             self._open_dossier_btn.setStyleSheet(
                 f"QPushButton {{ background: transparent; color: {COLOR_ACCENT};"
-                f" border: 1px solid {COLOR_BORDER}; border-radius: 4px;"
+                f" border: none; border-radius: 4px;"
                 f" padding: 0 8px; font: 600 10px '{FONT_UI}'; }}"
                 f"QPushButton:hover {{ background: {COLOR_ELEVATED}; }}"
             )
@@ -1950,8 +1951,7 @@ class _RightPanel(QWidget):
         self._info_box.setTextFormat(Qt.TextFormat.RichText)
         self._info_box.setStyleSheet(
             f"color: {COLOR_TEXT_SECONDARY}; font: 12px '{FONT_UI}';"
-            f" background: {COLOR_SURFACE}; border: 1px solid {COLOR_BORDER};"
-            f" border-radius: {RADIUS_MD}px; padding: {SP[2]}px;"
+            f" background: transparent; border: none; padding: {SP[1]}px;"
         )
         self._info_box.setAlignment(Qt.AlignmentFlag.AlignTop)
         v.addWidget(self._info_box)
@@ -1973,7 +1973,7 @@ class _RightPanel(QWidget):
                 f"QPushButton:hover {{ background: {COLOR_ELEVATED};"
                 f" border-color: {COLOR_ACCENT}; }}"
                 f"QPushButton:disabled {{ color: {COLOR_TEXT_MUTED};"
-                f" border-color: {COLOR_BORDER}; background: {COLOR_SURFACE}; }}"
+                f" border: none; background: {COLOR_SURFACE}; }}"
             )
 
         self.btn_show_in_folder = QPushButton("Thư mục chứa")
@@ -2835,24 +2835,23 @@ class RepositoryScreen(ScreenContent):
         bar.setObjectName("repositoryActionBar")
         bar.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         bar.setStyleSheet(
-            f"QFrame#repositoryActionBar {{ background: {COLOR_PANEL};"
-            f" border: 1px solid {COLOR_BORDER}; border-radius: {RADIUS_MD}px; }}"
+            "QFrame#repositoryActionBar { background: transparent; border: none; }"
         )
         h = QHBoxLayout(bar)
-        h.setContentsMargins(SP[2], SP[1], SP[2], SP[1])
+        h.setContentsMargins(0, 0, 0, 0)
         h.setSpacing(SP[2])
         action_h = 34
 
         tab_qss = (
             f"QPushButton {{ background: transparent; color: {COLOR_TEXT_SECONDARY};"
-            f" border: 1px solid {COLOR_BORDER}; border-radius: 4px;"
+            f" border: none; border-bottom: 2px solid transparent; border-radius: 0;"
             f" padding: 0 12px; font: 600 12px '{FONT_UI}'; }}"
             f"QPushButton:hover {{ background: {COLOR_ELEVATED}; color: {COLOR_TEXT};"
-            f" border-color: {COLOR_ACCENT}; }}"
-            f"QPushButton:checked {{ background: {COLOR_ELEVATED}; color: {COLOR_ACCENT};"
-            f" border-color: {COLOR_ACCENT}; }}"
-            f"QPushButton:checked:disabled {{ background: {COLOR_ELEVATED};"
-            f" color: {COLOR_ACCENT}; border-color: {COLOR_ACCENT}; }}"
+            f" border-bottom-color: {COLOR_ACCENT}; }}"
+            f"QPushButton:checked {{ background: transparent; color: {COLOR_ACCENT};"
+            f" border-bottom-color: {COLOR_ACCENT}; }}"
+            f"QPushButton:checked:disabled {{ background: transparent;"
+            f" color: {COLOR_ACCENT}; border-bottom-color: {COLOR_ACCENT}; }}"
         )
 
         self._btn_back_to_dossiers = QPushButton("Hồ sơ")
@@ -2890,9 +2889,8 @@ class RepositoryScreen(ScreenContent):
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
         )
         self._list_count_label.setStyleSheet(
-            f"color: {COLOR_TEXT_SECONDARY}; background: {COLOR_SURFACE};"
-            f" border: 1px solid {COLOR_BORDER}; border-radius: 4px;"
-            f" padding: 6px 10px; font: 12px '{FONT_UI}';"
+            f"color: {COLOR_TEXT_SECONDARY}; background: transparent;"
+            f" border: none; padding: 0 4px; font: 12px '{FONT_UI}';"
         )
         h.addWidget(self._list_count_label, 1)
 
@@ -2961,7 +2959,7 @@ class RepositoryScreen(ScreenContent):
             f" padding: 0 12px; font: 600 12px '{FONT_UI}'; }}"
             f"QPushButton:hover {{ background: {COLOR_GREEN_HOVER}; color: {COLOR_TEXT}; }}"
             f"QPushButton:disabled {{ background: {COLOR_ELEVATED};"
-            f" color: {COLOR_TEXT_MUTED}; border: 1px solid {COLOR_BORDER}; }}"
+            f" color: {COLOR_TEXT_MUTED}; border: none; }}"
         )
         self._btn_export_dossier_zip.clicked.connect(
             self._on_export_dossier_zip_clicked
@@ -3106,15 +3104,15 @@ class RepositoryScreen(ScreenContent):
 
     def _build_list_column(self) -> QWidget:
         box = QFrame()
+        box.setObjectName("repositoryListColumn")
         box.setMinimumWidth(240)
         box.setMaximumWidth(560)
         box.setStyleSheet(
-            f"background: {COLOR_BG}; border: 1px solid {COLOR_BORDER};"
-            f" border-radius: {RADIUS_MD}px;"
+            f"QFrame#repositoryListColumn {{ background: {COLOR_BG}; border: none; }}"
         )
         v = QVBoxLayout(box)
-        v.setContentsMargins(SP[1], SP[1], SP[1], SP[1])
-        v.setSpacing(SP[1])
+        v.setContentsMargins(0, 0, SP[1], 0)
+        v.setSpacing(0)
 
         # Scrollable card area
         self._list_scroll = _RepositoryListScrollArea()
@@ -3125,8 +3123,8 @@ class RepositoryScreen(ScreenContent):
         self._list_inner = QWidget()
         self._list_inner.setStyleSheet(f"background: {COLOR_BG};")
         self._list_layout = QVBoxLayout(self._list_inner)
-        self._list_layout.setContentsMargins(SP[1], SP[1], SP[1], SP[1])
-        self._list_layout.setSpacing(SP[2])
+        self._list_layout.setContentsMargins(0, 0, 0, 0)
+        self._list_layout.setSpacing(SP[1])
         self._list_layout.addStretch(1)
         self._list_scroll.setWidget(self._list_inner)
         v.addWidget(self._list_scroll, 1)
@@ -3135,11 +3133,10 @@ class RepositoryScreen(ScreenContent):
     def _build_toolbar(self) -> QWidget:
         bar = QFrame()
         bar.setStyleSheet(
-            f"QFrame {{ background: {COLOR_SURFACE}; border: 1px solid {COLOR_BORDER};"
-            f" border-radius: {RADIUS_MD}px; }}"
+            "QFrame { background: transparent; border: none; }"
         )
         h = QHBoxLayout(bar)
-        h.setContentsMargins(SP[2], SP[2], SP[2], SP[2])
+        h.setContentsMargins(0, 0, 0, 0)
         h.setSpacing(SP[2])
 
         self.search_input = QLineEdit()
@@ -3213,8 +3210,7 @@ class RepositoryScreen(ScreenContent):
         info_bar.setMinimumWidth(220)
         info_bar.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         info_bar.setStyleSheet(
-            f"QFrame#repositoryHeaderInfo {{ background: {COLOR_PANEL}; border: 1px solid {COLOR_BORDER};"
-            f" border-radius: {RADIUS_MD}px; }}"
+            "QFrame#repositoryHeaderInfo { background: transparent; border: none; }"
         )
         h = QHBoxLayout(info_bar)
         h.setContentsMargins(SP[2], 2, SP[2], 2)
