@@ -2701,6 +2701,7 @@ class RepositoryScreen(ScreenContent):
     _MODE_DOSSIERS = "dossiers"     # browsing dossier list
     _MODE_FILES    = "files"        # browsing files inside one dossier
     _MODE_SEARCH   = "search"       # search hits across all dossiers
+    _ACTION_BAR_BREAKPOINT = 1280
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -2832,15 +2833,33 @@ class RepositoryScreen(ScreenContent):
 
     def _build_action_bar(self) -> QWidget:
         bar = QFrame()
+        self._action_bar = bar
         bar.setObjectName("repositoryActionBar")
-        bar.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        # Ignore the one-row size hint horizontally so a direct restore/resize
+        # to 1024px can reach the breakpoint before the controls are reflowed.
+        bar.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         bar.setStyleSheet(
             f"QFrame#repositoryActionBar {{ background: {COLOR_PANEL};"
             f" border: 1px solid {COLOR_BORDER}; border-radius: {RADIUS_MD}px; }}"
         )
-        h = QHBoxLayout(bar)
-        h.setContentsMargins(SP[2], SP[1], SP[2], SP[1])
+        action_layout = QVBoxLayout(bar)
+        action_layout.setContentsMargins(SP[2], SP[1], SP[2], SP[1])
+        action_layout.setSpacing(SP[1])
+
+        h = QHBoxLayout()
+        h.setContentsMargins(0, 0, 0, 0)
         h.setSpacing(SP[2])
+        action_layout.addLayout(h)
+
+        self._action_filter_row = QWidget()
+        self._action_filter_row.setStyleSheet("background: transparent; border: none;")
+        filter_row = QHBoxLayout(self._action_filter_row)
+        filter_row.setContentsMargins(0, 0, 0, 0)
+        filter_row.setSpacing(SP[2])
+        action_layout.addWidget(self._action_filter_row)
+
+        self._action_primary_layout = h
+        self._action_filter_layout = filter_row
         action_h = 34
 
         tab_qss = (
@@ -2899,6 +2918,9 @@ class RepositoryScreen(ScreenContent):
         self._sort_label = QLabel("Sắp xếp:")
         self._sort_label.setFixedHeight(action_h)
         self._sort_label.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+        self._sort_label.setSizePolicy(
+            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
+        )
         self._sort_label.setStyleSheet(
             f"color: {COLOR_TEXT_MUTED}; font: 11px '{FONT_UI}';"
         )
@@ -3006,7 +3028,81 @@ class RepositoryScreen(ScreenContent):
         )
         self._btn_bulk_delete.clicked.connect(self._on_bulk_delete_selected)
         h.addWidget(self._btn_bulk_delete)
+
+        self._action_all_widgets = [
+            self._btn_back_to_dossiers,
+            self._btn_back_to_search,
+            self._list_count_label,
+            self._sort_label,
+            self._sort_combo,
+            self._fonds_filter_combo,
+            self._catalog_filter_combo,
+            self._btn_add_file,
+            self._btn_export_dossier_zip,
+            self._btn_clear_selection,
+            self._btn_bulk_delete,
+        ]
+        self._action_main_widgets = [
+            self._btn_back_to_dossiers,
+            self._btn_back_to_search,
+            self._list_count_label,
+            self._btn_add_file,
+            self._btn_export_dossier_zip,
+            self._btn_clear_selection,
+            self._btn_bulk_delete,
+        ]
+        self._action_secondary_widgets = [
+            self._sort_label,
+            self._sort_combo,
+            self._fonds_filter_combo,
+            self._catalog_filter_combo,
+        ]
+        self._action_bar_narrow: Optional[bool] = None
+        # Start with the compact arrangement so the layout itself does not
+        # impose a >1024px minimum before the first resize event arrives.
+        self._set_action_bar_narrow(True)
         return bar
+
+    def _set_action_bar_narrow(self, narrow: bool) -> None:
+        if not hasattr(self, "_action_primary_layout"):
+            return
+        narrow = bool(narrow)
+        if self._action_bar_narrow is narrow:
+            return
+        self._action_bar_narrow = narrow
+
+        primary = self._action_primary_layout
+        secondary = self._action_filter_layout
+        for widget in self._action_all_widgets:
+            primary.removeWidget(widget)
+            secondary.removeWidget(widget)
+
+        if narrow:
+            for widget in self._action_main_widgets:
+                primary.addWidget(
+                    widget, 1 if widget is self._list_count_label else 0
+                )
+            for widget in self._action_secondary_widgets:
+                secondary.addWidget(widget)
+            self._action_filter_row.setVisible(True)
+        else:
+            for widget in self._action_all_widgets:
+                primary.addWidget(
+                    widget, 1 if widget is self._list_count_label else 0
+                )
+            self._action_filter_row.setVisible(False)
+
+        self._action_filter_row.updateGeometry()
+        if hasattr(self, "_action_bar"):
+            self._action_bar.updateGeometry()
+        if hasattr(self, "_splitter"):
+            self._set_splitter_for_mode()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._set_action_bar_narrow(
+            event.size().width() < self._ACTION_BAR_BREAKPOINT
+        )
 
     def _style_dossier_filter_combo(self, combo: QComboBox) -> None:
         combo.setStyleSheet(
@@ -3107,7 +3203,12 @@ class RepositoryScreen(ScreenContent):
     def _set_splitter_for_mode(self) -> None:
         if not hasattr(self, "_splitter"):
             return
-        if self._mode == self._MODE_SEARCH:
+        narrow = self.width() < self._ACTION_BAR_BREAKPOINT
+        if narrow and self._mode == self._MODE_SEARCH:
+            self._splitter.setSizes([360, 680, 260])
+        elif narrow:
+            self._splitter.setSizes([300, 760, 260])
+        elif self._mode == self._MODE_SEARCH:
             self._splitter.setSizes([520, 680, 340])
         else:
             self._splitter.setSizes([360, 760, 340])
@@ -3127,6 +3228,9 @@ class RepositoryScreen(ScreenContent):
         # Scrollable card area
         self._list_scroll = _RepositoryListScrollArea()
         self._list_scroll.setWidgetResizable(True)
+        self._list_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
         self._list_scroll.setStyleSheet(
             f"QScrollArea {{ background: {COLOR_BG}; border: none; }}"
         )
