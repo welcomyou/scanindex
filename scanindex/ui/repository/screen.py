@@ -2881,25 +2881,33 @@ class RepositoryScreen(ScreenContent):
         h.addWidget(self._btn_back_to_search)
 
         self._list_count_label = QLabel("Đang tải hồ sơ…")
-        self._list_count_label.setMinimumHeight(action_h)
+        self._list_count_label.setFixedHeight(action_h)
         self._list_count_label.setMinimumWidth(72)
         self._list_count_label.setTextFormat(Qt.TextFormat.RichText)
-        self._list_count_label.setWordWrap(True)
+        self._list_count_label.setWordWrap(False)
         self._list_count_label.setAlignment(Qt.AlignmentFlag.AlignVCenter)
         self._list_count_label.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
         )
         self._list_count_label.setStyleSheet(
             f"color: {COLOR_TEXT_SECONDARY}; background: {COLOR_SURFACE};"
             f" border: 1px solid {COLOR_BORDER}; border-radius: 4px;"
-            f" padding: 6px 10px; font: 12px '{FONT_UI}';"
+            f" padding: 0 10px; font: 12px '{FONT_UI}';"
         )
         h.addWidget(self._list_count_label, 1)
+
+        self._sort_label = QLabel("Sắp xếp:")
+        self._sort_label.setFixedHeight(action_h)
+        self._sort_label.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+        self._sort_label.setStyleSheet(
+            f"color: {COLOR_TEXT_MUTED}; font: 11px '{FONT_UI}';"
+        )
+        h.addWidget(self._sort_label)
 
         self._sort_combo = QComboBox()
         self._sort_combo.setToolTip("Sắp xếp danh sách hiện tại")
         self._sort_combo.setFixedHeight(action_h)
-        self._sort_combo.setMinimumWidth(176)
+        self._sort_combo.setMinimumWidth(220)
         self._style_dossier_filter_combo(self._sort_combo)
         self._sort_combo.currentIndexChanged.connect(self._on_sort_changed)
         h.addWidget(self._sort_combo)
@@ -3139,7 +3147,7 @@ class RepositoryScreen(ScreenContent):
             f" border-radius: {RADIUS_MD}px; }}"
         )
         h = QHBoxLayout(bar)
-        h.setContentsMargins(SP[2], SP[2], SP[2], SP[2])
+        h.setContentsMargins(SP[2], SP[1], SP[2], SP[1])
         h.setSpacing(SP[2])
 
         self.search_input = QLineEdit()
@@ -3213,7 +3221,7 @@ class RepositoryScreen(ScreenContent):
         info_bar.setMinimumWidth(220)
         info_bar.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         info_bar.setStyleSheet(
-            f"QFrame#repositoryHeaderInfo {{ background: {COLOR_PANEL}; border: none;"
+            f"QFrame#repositoryHeaderInfo {{ background: transparent; border: none;"
             f" border-radius: {RADIUS_MD}px; }}"
         )
         h = QHBoxLayout(info_bar)
@@ -3224,7 +3232,8 @@ class RepositoryScreen(ScreenContent):
         self._path_label.setMinimumWidth(0)
         self._path_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self._path_label.setStyleSheet(
-            f"color: {COLOR_TEXT_SECONDARY}; font: 11px '{FONT_UI}';"
+            f"color: {COLOR_TEXT_SECONDARY}; background: transparent;"
+            f" border: none; font: 11px '{FONT_UI}';"
         )
         h.addWidget(self._path_label, 1)
 
@@ -3234,13 +3243,14 @@ class RepositoryScreen(ScreenContent):
         )
         self._stats_label.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self._stats_label.setStyleSheet(
-            f"color: {COLOR_TEXT_MUTED}; font: 11px '{FONT_UI}';"
+            f"color: {COLOR_TEXT_MUTED}; background: transparent;"
+            f" border: none; font: 11px '{FONT_UI}';"
         )
         h.addWidget(self._stats_label)
         outer.addWidget(info_bar, 1)
 
         # Repository-level actions use the otherwise empty header space while
-        # remaining outside the bordered path/statistics frame.
+        # remaining separate from the read-only path/statistics area.
         self.btn_import_zip = QPushButton("Nhập từ ZIP")
         self.btn_import_zip.setToolTip(
             "Nhập một hoặc nhiều file ZIP hồ sơ đã xuất (kèm .json.zst) vào "

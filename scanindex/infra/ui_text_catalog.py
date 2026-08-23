@@ -600,6 +600,7 @@ UI_TEXT_PAIRS: tuple[tuple[str, str], ...] = (
     ("Search results", "Kết quả tìm kiếm"),
     ("Search results ({})", "Kết quả tìm kiếm ({})"),
     ("Sort the current list", "Sắp xếp danh sách hiện tại"),
+    ("Sort:", "Sắp xếp:"),
     ("Clear search", "Xóa tìm kiếm"),
     ("All", "Tất cả"),
     ("OCR content", "Nội dung OCR"),
