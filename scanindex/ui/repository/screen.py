@@ -36,7 +36,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -128,11 +128,52 @@ class SearchWorker(QThread):
         self._query = query
         self._filters = filters
         self._mode = mode
+        self._cancel = False
+
+    def cancel(self):
+        """Cooperative cancel: engine polls between stages and inside the
+        linear fallback loops, then returns the partial results."""
+        self._cancel = True
+
+    @property
+    def cancelled(self) -> bool:
+        return self._cancel
 
     def run(self):
         try:
-            results = self._engine.search(self._query, self._filters, self._mode)
+            results = self._engine.search(
+                self._query, self._filters, self._mode,
+                cancel_check=lambda: self._cancel,
+            )
             self.finished_ok.emit(results)
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
+class _HydrateWorker(QThread):
+    """Off-thread hydration of word-level match bboxes.
+
+    Reads the per-PDF canonical OCR companion (zstd) or opens the PDF with
+    fitz — pure I/O that must never block the GUI thread. Results mutate the
+    passed SearchResult objects in place; the screen caches them so
+    re-selecting a document never re-reads disk.
+    """
+    finished_ok = Signal(str, list)   # (doc_id, hydrated chunks)
+    failed = Signal(str)
+
+    def __init__(self, engine: SearchEngine, doc_id: str,
+                 chunks: List[SearchResult]):
+        super().__init__()
+        self._engine = engine
+        self._doc_id = doc_id
+        self._chunks = chunks
+
+    def run(self):
+        try:
+            self._engine.hydrate_match_bboxes(
+                self._chunks, limit=max(48, len(self._chunks))
+            )
+            self.finished_ok.emit(self._doc_id, self._chunks)
         except Exception as e:
             self.failed.emit(str(e))
 
@@ -3025,6 +3066,18 @@ class RepositoryScreen(ScreenContent):
         # Kết quả tìm kiếm tab is selected again.
         self._search_list_cache: list[QWidget] = []
         self._search_list_cache_sort = ""
+        # Batched result rendering (large hit lists never block the UI
+        # thread): the first batch renders synchronously, the rest streams
+        # in via zero-delay QTimer batches guarded by a generation counter.
+        self._search_render_queue: list[tuple] = []
+        self._search_render_gen = 0
+        self._search_render_rank_width = 2
+        # Word-level match bbox cache (LRU) + off-thread hydration state.
+        self._bbox_cache: "OrderedDict[int, list]" = OrderedDict()
+        self._hydrate_worker: Optional[_HydrateWorker] = None
+        self._hydrate_pending: Optional[tuple] = None
+        # Set when the user clicks Hủy; labels the (partial) results.
+        self._search_cancel_requested = False
         self._dossier_scroll_value = 0
         self._return_to_search = False
         self._sort_by_mode = {
@@ -4119,6 +4172,7 @@ class RepositoryScreen(ScreenContent):
 
     def _stash_search_list(self) -> None:
         """Detach the current search cards without destroying them."""
+        self._cancel_search_render_queue()
         self._discard_search_list_cache()
         cached: list[QWidget] = []
         while self._list_layout.count() > 1:
@@ -5124,6 +5178,14 @@ class RepositoryScreen(ScreenContent):
 
     def _on_search_clicked(self):
         if self._busy:
+            # Second click while a search runs = cancel. The engine returns
+            # the partial results collected by the fast index passes.
+            worker = getattr(self, "_search_worker", None)
+            if (worker is not None and worker.isRunning()
+                    and not self._search_cancel_requested):
+                self._search_cancel_requested = True
+                worker.cancel()
+                self._list_count_label.setText("Đang hủy tìm kiếm…")
             return
         if self._active_scope() == "dossiers":
             self._run_dossier_search()
@@ -5139,7 +5201,10 @@ class RepositoryScreen(ScreenContent):
             self._reset_document_search_state()
             return
         self._busy = True
-        self.btn_search.setEnabled(False)
+        self._search_cancel_requested = False
+        # Button stays enabled so the same click cancels a long search
+        # (fallback scans over a huge archive).
+        self.btn_search.setText("Hủy")
         self.btn_clear_search.setEnabled(False)
         self._list_count_label.setText("Đang tìm…")
 
@@ -5161,7 +5226,10 @@ class RepositoryScreen(ScreenContent):
         self._search_worker.start()
 
     def _on_search_done(self, results: List[SearchResult]):
+        cancelled = self._search_cancel_requested
         self._busy = False
+        self._search_cancel_requested = False
+        self.btn_search.setText("Tìm")
         self.btn_search.setEnabled(True)
         self.btn_clear_search.setEnabled(True)
         self._search_query = getattr(
@@ -5179,6 +5247,10 @@ class RepositoryScreen(ScreenContent):
         self._search_selected_doc_id = ""
         self._search_scroll_value = 0
         self._render_search_results(restore_scroll=False)
+        if cancelled:
+            self._list_count_label.setText(
+                "Đã hủy — " + self._list_count_label.text().lower()
+            )
 
     def _sorted_search_hits(self) -> List[FileHit]:
         hits = list(self._search_hits)
@@ -5209,6 +5281,10 @@ class RepositoryScreen(ScreenContent):
         return hits
 
     def _render_search_results(self, *, restore_scroll: bool = True) -> None:
+        # Invalidate any batched render still streaming from a previous
+        # render of this list (generation counter + queue drop).
+        self._cancel_search_render_queue()
+        self._search_render_gen += 1
         was_search = self._mode == self._MODE_SEARCH
         if not was_search:
             self._sync_scope_state()
@@ -5277,21 +5353,23 @@ class RepositoryScreen(ScreenContent):
                     self._search_rank_by_doc[doc_id] = widget.rank
                     self._doc_cards_by_id[doc_id] = widget
         else:
+            # Batched rendering: descriptor queue instead of building every
+            # widget up front. First batch (incl. headers + the first hits)
+            # renders now so the list appears instantly; the rest streams in
+            # via zero-delay QTimer batches.
+            queue: list[tuple] = []
             for kind, label in labels:
                 group = [h for h in sorted_hits if h.match_kind == kind]
                 if not group:
                     continue
-                self._add_card(_GroupHeader(label, len(group)))
+                queue.append(("group", label, len(group)))
                 for hit in group:
                     rank += 1
                     self._search_rank_by_doc[hit.file_row.doc_id] = rank
-                    card = _SearchHitCard(
-                        hit, rank=rank, rank_width=rank_width,
-                    )
-                    card.clicked.connect(lambda _did, hh=hit: self._show_search_hit(hh))
-                    card.open_dossier.connect(self._open_search_hit_dossier)
-                    self._doc_cards_by_id[hit.file_row.doc_id] = card
-                    self._add_card(card)
+                    queue.append(("hit", hit, rank))
+            self._search_render_queue = queue
+            self._search_render_rank_width = rank_width
+            self._render_search_batch(first=True)
         selected = self._hits_by_doc.get(self._search_selected_doc_id)
         if selected is None and sorted_hits:
             selected = sorted_hits[0]
@@ -5303,6 +5381,50 @@ class RepositoryScreen(ScreenContent):
                 lambda value=self._search_scroll_value:
                     self._list_scroll.verticalScrollBar().setValue(value),
             )
+
+    # Render-batch size: enough to fill the visible list area in one go
+    # without a perceptible pause between batches.
+    _RENDER_BATCH_CARDS = 40
+
+    def _cancel_search_render_queue(self) -> None:
+        """Drop any pending batched cards (new render / mode switch / stash).
+        The generation counter makes in-flight timers no-op safely."""
+        self._search_render_queue = []
+
+    def _render_search_batch(self, *, first: bool = False) -> None:
+        """Materialize the next batch of queued result cards. Aborts when the
+        queue was cancelled, a newer render generation started, or the screen
+        left search mode (e.g. the user drilled into a dossier mid-stream)."""
+        gen = self._search_render_gen
+        queue = self._search_render_queue
+        if not queue or self._mode != self._MODE_SEARCH:
+            self._search_render_queue = []
+            return
+        budget = 160 if first else self._RENDER_BATCH_CARDS
+        n = 0
+        while queue and n < budget:
+            item = queue.pop(0)
+            if item[0] == "group":
+                self._add_card(_GroupHeader(item[1], item[2]))
+            else:
+                _, hit, rank = item
+                card = _SearchHitCard(
+                    hit, rank=rank, rank_width=self._search_render_rank_width,
+                )
+                card.clicked.connect(lambda _did, hh=hit: self._show_search_hit(hh))
+                card.open_dossier.connect(self._open_search_hit_dossier)
+                self._doc_cards_by_id[hit.file_row.doc_id] = card
+                self._add_card(card)
+            n += 1
+        if queue:
+            QTimer.singleShot(0, lambda: self._render_search_batch_safely(gen))
+        else:
+            self._search_render_queue = []
+
+    def _render_search_batch_safely(self, gen: int) -> None:
+        if gen != self._search_render_gen:
+            return  # superseded by a newer render
+        self._render_search_batch()
 
     def _show_search_tab(self) -> None:
         """Tài liệu tab click: restore the preserved results, or show the
@@ -5374,6 +5496,8 @@ class RepositoryScreen(ScreenContent):
 
     def _on_search_failed(self, err: str):
         self._busy = False
+        self._search_cancel_requested = False
+        self.btn_search.setText("Tìm")
         self.btn_search.setEnabled(True)
         self.btn_clear_search.setVisible(True)
         self.btn_clear_search.setEnabled(True)
@@ -5396,9 +5520,84 @@ class RepositoryScreen(ScreenContent):
         if not full.dossier_title and hit.file_row.dossier_title:
             full.dossier_title = hit.file_row.dossier_title
         chunk_hits = [] if hit.match_kind == "filter" else hit.chunks
-        if chunk_hits and self._engine is not None:
-            self._engine.hydrate_match_bboxes(chunk_hits, limit=max(48, len(chunk_hits)))
+        if chunk_hits:
+            missing = self._fill_bboxes_from_cache(chunk_hits)
+            if missing:
+                self._schedule_hydrate(hit.file_row.doc_id, missing)
         self._show_file(full, chunk_hits=chunk_hits or None)
+
+    # ------ Word-bbox hydration: LRU cache + off-thread worker ------
+
+    _BBOX_CACHE_CAP = 4096
+
+    def _fill_bboxes_from_cache(self, chunks: List[SearchResult]) -> List[SearchResult]:
+        """Apply cached match bboxes in place. Returns the chunks still
+        lacking bboxes (candidates for off-thread hydration)."""
+        missing: List[SearchResult] = []
+        for chunk in chunks or []:
+            if not getattr(chunk, "match_bboxes", None):
+                cid = chunk.chunk_id or 0
+                if cid in self._bbox_cache:
+                    chunk.match_bboxes = self._bbox_cache[cid]
+                else:
+                    missing.append(chunk)
+        return missing
+
+    def _store_bboxes_in_cache(self, chunks: List[SearchResult]) -> None:
+        for chunk in chunks or []:
+            cid = chunk.chunk_id or 0
+            if not cid:
+                continue
+            # Store even empty lists — they mean "computed, nothing found"
+            # and prevent re-reading disk for the same chunk.
+            boxes = list(getattr(chunk, "match_bboxes", None) or [])
+            self._bbox_cache[cid] = boxes
+            self._bbox_cache.move_to_end(cid)
+        while len(self._bbox_cache) > self._BBOX_CACHE_CAP:
+            self._bbox_cache.popitem(last=False)
+
+    def _schedule_hydrate(self, doc_id: str, chunks: List[SearchResult]) -> None:
+        """Hydrate word-level bboxes off the UI thread. Latest request wins:
+        while a worker runs, newer requests replace the pending slot."""
+        if self._engine is None or not chunks:
+            return
+        if (self._hydrate_worker is not None
+                and self._hydrate_worker.isRunning()):
+            self._hydrate_pending = (doc_id, chunks)
+            return
+        self._start_hydrate_worker(doc_id, chunks)
+
+    def _start_hydrate_worker(self, doc_id: str, chunks: List[SearchResult]) -> None:
+        worker = _HydrateWorker(self._engine, doc_id, chunks)
+        self._hydrate_worker = worker
+
+        def _on_done(_doc_id: str, hydrated: list):
+            self._store_bboxes_in_cache(hydrated or [])
+            pending = self._hydrate_pending
+            self._hydrate_pending = None
+            if pending is not None:
+                # Serve the newest request next (coalesced behind this one).
+                self._start_hydrate_worker(pending[0], pending[1])
+                return
+            # Refresh only when still viewing the hydrated document — and
+            # only the snippet panel: re-showing the PDF would snap the
+            # page back to the headline hit while the user may have
+            # navigated elsewhere. The next snippet click picks up the
+            # freshly cached bboxes.
+            if (self._current_file is not None
+                    and _doc_id == self._current_file.doc_id):
+                self._right_panel.show_file(
+                    self._current_file, self._archive_path,
+                    self._current_search_chunks_for_file(),
+                )
+
+        def _on_fail(_msg: str):
+            # Silent: the view simply keeps the chunk-bbox fallback.
+            self._hydrate_pending = None
+
+        worker.finished_ok.connect(_on_done)
+        worker.failed.connect(_on_fail)
+        worker.start()
 
     def _on_snippet_clicked(self, result: SearchResult):
         """Right-panel snippet click → jump PDF to that chunk's page+bbox.
@@ -5411,12 +5610,11 @@ class RepositoryScreen(ScreenContent):
         pdf_abs = (self._archive_path / self._current_file.file_path).resolve()
         is_meta = (getattr(result, "chunk_type", "body") == "metadata")
         file_chunks = self._current_search_chunks_for_file()
-        if (not is_meta
-                and self._engine is not None
-                and not getattr(result, "match_bboxes", None)):
-            self._engine.hydrate_match_bboxes([result], limit=1)
-        if self._engine is not None and file_chunks:
-            self._engine.hydrate_match_bboxes(file_chunks, limit=max(96, len(file_chunks)))
+        # Serve from cache; anything missing hydrates off-thread and the
+        # view refreshes via the worker callback (chunk bbox shows meanwhile).
+        missing = self._fill_bboxes_from_cache(file_chunks or [])
+        if missing:
+            self._schedule_hydrate(self._current_file.doc_id, missing)
         match_boxes = None if is_meta else (getattr(result, "match_bboxes", None) or None)
         all_match_boxes = [] if is_meta else self._match_page_boxes(file_chunks)
         is_text_match = self._is_text_search_result(result)

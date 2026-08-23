@@ -13,7 +13,7 @@ import time
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple
 
 from . import constants as C
 from .filter_builder import is_active
@@ -615,7 +615,15 @@ class SearchEngine:
                query: str = "",
                filters: Optional[dict] = None,
                mode: str = "all",
-               final_k: Optional[int] = None) -> List[SearchResult]:
+               final_k: Optional[int] = None,
+               cancel_check: Optional[Callable[[], bool]] = None) -> List[SearchResult]:
+        """Run the hybrid search. `cancel_check` (polled between stages and
+        inside the linear fallback loops) aborts the remaining stages and
+        returns the partial results collected so far — a cancelled search
+        still shows what the fast index passes already found."""
+        def _cancelled() -> bool:
+            return bool(cancel_check and cancel_check())
+
         filters = filters or {}
         candidate_doc_ids = self._scope_doc_ids(filters)
 
@@ -673,7 +681,7 @@ class SearchEngine:
         # "Ủy ban". `_build_results` then applies strict normalized word
         # boundaries, so these remain high-confidence keyword matches rather
         # than being mislabeled as typo-tolerant fuzzy results.
-        if len(exact_doc_ids) < C.MIN_RESULTS:
+        if len(exact_doc_ids) < C.MIN_RESULTS and not _cancelled():
             known_chunk_ids = {r.chunk_id for r in exact_results}
             normalized_hits = [
                 (cid, score)
@@ -682,6 +690,7 @@ class SearchEngine:
                     candidate_doc_ids,
                     chunk_type_filter=chunk_type_filter,
                     limit=C.TANTIVY_TOP_K,
+                    cancel_check=cancel_check,
                 )
                 if cid not in known_chunk_ids
             ]
@@ -703,7 +712,7 @@ class SearchEngine:
         # archive. Only pay that cost when the keyword search found too few
         # documents to be useful.
         span_fuzzy_hits = []
-        if len(exact_doc_ids) < C.MIN_RESULTS:
+        if len(exact_doc_ids) < C.MIN_RESULTS and not _cancelled():
             span_fuzzy_hits = [
                 (cid, did, score)
                 for cid, did, score in self._span_fuzzy_hits(
@@ -711,6 +720,7 @@ class SearchEngine:
                     candidate_doc_ids,
                     chunk_type_filter=chunk_type_filter,
                     limit=C.TANTIVY_TOP_K,
+                    cancel_check=cancel_check,
                 )
                 if did not in exact_doc_ids
             ]
@@ -747,7 +757,9 @@ class SearchEngine:
                                candidate_doc_ids: Optional[List[str]],
                                *,
                                chunk_type_filter: Optional[str],
-                               limit: int) -> List[Tuple[int, str, float]]:
+                               limit: int,
+                               cancel_check: Optional[Callable[[], bool]] = None
+                               ) -> List[Tuple[int, str, float]]:
         normalized = " ".join(_tokens(query))
         if not normalized:
             return []
@@ -774,7 +786,9 @@ class SearchEngine:
             params,
         ).fetchall()
         out: List[Tuple[int, str, float]] = []
-        for row in rows:
+        for n, row in enumerate(rows):
+            if cancel_check and n % 256 == 0 and cancel_check():
+                break
             frequency = _exact_frequency(str(row["text_original"] or ""), query)
             if frequency > 0:
                 out.append((
@@ -787,7 +801,9 @@ class SearchEngine:
                          candidate_doc_ids: Optional[List[str]],
                          *,
                          chunk_type_filter: Optional[str],
-                         limit: int) -> List[Tuple[int, str, float]]:
+                         limit: int,
+                         cancel_check: Optional[Callable[[], bool]] = None
+                         ) -> List[Tuple[int, str, float]]:
         if len(_content_tokens(_tokens(query))) < 2:
             return []
         params: List[Any] = []
@@ -809,7 +825,9 @@ class SearchEngine:
             params,
         ).fetchall()
         hits: List[Tuple[int, str, float]] = []
-        for row in rows:
+        for n, row in enumerate(rows):
+            if cancel_check and n % 256 == 0 and cancel_check():
+                break
             text = str(row["text_original"] or "")
             if len(text.strip()) < _MIN_CHUNK_TEXT_LEN:
                 continue
