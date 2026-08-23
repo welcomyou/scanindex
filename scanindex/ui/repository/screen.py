@@ -2922,7 +2922,8 @@ class RepositoryScreen(ScreenContent):
             QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
         )
         self._sort_label.setStyleSheet(
-            f"color: {COLOR_TEXT_MUTED}; font: 11px '{FONT_UI}';"
+            f"color: {COLOR_TEXT_MUTED}; background: transparent; border: none;"
+            f" font: 11px '{FONT_UI}';"
         )
         h.addWidget(self._sort_label)
 
@@ -3382,8 +3383,8 @@ class RepositoryScreen(ScreenContent):
             f"QLabel {{ color: {COLOR_TEXT_SECONDARY}; font: 11px '{FONT_UI}'; }}"
         )
         v = QVBoxLayout(panel)
-        v.setContentsMargins(SP[3], SP[2], SP[3], SP[2])
-        v.setSpacing(SP[2])
+        v.setContentsMargins(SP[3], SP[1], SP[3], SP[1])
+        v.setSpacing(SP[1])
 
         filter_hint = QLabel(
             "Các điều kiện dưới đây được kết hợp AND với nội dung cần tìm."
@@ -3395,6 +3396,7 @@ class RepositoryScreen(ScreenContent):
         hint_row.setContentsMargins(0, 0, 0, 0)
         hint_row.addWidget(filter_hint, 1)
         btn_reset = QPushButton("Đặt lại")
+        btn_reset.setFixedHeight(24)
         btn_reset.clicked.connect(self._reset_filters)
         hint_row.addWidget(btn_reset)
         v.addLayout(hint_row)
