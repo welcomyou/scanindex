@@ -3391,7 +3391,13 @@ class RepositoryScreen(ScreenContent):
         filter_hint.setStyleSheet(
             f"color: {COLOR_TEXT_MUTED}; font: 11px '{FONT_UI}'; border: none;"
         )
-        v.addWidget(filter_hint)
+        hint_row = QHBoxLayout()
+        hint_row.setContentsMargins(0, 0, 0, 0)
+        hint_row.addWidget(filter_hint, 1)
+        btn_reset = QPushButton("Đặt lại")
+        btn_reset.clicked.connect(self._reset_filters)
+        hint_row.addWidget(btn_reset)
+        v.addLayout(hint_row)
 
         grid = QGridLayout()
         grid.setHorizontalSpacing(SP[3])
@@ -3399,15 +3405,23 @@ class RepositoryScreen(ScreenContent):
 
         self._filter_inputs: dict[str, QWidget] = {}
 
+        def _prepare_input(widget: QWidget) -> None:
+            widget.setMinimumWidth(0)
+            policy = widget.sizePolicy()
+            policy.setHorizontalPolicy(QSizePolicy.Policy.Ignored)
+            widget.setSizePolicy(policy)
+
         def _add(row: int, col: int, label: str, key: str, width: int = 1):
             grid.addWidget(QLabel(label), row, col * 2)
             le = QLineEdit()
+            _prepare_input(le)
             grid.addWidget(le, row, col * 2 + 1, 1, width)
             self._filter_inputs[key] = le
 
         def _add_date(row: int, col: int, label: str, key: str):
             grid.addWidget(QLabel(label), row, col * 2)
             w = _DateFilterInput()
+            _prepare_input(w)
             grid.addWidget(w, row, col * 2 + 1)
             self._filter_inputs[key] = w
 
@@ -3426,6 +3440,7 @@ class RepositoryScreen(ScreenContent):
                     context="document_type",
                 )
             combo.setCurrentIndex(-1)
+            _prepare_input(combo)
             grid.addWidget(combo, row, col * 2 + 1)
             self._filter_inputs["doc_type"] = combo
             self._filter_doc_type_combo = combo
@@ -3435,6 +3450,7 @@ class RepositoryScreen(ScreenContent):
             combo = FuzzyComboBox(sort=False)
             combo.addItem(f"Tất cả {label.lower()}", "")
             combo.setCurrentIndex(0)
+            _prepare_input(combo)
             grid.addWidget(combo, row, col * 2 + 1)
             self._filter_inputs[key] = combo
             if key == "fonds":
@@ -3446,24 +3462,20 @@ class RepositoryScreen(ScreenContent):
         _add(0, 0, "Số ký hiệu", "doc_number")
         _add(0, 1, "Cơ quan", "issue_org")
         _add(0, 2, "Người ký", "signer_name")
-        _add_doc_type(1, 0)
-        _add_archive_combo(1, 1, "Phông", "fonds")
-        _add_archive_combo(1, 2, "Mục lục", "catalog")
-        _add_date(2, 0, "Ngày từ", "issue_date_from")
-        _add_date(2, 1, "Đến", "issue_date_to")
-        _add(2, 2, "Trích yếu", "subject")
-        _add(3, 0, "Nhiệm kỳ", "term")
-        _add(3, 1, "Thời hạn", "retention")
-        _add(3, 2, "Độ mật", "confidentiality")
+        _add_doc_type(0, 3)
+        _add_archive_combo(1, 0, "Phông", "fonds")
+        _add_archive_combo(1, 1, "Mục lục", "catalog")
+        _add_date(1, 2, "Ngày từ", "issue_date_from")
+        _add_date(1, 3, "Đến", "issue_date_to")
+        _add(2, 0, "Trích yếu", "subject")
+        _add(2, 1, "Nhiệm kỳ", "term")
+        _add(2, 2, "Thời hạn", "retention")
+        _add(2, 3, "Độ mật", "confidentiality")
+
+        for col in range(4):
+            grid.setColumnStretch(col * 2 + 1, 1)
 
         v.addLayout(grid)
-
-        actions = QHBoxLayout()
-        actions.addStretch(1)
-        btn_reset = QPushButton("Đặt lại")
-        btn_reset.clicked.connect(self._reset_filters)
-        actions.addWidget(btn_reset)
-        v.addLayout(actions)
         return panel
 
     # ------ Store/Index lifecycle ------
