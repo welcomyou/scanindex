@@ -5337,6 +5337,7 @@ class RepositoryScreen(ScreenContent):
         labels = [
             ("filter", "Khớp bộ lọc"),
             ("exact", "Khớp từ khóa (kể cả không dấu)"),
+            ("substring", "Chứa chuỗi con"),
             ("fuzzy", "Kết quả gần đúng"),
         ]
         sorted_hits = self._sorted_search_hits()

@@ -139,7 +139,7 @@ def _build_boosted_query(query: str,
         return ""
     segmented = _segment_query_if_enabled(query)
     safe_segmented = _escape_query(segmented)
-    # One canonical normalized form feeds every _nodiac/_tri twin.
+    # One canonical normalized form feeds every _nodiac twin.
     safe_norm = _escape_query(_normalized_index_text(query))
     parts = []
     for fname in _normalize_fields(fields):
@@ -153,13 +153,14 @@ def _build_boosted_query(query: str,
                 parts.append(
                     f"{fname}_nodiac:({safe_norm})^{weight * C.NODIAC_WEIGHT_SCALE}"
                 )
-                parts.append(
-                    f"{fname}_tri:({safe_norm})^{weight * C.TRIGRAM_WEIGHT_SCALE}"
-                )
         elif fname == "body_original":
             # body_no_diacritic already IS the body's normalized twin.
-            if safe_norm:
-                parts.append(f"body_tri:({safe_norm})^{weight * C.TRIGRAM_WEIGHT_SCALE}")
+            pass
+    # NOTE: the *_trigram twins are intentionally NOT part of the exact
+    # candidate query — a trigram hit is a substring hit, and the exact
+    # group's Python verifier enforces word boundaries, so trigram
+    # candidates here would only waste top-K slots. Substring recall has
+    # its own pass (search_substring) with substring verification.
     return " OR ".join(parts)
 
 
@@ -447,6 +448,59 @@ class HybridIndex:
 
     # ---------- Search ----------
 
+    def _with_doc_filter(self, query: "tantivy.Query",
+                         filter_doc_ids: Optional[Set[str]]
+                         ) -> Optional["tantivy.Query"]:
+        """Combine `query` with a MUST TermSetQuery on doc_id.
+
+        Pushing the filter INSIDE the query (instead of post-filtering an
+        over-fetched top-K) guarantees in-scope hits are never displaced by
+        out-of-scope ones. Returns None when the combination is not
+        possible, so callers fall back to the old post-filter path.
+        """
+        if not filter_doc_ids:
+            return query
+        try:
+            termset = tantivy.Query.term_set_query(
+                self._tan_index.schema, "doc_id", list(filter_doc_ids)
+            )
+            return tantivy.Query.boolean_query([
+                (tantivy.Occur.Must, termset),
+                (tantivy.Occur.Must, query),
+            ])
+        except Exception:
+            return None
+
+    def _run_chunk_query(self, query: "tantivy.Query",
+                         top_k: int,
+                         filter_doc_ids: Optional[Set[str]]
+                         ) -> List[Tuple[int, str, float]]:
+        """Run a chunk-level query, honoring the doc filter inside the
+        query when possible (else via post-filter over-fetch)."""
+        combined = self._with_doc_filter(query, filter_doc_ids)
+        searcher = self._tan_index.searcher()
+        if combined is not None:
+            results = searcher.search(combined, limit=top_k)
+            post_filter = False
+        else:
+            results = searcher.search(query, limit=top_k * 3)
+            post_filter = True
+        out: List[Tuple[int, str, float]] = []
+        for score, addr in results.hits:
+            doc = searcher.doc(addr)
+            doc_id_list = doc["doc_id"]
+            chunk_id_list = doc["chunk_id"]
+            if not doc_id_list or not chunk_id_list:
+                continue
+            doc_id = doc_id_list[0]
+            if post_filter and filter_doc_ids is not None \
+                    and doc_id not in filter_doc_ids:
+                continue
+            out.append((int(chunk_id_list[0]), doc_id, float(score)))
+            if len(out) >= top_k:
+                break
+        return out
+
     def search_lexical(self, query: str,
                        top_k: int = C.TANTIVY_TOP_K,
                        filter_doc_ids: Optional[Set[str]] = None,
@@ -457,7 +511,6 @@ class HybridIndex:
         boosted = _build_boosted_query(query, search_fields)
         if not boosted:
             return []
-        searcher = self._tan_index.searcher()
         try:
             tan_query = self._tan_index.parse_query(boosted, list(search_fields))
         except Exception:
@@ -466,24 +519,7 @@ class HybridIndex:
             if not safe:
                 return []
             tan_query = self._tan_index.parse_query(safe, list(search_fields))
-
-        # Over-fetch when filtering, since some hits will be discarded.
-        fetch_k = top_k * 3 if filter_doc_ids else top_k
-        results = searcher.search(tan_query, limit=fetch_k)
-        out: List[Tuple[int, str, float]] = []
-        for score, addr in results.hits:
-            doc = searcher.doc(addr)
-            doc_id_list = doc["doc_id"]
-            chunk_id_list = doc["chunk_id"]
-            if not doc_id_list or not chunk_id_list:
-                continue
-            doc_id = doc_id_list[0]
-            if filter_doc_ids is not None and doc_id not in filter_doc_ids:
-                continue
-            out.append((int(chunk_id_list[0]), doc_id, float(score)))
-            if len(out) >= top_k:
-                break
-        return out
+        return self._run_chunk_query(tan_query, top_k, filter_doc_ids)
 
     def search_fuzzy(self, query: str,
                      top_k: int = C.TANTIVY_TOP_K,
@@ -494,21 +530,34 @@ class HybridIndex:
         fuzzy_query = _build_structured_fuzzy_query(self._tan_index, query, fields)
         if fuzzy_query is None:
             return []
-        searcher = self._tan_index.searcher()
+        return self._run_chunk_query(fuzzy_query, top_k, filter_doc_ids)
 
-        fetch_k = top_k * 3 if filter_doc_ids else top_k
-        results = searcher.search(fuzzy_query, limit=fetch_k)
-        out: List[Tuple[int, str, float]] = []
-        for score, addr in results.hits:
-            doc = searcher.doc(addr)
-            doc_id_list = doc["doc_id"]
-            chunk_id_list = doc["chunk_id"]
-            if not doc_id_list or not chunk_id_list:
+    def search_substring(self, query: str,
+                         top_k: int = C.TANTIVY_TOP_K,
+                         filter_doc_ids: Optional[Set[str]] = None,
+                         fields: Optional[Iterable[str]] = None,
+                         ) -> List[Tuple[int, str, float]]:
+        """Substring candidates via the *_tri trigram twins only.
+
+        These feed the dedicated "Chứa chuỗi con" group: the caller
+        verifies with substring semantics (no word boundaries), so the
+        trigram promise of mid-token matches actually holds.
+        """
+        safe_norm = _escape_query(_normalized_index_text(query))
+        if not safe_norm:
+            return []
+        norm_set = set(_normalize_fields(fields))
+        parts = []
+        for tri in _TRI_FIELDS:
+            base = _TRI_SOURCE_FIELD[tri]
+            if base not in norm_set:
                 continue
-            doc_id = doc_id_list[0]
-            if filter_doc_ids is not None and doc_id not in filter_doc_ids:
-                continue
-            out.append((int(chunk_id_list[0]), doc_id, float(score)))
-            if len(out) >= top_k:
-                break
-        return out
+            weight = C.TANTIVY_FIELD_WEIGHTS.get(base, 1.0)
+            parts.append(f"{tri}:({safe_norm})^{weight * C.TRIGRAM_WEIGHT_SCALE}")
+        if not parts:
+            return []
+        try:
+            tan_query = self._tan_index.parse_query(" OR ".join(parts), list(_TRI_FIELDS))
+        except Exception:
+            return []
+        return self._run_chunk_query(tan_query, top_k, filter_doc_ids)

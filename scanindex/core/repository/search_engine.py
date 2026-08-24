@@ -75,6 +75,20 @@ def _exact_frequency(text: str, query: str) -> int:
     return len(re.findall(rf"(?<!\w){re.escape(q)}(?!\w)", t))
 
 
+def _substring_frequency(text: str, query: str) -> int:
+    """Substring occurrences WITHOUT word boundaries (the "Chứa chuỗi con"
+    group). The trigram twins promise mid-token matches ("ban" in "urban
+    band"); this verifier keeps that promise instead of applying the exact
+    group's boundary check."""
+    q = "".join(_tokens(query))
+    if not q:
+        return 0
+    t = "".join(_tokens(text))
+    if not t or len(q) > len(t):
+        return 0
+    return t.count(q)
+
+
 def _bbox_intersects(a: list[float], b: list[float]) -> bool:
     if len(a) != 4 or len(b) != 4:
         return False
@@ -718,10 +732,34 @@ class SearchEngine:
                 trusted_exact_counts=trusted,
             ))
             exact_doc_ids = {r.doc_id for r in exact_results}
+        # Substring pass (trigram twins): mid-token matches the exact
+        # group's word-boundary verifier deliberately rejects — they get
+        # their own result group ("Chứa chuỗi con") with substring
+        # verification, so the trigram promise actually holds.
+        substring_results: List[SearchResult] = []
+        substring_doc_ids: set = set()
+        if not _cancelled():
+            sub_hits = self.index.search_substring(
+                query, C.TANTIVY_TOP_K, cset, fields=fields,
+            )
+            sub_pairs = [
+                (cid, score)
+                for cid, did, score in sub_hits
+                if did not in exact_doc_ids
+            ]
+            if sub_pairs:
+                substring_results = self._build_results(
+                    sub_pairs,
+                    match_kind="substring",
+                    query=query,
+                    chunk_type_filter=chunk_type_filter,
+                    build_match_bboxes=False,
+                )
+                substring_doc_ids = {r.doc_id for r in substring_results}
         fuzzy_hits = [
             (cid, did, score)
             for cid, did, score in fuzzy_hits
-            if did not in exact_doc_ids
+            if did not in exact_doc_ids and did not in substring_doc_ids
         ]
         # The Python span fallback is intentionally lazy: Tantivy fuzzy search
         # is cheap, while scanning every chunk becomes prohibitive for a large
@@ -756,7 +794,7 @@ class SearchEngine:
             chunk_type_filter=chunk_type_filter,
             build_match_bboxes=False,
         )
-        results = exact_results + fuzzy_results
+        results = exact_results + substring_results + fuzzy_results
         _log.info(
             "[search] '%s' mode=%s exact=%d fuzzy=%d elapsed=%.0fms results=%d",
             query,
@@ -776,12 +814,12 @@ class SearchEngine:
                                limit: int,
                                cancel_check: Optional[Callable[[], bool]] = None
                                ) -> List[Tuple[int, str, float]]:
-        """Literal-phrase hits from SQLite, DOCUMENT-aware (window function).
+        """Literal-phrase hits from SQLite, DOCUMENT-aware (two windows).
 
-        At most `per_doc` matching chunks per document — enough to rank
-        (the UI's relevance sums each file's top-3 chunks) while bounding
-        the verification volume for phrases that appear in every chunk of
-        every document. `limit` caps total returned chunk rows.
+        Window 1 ranks a document's matching chunks; window 2 picks the
+        first PHRASE_COMPLETENESS_MAX_DOCS documents. The cap therefore
+        limits *documents* (not chunk rows), regardless of how many
+        matching chunks each document carries.
         """
         normalized = " ".join(_tokens(query))
         if not normalized:
@@ -800,10 +838,10 @@ class SearchEngine:
             params.extend(candidate_doc_ids)
         where.append("instr(lower(c.text_no_diacritic), ?) > 0")
         params.append(normalized)
+        params.append(C.PHRASE_COMPLETENESS_MAX_DOCS)
         params.append(per_doc)
-        params.append(max(1, int(limit or 1)))
         rows = self.store.connect().execute(
-            "SELECT chunk_id, doc_id, text_original FROM ("
+            "WITH m AS ("
             "  SELECT c.chunk_id AS chunk_id, c.doc_id AS doc_id, "
             "         c.text_original AS text_original, "
             "         ROW_NUMBER() OVER ("
@@ -812,7 +850,13 @@ class SearchEngine:
             "  FROM chunks c "
             "  JOIN documents d ON c.doc_id = d.doc_id "
             f"  WHERE {' AND '.join(where)} "
-            ") WHERE rn <= ? ORDER BY chunk_id LIMIT ?",
+            "), picked AS ("
+            "  SELECT doc_id FROM m GROUP BY doc_id "
+            "  ORDER BY MIN(chunk_id) LIMIT ?"
+            ") "
+            "SELECT m.chunk_id, m.doc_id, m.text_original "
+            "FROM m JOIN picked ON m.doc_id = picked.doc_id "
+            "WHERE m.rn <= ? ORDER BY m.chunk_id",
             params,
         ).fetchall()
         out: List[Tuple[int, str, float]] = []
@@ -824,11 +868,12 @@ class SearchEngine:
                 out.append((
                     int(row["chunk_id"]), str(row["doc_id"]), float(frequency)
                 ))
-        if len(rows) >= max(1, int(limit or 1)):
+        distinct_docs = {str(r["doc_id"]) for r in rows}
+        if len(distinct_docs) >= C.PHRASE_COMPLETENESS_MAX_DOCS:
             _log.info(
-                "phrase-completeness cap reached (%d chunk rows) for '%s' — "
+                "phrase-completeness cap reached (%d documents) for '%s' — "
                 "results beyond the first %d documents are truncated",
-                len(rows), normalized, C.PHRASE_COMPLETENESS_MAX_DOCS,
+                len(distinct_docs), normalized, C.PHRASE_COMPLETENESS_MAX_DOCS,
             )
         return out
 
@@ -853,34 +898,46 @@ class SearchEngine:
             ph = ",".join("?" * len(candidate_doc_ids))
             where.append(f"c.doc_id IN ({ph})")
             params.extend(candidate_doc_ids)
-        rows = self.store.connect().execute(
+        # Stream rows with fetchmany instead of fetchall(): on a large
+        # archive, materializing every chunk row (text included) before the
+        # loop would blow RAM and sit OUTSIDE the wall-clock budget.
+        cur = self.store.connect().execute(
             "SELECT c.chunk_id, c.doc_id, c.text_original "
             "FROM chunks c "
             "JOIN documents d ON c.doc_id = d.doc_id "
             f"WHERE {' AND '.join(where)}",
             params,
-        ).fetchall()
+        )
         hits: List[Tuple[int, str, float]] = []
         budget_deadline = time.monotonic() + C.SPAN_FUZZY_TIME_BUDGET_SEC
-        for n, row in enumerate(rows):
-            if n % 256 == 0:
-                if cancel_check and cancel_check():
-                    break
-                # Wall-clock budget: this is the only stage whose cost grows
-                # linearly with the archive; past the budget the search
-                # returns what the index + SQL passes already found.
-                if time.monotonic() > budget_deadline:
-                    _log.info(
-                        "span-fuzzy budget hit after %d/%d chunks", n, len(rows)
-                    )
-                    break
-            text = str(row["text_original"] or "")
-            if len(text.strip()) < _MIN_CHUNK_TEXT_LEN:
-                continue
-            score = _fuzzy_frequency(text, query)
-            if score <= 0:
-                continue
-            hits.append((int(row["chunk_id"]), str(row["doc_id"]), float(score)))
+        n = 0
+        while True:
+            batch = cur.fetchmany(512)
+            if not batch:
+                break
+            for row in batch:
+                if n % 256 == 0:
+                    if cancel_check and cancel_check():
+                        cur.close()
+                        hits.sort(key=lambda item: item[2], reverse=True)
+                        return hits[:max(1, int(limit or 1))]
+                    # Wall-clock budget: this is the only stage whose cost
+                    # grows linearly with the archive; past the budget the
+                    # search returns what was already collected.
+                    if time.monotonic() > budget_deadline:
+                        _log.info("span-fuzzy budget hit after %d chunks", n)
+                        cur.close()
+                        hits.sort(key=lambda item: item[2], reverse=True)
+                        return hits[:max(1, int(limit or 1))]
+                n += 1
+                text = str(row["text_original"] or "")
+                if len(text.strip()) < _MIN_CHUNK_TEXT_LEN:
+                    continue
+                score = _fuzzy_frequency(text, query)
+                if score <= 0:
+                    continue
+                hits.append((int(row["chunk_id"]), str(row["doc_id"]), float(score)))
+        cur.close()
         hits.sort(key=lambda item: item[2], reverse=True)
         return hits[:max(1, int(limit or 1))]
 
@@ -1229,7 +1286,7 @@ class SearchEngine:
                 continue
             if (result.chunk_type or "body") == "metadata":
                 continue
-            if result.match_kind not in {"exact", "fuzzy"}:
+            if result.match_kind not in {"exact", "fuzzy", "substring"}:
                 continue
             if not result.query or not result.file_path:
                 continue
@@ -1324,6 +1381,23 @@ class SearchEngine:
                     if match_count <= 0:
                         continue
                 if build_match_bboxes:
+                    match_bboxes = self._exact_match_bboxes(
+                        query=query,
+                        pdf_rel_path=r["file_path"] or "",
+                        page=int(r["page"]) if r["page"] is not None else 0,
+                        chunk_bbox=bbox,
+                        word_cache=word_cache,
+                    )
+                    if match_bboxes:
+                        match_count = len(match_bboxes)
+                score = float(match_count)
+            elif query and match_kind == "substring":
+                match_count = _substring_frequency(text, query)
+                if match_count <= 0:
+                    continue
+                if build_match_bboxes:
+                    # Word-window matching approximates the highlight; a
+                    # pure mid-token match may not draw a box.
                     match_bboxes = self._exact_match_bboxes(
                         query=query,
                         pdf_rel_path=r["file_path"] or "",
