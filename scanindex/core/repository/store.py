@@ -110,13 +110,41 @@ class ArchiveStore:
         )
         ddl = _SCHEMA_FILE.read_text(encoding="utf-8")
         conn.executescript(ddl)
+        # Same-version self-heal: the schema converters normally run during
+        # the release rename (migrate_db_if_needed), but a dev build or any
+        # same-version run reopens the identical filename — that path never
+        # renames, so pending conversions would be skipped forever. Run
+        # them here too, with the same .preconv.bak safety net.
+        try:
+            from .schema_converters import (
+                convert_schema_to_latest, needs_conversion,
+                MissingConverterError,
+            )
+            if needs_conversion(conn):
+                try:
+                    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                except sqlite3.Error:
+                    pass
+                backup = Path(str(self.db_path) + ".preconv.bak")
+                if not backup.exists():
+                    shutil.copy2(self.db_path, backup)
+                converted = convert_schema_to_latest(conn)
+                conn.commit()
+                if converted:
+                    print(f"[Store] schema self-healed {converted[0]} -> "
+                          f"{converted[1]} for {self.db_path.name}")
+        except MissingConverterError:
+            pass  # flagged below via version_mismatches(); never start fresh
+        except Exception as exc:
+            print(f"[Store] schema self-heal skipped (non-fatal): {exc}")
         self._seed_meta_if_empty()
         self.set_meta(
             "needs_migration",
             "1" if (has_version_mismatch or self.version_mismatches()) else "0",
         )
         # v10+: heal rows whose doc_filter_text is NULL (inserted by an
-        # older release after the upgrade). No-op on current data.
+        # older release after the upgrade). No-op on current data — and
+        # the column itself self-heals inside the backfill helper.
         try:
             from .filter_builder import backfill_missing_filter_text
             backfill_missing_filter_text(conn)

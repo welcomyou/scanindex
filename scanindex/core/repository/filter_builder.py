@@ -54,10 +54,38 @@ _BACKFILL_SQL = (
 )
 
 
+def ensure_filter_text_column(conn) -> bool:
+    """Create documents.doc_filter_text when missing (self-healing).
+
+    The column normally arrives via the v9→v10 schema converter, but that
+    converter only runs on the release rename path — a dev build (or any
+    same-version run) opening an existing v9 DB never renames the file, so
+    the writers must not assume the column exists. ALTER TABLE ADD COLUMN
+    is idempotent-guarded and races are swallowed (another thread may have
+    added it first). Returns True when the column is present afterwards.
+    """
+    try:
+        cols = {row[1] for row in conn.execute(
+            "PRAGMA table_info(documents)"
+        ).fetchall()}
+        if "doc_filter_text" in cols:
+            return True
+        conn.execute(
+            "ALTER TABLE documents ADD COLUMN doc_filter_text TEXT"
+        )
+        return True
+    except Exception:
+        # Pre-v10 table shape or a concurrent ALTER — callers keep working
+        # without the prefilter column.
+        return False
+
+
 def backfill_missing_filter_text(conn) -> int:
     """Fill doc_filter_text for rows lacking it (pre-v10 data, or rows an
     older app release inserted without maintaining the column). Idempotent.
     Returns the number of rows updated."""
+    if not ensure_filter_text_column(conn):
+        return 0
     rows = conn.execute(_BACKFILL_SQL).fetchall()
     for r in rows:
         conn.execute(
@@ -70,6 +98,8 @@ def backfill_missing_filter_text(conn) -> int:
 def refresh_doc_filter_text(conn, doc_ids) -> int:
     """Recompute doc_filter_text for specific documents (after KIE edits or
     dossier-level changes). Returns the number of rows updated."""
+    if not ensure_filter_text_column(conn):
+        return 0
     ids = [d for d in (doc_ids or []) if d]
     if not ids:
         return 0

@@ -1137,9 +1137,12 @@ class Importer:
             "created_at":          created_at,
         }
         conn = self.store.connect()
-        # v10: keep the advanced-filter prefilter column fresh.
+        # v10: keep the advanced-filter prefilter column fresh. The column
+        # self-heals here because the converter only runs on the release
+        # rename path — a same-version run may still be on the old shape.
         from .filter_builder import (
             DOC_FILTER_DOC_FIELDS, doc_filter_text_from_row,
+            ensure_filter_text_column,
         )
         dsr = conn.execute(
             "SELECT fonds, fonds_name, catalog, catalog_name, "
@@ -1147,9 +1150,10 @@ class Importer:
             "FROM dossiers WHERE dossier_id = ?",
             (dossier_id,),
         ).fetchone()
-        params["doc_filter_text"] = doc_filter_text_from_row(
-            {f: params.get(f, "") for f in DOC_FILTER_DOC_FIELDS}, dsr,
-        )
+        if ensure_filter_text_column(conn):
+            params["doc_filter_text"] = doc_filter_text_from_row(
+                {f: params.get(f, "") for f in DOC_FILTER_DOC_FIELDS}, dsr,
+            )
         existing = conn.execute(
             "SELECT 1 FROM documents WHERE doc_id = ?", (doc_id,)
         ).fetchone()

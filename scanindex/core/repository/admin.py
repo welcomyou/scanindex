@@ -980,9 +980,11 @@ def add_document(store: ArchiveStore, index: HybridIndex, *,
         "page_count": page_count, "sha256": sha,
         "indexed_status": "pending", "created_at": now,
     }
-    # v10: maintain the advanced-filter prefilter column.
+    # v10: maintain the advanced-filter prefilter column (self-heals when
+    # the converter has not run — see filter_builder.ensure_filter_text_column).
     from .filter_builder import (
         DOC_FILTER_DOC_FIELDS, doc_filter_text_from_row,
+        ensure_filter_text_column,
     )
     dsr = conn.execute(
         "SELECT fonds, fonds_name, catalog, catalog_name, "
@@ -990,9 +992,10 @@ def add_document(store: ArchiveStore, index: HybridIndex, *,
         "FROM dossiers WHERE dossier_id = ?",
         (dossier_id,),
     ).fetchone()
-    params["doc_filter_text"] = doc_filter_text_from_row(
-        {f: params.get(f, "") for f in DOC_FILTER_DOC_FIELDS}, dsr,
-    )
+    if ensure_filter_text_column(conn):
+        params["doc_filter_text"] = doc_filter_text_from_row(
+            {f: params.get(f, "") for f in DOC_FILTER_DOC_FIELDS}, dsr,
+        )
     cols_all = list(params.keys())
     placeholders = ", ".join(f":{c}" for c in cols_all)
     conn.execute(
