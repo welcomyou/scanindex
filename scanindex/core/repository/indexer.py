@@ -18,7 +18,7 @@ from typing import Iterable, List, Optional, Set, Tuple
 import tantivy
 
 from . import constants as C
-from .tokenizer import segment_query, to_no_diacritic
+from .tokenizer import PAGE_SENTINEL_TOKEN, search_norm, segment_query, to_no_diacritic
 
 
 # Fields that are searchable text (default tokenizer) — order matters for query build.
@@ -103,6 +103,13 @@ def _build_schema() -> tantivy.Schema:
         sb.add_text_field(
             fname, stored=False, tokenizer_name=C.TRIGRAM_TOKENIZER_NAME
         )
+    # Indexer v3 DOCUMENT-level record fields: canonical token streams
+    # (tokenizer.search_norm) with positions, so slop-0 phrase queries
+    # retrieve every matching document without any linear scan. Page
+    # sentinels between pages prevent phrases from matching across page
+    # boundaries. Chunk records leave these blank.
+    sb.add_text_field("doc_meta_norm", stored=False, tokenizer_name="default")
+    sb.add_text_field("doc_body_norm", stored=False, tokenizer_name="default")
     return sb.build()
 
 
@@ -378,6 +385,8 @@ class HybridIndex:
             "body_original": "",
             "body_no_diacritic": "",
             "body_segmented": "",
+            "doc_meta_norm": "",
+            "doc_body_norm": "",
         }
         for fname, raw in per_field.items():
             text = raw or ""
@@ -425,6 +434,31 @@ class HybridIndex:
             body_no_diacritic=body_no_diacritic or "",
             body_segmented=body_segmented or "",
             body_tri=norm,
+            doc_meta_norm="",
+            doc_body_norm="",
+        ))
+
+    def add_document_record(self, *,
+                            doc_id: str,
+                            dossier_id: Optional[int],
+                            meta_norm: str,
+                            body_pages_norm: List[str]) -> None:
+        """Index the DOCUMENT-level record (indexer v3).
+
+        `meta_norm` / each entry of `body_pages_norm` must come from
+        ``tokenizer.search_norm`` — the same canonical stream the phrase
+        verifier uses. Pages are joined with a sentinel token so slop-0
+        phrases never match across page boundaries.
+        """
+        if self._tan_writer is None:
+            self.begin_writer()
+        body = f" {PAGE_SENTINEL_TOKEN} ".join(body_pages_norm or [])
+        self._tan_writer.add_document(tantivy.Document(
+            doc_id=doc_id,
+            chunk_id="",
+            dossier_id=str(dossier_id) if dossier_id is not None else "",
+            doc_meta_norm=meta_norm or "",
+            doc_body_norm=body or "",
         ))
 
     def delete_tantivy_by_doc(self, doc_id: str) -> None:
@@ -561,3 +595,100 @@ class HybridIndex:
         except Exception:
             return []
         return self._run_chunk_query(tan_query, top_k, filter_doc_ids)
+
+    # ---------- Phrase search (indexer v3) ----------
+
+    def search_lexical_phrase(self, query: str,
+                              top_k: int,
+                              filter_doc_ids: Optional[Set[str]] = None,
+                              fields: Optional[Iterable[str]] = None,
+                              ) -> List[Tuple[int, str, float]]:
+        """True PHRASE query across chunk fields (quoted syntax).
+
+        Unlike search_lexical (whose un-quoted multi-term syntax is an OR
+        that wastes top-K on single-term hits), every candidate here
+        contains the tokens adjacently. `top_k` may be large — this pass
+        replaces the always-on SQL completeness scan.
+        """
+        phrase = _escape_query(search_norm(query))
+        if not phrase:
+            return []
+        parts = []
+        search_fields: List[str] = []
+        for fname in _normalize_fields(fields):
+            weight = C.TANTIVY_FIELD_WEIGHTS.get(fname, 1.0)
+            parts.append(f'{fname}:("{phrase}")^{weight}')
+            search_fields.append(fname)
+            if fname in _METADATA_TEXT_FIELDS:
+                parts.append(
+                    f'{fname}_nodiac:("{phrase}")^{weight * C.NODIAC_WEIGHT_SCALE}'
+                )
+                search_fields.append(fname + "_nodiac")
+            elif fname == "body_original":
+                # body_no_diacritic is the body's normalized twin.
+                parts.append(
+                    f'body_no_diacritic:("{phrase}")^{weight * C.NODIAC_WEIGHT_SCALE}'
+                )
+                search_fields.append("body_no_diacritic")
+        if not parts:
+            return []
+        try:
+            tan_query = self._tan_index.parse_query(" OR ".join(parts), search_fields)
+        except Exception:
+            return []
+        return self._run_chunk_query(tan_query, top_k, filter_doc_ids)
+
+    def search_doc_phrase(self, query: str,
+                          limit: int,
+                          filter_doc_ids: Optional[Set[str]] = None,
+                          mode: str = "all",
+                          ) -> List[str]:
+        """DOCUMENT-level phrase query on the canonical norm streams.
+
+        Returns matching doc_ids (deduped). This is the completeness
+        authority: any document whose canonical stream contains the phrase
+        adjacently is returned, regardless of how its chunks rank. `mode`
+        restricts which stream is queried ("metadata" / "content" / "all")
+        so a body phrase never leaks into a metadata-only search.
+        """
+        phrase = _escape_query(search_norm(query))
+        if not phrase:
+            return []
+        meta_w = C.TANTIVY_FIELD_WEIGHTS.get("metadata_text", 2.5)
+        parts = []
+        fields: List[str] = []
+        if mode in ("all", "metadata"):
+            parts.append(f'doc_meta_norm:("{phrase}")^{meta_w}')
+            fields.append("doc_meta_norm")
+        if mode in ("all", "content"):
+            parts.append(f'doc_body_norm:("{phrase}")')
+            fields.append("doc_body_norm")
+        if not parts:
+            return []
+        try:
+            tan_query = self._tan_index.parse_query(" OR ".join(parts), fields)
+        except Exception:
+            return []
+        combined = self._with_doc_filter(tan_query, filter_doc_ids)
+        searcher = self._tan_index.searcher()
+        if combined is not None:
+            results = searcher.search(combined, limit=limit)
+        else:
+            results = searcher.search(tan_query, limit=limit * 2)
+        seen: List[str] = []
+        seen_set: Set[str] = set()
+        for _score, addr in results.hits:
+            doc_id_list = searcher.doc(addr)["doc_id"]
+            if not doc_id_list:
+                continue
+            doc_id = doc_id_list[0]
+            if doc_id in seen_set:
+                continue
+            if combined is None and filter_doc_ids is not None \
+                    and doc_id not in filter_doc_ids:
+                continue
+            seen.append(doc_id)
+            seen_set.add(doc_id)
+            if len(seen) >= limit:
+                break
+        return seen

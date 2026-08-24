@@ -961,6 +961,10 @@ class Importer:
             page_count = f.page_count
 
         now = int(time.time())
+        from .reindex import _add_document_record_from_sql, enqueue_index_job
+        # Outbox first: if anything below crashes before the Tantivy
+        # commit, startup replay rebuilds this doc from the final truth.
+        enqueue_index_job(conn, doc_id)
         self._upsert_document_kie(
             doc_id, dossier_id, target_pdf, target_name,
             kie_fields, kie_annotation_json,
@@ -993,6 +997,9 @@ class Importer:
             "UPDATE chunks SET indexed_status = 'indexed' WHERE doc_id = ?",
             (doc_id,),
         )
+        # Indexer v3: the DOCUMENT-level phrase record (built from the now
+        # final SQLite state, same session as the chunk writes above).
+        _add_document_record_from_sql(self.index, conn, doc_id)
         return True, duplicate
 
     # ---------- Per-chunk insert helpers (v2) ----------

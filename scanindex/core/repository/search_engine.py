@@ -688,50 +688,74 @@ class SearchEngine:
             build_match_bboxes=False,
         )
         exact_doc_ids = {r.doc_id for r in exact_results}
-        # Tantivy's dedicated no-diacritic field currently exists for OCR
-        # body chunks, while metadata chunks keep their canonical spelling.
-        # SQLite's persisted normalized chunk text recovers literal phrase
-        # matches such as "uy ban" ↔ "Ủy ban". `_build_results` then applies
-        # strict normalized word boundaries, so these remain high-confidence
-        # keyword matches rather than being mislabeled as typo-tolerant
-        # fuzzy results.
-        #
-        # This pass now runs on EVERY keyword search (not only when the
-        # index found < MIN_RESULTS docs): the Tantivy passes cap candidates
-        # at TANTIVY_TOP_K *chunks*, and a phrase spread over many chunks
-        # per document hides whole documents — e.g. "Nơi nhận" in 77 of 90
-        # documents surfaced only 63 via the index. The instr scan runs at
-        # C speed inside SQLite; dense queries early-stop at
-        # PHRASE_COMPLETENESS_CHUNK_LIMIT, sparse ones pay the same cost
-        # the old conditional fallback did.
+        # ---- Indexer v3 completeness: TRUE phrase retrieval ----
+        # 1) A chunk-level phrase query (quoted syntax) collects every
+        #    chunk whose tokens appear adjacently — no OR-diluted top-K.
+        # 2) A DOCUMENT-level phrase audit (canonical norm streams) lists
+        #    every matching document; docs no chunk surfaced for (phrase
+        #    spanning chunk boundaries) get direct SQL verification.
+        # 3) The linear SQL instr scan only runs as a FALLBACK when the
+        #    phrase passes are unavailable (older index generation, query
+        #    error). This removes the archive-size-linear stage from the
+        #    common path entirely.
         if not _cancelled():
             known_chunk_ids = {r.chunk_id for r in exact_results}
-            raw_norm = self._normalized_exact_hits(
-                query,
-                candidate_doc_ids,
-                chunk_type_filter=chunk_type_filter,
-                limit=(C.PHRASE_COMPLETENESS_MAX_DOCS
-                       * C.PHRASE_COMPLETENESS_PER_DOC_CHUNKS),
-                cancel_check=cancel_check,
-            )
-            normalized_hits = [
-                (cid, freq)
-                for cid, _did, freq in raw_norm
-                if cid not in known_chunk_ids
-            ]
-            # The pass above already verified strict word boundaries and
-            # counted occurrences — trust those counts instead of paying
-            # _exact_frequency a second time inside _build_results.
-            trusted = {cid: int(freq) for cid, _did, freq in raw_norm}
-            exact_results.extend(self._build_results(
-                normalized_hits,
-                match_kind="exact",
-                query=query,
-                chunk_type_filter=chunk_type_filter,
-                build_match_bboxes=False,
-                trusted_exact_counts=trusted,
-            ))
-            exact_doc_ids = {r.doc_id for r in exact_results}
+            try:
+                phrase_hits = self.index.search_lexical_phrase(
+                    query, C.PHRASE_CHUNK_RANK_LIMIT, cset, fields=fields,
+                )
+                phrase_pairs = [
+                    (cid, score)
+                    for cid, _did, score in phrase_hits
+                    if cid not in known_chunk_ids
+                ]
+                if phrase_pairs:
+                    exact_results.extend(self._build_results(
+                        phrase_pairs,
+                        match_kind="exact",
+                        query=query,
+                        chunk_type_filter=chunk_type_filter,
+                        build_match_bboxes=False,
+                    ))
+                    exact_doc_ids = {r.doc_id for r in exact_results}
+                doc_ids = self.index.search_doc_phrase(
+                    query, C.PHRASE_COMPLETENESS_MAX_DOCS, cset,
+                    mode=mode,
+                )
+                missing = [d for d in doc_ids if d not in exact_doc_ids]
+                if missing:
+                    exact_results.extend(self._audit_phrase_docs(
+                        missing, query, chunk_type_filter, candidate_doc_ids,
+                    ))
+                    exact_doc_ids = {r.doc_id for r in exact_results}
+            except Exception as exc:
+                _log.warning(
+                    "phrase passes unavailable (%s); falling back to the "
+                    "SQL literal scan", exc,
+                )
+                raw_norm = self._normalized_exact_hits(
+                    query,
+                    candidate_doc_ids,
+                    chunk_type_filter=chunk_type_filter,
+                    limit=(C.PHRASE_COMPLETENESS_MAX_DOCS
+                           * C.PHRASE_COMPLETENESS_PER_DOC_CHUNKS),
+                    cancel_check=cancel_check,
+                )
+                normalized_hits = [
+                    (cid, freq)
+                    for cid, _did, freq in raw_norm
+                    if cid not in known_chunk_ids
+                ]
+                trusted = {cid: int(freq) for cid, _did, freq in raw_norm}
+                exact_results.extend(self._build_results(
+                    normalized_hits,
+                    match_kind="exact",
+                    query=query,
+                    chunk_type_filter=chunk_type_filter,
+                    build_match_bboxes=False,
+                    trusted_exact_counts=trusted,
+                ))
+                exact_doc_ids = {r.doc_id for r in exact_results}
         # Substring pass (trigram twins): mid-token matches the exact
         # group's word-boundary verifier deliberately rejects — they get
         # their own result group ("Chứa chuỗi con") with substring
@@ -805,6 +829,98 @@ class SearchEngine:
             len(results),
         )
         return results
+
+    def _audit_phrase_docs(self,
+                           doc_ids: List[str],
+                           query: str,
+                           chunk_type_filter: Optional[str],
+                           candidate_doc_ids: Optional[List[str]],
+                           ) -> List[SearchResult]:
+        """Documents the doc-phrase audit matched but no verified chunk
+        hit covers (beyond the chunk-phrase ranking horizon, or the phrase
+        spans a chunk boundary).
+
+        The doc-level index record already guarantees the phrase exists,
+        so no per-chunk verification is needed for these tail results:
+        ONE batched query attaches each doc's first chunk as the snippet
+        location (approximate), with a count-1 match that ranks them after
+        the verified head of the list.
+        """
+        if candidate_doc_ids is not None:
+            allowed = set(candidate_doc_ids)
+            doc_ids = [d for d in doc_ids if d in allowed]
+        doc_ids = doc_ids[:C.PHRASE_COMPLETENESS_MAX_DOCS]
+        if not doc_ids:
+            return []
+        conn = self.store.connect()
+        ph = ",".join("?" * len(doc_ids))
+        params: List[Any] = list(doc_ids)
+        type_cond = "AND c.chunk_type = ?" if chunk_type_filter else ""
+        if chunk_type_filter:
+            params.append(chunk_type_filter)
+        rows = conn.execute(
+            "SELECT c.chunk_id, c.doc_id, c.page, c.text_original,"
+            "       c.bbox, c.chunk_type,"
+            "       d.kie_doc_number_symbol AS doc_number,"
+            "       d.kie_doc_subject       AS subject,"
+            "       d.kie_issue_org_name    AS issue_org,"
+            "       d.kie_issue_org_superior AS issue_org_superior,"
+            "       d.kie_signer_name       AS signer_name,"
+            "       d.kie_place_date        AS issue_date,"
+            "       d.kie_doc_type          AS doc_type,"
+            "       d.file_name, d.file_path,"
+            "       d.dossier_id, ds.title AS dossier_title,"
+            "       ds.fonds, ds.catalog, ds.dossier_code "
+            "FROM ("
+            "  SELECT c1.*, ROW_NUMBER() OVER ("
+            "    PARTITION BY c1.doc_id ORDER BY c1.chunk_id"
+            "  ) AS rn FROM chunks c1 "
+            f"  WHERE c1.doc_id IN ({ph}) AND c1.indexed_status = 'indexed' "
+            f"  {type_cond} "
+            ") c "
+            "JOIN documents d ON c.doc_id = d.doc_id "
+            "LEFT JOIN dossiers ds ON d.dossier_id = ds.dossier_id "
+            "WHERE c.rn = 1",
+            params,
+        ).fetchall()
+        out: List[SearchResult] = []
+        for r in rows:
+            try:
+                bbox = json.loads(r["bbox"]) if r["bbox"] else []
+            except Exception:
+                bbox = []
+            out.append(SearchResult(
+                chunk_id=int(r["chunk_id"]),
+                doc_id=r["doc_id"],
+                score=1.0,
+                page=int(r["page"]) if r["page"] is not None else 0,
+                text=(r["text_original"] or "").strip(),
+                bbox=bbox,
+                doc_number=r["doc_number"],
+                subject=r["subject"],
+                issue_org=r["issue_org"],
+                issue_org_superior=r["issue_org_superior"],
+                signer_name=r["signer_name"],
+                issue_date=r["issue_date"],
+                file_name=r["file_name"],
+                file_path=r["file_path"],
+                dossier_title=r["dossier_title"],
+                dossier_id=(int(r["dossier_id"])
+                            if r["dossier_id"] is not None else None),
+                fonds=r["fonds"],
+                catalog=r["catalog"],
+                dossier_code=r["dossier_code"],
+                doc_type=r["doc_type"],
+                chunk_type=r["chunk_type"] or "body",
+                match_kind="exact",
+                match_count=1,
+                match_bboxes=None,
+                query=query,
+            ))
+        if len(out) > 1:
+            _log.info("doc-phrase audit attached %d tail document(s) with "
+                      "approximate snippets", len(out))
+        return out
 
     def _normalized_exact_hits(self,
                                query: str,

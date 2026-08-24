@@ -52,6 +52,27 @@ def build_filter_text(*field_values: Optional[str]) -> str:
     return " " + " ".join(toks) + " " if toks else " "
 
 
+# ---------------------------------------------------------------------------
+# Canonical phrase-search stream (indexer v3)
+# ---------------------------------------------------------------------------
+# One normalization shared by BOTH sides of phrase search: the document
+# records' norm fields are built with it, and the Python verifier counts
+# occurrences on it — so "nơi: nhận", "thực-hiện" and line-wrapped phrases
+# all normalize to the same "noi nhan" / "thuc hien" token stream on both
+# sides. Single source of truth; do not hand-roll variants.
+
+# Inserted between pages inside a document's body_norm stream so a phrase
+# query with slop=0 can never match across a page boundary. Alphanumeric
+# so the default tokenizer keeps it as one token; distinctive enough that
+# real OCR text never produces it.
+PAGE_SENTINEL_TOKEN = "zpgbrkz9"
+
+
+def search_norm(text: str) -> str:
+    """Canonical phrase-search stream: tokens joined by single spaces."""
+    return " ".join(norm_tokens(text or ""))
+
+
 _UNDER_SEGMENTER = None
 _UNDER_INIT_FAILED = False
 

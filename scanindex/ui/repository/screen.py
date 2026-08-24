@@ -4016,6 +4016,18 @@ class RepositoryScreen(ScreenContent):
                 self._store, self._index,
                 log_cb=lambda m: self.log_message.emit(m, "info"),
             )
+            # Outbox replay: converge Tantivy onto SQLite for documents
+            # whose write session crashed between the two commits.
+            from scanindex.core.repository.reindex import (
+                replay_pending_index_jobs,
+            )
+            replayed = replay_pending_index_jobs(self._store, self._index)
+            if replayed.get("replayed") or replayed.get("deleted"):
+                self.log_message.emit(
+                    "Kho: đã đồng bộ lại chỉ mục cho "
+                    f"{replayed.get('replayed', 0)} văn bản "
+                    f"({replayed.get('deleted', 0)} đã xóa).", "info",
+                )
             self._importer = Importer(self._store, self._index)
             self._engine = SearchEngine(self._store, self._index)
             self._refresh_status()

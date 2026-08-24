@@ -156,6 +156,23 @@ CREATE TABLE IF NOT EXISTS index_meta (
 );
 
 -- =====================================================================
+-- index_jobs — outbox for crash-safe SQLite ↔ Tantivy synchronisation.
+-- A job row is written in the SAME transaction as the document mutation;
+-- it is deleted only after the matching Tantivy commit succeeded. Startup
+-- replays whatever is left (delete + re-add per doc, idempotent), closing
+-- the window where a crash between the two commits left the derived index
+-- silently stale — a state the chunk-count watermark could not detect
+-- (same chunk count before and after an edit).
+-- =====================================================================
+CREATE TABLE IF NOT EXISTS index_jobs (
+    job_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    doc_id     TEXT NOT NULL,
+    op         TEXT NOT NULL DEFAULT 'reindex',  -- reindex | delete
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_index_jobs_doc ON index_jobs(doc_id);
+
+-- =====================================================================
 -- Import history — one row per import session for audit / debug.
 -- =====================================================================
 CREATE TABLE IF NOT EXISTS import_history (

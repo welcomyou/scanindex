@@ -6,7 +6,7 @@ in a way that invalidates the on-disk index.
 """
 
 # ---------- Versions (bump to trigger rebuild) ----------
-SCHEMA_VERSION       = "10"     # v10: documents gain doc_filter_text (normalized advanced-filter prefilter)
+SCHEMA_VERSION       = "11"     # v11: index_jobs outbox (crash-safe SQLite↔Tantivy sync)
 CHUNKER_VERSION      = "2.1"    # tighter merge: TARGET=100 / MAX=250 / Y_RATIO=6 + tiny-chunk rescue
 TOKENIZER_NAME       = "underthesea"
 TOKENIZER_VERSION    = "1.x"           # filled at runtime if available
@@ -19,8 +19,8 @@ PDF_SUBDIR              = "pdf"
 # bumping INDEXER_VERSION must bump this name so a new index is built
 # alongside the old one. Older app releases keep reading their own folder,
 # which makes downgrading safe (worst case: stale search until re-import).
-TANTIVY_SUBDIR          = "tantivy_index-v2"
-LEGACY_TANTIVY_SUBDIRS  = ("tantivy_index",)   # v1; wiped only by explicit reset
+TANTIVY_SUBDIR          = "tantivy_index-v3"
+LEGACY_TANTIVY_SUBDIRS  = ("tantivy_index", "tantivy_index-v2")  # wiped only by reset
 SQLITE_FILE             = "repository.db"
 IMPORT_LOG_FILE         = "import_log.json"
 
@@ -35,6 +35,11 @@ MIN_RESULTS            = 5              # below this -> fallback
 # UI's relevance sums the top-3 chunks) and at most MAX_DOCS documents.
 PHRASE_COMPLETENESS_PER_DOC_CHUNKS = 3
 PHRASE_COMPLETENESS_MAX_DOCS = 5000
+# How many chunk-phrase hits to verify per-chunk (snippet + true match
+# counts). Documents matched only by the doc-level phrase audit beyond
+# this horizon still appear (count-1 tail) but skip per-chunk
+# verification — bounding Python work on phrases that hit every chunk.
+PHRASE_CHUNK_RANK_LIMIT = 2000
 # The Python span-fuzzy fallback (rapidfuzz over every chunk) is the one
 # linear-in-archive-size stage left. Give it a wall-clock budget: past it,
 # the search returns what it already collected (index passes + SQL phrase
@@ -42,11 +47,15 @@ PHRASE_COMPLETENESS_MAX_DOCS = 5000
 SPAN_FUZZY_TIME_BUDGET_SEC = 3.0
 
 # ---------- Indexer schema ----------
-# v2: every searchable field gains a no-diacritic twin (default tokenizer) and
-# a character-trigram twin (substring/typo recall), so queries typed without
-# Vietnamese diacritics and OCR slips are served by the index instead of the
-# linear SQLite fallbacks. Bump + change TANTIVY_SUBDIR when fields change.
-INDEXER_VERSION        = "2"
+# v2: no-diacritic + trigram twins on every searchable field, so queries
+# typed without Vietnamese diacritics and OCR slips are served by the
+# index instead of the linear SQLite fallbacks.
+# v3: DOCUMENT-level records (doc_meta_norm / doc_body_norm on a canonical
+#     token stream, page sentinels between pages) so true phrase queries
+#     retrieve every matching document from the index; the linear SQL
+#     instr completeness scan becomes a fallback instead of the main path.
+# Bump + change TANTIVY_SUBDIR when fields change.
+INDEXER_VERSION        = "3"
 TRIGRAM_TOKENIZER_NAME = "scanindex_trigram"
 TRIGRAM_MIN_GRAM       = 3
 TRIGRAM_MAX_GRAM       = 3

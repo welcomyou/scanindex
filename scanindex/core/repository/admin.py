@@ -240,7 +240,12 @@ def delete_document(store: ArchiveStore, index: HybridIndex,
         "SELECT COUNT(*) AS n FROM chunks WHERE doc_id = ?", (doc_id,)
     ).fetchone()["n"]
 
-    # Tantivy delete-by-doc (removes BOTH metadata + body chunks).
+    # Outbox: if the flow dies between the tantivy delete above and the
+    # commit below, startup replay re-runs the (idempotent) purge.
+    from .reindex import enqueue_index_job
+    enqueue_index_job(conn, doc_id, op="delete")
+
+    # Tantivy delete-by-doc (removes chunks AND the document record).
     index.delete_tantivy_by_doc(doc_id)
 
     # Hard-delete SQL row: CASCADE wipes chunks.
@@ -387,6 +392,10 @@ def update_document_metadata(store: ArchiveStore, index: HybridIndex,
     params = {c: cleaned.get(c, "") for c in KIE_COLUMNS}
     params["doc_id"] = doc_id
     params["now"] = int(time.time())
+    # Outbox: a crash between this UPDATE and the Tantivy commit must not
+    # leave the derived index silently stale.
+    from .reindex import enqueue_index_job
+    enqueue_index_job(conn, doc_id)
     conn.execute(
         f"UPDATE documents SET {sets}, updated_at = :now WHERE doc_id = :doc_id",
         params,
@@ -498,6 +507,10 @@ def update_document_metadata(store: ArchiveStore, index: HybridIndex,
                 body_no_diacritic=tno,
                 body_segmented=tseg or "",
             )
+    # Indexer v3: rebuild the document-level phrase record from the
+    # edited truth (delete_tantivy_by_doc above removed the old one).
+    from .reindex import _add_document_record_from_sql
+    _add_document_record_from_sql(index, conn, doc_id)
     index.commit()
     note_index_write(store)
 
@@ -971,6 +984,10 @@ def add_document(store: ArchiveStore, index: HybridIndex, *,
     with fitz.open(str(target_pdf)) as f:
         page_count = f.page_count
     now = int(time.time())
+    # Outbox: enqueue BEFORE any write so a crash mid-flow leaves a job
+    # that startup replay converges from the final SQLite truth.
+    from .reindex import enqueue_index_job
+    enqueue_index_job(conn, doc_id)
     cols_kie = {col: (kie_fields.get(col) or "") for col in KIE_COLUMNS}
     params = {
         "doc_id": doc_id, "dossier_id": dossier_id,
@@ -1072,6 +1089,9 @@ def add_document(store: ArchiveStore, index: HybridIndex, *,
         "UPDATE chunks SET indexed_status = 'indexed' WHERE doc_id = ?",
         (doc_id,),
     )
+    # Indexer v3: document-level phrase record from the final SQLite state.
+    from .reindex import _add_document_record_from_sql
+    _add_document_record_from_sql(index, conn, doc_id)
     index.commit()
     store.refresh_counters()
     note_index_write(store)

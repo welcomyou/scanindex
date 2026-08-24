@@ -75,11 +75,31 @@ def _convert_v9_to_v10(conn: sqlite3.Connection) -> None:
         backfill_missing_filter_text(conn)
 
 
+def _convert_v10_to_v11(conn: sqlite3.Connection) -> None:
+    """v10 → v11: add the ``index_jobs`` outbox table.
+
+    Rows are written in the same transaction as document mutations and
+    deleted after the matching Tantivy commit; startup replays leftovers
+    (delete + re-add per doc, idempotent). CREATE TABLE IF NOT EXISTS
+    keeps this idempotent for partially-migrated databases.
+    """
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS index_jobs (
+            job_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+            doc_id     TEXT NOT NULL,
+            op         TEXT NOT NULL DEFAULT 'reindex',
+            created_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_index_jobs_doc ON index_jobs(doc_id);
+    """)
+
+
 # schema_version (source) -> converter to the next version.
 _CONVERTERS: dict[str, Converter] = {
     # "7": _convert_v7_to_v8,
     "8": _convert_v8_to_v9,
     "9": _convert_v9_to_v10,
+    "10": _convert_v10_to_v11,
 }
 
 
