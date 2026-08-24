@@ -54,10 +54,13 @@ class SearchResult:
     dossier_code: Optional[str] = None
     doc_type: Optional[str] = None
     chunk_type: str = "body"   # metadata | body
-    match_kind: str = ""       # exact | fuzzy | filter
+    match_kind: str = ""       # exact | substring | fuzzy | filter
     match_count: int = 0
     match_bboxes: Optional[List[List[float]]] = None
     query: str = ""
+    # Raw Tantivy BM25 of the candidate (pre-verification). The final
+    # `score` is the verified match count; ranking blends both.
+    bm25: float = 0.0
 
 
 def _tokens(text: str) -> List[str]:
@@ -1484,6 +1487,7 @@ class SearchEngine:
                 bbox = []
             match_count = 0
             score = float(score_map.get(cid, 0.0))
+            bm25_raw = float(score_map.get(cid, 0.0))
             match_bboxes = None
             if query and match_kind == "exact":
                 if trusted_exact_counts is not None and cid in trusted_exact_counts:
@@ -1543,6 +1547,7 @@ class SearchEngine:
                 chunk_id=cid,
                 doc_id=r["doc_id"],
                 score=score,
+                bm25=bm25_raw,
                 page=int(r["page"]) if r["page"] is not None else 0,
                 text=text,
                 bbox=bbox,

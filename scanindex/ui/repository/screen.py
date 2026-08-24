@@ -42,12 +42,18 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
-from PySide6.QtCore import QEvent, QMimeData, Qt, Signal, QThread, QTimer
-from PySide6.QtGui import QCursor, QDrag, QImage, QPainter, QPen, QColor, QPixmap
+from PySide6.QtCore import (
+    QEvent, QMimeData, QModelIndex, QRect, QRectF, QSize, Qt, Signal,
+    QAbstractListModel, QThread, QTimer,
+)
+from PySide6.QtGui import (
+    QCursor, QDrag, QImage, QPainter, QPainterPath, QPen, QColor, QPixmap,
+)
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
-    QComboBox, QFrame, QScrollArea, QSplitter,
-    QFileDialog, QMessageBox, QProgressBar, QGridLayout,
+    QComboBox, QFrame, QScrollArea, QSplitter, QStackedWidget,
+    QFileDialog, QMessageBox, QProgressBar, QGridLayout, QListView,
+    QStyle, QStyledItemDelegate,
     QToolButton, QApplication, QCheckBox, QSizePolicy, QDialog, QDialogButtonBox,
 )
 
@@ -59,7 +65,7 @@ from scanindex.ui.theme import (
     COLOR_TEXT, COLOR_TEXT_MUTED, COLOR_TEXT_SECONDARY,
     COMBOBOX_DROPDOWN_QSS,
     BUTTON_PRIMARY_QSS,
-    FONT_UI, RADIUS_MD, RADIUS_SM, SP,
+    FONT_UI, FONT_MONO, RADIUS_MD, RADIUS_SM, SP,
 )
 from scanindex.ui.widgets.fuzzy_combobox import FuzzyComboBox
 from scanindex.ui.widgets.pdf_viewer_widget import PdfViewerWidget
@@ -80,7 +86,7 @@ from scanindex.core.repository.search_engine import (
     _fuzzy_span_token_ranges,
 )
 from scanindex.core.repository.repair import run_startup_repair
-from scanindex.core.repository.tokenizer import to_no_diacritic
+from scanindex.core.repository.tokenizer import search_norm, to_no_diacritic
 
 
 # Độ mật levels for the Tra cứu tài liệu criteria combo. Same canonical
@@ -834,6 +840,11 @@ class FileHit:
     score_total: float = 0.0
     match_total: int = 0
     match_kind: str = ""
+    # Tiered relevance: match class ×1000 + field weight ×40 + saturated
+    # term frequency ×10 + BM25 percentile tie-break ×5. See
+    # _filehit_relevance — replaces the pure-frequency ordering, which
+    # biased long documents and boilerplate forms.
+    relevance: float = 0.0
 
 
 def _bbox_tuple(chunk: SearchResult) -> Optional[tuple[float, float, float, float]]:
@@ -1362,6 +1373,84 @@ class _DateFilterInput(QWidget):
         dlg.exec()
 
 
+# Field-probe order for the ranking weight W: the first KIE field whose
+# normalized value contains the query phrase determines the weight.
+_RANK_FIELD_PROBES: tuple[tuple[str, float], ...] = (
+    ("doc_number", 6.0), ("signer_name", 4.0),
+    ("issue_org", 3.0), ("subject", 3.0), ("recipients", 2.0),
+)
+
+
+def _filehit_relevance(fh: "FileHit", query_norm: str,
+                       bm25_scale: float) -> float:
+    """Tiered relevance for one FileHit (expert-review formula, adapted).
+
+        G: 4 query == full doc_number · 3 exact in metadata · 2 exact in
+           body · 1.5 substring · 1 fuzzy
+        W: weight of the strongest matched field (metadata prose → 2.5)
+        TF: saturated, length-normalized frequency — long documents and
+            boilerplate forms can no longer win by repetition alone
+        BM25 percentile: light tie-break, never discarded entirely
+
+    score = 1000·G + 40·W + 10·TF + 5·BM25p
+    """
+    import math
+
+    chunks = fh.chunks or []
+    has_meta_exact = any(
+        (c.match_kind or "") == "exact"
+        and (c.chunk_type or "body") == "metadata" for c in chunks
+    )
+    has_body_exact = any(
+        (c.match_kind or "") == "exact"
+        and (c.chunk_type or "body") != "metadata" for c in chunks
+    )
+    if (query_norm and fh.file_row.doc_number
+            and query_norm == search_norm(fh.file_row.doc_number)):
+        g = 4.0
+    elif has_meta_exact:
+        g = 3.0
+    elif has_body_exact:
+        g = 2.0
+    elif (fh.match_kind or "") == "substring":
+        g = 1.5
+    else:
+        g = 1.0
+
+    w = 1.0
+    if has_meta_exact:
+        for attr, weight in _RANK_FIELD_PROBES:
+            value = getattr(fh.file_row, attr, "") or ""
+            if query_norm and query_norm in search_norm(value):
+                w = max(w, weight)
+        if w <= 1.0:
+            w = 2.5  # matched the synthesized metadata prose
+
+    tf_meta = sum(
+        int(c.match_count or 0) for c in chunks
+        if (c.chunk_type or "body") == "metadata" and (c.match_kind or "") == "exact"
+    )
+    tf_body = sum(
+        int(c.match_count or 0) for c in chunks
+        if (c.chunk_type or "body") != "metadata" and (c.match_kind or "") == "exact"
+    )
+    body_words = sum(
+        len((c.text or "").split()) for c in chunks
+        if (c.chunk_type or "body") != "metadata"
+    )
+    tf = (
+        w * math.log2(1 + min(tf_meta, 3))
+        + math.log2(1 + min(tf_body, 8))
+        / math.sqrt(max(body_words / 500.0, 1.0))
+    )
+
+    best_bm25 = max((getattr(c, "bm25", 0.0) or 0.0) for c in chunks) \
+        if chunks else 0.0
+    bm25p = 100.0 * (best_bm25 / bm25_scale) if bm25_scale > 0 else 0.0
+
+    return 1000.0 * g + 40.0 * w + 10.0 * tf + 5.0 * bm25p
+
+
 def _group_results_by_file(results: List[SearchResult]) -> List[FileHit]:
     """Dedupe per-chunk SearchResults into one FileHit per doc_id."""
     by_doc: dict[str, List[SearchResult]] = defaultdict(list)
@@ -1456,7 +1545,19 @@ def _group_results_by_file(results: List[SearchResult]) -> List[FileHit]:
             match_total=match_total,
             match_kind=getattr(head, "match_kind", "") or "",
         ))
-    out.sort(key=lambda fh: (fh.match_total, fh.score_total), reverse=True)
+    # Tiered relevance (match class first, field + saturated frequency +
+    # BM25 tie-break after) — the pure (match_total, score_total) ordering
+    # biased long documents and repeated boilerplate.
+    bm25_scale = max(
+        (getattr(r, "bm25", 0.0) or 0.0) for r in results
+    ) if results else 0.0
+    query_norm = search_norm(results[0].query or "") if results else ""
+    for fh in out:
+        fh.relevance = _filehit_relevance(fh, query_norm, bm25_scale)
+    out.sort(
+        key=lambda fh: (fh.relevance, fh.match_total, fh.score_total),
+        reverse=True,
+    )
     return out
 
 
@@ -1954,6 +2055,245 @@ class _FileCard(QFrame):
             dragged_doc_id, self.file.doc_id, insert_after
         )
         e.acceptProposedAction()
+
+
+# ---------------------------------------------------------------------------
+# Virtualized search results (QListView + model + delegate)
+# ---------------------------------------------------------------------------
+# The widget-card list materializes one QFrame per hit; at thousands of
+# results that is tens of thousands of live widgets (RAM + scroll jank).
+# The model/delegate pair paints the same card look with ONLY the visible
+# rows realized — O(viewport) regardless of result count.
+
+_GROUP_ROW_H = 38
+_HIT_ROW_H = 96
+
+
+class _SearchResultsModel(QAbstractListModel):
+    """Rows: ("group", label, count) or ("hit", rank, rank_width, FileHit)."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._entries: list[tuple] = []
+        self._active_doc_id: str = ""
+
+    # ---- Qt model ----
+    def rowCount(self, parent=QModelIndex()) -> int:
+        return 0 if parent.isValid() else len(self._entries)
+
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
+        if not index.isValid() or role != Qt.ItemDataRole.UserRole:
+            return None
+        return self._entries[index.row()]
+
+    def flags(self, index):
+        if not index.isValid():
+            return Qt.ItemFlag.NoItemFlags
+        return Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+
+    # ---- population / state ----
+    def set_entries(self, entries: list[tuple]) -> None:
+        self.beginResetModel()
+        self._entries = list(entries or [])
+        self.endResetModel()
+
+    def entry_at(self, row: int):
+        if 0 <= row < len(self._entries):
+            return self._entries[row]
+        return None
+
+    def set_active(self, doc_id: str) -> None:
+        if doc_id == self._active_doc_id:
+            return
+        old, new = self._active_doc_id, doc_id or ""
+        self._active_doc_id = new
+
+        def _touch(d):
+            for row, e in enumerate(self._entries):
+                if e[0] == "hit" and e[3].file_row.doc_id == d:
+                    self.dataChanged.emit(
+                        self.index(row, 0), self.index(row, 0))
+                    return
+
+        if old:
+            _touch(old)
+        if new:
+            _touch(new)
+
+    @property
+    def active_doc_id(self) -> str:
+        return self._active_doc_id
+
+
+class _SearchHitDelegate(QStyledItemDelegate):
+    """Paints group headers + hit cards; emits clicks (incl. the inline
+    "Mở hồ sơ" pill, hit-tested against the same rect it was painted at)."""
+
+    hit_clicked = Signal(str)      # doc_id
+    open_dossier = Signal(int)     # dossier_id
+
+    _BTN_W, _BTN_H = 84, 24
+
+    def sizeHint(self, option, index):
+        e = index.data(Qt.ItemDataRole.UserRole)
+        if e and e[0] == "group":
+            return QSize(option.rect.width(), _GROUP_ROW_H)
+        return QSize(option.rect.width(), _HIT_ROW_H)
+
+    # ---- geometry helpers (shared by paint + hit-test) ----
+    def _button_rect(self, option) -> QRect:
+        m = SP[3]
+        return QRect(
+            option.rect.right() - m - self._BTN_W,
+            option.rect.bottom() - m - 4 - self._BTN_H,
+            self._BTN_W, self._BTN_H,
+        )
+
+    def _elided(self, painter, text: str, width: int) -> str:
+        fm = painter.fontMetrics()
+        return fm.elidedText(text, Qt.TextElideMode.ElideRight, max(10, width))
+
+    def paint(self, painter, option, index):
+        e = index.data(Qt.ItemDataRole.UserRole)
+        if e is None:
+            return
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        r = option.rect.adjusted(SP[2], 3, -SP[2], -3)
+
+        if e[0] == "group":
+            _, label, count = e
+            painter.setPen(QColor(COLOR_TEXT_SECONDARY))
+            f = painter.font()
+            f.setPointSizeF(8.5)
+            f.setBold(True)
+            painter.setFont(f)
+            painter.drawText(
+                r.adjusted(SP[2], 0, 0, 0),
+                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                f"{label.upper()} · {count}",
+            )
+            painter.restore()
+            return
+
+        _, rank, rank_width, fh = e
+        f_row = fh.file_row
+        hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
+        try:
+            active = index.model().active_doc_id == f_row.doc_id
+        except Exception:
+            active = False
+        bg = COLOR_ELEVATED if active else COLOR_SURFACE
+        border = COLOR_ACCENT if (active or hovered) else COLOR_BORDER
+        path = QPainterPath()
+        path.addRoundedRect(
+            QRectF(r.x(), r.y(), r.width(), r.height()), RADIUS_MD, RADIUS_MD)
+        painter.fillPath(path, QColor(bg))
+        painter.setPen(QPen(QColor(border), 1))
+        painter.drawPath(path)
+
+        pad = SP[3]
+        text_r = r.adjusted(pad, 6, -pad, -6)
+        # Rank badge (right column, monospace).
+        rank_text = str(rank or 0).rjust(rank_width or 2)
+        painter.setPen(QColor(COLOR_TEXT_MUTED))
+        rf = painter.font()
+        rf.setFamily(FONT_MONO)
+        rf.setPointSizeF(8.5)
+        painter.setFont(rf)
+        painter.drawText(
+            QRect(text_r.right() - 44, text_r.y(), 44, 18),
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+            rank_text,
+        )
+        body_w = text_r.width() - 52
+
+        # Title (bold).
+        painter.setPen(QColor(COLOR_TEXT))
+        tf = painter.font()
+        tf.setFamily(FONT_UI)
+        tf.setPointSizeF(10.5)
+        tf.setBold(True)
+        painter.setFont(tf)
+        title = f_row.subject or f_row.file_name or f_row.doc_id[:14]
+        painter.drawText(
+            QRect(text_r.x(), text_r.y(), body_w, 20),
+            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+            self._elided(painter, title, body_w),
+        )
+        # Meta line.
+        painter.setPen(QColor(COLOR_TEXT_SECONDARY))
+        mf = painter.font()
+        mf.setBold(False)
+        mf.setPointSizeF(8.5)
+        painter.setFont(mf)
+        meta = _file_summary_text(f_row, localized=True)
+        if meta:
+            painter.drawText(
+                QRect(text_r.x(), text_r.y() + 20, body_w, 16),
+                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                self._elided(painter, meta, body_w),
+            )
+        # File name (green).
+        if f_row.file_name:
+            painter.setPen(QColor(COLOR_GREEN))
+            ff = painter.font()
+            ff.setBold(True)
+            painter.setFont(ff)
+            painter.drawText(
+                QRect(text_r.x(), text_r.y() + 36, body_w, 16),
+                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                self._elided(painter, f"📄 {f_row.file_name}", body_w),
+            )
+        # Archive row + button pill.
+        bits = []
+        if f_row.fonds:
+            bits.append(f"Phông {f_row.fonds}")
+        if f_row.catalog:
+            bits.append(f"Mục lục {f_row.catalog}")
+        if f_row.dossier_code:
+            bits.append(f"Hồ sơ {f_row.dossier_code}")
+        painter.setPen(QColor(COLOR_TEXT_MUTED))
+        af = painter.font()
+        af.setBold(False)
+        af.setPointSizeF(8)
+        painter.setFont(af)
+        if bits:
+            btn = self._button_rect(option)
+            painter.drawText(
+                QRect(text_r.x(), btn.y(), text_r.width() - self._BTN_W - SP[3], self._BTN_H),
+                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                self._elided(painter, " · ".join(bits),
+                             text_r.width() - self._BTN_W - SP[3] * 2),
+            )
+        if f_row.dossier_id is not None:
+            btn = self._button_rect(option)
+            bp = QPainterPath()
+            bp.addRoundedRect(QRectF(btn), 4, 4)
+            painter.fillPath(bp, QColor(COLOR_SURFACE))
+            painter.setPen(QPen(QColor(COLOR_BORDER), 1))
+            painter.drawPath(bp)
+            painter.setPen(QColor(COLOR_ACCENT))
+            bf = painter.font()
+            bf.setBold(True)
+            bf.setPointSizeF(8)
+            painter.setFont(bf)
+            painter.drawText(btn, Qt.AlignmentFlag.AlignCenter, "Mở hồ sơ")
+        painter.restore()
+
+    def editorEvent(self, event, model, option, index) -> bool:
+        if event.type() != QEvent.Type.MouseButtonRelease:
+            return False
+        e = index.data(Qt.ItemDataRole.UserRole)
+        if e is None or e[0] != "hit":
+            return False
+        fh = e[3]
+        if fh.file_row.dossier_id is not None and \
+                self._button_rect(option).contains(event.position().toPoint()):
+            self.open_dossier.emit(int(fh.file_row.dossier_id))
+            return True
+        self.hit_clicked.emit(fh.file_row.doc_id)
+        return True
 
 
 class _SearchHitCard(QFrame):
@@ -3066,12 +3406,6 @@ class RepositoryScreen(ScreenContent):
         # Kết quả tìm kiếm tab is selected again.
         self._search_list_cache: list[QWidget] = []
         self._search_list_cache_sort = ""
-        # Batched result rendering (large hit lists never block the UI
-        # thread): the first batch renders synchronously, the rest streams
-        # in via zero-delay QTimer batches guarded by a generation counter.
-        self._search_render_queue: list[tuple] = []
-        self._search_render_gen = 0
-        self._search_render_rank_width = 2
         # Word-level match bbox cache (LRU) + off-thread hydration state.
         self._bbox_cache: "OrderedDict[int, list]" = OrderedDict()
         self._hydrate_worker: Optional[_HydrateWorker] = None
@@ -3647,8 +3981,36 @@ class RepositoryScreen(ScreenContent):
         self._list_layout.setSpacing(SP[2])
         self._list_layout.addStretch(1)
         self._list_scroll.setWidget(self._list_inner)
-        v.addWidget(self._list_scroll, 1)
+
+        # Search results use a VIRTUALIZED view (model + delegate): only
+        # visible rows are painted, so 3.000+ hits scroll as smoothly as
+        # 30. Browse modes keep the widget-based scroll area (page 0).
+        self._list_stack = QStackedWidget()
+        self._list_stack.addWidget(self._list_scroll)          # page 0
+        self._search_model = _SearchResultsModel(self)
+        self._search_delegate = _SearchHitDelegate(self._list_stack)
+        self._search_delegate.hit_clicked.connect(self._on_virtual_hit_clicked)
+        self._search_delegate.open_dossier.connect(self._open_search_hit_dossier)
+        self._search_view = QListView()
+        self._search_view.setModel(self._search_model)
+        self._search_view.setItemDelegate(self._search_delegate)
+        self._search_view.setMouseTracking(True)
+        self._search_view.setSelectionMode(QListView.SelectionMode.NoSelection)
+        self._search_view.setSpacing(SP[1])
+        self._search_view.setVerticalScrollMode(
+            QListView.ScrollMode.ScrollPerPixel
+        )
+        self._search_view.setStyleSheet(
+            f"QListView {{ background: {COLOR_BG}; border: none; }}"
+        )
+        self._list_stack.addWidget(self._search_view)          # page 1
+        v.addWidget(self._list_stack, 1)
         return box
+
+    def _on_virtual_hit_clicked(self, doc_id: str) -> None:
+        hit = self._hits_by_doc.get(doc_id)
+        if hit is not None:
+            self._show_search_hit(hit)
 
     def _build_toolbar(self) -> QWidget:
         bar = QFrame()
@@ -4168,6 +4530,12 @@ class RepositoryScreen(ScreenContent):
     # ------ List rendering helpers ------
 
     def _clear_list(self):
+        # Browse modes render widget cards into the scroll layout — make
+        # sure the stack shows that page (search mode flips to the
+        # virtualized view after its own _clear_list call).
+        stack = getattr(self, "_list_stack", None)
+        if stack is not None and stack.currentIndex() != 0:
+            stack.setCurrentIndex(0)
         while self._list_layout.count() > 1:
             item = self._list_layout.takeAt(0)
             if item is None:
@@ -4184,7 +4552,6 @@ class RepositoryScreen(ScreenContent):
 
     def _stash_search_list(self) -> None:
         """Detach the current search cards without destroying them."""
-        self._cancel_search_render_queue()
         self._discard_search_list_cache()
         cached: list[QWidget] = []
         while self._list_layout.count() > 1:
@@ -4210,6 +4577,10 @@ class RepositoryScreen(ScreenContent):
         for cid, card in self._doc_cards_by_id.items():
             if hasattr(card, "set_active"):
                 card.set_active(cid == self._active_doc_id)
+        # Virtualized search list repaints the touched rows.
+        model = getattr(self, "_search_model", None)
+        if model is not None:
+            model.set_active(self._active_doc_id)
 
     # ------ Mode A: dossier list ------
 
@@ -5293,23 +5664,11 @@ class RepositoryScreen(ScreenContent):
         return hits
 
     def _render_search_results(self, *, restore_scroll: bool = True) -> None:
-        # Invalidate any batched render still streaming from a previous
-        # render of this list (generation counter + queue drop).
-        self._cancel_search_render_queue()
-        self._search_render_gen += 1
         was_search = self._mode == self._MODE_SEARCH
         if not was_search:
             self._sync_scope_state()
-        requested_sort = self._current_sort(self._MODE_SEARCH)
-        use_cached_list = bool(
-            not was_search
-            and self._search_list_cache
-            and self._search_list_cache_sort == requested_sort
-        )
-        if not use_cached_list and self._search_list_cache:
-            self._discard_search_list_cache()
         if was_search:
-            self._search_scroll_value = self._list_scroll.verticalScrollBar().value()
+            self._search_scroll_value = self._search_scrollbar().value()
         self._mode = self._MODE_SEARCH
         self._current_dossier = None
         self._current_file = None
@@ -5330,9 +5689,14 @@ class RepositoryScreen(ScreenContent):
         self._dossier_cards_by_id.clear()
         self._update_selection_toolbar()
         self.btn_clear_search.setEnabled(True)
+        self._discard_search_list_cache()
         self._clear_list()
         self._pdf_pane.clear()
         self._search_rank_by_doc = {}
+        # Virtualized list page (model + delegate): O(viewport) regardless
+        # of how many hits there are.
+        self._list_stack.setCurrentWidget(self._search_view)
+        self._search_model.set_active("")
         if not self._search_hits:
             self._list_count_label.setText("Không có kết quả.")
             self._right_panel.show_dossier(DossierRow(
@@ -5355,89 +5719,36 @@ class RepositoryScreen(ScreenContent):
         sorted_hits = self._sorted_search_hits()
         rank = 0
         rank_width = max(2, len(str(len(sorted_hits))))
-        if use_cached_list:
-            cached, self._search_list_cache = self._search_list_cache, []
-            self._search_list_cache_sort = ""
-            for widget in cached:
-                self._add_card(widget)
-                widget.show()
-                if isinstance(widget, _SearchHitCard):
-                    doc_id = widget.hit.file_row.doc_id
-                    self._search_rank_by_doc[doc_id] = widget.rank
-                    self._doc_cards_by_id[doc_id] = widget
-        else:
-            # Batched rendering: descriptor queue instead of building every
-            # widget up front. First batch (incl. headers + the first hits)
-            # renders now so the list appears instantly; the rest streams in
-            # via zero-delay QTimer batches.
-            queue: list[tuple] = []
-            for kind, label in labels:
-                group = [h for h in sorted_hits if h.match_kind == kind]
-                if not group:
-                    continue
-                queue.append(("group", label, len(group)))
-                for hit in group:
-                    rank += 1
-                    self._search_rank_by_doc[hit.file_row.doc_id] = rank
-                    queue.append(("hit", hit, rank))
-            self._search_render_queue = queue
-            self._search_render_rank_width = rank_width
-            self._render_search_batch(first=True)
+        entries: list[tuple] = []
+        for kind, label in labels:
+            group = [h for h in sorted_hits if h.match_kind == kind]
+            if not group:
+                continue
+            entries.append(("group", label, len(group)))
+            for hit in group:
+                rank += 1
+                self._search_rank_by_doc[hit.file_row.doc_id] = rank
+                entries.append(("hit", rank, rank_width, hit))
+        self._search_model.set_entries(entries)
         selected = self._hits_by_doc.get(self._search_selected_doc_id)
         if selected is None and sorted_hits:
             selected = sorted_hits[0]
         if selected is not None:
             self._show_search_hit(selected)
         if restore_scroll:
+            bar = self._search_scrollbar()
             QTimer.singleShot(
                 0,
-                lambda value=self._search_scroll_value:
-                    self._list_scroll.verticalScrollBar().setValue(value),
+                lambda value=self._search_scroll_value: bar.setValue(value),
             )
 
-    # Render-batch size: enough to fill the visible list area in one go
-    # without a perceptible pause between batches.
-    _RENDER_BATCH_CARDS = 40
-
-    def _cancel_search_render_queue(self) -> None:
-        """Drop any pending batched cards (new render / mode switch / stash).
-        The generation counter makes in-flight timers no-op safely."""
-        self._search_render_queue = []
-
-    def _render_search_batch(self, *, first: bool = False) -> None:
-        """Materialize the next batch of queued result cards. Aborts when the
-        queue was cancelled, a newer render generation started, or the screen
-        left search mode (e.g. the user drilled into a dossier mid-stream)."""
-        gen = self._search_render_gen
-        queue = self._search_render_queue
-        if not queue or self._mode != self._MODE_SEARCH:
-            self._search_render_queue = []
-            return
-        budget = 160 if first else self._RENDER_BATCH_CARDS
-        n = 0
-        while queue and n < budget:
-            item = queue.pop(0)
-            if item[0] == "group":
-                self._add_card(_GroupHeader(item[1], item[2]))
-            else:
-                _, hit, rank = item
-                card = _SearchHitCard(
-                    hit, rank=rank, rank_width=self._search_render_rank_width,
-                )
-                card.clicked.connect(lambda _did, hh=hit: self._show_search_hit(hh))
-                card.open_dossier.connect(self._open_search_hit_dossier)
-                self._doc_cards_by_id[hit.file_row.doc_id] = card
-                self._add_card(card)
-            n += 1
-        if queue:
-            QTimer.singleShot(0, lambda: self._render_search_batch_safely(gen))
-        else:
-            self._search_render_queue = []
-
-    def _render_search_batch_safely(self, gen: int) -> None:
-        if gen != self._search_render_gen:
-            return  # superseded by a newer render
-        self._render_search_batch()
+    def _search_scrollbar(self):
+        """Active scrollbar for the search list (virtualized view when the
+        search page is up, else the widget scroll area)."""
+        if (getattr(self, "_list_stack", None) is not None
+                and self._list_stack.currentIndex() == 1):
+            return self._search_view.verticalScrollBar()
+        return self._list_scroll.verticalScrollBar()
 
     def _show_search_tab(self) -> None:
         """Tài liệu tab click: restore the preserved results, or show the
