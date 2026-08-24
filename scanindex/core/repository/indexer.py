@@ -434,6 +434,14 @@ class HybridIndex:
     def commit(self) -> None:
         if self._tan_writer is not None:
             self._tan_writer.commit()
+            # Background merge threads keep file handles open after commit
+            # (large indexes especially); without waiting, Windows denies
+            # later renames/deletes of the index directory (e.g. during a
+            # staged rebuild or an archive reset).
+            try:
+                self._tan_writer.wait_merging_threads()
+            except Exception:
+                pass
             self._tan_writer = None  # release lock
         self._tan_index.reload()
 

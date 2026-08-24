@@ -692,23 +692,30 @@ class SearchEngine:
         # the old conditional fallback did.
         if not _cancelled():
             known_chunk_ids = {r.chunk_id for r in exact_results}
+            raw_norm = self._normalized_exact_hits(
+                query,
+                candidate_doc_ids,
+                chunk_type_filter=chunk_type_filter,
+                limit=(C.PHRASE_COMPLETENESS_MAX_DOCS
+                       * C.PHRASE_COMPLETENESS_PER_DOC_CHUNKS),
+                cancel_check=cancel_check,
+            )
             normalized_hits = [
-                (cid, score)
-                for cid, _did, score in self._normalized_exact_hits(
-                    query,
-                    candidate_doc_ids,
-                    chunk_type_filter=chunk_type_filter,
-                    limit=C.PHRASE_COMPLETENESS_CHUNK_LIMIT,
-                    cancel_check=cancel_check,
-                )
+                (cid, freq)
+                for cid, _did, freq in raw_norm
                 if cid not in known_chunk_ids
             ]
+            # The pass above already verified strict word boundaries and
+            # counted occurrences — trust those counts instead of paying
+            # _exact_frequency a second time inside _build_results.
+            trusted = {cid: int(freq) for cid, _did, freq in raw_norm}
             exact_results.extend(self._build_results(
                 normalized_hits,
                 match_kind="exact",
                 query=query,
                 chunk_type_filter=chunk_type_filter,
                 build_match_bboxes=False,
+                trusted_exact_counts=trusted,
             ))
             exact_doc_ids = {r.doc_id for r in exact_results}
         fuzzy_hits = [
@@ -769,9 +776,17 @@ class SearchEngine:
                                limit: int,
                                cancel_check: Optional[Callable[[], bool]] = None
                                ) -> List[Tuple[int, str, float]]:
+        """Literal-phrase hits from SQLite, DOCUMENT-aware (window function).
+
+        At most `per_doc` matching chunks per document — enough to rank
+        (the UI's relevance sums each file's top-3 chunks) while bounding
+        the verification volume for phrases that appear in every chunk of
+        every document. `limit` caps total returned chunk rows.
+        """
         normalized = " ".join(_tokens(query))
         if not normalized:
             return []
+        per_doc = C.PHRASE_COMPLETENESS_PER_DOC_CHUNKS
         params: List[Any] = []
         where = ["d.indexed_status = 'indexed'"]
         if chunk_type_filter:
@@ -785,13 +800,19 @@ class SearchEngine:
             params.extend(candidate_doc_ids)
         where.append("instr(lower(c.text_no_diacritic), ?) > 0")
         params.append(normalized)
+        params.append(per_doc)
         params.append(max(1, int(limit or 1)))
         rows = self.store.connect().execute(
-            "SELECT c.chunk_id, c.doc_id, c.text_original "
-            "FROM chunks c "
-            "JOIN documents d ON c.doc_id = d.doc_id "
-            f"WHERE {' AND '.join(where)} "
-            "ORDER BY c.chunk_id LIMIT ?",
+            "SELECT chunk_id, doc_id, text_original FROM ("
+            "  SELECT c.chunk_id AS chunk_id, c.doc_id AS doc_id, "
+            "         c.text_original AS text_original, "
+            "         ROW_NUMBER() OVER ("
+            "           PARTITION BY c.doc_id ORDER BY c.chunk_id"
+            "         ) AS rn "
+            "  FROM chunks c "
+            "  JOIN documents d ON c.doc_id = d.doc_id "
+            f"  WHERE {' AND '.join(where)} "
+            ") WHERE rn <= ? ORDER BY chunk_id LIMIT ?",
             params,
         ).fetchall()
         out: List[Tuple[int, str, float]] = []
@@ -803,6 +824,12 @@ class SearchEngine:
                 out.append((
                     int(row["chunk_id"]), str(row["doc_id"]), float(frequency)
                 ))
+        if len(rows) >= max(1, int(limit or 1)):
+            _log.info(
+                "phrase-completeness cap reached (%d chunk rows) for '%s' — "
+                "results beyond the first %d documents are truncated",
+                len(rows), normalized, C.PHRASE_COMPLETENESS_MAX_DOCS,
+            )
         return out
 
     def _span_fuzzy_hits(self,
@@ -1236,6 +1263,7 @@ class SearchEngine:
                        query: str = "",
                        chunk_type_filter: Optional[str] = None,
                        build_match_bboxes: bool = True,
+                       trusted_exact_counts: Optional[dict] = None,
                        ) -> List[SearchResult]:
         if not chunk_id_score_pairs:
             return []
@@ -1285,9 +1313,16 @@ class SearchEngine:
             score = float(score_map.get(cid, 0.0))
             match_bboxes = None
             if query and match_kind == "exact":
-                match_count = _exact_frequency(text, query)
-                if match_count <= 0:
-                    continue
+                if trusted_exact_counts is not None and cid in trusted_exact_counts:
+                    # Pre-verified by the completeness pass (strict word
+                    # boundaries already applied there).
+                    match_count = int(trusted_exact_counts[cid])
+                    if match_count <= 0:
+                        continue
+                else:
+                    match_count = _exact_frequency(text, query)
+                    if match_count <= 0:
+                        continue
                 if build_match_bboxes:
                     match_bboxes = self._exact_match_bboxes(
                         query=query,

@@ -66,6 +66,27 @@ def index_needs_rebuild(store: ArchiveStore,
     return None
 
 
+def _rename_with_retry(src: Path, dst: Path, attempts: int = 4) -> None:
+    """Directory rename that tolerates Windows' lingering-mmap window.
+
+    Even after tantivy's writer/lock is released and the Python-side Index
+    object dropped, Windows can deny the rename for a moment while segment
+    mmaps close. Force GC, then retry briefly before giving up.
+    """
+    import gc
+
+    last_exc: Exception | None = None
+    for attempt in range(attempts):
+        gc.collect()
+        try:
+            src.rename(dst)
+            return
+        except OSError as exc:
+            last_exc = exc
+            time.sleep(0.25 * (attempt + 1))
+    raise last_exc if last_exc else OSError(f"rename failed: {src} -> {dst}")
+
+
 def _count_indexable_chunks(store: ArchiveStore) -> int:
     row = store.connect().execute(
         "SELECT COUNT(*) AS n FROM chunks c "
@@ -169,13 +190,14 @@ def rebuild_search_index(store: ArchiveStore,
         staging.commit()
     finally:
         staging.close()
+        staging = None  # drop the last reference so mmaps can close (Windows)
 
     # Swap only after a fully-built index exists. Replacing an existing
     # generation is safe: it is derived data, and old generations used by
     # older app releases keep their own folder names.
     if target_dir.exists():
         shutil.rmtree(target_dir, ignore_errors=True)
-    build_dir.rename(target_dir)
+    _rename_with_retry(build_dir, target_dir)
 
     store.set_meta("indexer_version", C.INDEXER_VERSION)
     store.set_meta("indexer_built_chunks", str(done))

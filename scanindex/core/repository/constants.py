@@ -30,9 +30,11 @@ MIN_RESULTS            = 5              # below this -> fallback
 # Completeness guard: the Tantivy passes cap candidates at TANTIVY_TOP_K
 # *chunks*, so a phrase spread over many chunks per document (e.g. "Nơi
 # nhận" in nearly every doc) can hide whole documents. The literal-phrase
-# SQL pass therefore ALWAYS unions into the exact group, up to this many
-# chunks (dense queries early-stop at the limit inside SQLite).
-PHRASE_COMPLETENESS_CHUNK_LIMIT = 4000
+# SQL pass therefore ALWAYS unions into the exact group — DOCUMENT-aware:
+# at most PER_DOC matching chunks per document (enough for ranking, the
+# UI's relevance sums the top-3 chunks) and at most MAX_DOCS documents.
+PHRASE_COMPLETENESS_PER_DOC_CHUNKS = 3
+PHRASE_COMPLETENESS_MAX_DOCS = 5000
 # The Python span-fuzzy fallback (rapidfuzz over every chunk) is the one
 # linear-in-archive-size stage left. Give it a wall-clock budget: past it,
 # the search returns what it already collected (index passes + SQL phrase
