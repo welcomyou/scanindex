@@ -34,17 +34,21 @@ MIN_RESULTS            = 5              # below this -> fallback
 # at most PER_DOC matching chunks per document (enough for ranking, the
 # UI's relevance sums the top-3 chunks) and at most MAX_DOCS documents.
 PHRASE_COMPLETENESS_PER_DOC_CHUNKS = 3
-PHRASE_COMPLETENESS_MAX_DOCS = 5000
+# Document-phrase retrieval is uncapped by design (the virtualized list
+# renders any count); this is only a sanity guard against pathological
+# corruption, far above the target archive sizes.
+PHRASE_COMPLETENESS_MAX_DOCS = 200000
 # How many chunk-phrase hits to verify per-chunk (snippet + true match
 # counts). Documents matched only by the doc-level phrase audit beyond
 # this horizon still appear (count-1 tail) but skip per-chunk
 # verification — bounding Python work on phrases that hit every chunk.
 PHRASE_CHUNK_RANK_LIMIT = 2000
 # The Python span-fuzzy fallback (rapidfuzz over every chunk) is the one
-# linear-in-archive-size stage left. Give it a wall-clock budget: past it,
-# the search returns what it already collected (index passes + SQL phrase
-# pass) instead of grinding for minutes on a huge archive.
-SPAN_FUZZY_TIME_BUDGET_SEC = 3.0
+# linear-in-archive-size stage left. A no-match query should be the
+# FASTEST query, not a 3+ second scan — the budget keeps it bounded and
+# the whole search cancelable; deep OCR-typo recall beyond it waits for a
+# narrower query (the index fuzzy + trigram passes already ran).
+SPAN_FUZZY_TIME_BUDGET_SEC = 1.5
 
 # ---------- Indexer schema ----------
 # v2: no-diacritic + trigram twins on every searchable field, so queries

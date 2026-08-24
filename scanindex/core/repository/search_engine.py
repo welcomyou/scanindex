@@ -61,6 +61,10 @@ class SearchResult:
     # Raw Tantivy BM25 of the candidate (pre-verification). The final
     # `score` is the verified match count; ranking blends both.
     bm25: float = 0.0
+    # Whole-document body word count (SUM(chunks.word_count)), projected
+    # once per search for length normalization — retrieved-chunk words
+    # undercount long documents.
+    doc_word_count: int = 0
 
 
 def _tokens(text: str) -> List[str]:
@@ -643,6 +647,12 @@ class SearchEngine:
 
         filters = filters or {}
         candidate_doc_ids = self._scope_doc_ids(filters)
+        # An EMPTY candidate list is a valid "filters match nothing" state
+        # — not "no filters". Returning early guarantees no downstream pass
+        # can silently widen the scope (belt and suspenders alongside
+        # _with_doc_filter's None-vs-empty-set handling).
+        if candidate_doc_ids == []:
+            return []
 
         if not query or not query.strip():
             return self._sql_only(candidate_doc_ids, limit=final_k or 50)
@@ -721,11 +731,11 @@ class SearchEngine:
                         build_match_bboxes=False,
                     ))
                     exact_doc_ids = {r.doc_id for r in exact_results}
-                doc_ids = self.index.search_doc_phrase(
+                doc_hits = self.index.search_doc_phrase(
                     query, C.PHRASE_COMPLETENESS_MAX_DOCS, cset,
                     mode=mode,
                 )
-                missing = [d for d in doc_ids if d not in exact_doc_ids]
+                missing = [dh for dh in doc_hits if dh[0] not in exact_doc_ids]
                 if missing:
                     exact_results.extend(self._audit_phrase_docs(
                         missing, query, chunk_type_filter, candidate_doc_ids,
@@ -822,6 +832,7 @@ class SearchEngine:
             build_match_bboxes=False,
         )
         results = exact_results + substring_results + fuzzy_results
+        self._project_doc_word_counts(results)
         _log.info(
             "[search] '%s' mode=%s exact=%d fuzzy=%d elapsed=%.0fms results=%d",
             query,
@@ -833,8 +844,30 @@ class SearchEngine:
         )
         return results
 
+    def _project_doc_word_counts(self, results: List[SearchResult]) -> None:
+        """One batched SQL: whole-document word counts for every hit doc,
+        stamped onto the results so ranking normalizes by true document
+        length (retrieved chunks alone undercount long documents)."""
+        doc_ids = list({r.doc_id for r in results if r.doc_id})
+        if not doc_ids:
+            return
+        conn = self.store.connect()
+        words: dict[str, int] = {}
+        _BATCH = 4000
+        for start in range(0, len(doc_ids), _BATCH):
+            batch = doc_ids[start:start + _BATCH]
+            ph = ",".join("?" * len(batch))
+            for row in conn.execute(
+                "SELECT doc_id, SUM(word_count) AS w FROM chunks "
+                f"WHERE doc_id IN ({ph}) AND chunk_type = 'body' "
+                "GROUP BY doc_id", batch,
+            ).fetchall():
+                words[row["doc_id"]] = int(row["w"] or 0)
+        for r in results:
+            r.doc_word_count = words.get(r.doc_id, 0)
+
     def _audit_phrase_docs(self,
-                           doc_ids: List[str],
+                           doc_hits: List[Tuple[str, str]],
                            query: str,
                            chunk_type_filter: Optional[str],
                            candidate_doc_ids: Optional[List[str]],
@@ -843,49 +876,63 @@ class SearchEngine:
         hit covers (beyond the chunk-phrase ranking horizon, or the phrase
         spans a chunk boundary).
 
-        The doc-level index record already guarantees the phrase exists,
-        so no per-chunk verification is needed for these tail results:
-        ONE batched query attaches each doc's first chunk as the snippet
-        location (approximate), with a count-1 match that ranks them after
-        the verified head of the list.
+        `doc_hits` carries the match SOURCE ("meta"/"body") so the
+        attached snippet chunk has the right type — a body-only phrase is
+        never classified as a metadata hit. The doc-level index record
+        already guarantees the phrase exists, so no per-chunk verification
+        is needed for these tail results: ONE batched query attaches each
+        doc's first chunk of that type as the snippet location
+        (approximate), with a count-1 match that ranks them after the
+        verified head of the list.
         """
         if candidate_doc_ids is not None:
             allowed = set(candidate_doc_ids)
-            doc_ids = [d for d in doc_ids if d in allowed]
-        doc_ids = doc_ids[:C.PHRASE_COMPLETENESS_MAX_DOCS]
-        if not doc_ids:
+            doc_hits = [(d, s) for d, s in doc_hits if d in allowed]
+        doc_hits = doc_hits[:C.PHRASE_COMPLETENESS_MAX_DOCS]
+        if not doc_hits:
             return []
+        # In "all" mode the source picks the chunk type; a user-chosen
+        # chunk_type_filter always wins (the streams queried already
+        # respected it).
+        effective_type = chunk_type_filter
         conn = self.store.connect()
-        ph = ",".join("?" * len(doc_ids))
-        params: List[Any] = list(doc_ids)
-        type_cond = "AND c.chunk_type = ?" if chunk_type_filter else ""
-        if chunk_type_filter:
-            params.append(chunk_type_filter)
-        rows = conn.execute(
-            "SELECT c.chunk_id, c.doc_id, c.page, c.text_original,"
-            "       c.bbox, c.chunk_type,"
-            "       d.kie_doc_number_symbol AS doc_number,"
-            "       d.kie_doc_subject       AS subject,"
-            "       d.kie_issue_org_name    AS issue_org,"
-            "       d.kie_issue_org_superior AS issue_org_superior,"
-            "       d.kie_signer_name       AS signer_name,"
-            "       d.kie_place_date        AS issue_date,"
-            "       d.kie_doc_type          AS doc_type,"
-            "       d.file_name, d.file_path,"
-            "       d.dossier_id, ds.title AS dossier_title,"
-            "       ds.fonds, ds.catalog, ds.dossier_code "
-            "FROM ("
-            "  SELECT c1.*, ROW_NUMBER() OVER ("
-            "    PARTITION BY c1.doc_id ORDER BY c1.chunk_id"
-            "  ) AS rn FROM chunks c1 "
-            f"  WHERE c1.doc_id IN ({ph}) AND c1.indexed_status = 'indexed' "
-            f"  {type_cond} "
-            ") c "
-            "JOIN documents d ON c.doc_id = d.doc_id "
-            "LEFT JOIN dossiers ds ON d.dossier_id = ds.dossier_id "
-            "WHERE c.rn = 1",
-            params,
-        ).fetchall()
+        # Batch the IN(...) lists: SQLite caps bound parameters (~32k) and
+        # completeness is uncapped by design now.
+        _BATCH = 4000
+        rows: List[Any] = []
+        for want_type in ("metadata", "body") if effective_type is None else (effective_type,):
+            ids = [d for d, s in doc_hits if s == ("meta" if want_type == "metadata" else "body")] \
+                if effective_type is None else [d for d, _s in doc_hits]
+            for start in range(0, len(ids), _BATCH):
+                batch = ids[start:start + _BATCH]
+                ph = ",".join("?" * len(batch))
+                doc_params: List[Any] = list(batch)
+                doc_params.append(want_type)
+                rows.extend(conn.execute(
+                "SELECT c.chunk_id, c.doc_id, c.page, c.text_original,"
+                "       c.bbox, c.chunk_type,"
+                "       d.kie_doc_number_symbol AS doc_number,"
+                "       d.kie_doc_subject       AS subject,"
+                "       d.kie_issue_org_name    AS issue_org,"
+                "       d.kie_issue_org_superior AS issue_org_superior,"
+                "       d.kie_signer_name       AS signer_name,"
+                "       d.kie_place_date        AS issue_date,"
+                "       d.kie_doc_type          AS doc_type,"
+                "       d.file_name, d.file_path,"
+                "       d.dossier_id, ds.title AS dossier_title,"
+                "       ds.fonds, ds.catalog, ds.dossier_code "
+                "FROM ("
+                "  SELECT c1.*, ROW_NUMBER() OVER ("
+                "    PARTITION BY c1.doc_id ORDER BY c1.chunk_id"
+                "  ) AS rn FROM chunks c1 "
+                f"  WHERE c1.doc_id IN ({ph}) AND c1.indexed_status = 'indexed' "
+                "  AND c1.chunk_type = ? "
+                ") c "
+                "JOIN documents d ON c.doc_id = d.doc_id "
+                "LEFT JOIN dossiers ds ON d.dossier_id = ds.dossier_id "
+                "WHERE c.rn = 1",
+                doc_params,
+            ).fetchall())
         out: List[SearchResult] = []
         for r in rows:
             try:

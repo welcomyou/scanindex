@@ -147,7 +147,11 @@ def main() -> int:
             ("no-match", "không tồn tại xyzzy", {}),
             ("filtered-phrase", "Nơi nhận", {"fonds": "B01"}),
             ("substring", "ternetdan", {}),
-            ("fuzzy-ocr", "Nơi nhạn", {}),
+            # TRUE fuzzy: "nhậx" is NOT a no-diacritic variant of "nhận"
+            # (that would be "nhan") — edit-distance-1 OCR slip.
+            ("fuzzy-real", "Nơi nhậx", {}),
+            # Sanity: the old "fuzzy-ocr" label measured exact no-diacritic.
+            ("nodiac-exact", "Nơi nhạn", {}),
         ]
         report = {"label": label, "setup": stats, "queries": []}
         for name, q, filters in battery:

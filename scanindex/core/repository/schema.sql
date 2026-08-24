@@ -157,12 +157,13 @@ CREATE TABLE IF NOT EXISTS index_meta (
 
 -- =====================================================================
 -- index_jobs — outbox for crash-safe SQLite ↔ Tantivy synchronisation.
--- A job row is written in the SAME transaction as the document mutation;
--- it is deleted only after the matching Tantivy commit succeeded. Startup
--- replays whatever is left (delete + re-add per doc, idempotent), closing
--- the window where a crash between the two commits left the derived index
--- silently stale — a state the chunk-count watermark could not detect
--- (same chunk count before and after an edit).
+-- A job row is written BEFORE the document mutation (autocommit mode);
+-- it is deleted only after the matching Tantivy commit succeeded, and
+-- only for the jobs the writing session itself enqueued. Because replay
+-- rebuilds from the FINAL SQLite truth, a job surviving a partial crash
+-- is harmless (idempotent re-add/purge) — the guarantee needed is "a job
+-- exists whenever divergence is possible", which enqueue-first satisfies
+-- without wrapping long imports in write transactions.
 -- =====================================================================
 CREATE TABLE IF NOT EXISTS index_jobs (
     job_id     INTEGER PRIMARY KEY AUTOINCREMENT,

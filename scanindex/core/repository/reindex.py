@@ -39,9 +39,11 @@ _BATCH_SIZE = 2000
 # ---------------------------------------------------------------------------
 
 _DOC_RECORD_META_SQL = (
-    "SELECT kie_doc_number_symbol, kie_issue_org_name, "
-    "kie_issue_org_superior, kie_signer_name, kie_doc_subject, "
-    "kie_recipients FROM documents WHERE doc_id = ?"
+    "SELECT kie_regime_header, kie_issue_org_superior, kie_issue_org_name,"
+    " kie_doc_number_symbol, kie_place_date, kie_doc_subject,"
+    " kie_addressee, kie_recipients, kie_signer_role, kie_signer_name,"
+    " kie_urgency_mark, kie_secrecy_mark, kie_circulation_mark,"
+    " kie_doc_type FROM documents WHERE doc_id = ?"
 )
 
 
@@ -49,19 +51,24 @@ def document_norm_payload(conn, doc_id: str):
     """Canonical-stream payload for one document's Tantivy record.
 
     Returns (dossier_id, meta_norm, body_pages_norm) or None when the doc
-    no longer exists. `meta_norm` folds the KIE projections; each body
-    page's chunks are concatenated and normalized with the SAME
+    no longer exists. `meta_norm` folds ALL 14 KIE fields, each separated
+    by a FIELD sentinel so a phrase can never match across two fields;
+    each body page's chunks are concatenated and normalized with the SAME
     tokenizer.search_norm the phrase verifier uses — single source of
     truth on both sides of the query.
     """
+    from .tokenizer import FIELD_SENTINEL_TOKEN
+
     d = conn.execute(_DOC_RECORD_META_SQL, (doc_id,)).fetchone()
     if d is None:
         return None
-    meta_norm = search_norm(" ".join(filter(None, [
-        d["kie_doc_number_symbol"], d["kie_issue_org_name"],
-        d["kie_issue_org_superior"], d["kie_signer_name"],
-        d["kie_doc_subject"], d["kie_recipients"],
-    ])))
+    field_norms = [
+        search_norm(d[key] or "")
+        for key in d.keys()
+    ]
+    meta_norm = f" {FIELD_SENTINEL_TOKEN} ".join(
+        fn for fn in field_norms if fn
+    )
     did_row = conn.execute(
         "SELECT dossier_id FROM documents WHERE doc_id = ?", (doc_id,)
     ).fetchone()
@@ -101,21 +108,35 @@ def _add_document_record_from_sql(index: HybridIndex, conn, doc_id: str) -> bool
 # Outbox: crash-safe SQLite → Tantivy synchronisation (schema v11)
 # ---------------------------------------------------------------------------
 
-def enqueue_index_job(conn, doc_id: str, op: str = "reindex") -> None:
+def enqueue_index_job(conn, doc_id: str, op: str = "reindex", *,
+                      store: "ArchiveStore | None" = None):
     """Record that `doc_id`'s Tantivy state must be rebuilt.
 
     Called BEFORE the SQLite mutation: the connection is autocommit, so
     the job may outlive a partially-applied mutation — which is fine,
     because replay rebuilds from the FINAL SQLite truth (idempotent).
-    Cleared by note_index_write() after the covering Tantivy commit.
+
+    With `store` passed, the new job id is tracked on that store instance
+    so note_index_write() deletes exactly THIS session's applied jobs —
+    never a concurrent worker's pending ones. Returns the job id (or None
+    on a pre-v11 schema, where replay is unavailable by design).
     """
     try:
-        conn.execute(
+        cur = conn.execute(
             "INSERT INTO index_jobs (doc_id, op, created_at) VALUES (?, ?, ?)",
             (doc_id, op, int(time.time())),
         )
-    except Exception:
-        pass  # pre-v11 schema — replay is best-effort hardening
+    except Exception as exc:
+        if "no such table" in str(exc):
+            return None  # pre-v11 schema — outbox hardening unavailable
+        raise  # real failure: surface it, never silently lose the job
+    job_id = int(cur.lastrowid)
+    if store is not None:
+        try:
+            store._session_job_ids.add(job_id)
+        except Exception:
+            pass
+    return job_id
 
 
 def replay_pending_index_jobs(store: ArchiveStore, index: HybridIndex) -> dict:
@@ -267,18 +288,27 @@ def _count_indexable_chunks(store: ArchiveStore) -> int:
 def note_index_write(store: ArchiveStore) -> None:
     """Refresh the built-chunks watermark after any index-writing session
     (import / admin edit / repair) so staleness detection stays accurate.
-    Also clears the outbox: callers invoke this right AFTER a successful
-    Tantivy commit, so every job enqueued this session is now in sync.
-    (Jobs from previous sessions were already replayed at startup.)"""
+    Also clears the outbox — but ONLY the job ids THIS store instance
+    enqueued (they are the ones the just-finished Tantivy commit covered).
+    Jobs from other concurrent workers survive untouched; a crashed
+    session's ids are simply never deleted, so startup replays them."""
     try:
         store.set_meta("indexer_built_chunks", str(_count_indexable_chunks(store)))
         store.set_meta("indexer_version", C.INDEXER_VERSION)
     except Exception:
         pass  # bookkeeping only; never fail the caller's commit path
-    try:
-        store.connect().execute("DELETE FROM index_jobs")
-    except Exception:
-        pass
+    ids = list(getattr(store, "_session_job_ids", set()) or ())
+    if not ids:
+        return
+    conn = store.connect()
+    for start in range(0, len(ids), 1000):
+        batch = ids[start:start + 1000]
+        try:
+            ph = ",".join("?" * len(batch))
+            conn.execute(f"DELETE FROM index_jobs WHERE job_id IN ({ph})", batch)
+        except Exception:
+            break  # never fail the caller's commit path
+    store._session_job_ids.clear()
 
 
 def rebuild_search_index(store: ArchiveStore,

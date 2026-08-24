@@ -491,9 +491,25 @@ class HybridIndex:
         over-fetched top-K) guarantees in-scope hits are never displaced by
         out-of-scope ones. Returns None when the combination is not
         possible, so callers fall back to the old post-filter path.
+
+        None means "no filter". An EMPTY set is a *valid* filter that
+        matches nothing — it must not be treated as "no filter" here (an
+        unfiltered query would silently return everything).
         """
-        if not filter_doc_ids:
+        if filter_doc_ids is None:
             return query
+        if not filter_doc_ids:
+            # Valid empty scope: build a boolean that can match nothing.
+            try:
+                termset = tantivy.Query.term_set_query(
+                    self._tan_index.schema, "doc_id", []
+                )
+                return tantivy.Query.boolean_query([
+                    (tantivy.Occur.Must, termset),
+                    (tantivy.Occur.Must, query),
+                ])
+            except Exception:
+                return None
         try:
             termset = tantivy.Query.term_set_query(
                 self._tan_index.schema, "doc_id", list(filter_doc_ids)
@@ -642,53 +658,55 @@ class HybridIndex:
                           limit: int,
                           filter_doc_ids: Optional[Set[str]] = None,
                           mode: str = "all",
-                          ) -> List[str]:
+                          ) -> List[Tuple[str, str]]:
         """DOCUMENT-level phrase query on the canonical norm streams.
 
-        Returns matching doc_ids (deduped). This is the completeness
-        authority: any document whose canonical stream contains the phrase
-        adjacently is returned, regardless of how its chunks rank. `mode`
-        restricts which stream is queried ("metadata" / "content" / "all")
-        so a body phrase never leaks into a metadata-only search.
+        Returns (doc_id, source) pairs, source ∈ {"meta", "body"} — the
+        caller uses it to attach the audit snippet to the right chunk
+        type (so a body-only phrase is never classified as a metadata
+        hit). This is the completeness authority: any document whose
+        canonical stream contains the phrase adjacently is returned,
+        regardless of how its chunks rank. `mode` restricts which stream
+        is queried ("metadata" / "content" / "all").
         """
         phrase = _escape_query(search_norm(query))
         if not phrase:
             return []
         meta_w = C.TANTIVY_FIELD_WEIGHTS.get("metadata_text", 2.5)
-        parts = []
-        fields: List[str] = []
+        out: List[Tuple[str, str]] = []
+        seen: Set[str] = set()
+        streams: List[Tuple[str, str, float]] = []
         if mode in ("all", "metadata"):
-            parts.append(f'doc_meta_norm:("{phrase}")^{meta_w}')
-            fields.append("doc_meta_norm")
+            streams.append(("doc_meta_norm", "meta", meta_w))
         if mode in ("all", "content"):
-            parts.append(f'doc_body_norm:("{phrase}")')
-            fields.append("doc_body_norm")
-        if not parts:
-            return []
-        try:
-            tan_query = self._tan_index.parse_query(" OR ".join(parts), fields)
-        except Exception:
-            return []
-        combined = self._with_doc_filter(tan_query, filter_doc_ids)
-        searcher = self._tan_index.searcher()
-        if combined is not None:
-            results = searcher.search(combined, limit=limit)
-        else:
-            results = searcher.search(tan_query, limit=limit * 2)
-        seen: List[str] = []
-        seen_set: Set[str] = set()
-        for _score, addr in results.hits:
-            doc_id_list = searcher.doc(addr)["doc_id"]
-            if not doc_id_list:
+            streams.append(("doc_body_norm", "body", 1.0))
+        for field, source, weight in streams:
+            try:
+                tan_query = self._tan_index.parse_query(
+                    f'{field}:("{phrase}")^{weight}', [field]
+                )
+            except Exception:
                 continue
-            doc_id = doc_id_list[0]
-            if doc_id in seen_set:
-                continue
-            if combined is None and filter_doc_ids is not None \
-                    and doc_id not in filter_doc_ids:
-                continue
-            seen.append(doc_id)
-            seen_set.add(doc_id)
-            if len(seen) >= limit:
-                break
-        return seen
+            combined = self._with_doc_filter(tan_query, filter_doc_ids)
+            searcher = self._tan_index.searcher()
+            if combined is not None:
+                results = searcher.search(combined, limit=limit)
+                post_filter = False
+            else:
+                results = searcher.search(tan_query, limit=limit * 2)
+                post_filter = True
+            for _score, addr in results.hits:
+                doc_id_list = searcher.doc(addr)["doc_id"]
+                if not doc_id_list:
+                    continue
+                doc_id = doc_id_list[0]
+                if post_filter and filter_doc_ids is not None \
+                        and doc_id not in filter_doc_ids:
+                    continue
+                if doc_id in seen:
+                    continue
+                seen.add(doc_id)
+                out.append((doc_id, source))
+                if len(out) >= limit:
+                    return out
+        return out

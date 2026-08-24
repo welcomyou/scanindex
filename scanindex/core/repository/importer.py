@@ -964,7 +964,7 @@ class Importer:
         from .reindex import _add_document_record_from_sql, enqueue_index_job
         # Outbox first: if anything below crashes before the Tantivy
         # commit, startup replay rebuilds this doc from the final truth.
-        enqueue_index_job(conn, doc_id)
+        enqueue_index_job(conn, doc_id, store=self.store)
         self._upsert_document_kie(
             doc_id, dossier_id, target_pdf, target_name,
             kie_fields, kie_annotation_json,

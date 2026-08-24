@@ -67,6 +67,11 @@ def build_filter_text(*field_values: Optional[str]) -> str:
 # real OCR text never produces it.
 PAGE_SENTINEL_TOKEN = "zpgbrkz9"
 
+# Inserted between KIE fields inside a document's meta_norm stream so a
+# phrase query can never match ACROSS two fields (issue_org "alpha" +
+# signer_name "beta" must not surface for the exact query "alpha beta").
+FIELD_SENTINEL_TOKEN = "zfldbrkz7"
+
 
 def search_norm(text: str) -> str:
     """Canonical phrase-search stream: tokens joined by single spaces."""

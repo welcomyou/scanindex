@@ -39,6 +39,10 @@ class ArchiveStore:
         # any call site that hasn't been migrated yet.
         self.db_path = self.archive_path / (db_filename or C.SQLITE_FILE)
         self._conn: Optional[sqlite3.Connection] = None
+        # Outbox bookkeeping: index-job ids enqueued through THIS store
+        # instance. note_index_write deletes exactly these — never another
+        # concurrent worker's pending jobs.
+        self._session_job_ids: set[int] = set()
 
     # ---------- Folder + connection ----------
 

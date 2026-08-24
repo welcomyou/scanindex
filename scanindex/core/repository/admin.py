@@ -243,7 +243,7 @@ def delete_document(store: ArchiveStore, index: HybridIndex,
     # Outbox: if the flow dies between the tantivy delete above and the
     # commit below, startup replay re-runs the (idempotent) purge.
     from .reindex import enqueue_index_job
-    enqueue_index_job(conn, doc_id, op="delete")
+    enqueue_index_job(conn, doc_id, op="delete", store=store)
 
     # Tantivy delete-by-doc (removes chunks AND the document record).
     index.delete_tantivy_by_doc(doc_id)
@@ -395,7 +395,7 @@ def update_document_metadata(store: ArchiveStore, index: HybridIndex,
     # Outbox: a crash between this UPDATE and the Tantivy commit must not
     # leave the derived index silently stale.
     from .reindex import enqueue_index_job
-    enqueue_index_job(conn, doc_id)
+    enqueue_index_job(conn, doc_id, store=store)
     conn.execute(
         f"UPDATE documents SET {sets}, updated_at = :now WHERE doc_id = :doc_id",
         params,
@@ -987,7 +987,7 @@ def add_document(store: ArchiveStore, index: HybridIndex, *,
     # Outbox: enqueue BEFORE any write so a crash mid-flow leaves a job
     # that startup replay converges from the final SQLite truth.
     from .reindex import enqueue_index_job
-    enqueue_index_job(conn, doc_id)
+    enqueue_index_job(conn, doc_id, store=store)
     cols_kie = {col: (kie_fields.get(col) or "") for col in KIE_COLUMNS}
     params = {
         "doc_id": doc_id, "dossier_id": dossier_id,

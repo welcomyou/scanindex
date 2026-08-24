@@ -1434,21 +1434,28 @@ def _filehit_relevance(fh: "FileHit", query_norm: str,
         int(c.match_count or 0) for c in chunks
         if (c.chunk_type or "body") != "metadata" and (c.match_kind or "") == "exact"
     )
-    body_words = sum(
-        len((c.text or "").split()) for c in chunks
-        if (c.chunk_type or "body") != "metadata"
-    )
+    # Length normalization uses the DOCUMENT's real word count when the
+    # engine projected it (SUM(chunks.word_count)); retrieved-chunk words
+    # are only a fallback for projections that lack it.
+    doc_words = int(getattr(fh.chunks[0], "doc_word_count", 0) or 0) if chunks else 0
+    if doc_words <= 0:
+        doc_words = sum(
+            len((c.text or "").split()) for c in chunks
+            if (c.chunk_type or "body") != "metadata"
+        )
     tf = (
         w * math.log2(1 + min(tf_meta, 3))
         + math.log2(1 + min(tf_body, 8))
-        / math.sqrt(max(body_words / 500.0, 1.0))
+        / math.sqrt(max(doc_words / 500.0, 1.0))
     )
 
     best_bm25 = max((getattr(c, "bm25", 0.0) or 0.0) for c in chunks) \
         if chunks else 0.0
-    bm25p = 100.0 * (best_bm25 / bm25_scale) if bm25_scale > 0 else 0.0
+    # Normalized to 0..1 — a LIGHT tie-break worth at most 5 points, not
+    # the earlier ×100 scale that let BM25 outweigh field weights.
+    bm25n = (best_bm25 / bm25_scale) if bm25_scale > 0 else 0.0
 
-    return 1000.0 * g + 40.0 * w + 10.0 * tf + 5.0 * bm25p
+    return 1000.0 * g + 40.0 * w + 10.0 * tf + 5.0 * bm25n
 
 
 def _group_results_by_file(results: List[SearchResult]) -> List[FileHit]:
