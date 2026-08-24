@@ -676,12 +676,21 @@ class SearchEngine:
         exact_doc_ids = {r.doc_id for r in exact_results}
         # Tantivy's dedicated no-diacritic field currently exists for OCR
         # body chunks, while metadata chunks keep their canonical spelling.
-        # When lexical search is sparse, use SQLite's persisted normalized
-        # chunk text to recover literal phrase matches such as "uy ban" ↔
-        # "Ủy ban". `_build_results` then applies strict normalized word
-        # boundaries, so these remain high-confidence keyword matches rather
-        # than being mislabeled as typo-tolerant fuzzy results.
-        if len(exact_doc_ids) < C.MIN_RESULTS and not _cancelled():
+        # SQLite's persisted normalized chunk text recovers literal phrase
+        # matches such as "uy ban" ↔ "Ủy ban". `_build_results` then applies
+        # strict normalized word boundaries, so these remain high-confidence
+        # keyword matches rather than being mislabeled as typo-tolerant
+        # fuzzy results.
+        #
+        # This pass now runs on EVERY keyword search (not only when the
+        # index found < MIN_RESULTS docs): the Tantivy passes cap candidates
+        # at TANTIVY_TOP_K *chunks*, and a phrase spread over many chunks
+        # per document hides whole documents — e.g. "Nơi nhận" in 77 of 90
+        # documents surfaced only 63 via the index. The instr scan runs at
+        # C speed inside SQLite; dense queries early-stop at
+        # PHRASE_COMPLETENESS_CHUNK_LIMIT, sparse ones pay the same cost
+        # the old conditional fallback did.
+        if not _cancelled():
             known_chunk_ids = {r.chunk_id for r in exact_results}
             normalized_hits = [
                 (cid, score)
@@ -689,7 +698,7 @@ class SearchEngine:
                     query,
                     candidate_doc_ids,
                     chunk_type_filter=chunk_type_filter,
-                    limit=C.TANTIVY_TOP_K,
+                    limit=C.PHRASE_COMPLETENESS_CHUNK_LIMIT,
                     cancel_check=cancel_check,
                 )
                 if cid not in known_chunk_ids
@@ -825,9 +834,19 @@ class SearchEngine:
             params,
         ).fetchall()
         hits: List[Tuple[int, str, float]] = []
+        budget_deadline = time.monotonic() + C.SPAN_FUZZY_TIME_BUDGET_SEC
         for n, row in enumerate(rows):
-            if cancel_check and n % 256 == 0 and cancel_check():
-                break
+            if n % 256 == 0:
+                if cancel_check and cancel_check():
+                    break
+                # Wall-clock budget: this is the only stage whose cost grows
+                # linearly with the archive; past the budget the search
+                # returns what the index + SQL passes already found.
+                if time.monotonic() > budget_deadline:
+                    _log.info(
+                        "span-fuzzy budget hit after %d/%d chunks", n, len(rows)
+                    )
+                    break
             text = str(row["text_original"] or "")
             if len(text.strip()) < _MIN_CHUNK_TEXT_LEN:
                 continue

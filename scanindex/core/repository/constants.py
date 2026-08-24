@@ -27,6 +27,17 @@ IMPORT_LOG_FILE         = "import_log.json"
 # ---------- Search parameters ----------
 TANTIVY_TOP_K          = 100
 MIN_RESULTS            = 5              # below this -> fallback
+# Completeness guard: the Tantivy passes cap candidates at TANTIVY_TOP_K
+# *chunks*, so a phrase spread over many chunks per document (e.g. "Nơi
+# nhận" in nearly every doc) can hide whole documents. The literal-phrase
+# SQL pass therefore ALWAYS unions into the exact group, up to this many
+# chunks (dense queries early-stop at the limit inside SQLite).
+PHRASE_COMPLETENESS_CHUNK_LIMIT = 4000
+# The Python span-fuzzy fallback (rapidfuzz over every chunk) is the one
+# linear-in-archive-size stage left. Give it a wall-clock budget: past it,
+# the search returns what it already collected (index passes + SQL phrase
+# pass) instead of grinding for minutes on a huge archive.
+SPAN_FUZZY_TIME_BUDGET_SEC = 3.0
 
 # ---------- Indexer schema ----------
 # v2: every searchable field gains a no-diacritic twin (default tokenizer) and
