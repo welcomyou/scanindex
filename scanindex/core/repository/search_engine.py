@@ -641,7 +641,13 @@ class SearchEngine:
         """Run the hybrid search. `cancel_check` (polled between stages and
         inside the linear fallback loops) aborts the remaining stages and
         returns the partial results collected so far — a cancelled search
-        still shows what the fast index passes already found."""
+        still shows what the fast index passes already found.
+
+        Sets self.fuzzy_budget_exhausted = True when the deep fuzzy scan
+        hit its wall-clock budget, so the UI can tell the user the
+        near-match list may be incomplete."""
+        self.fuzzy_budget_exhausted = False
+
         def _cancelled() -> bool:
             return bool(cancel_check and cancel_check())
 
@@ -1092,6 +1098,7 @@ class SearchEngine:
                     # search returns what was already collected.
                     if time.monotonic() > budget_deadline:
                         _log.info("span-fuzzy budget hit after %d chunks", n)
+                        self.fuzzy_budget_exhausted = True
                         cur.close()
                         hits.sort(key=lambda item: item[2], reverse=True)
                         return hits[:max(1, int(limit or 1))]

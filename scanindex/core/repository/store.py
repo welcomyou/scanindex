@@ -39,10 +39,18 @@ class ArchiveStore:
         # any call site that hasn't been migrated yet.
         self.db_path = self.archive_path / (db_filename or C.SQLITE_FILE)
         self._conn: Optional[sqlite3.Connection] = None
-        # Outbox bookkeeping: index-job ids enqueued through THIS store
-        # instance. note_index_write deletes exactly these — never another
-        # concurrent worker's pending jobs.
-        self._session_job_ids: set[int] = set()
+        # Outbox bookkeeping: doc_ids whose Tantivy writes THIS session
+        # completed successfully (chunks + document record handed to the
+        # writer). note_index_write acknowledges exactly these — a
+        # document that FAILED mid-import keeps its job for startup
+        # replay, and another concurrent worker's jobs are never touched.
+        self._applied_job_docs: set[str] = set()
+
+    def note_job_applied(self, doc_id: str) -> None:
+        """Mark `doc_id`'s outbox job as applied (called right after the
+        doc's Tantivy writes succeeded, before the batch commit)."""
+        if doc_id:
+            self._applied_job_docs.add(doc_id)
 
     # ---------- Folder + connection ----------
 

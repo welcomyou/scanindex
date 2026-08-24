@@ -125,7 +125,7 @@ class ImportWorker(QThread):
 
 
 class SearchWorker(QThread):
-    finished_ok = Signal(list)
+    finished_ok = Signal(list, bool)   # results, fuzzy_budget_exhausted
     failed = Signal(str)
 
     def __init__(self, engine: SearchEngine, query: str, filters: dict, mode: str):
@@ -151,7 +151,10 @@ class SearchWorker(QThread):
                 self._query, self._filters, self._mode,
                 cancel_check=lambda: self._cancel,
             )
-            self.finished_ok.emit(results)
+            self.finished_ok.emit(
+                results,
+                bool(getattr(self._engine, "fuzzy_budget_exhausted", False)),
+            )
         except Exception as e:
             self.failed.emit(str(e))
 
@@ -5615,7 +5618,8 @@ class RepositoryScreen(ScreenContent):
         self._search_worker.failed.connect(self._on_search_failed)
         self._search_worker.start()
 
-    def _on_search_done(self, results: List[SearchResult]):
+    def _on_search_done(self, results: List[SearchResult],
+                        fuzzy_truncated: bool = False):
         cancelled = self._search_cancel_requested
         self._busy = False
         self._search_cancel_requested = False
@@ -5640,6 +5644,11 @@ class RepositoryScreen(ScreenContent):
         if cancelled:
             self._list_count_label.setText(
                 "Đã hủy — " + self._list_count_label.text().lower()
+            )
+        elif fuzzy_truncated:
+            self._list_count_label.setText(
+                self._list_count_label.text()
+                + " · kết quả gần đúng có thể thiếu (hết thời gian quét sâu)"
             )
 
     def _sorted_search_hits(self) -> List[FileHit]:

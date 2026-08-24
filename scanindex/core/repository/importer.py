@@ -1000,6 +1000,10 @@ class Importer:
         # Indexer v3: the DOCUMENT-level phrase record (built from the now
         # final SQLite state, same session as the chunk writes above).
         _add_document_record_from_sql(self.index, conn, doc_id)
+        # Outbox acknowledge: this doc's Tantivy writes are complete. A
+        # doc that throws anywhere above never reaches this line, so its
+        # job survives for startup replay.
+        self.store.note_job_applied(doc_id)
         return True, duplicate
 
     # ---------- Per-chunk insert helpers (v2) ----------

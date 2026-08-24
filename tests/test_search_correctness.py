@@ -283,8 +283,9 @@ def test_outbox_session_scoping(engine):
     store_b.connect()
     conn_b = store_b.connect()
     enqueue_index_job(conn_b, probe, store=store_b)
-    # Store A (khác phiên) ghi index xong và note_index_write.
-    store._session_job_ids.clear()          # A không có job nào
+    # Store A (khác phiên) ghi index xong và note_index_write — A không
+    # acknowledge doc nào (chưa note_job_applied).
+    store._applied_job_docs.clear()          # A không có doc nào đã apply
     note_index_write(store)
     left = conn.execute("SELECT COUNT(*) FROM index_jobs").fetchone()[0]
     assert left == 1, "job của store B phải sống sót qua note_index_write của A"
@@ -328,7 +329,75 @@ def test_merged_token_fuzzy(engine):
     replay_pending_index_jobs(store, idx)
 
 
-# ---- 7. Ranking scale guard ---------------------------------------------------
+# ---- 7. Overlap join must not create artificial phrases (round-3 P0) -------
+
+def test_overlapping_chunks_do_not_create_artificial_phrases(engine):
+    """Chuyên gia tái hiện: chunk1 '...gamma delta', chunk2 'gamma delta
+    epsilon...' (overlap chunker) — query 'delta gamma' phải ÂM TÍNH vì
+    cụm không tồn tại trong văn bản gốc."""
+    eng, store, idx, dst = engine
+    conn = store.connect()
+    probe = conn.execute(
+        "SELECT doc_id FROM documents LIMIT 1").fetchone()["doc_id"]
+    for block_idx, text in ((0, "alpha beta gamma delta"),
+                            (1, "gamma delta epsilon zeta")):
+        conn.execute(
+            "INSERT INTO chunks (doc_id, doc_version, chunk_type, page,"
+            " block_idx, text_original, text_no_diacritic, bbox,"
+            " word_count, indexed_status, created_at)"
+            " VALUES (?, 1, 'body', 7, ?, ?, ?, '[]', 4, 'indexed', 0)",
+            (probe, block_idx, text, to_no_diacritic(text).lower()))
+    enqueue_index_job(conn, probe)
+    replay_pending_index_jobs(store, idx)
+
+    res = eng.search("delta gamma", {}, "all")
+    exact = [r for r in res if r.doc_id == probe and r.match_kind == "exact"]
+    assert not exact, (
+        f"cụm nhân tạo tại điểm nối overlap: {len(exact)} exact — "
+        "de-overlap phải triệt tiêu"
+    )
+    # Đối chứng dương: cụm CÓ THẬT vẫn tìm được, kể cả xuyên điểm nối
+    # thật (sau khi bỏ overlap, 'delta' kết thúc chunk1, 'epsilon' mở
+    # đầu phần còn lại của chunk2).
+    ok1 = eng.search("gamma delta", {}, "all")
+    assert probe in _docs(ok1), "cụm thật 'gamma delta' vẫn phải khớp"
+    ok2 = eng.search("delta epsilon", {}, "all")
+    assert probe in _docs(ok2), "cụm thật xuyên ranh giới chunk vẫn phải khớp"
+
+    conn.execute("DELETE FROM chunks WHERE doc_id = ? AND page = 7", (probe,))
+    enqueue_index_job(conn, probe)
+    replay_pending_index_jobs(store, idx)
+
+
+# ---- 8. Outbox acknowledges per-APPLIED doc (round-3 P0) --------------------
+
+def test_note_index_write_keeps_failed_docs_job(engine):
+    """Chuyên gia tái hiện: job A (tài liệu LỖI trước khi index) và job B
+    (thành công) cùng store — note_index_write chỉ được xóa B."""
+    from scanindex.core.repository.reindex import note_index_write
+
+    eng, store, idx, dst = engine
+    conn = store.connect()
+    docs = [r["doc_id"] for r in conn.execute(
+        "SELECT doc_id FROM documents LIMIT 2").fetchall()]
+    doc_a, doc_b = docs
+    # A: enqueue nhưng thất bại (không bao giờ note_job_applied).
+    enqueue_index_job(conn, doc_a, store=store)
+    # B: enqueue + tantivy writes thành công → acknowledge.
+    enqueue_index_job(conn, doc_b, store=store)
+    store.note_job_applied(doc_b)
+    note_index_write(store)
+    left = {r["doc_id"] for r in conn.execute(
+        "SELECT doc_id FROM index_jobs").fetchall()}
+    assert left == {doc_a}, (
+        f"job của tài liệu lỗi phải sống sót, còn lại: {left}"
+    )
+    # Dọn: replay hội tụ A.
+    replay_pending_index_jobs(store, idx)
+    assert conn.execute("SELECT COUNT(*) FROM index_jobs").fetchone()[0] == 0
+
+
+# ---- 9. Ranking scale guard ---------------------------------------------------
 
 def test_bm25_is_light_tiebreak_only():
     """Kiểm công thức: chênh BM25 tối đa chỉ đổi 5 điểm, không lật tier."""

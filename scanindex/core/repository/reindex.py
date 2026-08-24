@@ -24,7 +24,7 @@ from typing import Callable, Optional
 from . import constants as C
 from .indexer import HybridIndex
 from .store import ArchiveStore
-from .tokenizer import search_norm, to_no_diacritic
+from .tokenizer import norm_tokens, search_norm, to_no_diacritic
 
 _log = logging.getLogger(__name__)
 
@@ -45,6 +45,28 @@ _DOC_RECORD_META_SQL = (
     " kie_urgency_mark, kie_secrecy_mark, kie_circulation_mark,"
     " kie_doc_type FROM documents WHERE doc_id = ?"
 )
+
+# Long chunks are split with CHUNK_OVERLAP_WORDS of repeated context, so
+# naively concatenating a page's chunks duplicates the overlap and creates
+# ARTIFICIAL phrases at the join ("delta" + "gamma" from two chunks
+# matching a query that never existed in the document). De-overlap before
+# building the page stream: strip an exact suffix==prefix repeat (the
+# chunker always re-emits the overlap verbatim).
+_DEOVERLAP_MAX_TOKENS = 40   # chunker overlap is 30; slack for safety
+_DEOVERLAP_MIN_TOKENS = 2
+
+
+def _deoverlap_page_tokens(token_lists: list) -> list:
+    out: list = []
+    for toks in token_lists:
+        if out and len(toks) >= _DEOVERLAP_MIN_TOKENS:
+            max_n = min(len(out), len(toks), _DEOVERLAP_MAX_TOKENS)
+            for n in range(max_n, _DEOVERLAP_MIN_TOKENS - 1, -1):
+                if out[-n:] == toks[:n]:
+                    toks = toks[n:]
+                    break
+        out.extend(toks)
+    return out
 
 
 def document_norm_payload(conn, doc_id: str):
@@ -79,13 +101,15 @@ def document_norm_payload(conn, doc_id: str):
         "AND indexed_status = 'indexed' ORDER BY page, chunk_id",
         (doc_id,),
     ).fetchall()
-    pages: dict[int, list[str]] = {}
+    pages: dict[int, list[list]] = {}
     for r in rows:
-        pages.setdefault(int(r["page"] or 1), []).append(r["text_original"] or "")
+        pages.setdefault(int(r["page"] or 1), []).append(
+            norm_tokens(r["text_original"] or "")
+        )
     body_pages = [
-        search_norm(" ".join(texts))
-        for _page, texts in sorted(pages.items())
-        if any(texts)
+        " ".join(_deoverlap_page_tokens(token_lists))
+        for _page, token_lists in sorted(pages.items())
+        if any(token_lists)
     ]
     return dossier_id, meta_norm, body_pages
 
@@ -115,11 +139,10 @@ def enqueue_index_job(conn, doc_id: str, op: str = "reindex", *,
     Called BEFORE the SQLite mutation: the connection is autocommit, so
     the job may outlive a partially-applied mutation — which is fine,
     because replay rebuilds from the FINAL SQLite truth (idempotent).
-
-    With `store` passed, the new job id is tracked on that store instance
-    so note_index_write() deletes exactly THIS session's applied jobs —
-    never a concurrent worker's pending ones. Returns the job id (or None
-    on a pre-v11 schema, where replay is unavailable by design).
+    The job is acknowledged later, per document, via
+    ``store.note_job_applied(doc_id)`` once that doc's Tantivy writes
+    succeeded — never wholesale at session level. Returns the job id (or
+    None on a pre-v11 schema, where replay is unavailable by design).
     """
     try:
         cur = conn.execute(
@@ -130,13 +153,7 @@ def enqueue_index_job(conn, doc_id: str, op: str = "reindex", *,
         if "no such table" in str(exc):
             return None  # pre-v11 schema — outbox hardening unavailable
         raise  # real failure: surface it, never silently lose the job
-    job_id = int(cur.lastrowid)
-    if store is not None:
-        try:
-            store._session_job_ids.add(job_id)
-        except Exception:
-            pass
-    return job_id
+    return int(cur.lastrowid)
 
 
 def replay_pending_index_jobs(store: ArchiveStore, index: HybridIndex) -> dict:
@@ -288,27 +305,28 @@ def _count_indexable_chunks(store: ArchiveStore) -> int:
 def note_index_write(store: ArchiveStore) -> None:
     """Refresh the built-chunks watermark after any index-writing session
     (import / admin edit / repair) so staleness detection stays accurate.
-    Also clears the outbox — but ONLY the job ids THIS store instance
-    enqueued (they are the ones the just-finished Tantivy commit covered).
-    Jobs from other concurrent workers survive untouched; a crashed
-    session's ids are simply never deleted, so startup replays them."""
+    Acknowledges the outbox for EXACTLY the documents whose Tantivy writes
+    this session completed (store.note_job_applied) — a document that
+    failed mid-import keeps its job for startup replay, and another
+    concurrent worker's pending jobs are never touched."""
     try:
         store.set_meta("indexer_built_chunks", str(_count_indexable_chunks(store)))
         store.set_meta("indexer_version", C.INDEXER_VERSION)
     except Exception:
         pass  # bookkeeping only; never fail the caller's commit path
-    ids = list(getattr(store, "_session_job_ids", set()) or ())
-    if not ids:
+    docs = list(getattr(store, "_applied_job_docs", set()) or ())
+    if not docs:
         return
     conn = store.connect()
-    for start in range(0, len(ids), 1000):
-        batch = ids[start:start + 1000]
+    for start in range(0, len(docs), 4000):
+        batch = docs[start:start + 4000]
         try:
             ph = ",".join("?" * len(batch))
-            conn.execute(f"DELETE FROM index_jobs WHERE job_id IN ({ph})", batch)
+            conn.execute(
+                f"DELETE FROM index_jobs WHERE doc_id IN ({ph})", batch)
         except Exception:
             break  # never fail the caller's commit path
-    store._session_job_ids.clear()
+    store._applied_job_docs.clear()
 
 
 def rebuild_search_index(store: ArchiveStore,

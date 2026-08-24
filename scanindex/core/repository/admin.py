@@ -247,6 +247,7 @@ def delete_document(store: ArchiveStore, index: HybridIndex,
 
     # Tantivy delete-by-doc (removes chunks AND the document record).
     index.delete_tantivy_by_doc(doc_id)
+    store.note_job_applied(doc_id)   # outbox acknowledge (per-doc)
 
     # Hard-delete SQL row: CASCADE wipes chunks.
     conn.execute("DELETE FROM documents WHERE doc_id = ?", (doc_id,))
@@ -511,6 +512,7 @@ def update_document_metadata(store: ArchiveStore, index: HybridIndex,
     # edited truth (delete_tantivy_by_doc above removed the old one).
     from .reindex import _add_document_record_from_sql
     _add_document_record_from_sql(index, conn, doc_id)
+    store.note_job_applied(doc_id)   # outbox acknowledge (per-doc)
     index.commit()
     note_index_write(store)
 
@@ -1092,6 +1094,7 @@ def add_document(store: ArchiveStore, index: HybridIndex, *,
     # Indexer v3: document-level phrase record from the final SQLite state.
     from .reindex import _add_document_record_from_sql
     _add_document_record_from_sql(index, conn, doc_id)
+    store.note_job_applied(doc_id)   # outbox acknowledge (per-doc)
     index.commit()
     store.refresh_counters()
     note_index_write(store)
