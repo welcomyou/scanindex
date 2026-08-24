@@ -60,6 +60,15 @@ else:
     except Exception as exc:
         print(f"[Portable] Warning: setup_offline_mode failed: {exc}")
 
+# Durable rotating file log (<base_dir>/logs/app.log). Every UI log message
+# and the scanindex.* loggers land here; setup is idempotent and can never
+# block startup.
+try:
+    from scanindex.infra import app_log
+    app_log.setup()
+except Exception:
+    pass
+
 # FORCE CPU ONLY — must be before any torch import
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"

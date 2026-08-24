@@ -55,6 +55,13 @@ _LOG_PREFIX = "[Versioning]"
 
 
 def _log(msg: str) -> None:
+    # Durable trail: bare print() is invisible in a windowed build.
+    try:
+        from scanindex.infra.app_log import write as _app_log_write
+        _app_log_write(f"{_LOG_PREFIX} {msg}", "info")
+        return
+    except Exception:
+        pass
     print(f"{_LOG_PREFIX} {msg}")
 
 

@@ -15,6 +15,7 @@ release keeps reading its own folder, at worst with stale search results.
 """
 from __future__ import annotations
 
+import logging
 import shutil
 import time
 from pathlib import Path
@@ -24,6 +25,8 @@ from . import constants as C
 from .indexer import HybridIndex
 from .store import ArchiveStore
 from .tokenizer import to_no_diacritic
+
+_log = logging.getLogger(__name__)
 
 ProgressCallback = Callable[[int, int], None]
 CancelCheck = Callable[[], bool]
@@ -101,6 +104,7 @@ def rebuild_search_index(store: ArchiveStore,
     build_dir = archive_path / (C.TANTIVY_SUBDIR + ".building")
     t0 = time.time()
     total = _count_indexable_chunks(store)
+    _log.info("rebuild start: %s chunks to index (target=%s)", total, target_dir.name)
 
     if build_dir.exists():
         shutil.rmtree(build_dir, ignore_errors=True)
@@ -126,6 +130,7 @@ def rebuild_search_index(store: ArchiveStore,
             if cancel_check and cancel_check():
                 staging.close()
                 shutil.rmtree(build_dir, ignore_errors=True)
+                _log.info("rebuild cancelled at %d/%d chunks", done, total)
                 return {"cancelled": True, "chunks": done}
             dossier_id = int(r["dossier_id"]) if r["dossier_id"] is not None else None
             if r["chunk_type"] == "metadata":
@@ -176,4 +181,6 @@ def rebuild_search_index(store: ArchiveStore,
     store.set_meta("indexer_built_chunks", str(done))
     if progress_cb:
         progress_cb(done, total)
+    _log.info("rebuild done: %d chunks in %.1fs -> %s",
+              done, time.time() - t0, target_dir.name)
     return {"chunks": done, "elapsed": time.time() - t0}

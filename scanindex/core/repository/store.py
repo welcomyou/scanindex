@@ -131,12 +131,17 @@ class ArchiveStore:
                 converted = convert_schema_to_latest(conn)
                 conn.commit()
                 if converted:
-                    print(f"[Store] schema self-healed {converted[0]} -> "
-                          f"{converted[1]} for {self.db_path.name}")
+                    from scanindex.infra.app_log import write as _app_write
+                    _app_write(
+                        f"[Store] schema self-healed {converted[0]} -> "
+                        f"{converted[1]} for {self.db_path.name}", "success",
+                    )
         except MissingConverterError:
             pass  # flagged below via version_mismatches(); never start fresh
         except Exception as exc:
-            print(f"[Store] schema self-heal skipped (non-fatal): {exc}")
+            from scanindex.infra.app_log import write as _app_write
+            _app_write(f"[Store] schema self-heal skipped (non-fatal): {exc}",
+                       "warning")
         self._seed_meta_if_empty()
         self.set_meta(
             "needs_migration",

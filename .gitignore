@@ -76,6 +76,8 @@ temp_cleanup_*.csv
 # --- Local agent/tooling scratch ---
 .zcode/
 .grep_py_results.txt
+# Persistent rotating app log (recreated at runtime)
+logs/
 
 # --- Operating System ---
 .DS_Store

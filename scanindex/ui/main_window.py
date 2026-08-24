@@ -1438,6 +1438,13 @@ class MainWindow(QMainWindow):
 
     @Slot(str, str)
     def _on_log_message(self, msg, level):
+        # Mirror every UI log into the persistent rotating file so support
+        # has a durable trail after the app closes (the LogPanel is RAM-only).
+        try:
+            from scanindex.infra import app_log
+            app_log.write(msg, level)
+        except Exception:
+            pass
         if hasattr(self, 'log_panel'):
             self.log_panel.append_log(msg, level)
 
