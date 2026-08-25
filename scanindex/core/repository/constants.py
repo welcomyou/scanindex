@@ -50,6 +50,21 @@ PHRASE_CHUNK_RANK_LIMIT = 2000
 # narrower query (the index fuzzy + trigram passes already ran).
 SPAN_FUZZY_TIME_BUDGET_SEC = 1.5
 
+# ---------- Near-match (fuzzy) thresholds ----------
+# Lucene-AUTO-style edit-distance caps, scaled by the diacritic-stripped
+# token length. TIGHTENED (round 6): Vietnamese words are mostly 4-7
+# chars after diacritic stripping, and 2 edits on a 6-char token
+# ("phuong" ~ "truong") reads as "not near at all" — that bulk was also
+# what bloated the "Kết quả gần đúng" group. One edit still catches the
+# usual OCR slips ("trêx" → "trên"); two edits are only tolerated on
+# long tokens (≥ 8 chars) where they stay a small fraction of the word.
+# Single source of truth: the Tantivy fuzzy query (indexer), the Python
+# verifier (search_engine) and the highlight painter (screen) all read
+# these boundaries. Lower FUZZY_ONE_EDIT_MAX_LEN (e.g. 5) to shrink the
+# near-match group further; raise it to loosen near-matches again.
+FUZZY_EXACT_MAX_LEN     = 2   # len <= 2  → 0 edits (exact only)
+FUZZY_ONE_EDIT_MAX_LEN  = 7   # len <= 7  → 1 edit; longer → 2 edits
+
 # ---------- Indexer schema ----------
 # v2: no-diacritic + trigram twins on every searchable field, so queries
 # typed without Vietnamese diacritics and OCR slips are served by the

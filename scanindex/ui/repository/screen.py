@@ -958,13 +958,16 @@ def _display_fuzzy_token_match(qt: str,
             return False
         if qt[:1] != token[:1]:
             return False
-        max_dist = 0 if len(qt) <= 2 else (1 if len(qt) <= 5 else 2)
+        max_dist = (
+            0 if len(qt) <= C.FUZZY_EXACT_MAX_LEN
+            else (1 if len(qt) <= C.FUZZY_ONE_EDIT_MAX_LEN else 2)
+        )
     else:
         if len(qt) <= 2:
             if not allow_short_fuzzy:
                 return False
             return qt == token
-        max_dist = 1 if len(qt) <= 5 else 2
+        max_dist = 1 if len(qt) <= C.FUZZY_ONE_EDIT_MAX_LEN else 2
         if abs(len(qt) - len(token)) > max_dist:
             return False
     try:
@@ -5926,9 +5929,18 @@ class RepositoryScreen(ScreenContent):
             # freshly cached bboxes.
             if (self._current_file is not None
                     and _doc_id == self._current_file.doc_id):
+                chunks_now = self._current_search_chunks_for_file()
+                self._fill_bboxes_from_cache(chunks_now)
+                # Round-6 fix: the FIRST open of a search hit races the
+                # async hydration — show_pdf ran before the boxes existed
+                # and cleared the highlight, so nothing was drawn until
+                # the user clicked away and back. Paint the freshly
+                # hydrated boxes onto the still-open PDF in place (no
+                # page jump) instead of waiting for the next click.
+                self._apply_match_highlight_to_pane(chunks_now)
                 self._right_panel.show_file(
                     self._current_file, self._archive_path,
-                    self._current_search_chunks_for_file(),
+                    chunks_now,
                 )
 
         def _on_fail(_msg: str):
@@ -5980,6 +5992,26 @@ class RepositoryScreen(ScreenContent):
         if hit is None:
             return []
         return list(hit.chunks or [])
+
+    def _apply_match_highlight_to_pane(self,
+                                       chunks: List[SearchResult]) -> None:
+        """Paint the hydrated match boxes onto the PDF pane WITHOUT moving
+        the page. Used after async bbox hydration: the first open of a
+        search hit shows the file before the word-level boxes exist (the
+        pane clears its highlight), and this callback then draws them in
+        place — previously they only appeared after clicking another
+        document and back. No-ops when the user already moved to a
+        different document or there is nothing to draw."""
+        if self._current_file is None or not self._current_file.file_path:
+            return
+        pdf_abs = (self._archive_path / self._current_file.file_path).resolve()
+        pane = self._pdf_pane
+        if getattr(pane, "_pdf_path", None) != str(pdf_abs):
+            return  # the pane is already showing a different document
+        page_boxes = self._match_page_boxes(chunks or [])
+        if not page_boxes:
+            return
+        pane.highlight_page_regions(page_boxes, "highlight")
 
     # ------ External-open helpers ------
 

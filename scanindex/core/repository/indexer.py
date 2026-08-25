@@ -254,7 +254,9 @@ def _build_structured_fuzzy_query(index: tantivy.Index,
             fuzzy_fields.append(("body_no_diacritic", C.NODIAC_WEIGHT_SCALE))
     token_queries = []
     for tok in tokens:
-        distance = 1 if len(tok) <= 5 else 2
+        # Same FUZZY_* boundaries the Python verifier uses — the index
+        # candidates must not be looser than the verification pass.
+        distance = 1 if len(tok) <= C.FUZZY_ONE_EDIT_MAX_LEN else 2
         field_queries = []
         for fname, scale in fuzzy_fields:
             weight = C.TANTIVY_FIELD_WEIGHTS.get(

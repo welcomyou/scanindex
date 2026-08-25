@@ -641,7 +641,54 @@ def test_single_delete_commit_failure_keeps_job(engine):
             "SELECT COUNT(*) FROM index_jobs").fetchone()[0] == 0
 
 
-# ---- 9. Ranking scale guard ---------------------------------------------------
+# ---- 9. Round-6: tightened near-match thresholds -----------------------------
+
+def test_fuzzy_two_edits_on_short_tokens_is_not_near(engine):
+    """Round-6: token 6 ký tự cách đúng 2 edit ('phuong' ~ 'truong') không
+    còn được tính là gần đúng — nhóm 'Kết quả gần đúng' thu về đúng nghĩa
+    OCR-slip 1 edit. Token 7 ký tự vẫn được 1 edit (biên
+    FUZZY_ONE_EDIT_MAX_LEN), chỉ token dài mới được 2 edit."""
+    from scanindex.core.repository import constants as C
+
+    assert C.FUZZY_ONE_EDIT_MAX_LEN == 7
+    eng, store, idx, dst = engine
+    conn = store.connect()
+    probe_far, probe_near = [r["doc_id"] for r in conn.execute(
+        "SELECT doc_id FROM documents LIMIT 2").fetchall()]
+    # 'phuong' vs 'truong': dist 2 trên token 6 ký tự → KHÔNG gần đúng.
+    # 'phuong' vs 'phuowng': dist 1 trên token 7 ký tự → vẫn gần đúng.
+    for page, probe, text in (
+        (10, probe_far, "truong tien day du phuc vu"),
+        (11, probe_near, "phuowng tien day du phuc vu"),
+    ):
+        conn.execute(
+            "INSERT INTO chunks (doc_id, doc_version, chunk_type, page,"
+            " block_idx, text_original, text_no_diacritic, bbox,"
+            " word_count, indexed_status, created_at)"
+            " VALUES (?, 1, 'body', ?, 0, ?, ?, '[]', 6, 'indexed', 0)",
+            (probe, page, text, to_no_diacritic(text).lower()))
+    enqueue_index_job(conn, probe_far)
+    enqueue_index_job(conn, probe_near)
+    replay_pending_index_jobs(store, idx)
+
+    res = eng.search("phuong tien", {}, "all")
+    docs = _docs(res)
+    assert probe_far not in docs, (
+        "'phuong'~'truong' (dist 2, 6 ký tự) phải rơi khỏi nhóm gần đúng"
+    )
+    assert probe_near in docs, (
+        "OCR-slip 1 edit ('phuowng', 7 ký tự) vẫn phải bắt được qua fuzzy"
+    )
+
+    for probe in (probe_far, probe_near):
+        conn.execute(
+            "DELETE FROM chunks WHERE doc_id = ? AND page IN (10, 11)",
+            (probe,))
+        enqueue_index_job(conn, probe)
+    replay_pending_index_jobs(store, idx)
+
+
+# ---- 10. Ranking scale guard ---------------------------------------------------
 
 def test_bm25_is_light_tiebreak_only():
     """Kiểm công thức: chênh BM25 tối đa chỉ đổi 5 điểm, không lật tier."""

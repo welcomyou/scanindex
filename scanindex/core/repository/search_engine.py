@@ -320,12 +320,13 @@ def _content_tokens(tokens: List[str]) -> List[str]:
 
 
 def _auto_fuzzy_max_edits(token: str) -> int:
-    """Elasticsearch/Lucene-style AUTO fuzziness: 0 edits for <=2 chars,
-    1 edit for 3..5 chars, 2 edits for >5 chars."""
+    """Lucene-AUTO style fuzziness scaled by token length. Boundaries live
+    in constants (FUZZY_*) so the index query, this verifier and the
+    highlight painter all agree on what "near" means."""
     n = len(token or "")
-    if n <= 2:
+    if n <= C.FUZZY_EXACT_MAX_LEN:
         return 0
-    if n <= 5:
+    if n <= C.FUZZY_ONE_EDIT_MAX_LEN:
         return 1
     return 2
 
