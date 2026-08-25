@@ -739,6 +739,8 @@ UI_TEXT_PAIRS: tuple[tuple[str, str], ...] = (
     ("No dossiers could be imported:", "Không nhập được hồ sơ nào:"),
     ("ZIP import complete", "Nhập từ ZIP hoàn tất"),
     ("ZIP import failed: {}", "Nhập ZIP thất bại: {}"),
+    ("Reading and extracting: {} ({}/{})", "Đang đọc và giải nén: {} ({}/{})"),
+    ("Failed to read ZIP:\n{}", "Đọc ZIP thất bại:\n{}"),
     ("Rename dossier code?", "Đổi mã hồ sơ?"),
     (
         "This renames all PDFs and accompanying OCR data and moves the storage folder. {} → {} Documents to rename: {} Continue?",

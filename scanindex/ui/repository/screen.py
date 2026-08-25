@@ -324,6 +324,82 @@ class _AddFilesWorker(QThread):
             self.failed.emit(f"{e}\n{traceback.format_exc()}")
 
 
+class _ZipKhoParseWorker(QThread):
+    """Phase 1 of the multi-ZIP Kho import: unpack and parse every ZIP on a
+    worker thread so the GUI stays responsive. `parse_export_zip_for_kho`
+    extracts the whole archive to disk, which used to run on the UI thread
+    before any progress dialog existed — with many/large ZIPs the screen
+    froze and the import dialog only appeared long after the click. Emits
+    (done, total, zip_name) per archive, then the parsed (jobs, problems);
+    cancelled or failed runs clean up every temp dir they created."""
+
+    progress = Signal(int, int, str)       # done, total, current zip name
+    finished_ok = Signal(object, object)   # jobs, problems
+    failed = Signal(str)
+
+    def __init__(self, zip_paths: list[str], stamp: str):
+        """`stamp` — `zip_kho_<stamp>_<n:02d>` temp dir prefix shared with
+        the import phase so both phases agree on extraction folders."""
+        super().__init__()
+        self._zip_paths = list(zip_paths)
+        self._stamp = stamp
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
+
+    def run(self):
+        from scanindex.core.digitization.zip_roundtrip import (
+            parse_export_zip_for_kho, ZipRoundtripError,
+        )
+        jobs: list[dict] = []
+        problems: list[str] = []
+        created_roots: list[str] = []
+        try:
+            total = len(self._zip_paths)
+            for i, path in enumerate(self._zip_paths, start=1):
+                if self._cancel:
+                    break
+                name = os.path.basename(path)
+                temp_root = os.path.join(
+                    os.getcwd(), "temp", f"zip_kho_{self._stamp}_{i:02d}",
+                )
+                created_roots.append(temp_root)
+                self.progress.emit(i - 1, total, name)
+                try:
+                    codes, docs, no_companion, _out_dir = (
+                        parse_export_zip_for_kho(path, temp_root)
+                    )
+                except ZipRoundtripError as e:
+                    problems.append(f"{name}: ZIP hồ sơ không hợp lệ — {e}")
+                    shutil.rmtree(temp_root, ignore_errors=True)
+                    continue
+                except Exception as e:
+                    problems.append(f"{name}: không đọc được — {e}")
+                    shutil.rmtree(temp_root, ignore_errors=True)
+                    continue
+                jobs.append({
+                    "codes": codes,
+                    "docs": docs,
+                    "temp_root": temp_root,
+                    "zip_name": name,
+                    "no_companion": no_companion,
+                })
+                self.progress.emit(i, total, name)
+            if self._cancel:
+                # Jobs parsed before the cancel are discarded — drop their
+                # extraction dirs too (already-deleted roots are no-ops).
+                for root in created_roots:
+                    shutil.rmtree(root, ignore_errors=True)
+                return
+            self.finished_ok.emit(jobs, problems)
+        except Exception as e:
+            import traceback
+            for root in created_roots:
+                shutil.rmtree(root, ignore_errors=True)
+            self.failed.emit(f"{e}\n{traceback.format_exc()}")
+
+
 class _ZipKhoImportWorker(QThread):
     """Import dossiers parsed from exported ZIPs into Kho — no OCR/KIE
     re-run. Docs with canonical `.json.zst` sidecars use them as-is; docs
@@ -6156,16 +6232,16 @@ class RepositoryScreen(ScreenContent):
 
     def _import_zip_paths(self, zip_paths: list[str]):
         """Shared back-end for the "Nhập từ ZIP" button and ZIP drag&drop:
-        parse every ZIP into an import job, confirm once, then push all
-        dossiers into Kho via one `_ZipKhoImportWorker` (no OCR/KIE
-        re-run). ZIPs are extracted under `temp/zip_kho_<ts>_<n>/` and
-        cleaned up by the worker once every doc is copied into the repo."""
+        unpack/parse every ZIP into an import job on a worker thread (with
+        its own progress dialog), then — in `_continue_zip_kho_import` —
+        confirm once and push all dossiers into Kho via one
+        `_ZipKhoImportWorker` (no OCR/KIE re-run). ZIPs are extracted under
+        `temp/zip_kho_<ts>_<n>/` and cleaned up by the workers once every
+        doc is copied into the repo."""
         from PySide6.QtWidgets import QProgressDialog
-        from scanindex.core.digitization.zip_roundtrip import (
-            parse_export_zip_for_kho, ZipRoundtripError,
-        )
 
-        if getattr(self, "_zip_kho_worker", None) is not None:
+        if (getattr(self, "_zip_kho_worker", None) is not None
+                or getattr(self, "_zip_parse_worker", None) is not None):
             QMessageBox.information(
                 self, "Nhập từ ZIP",
                 "Một lệnh nhập ZIP khác đang chạy. Vui lòng đợi hoàn tất.",
@@ -6180,49 +6256,91 @@ class RepositoryScreen(ScreenContent):
             return
 
         stamp = time.strftime("%Y%m%d_%H%M%S")
-        jobs: list[dict] = []
-        problems: list[str] = []
-        for i, path in enumerate(zip_paths, start=1):
-            name = os.path.basename(path)
-            temp_root = os.path.join(
-                os.getcwd(), "temp", f"zip_kho_{stamp}_{i:02d}",
+
+        # Phase 1 — unpack/parse every ZIP on a worker thread, with its own
+        # progress dialog. Extraction is the slow part and used to run on
+        # the GUI thread before any dialog existed: with many/large ZIPs the
+        # screen froze and the import progress bar only appeared long after
+        # the click. Phase 2 (codes dialogs → confirm → import) continues in
+        # `_continue_zip_kho_import` once parsing finishes.
+        parse_progress = QProgressDialog(
+            "Đang đọc và giải nén các file ZIP…", "Hủy",
+            0, len(zip_paths), self,
+        )
+        parse_progress.setWindowTitle("Nhập từ ZIP")
+        parse_progress.setWindowModality(Qt.WindowModality.WindowModal)
+        parse_progress.setMinimumDuration(0)
+        parse_progress.setAutoClose(False)
+        parse_progress.setAutoReset(False)
+        parse_progress.setValue(0)
+        parse_progress.show()
+
+        parse_worker = _ZipKhoParseWorker(zip_paths, stamp)
+
+        def on_parse_progress(done: int, total: int, name: str):
+            parse_progress.setLabelText(
+                f"Đang đọc và giải nén: {name}  ({done}/{total})"
             )
-            try:
-                codes, docs, no_companion, _out_dir = parse_export_zip_for_kho(
-                    path, temp_root
-                )
-            except ZipRoundtripError as e:
-                problems.append(f"{name}: ZIP hồ sơ không hợp lệ — {e}")
-                shutil.rmtree(temp_root, ignore_errors=True)
-                continue
-            except Exception as e:
-                problems.append(f"{name}: không đọc được — {e}")
-                shutil.rmtree(temp_root, ignore_errors=True)
-                continue
+            parse_progress.setValue(done)
+
+        def on_parsed(jobs: list, problems: list):
+            parse_progress.close()
+            self._continue_zip_kho_import(jobs, problems)
+
+        def on_parse_failed(error_msg: str):
+            parse_progress.close()
+            self.log_message.emit(
+                f"Repository: ZIP parse failed — {error_msg}", "err",
+            )
+            QMessageBox.critical(
+                self, "Lỗi", f"Đọc ZIP thất bại:\n{error_msg}",
+            )
+
+        def on_parse_thread_finished():
+            if getattr(self, "_zip_parse_worker", None) is parse_worker:
+                self._zip_parse_worker = None
+            parse_worker.deleteLater()
+
+        parse_worker.progress.connect(on_parse_progress)
+        parse_worker.finished_ok.connect(on_parsed)
+        parse_worker.failed.connect(on_parse_failed)
+        parse_worker.finished.connect(on_parse_thread_finished)
+        parse_progress.canceled.connect(parse_worker.cancel)
+        # Hold a reference so Python doesn't GC the QThread mid-run.
+        self._zip_parse_worker = parse_worker
+        parse_worker.start()
+
+    def _continue_zip_kho_import(self, jobs: list[dict], problems: list[str]):
+        """Phase 2 of the ZIP → Kho import, back on the GUI thread once
+        `_ZipKhoParseWorker` has unpacked every archive: fill in missing
+        identity codes (legacy generic-named ZIPs), confirm once, then run
+        one `_ZipKhoImportWorker` for all dossiers — no OCR/KIE re-run."""
+        # Generic ZIP names (e.g. HSLTCQ.zip): the identity codes are not in
+        # the file name. Ask the operator once — the codes only live on this
+        # import job.
+        for job in jobs:
+            codes = job["codes"]
             if not (codes.ma_dinh_danh and codes.fonds):
-                # Generic ZIP name (e.g. HSLTCQ.zip): the identity codes are
-                # not in the file name. Ask the operator once — the codes
-                # only live on this import job.
-                dlg = _LegacyZipCodesDialog(name, codes, self)
+                dlg = _LegacyZipCodesDialog(job["zip_name"], codes, self)
                 if dlg.exec() == QDialog.DialogCode.Accepted:
                     dlg.apply_to(codes)
+
+        kept: list[dict] = []
+        for job in jobs:
+            codes = job["codes"]
             if not (codes.ma_dinh_danh and codes.fonds):
                 problems.append(
-                    f"{name}: thiếu mã định danh / mã phông trong tên ZIP"
+                    f"{job['zip_name']}: thiếu mã định danh / mã phông trong tên ZIP"
                 )
-                shutil.rmtree(temp_root, ignore_errors=True)
-                continue
-            if not docs:
-                problems.append(f"{name}: không có văn bản PDF trong ZIP")
-                shutil.rmtree(temp_root, ignore_errors=True)
-                continue
-            jobs.append({
-                "codes": codes,
-                "docs": docs,
-                "temp_root": temp_root,
-                "zip_name": name,
-                "no_companion": no_companion,
-            })
+                shutil.rmtree(job["temp_root"], ignore_errors=True)
+            elif not job["docs"]:
+                problems.append(
+                    f"{job['zip_name']}: không có văn bản PDF trong ZIP"
+                )
+                shutil.rmtree(job["temp_root"], ignore_errors=True)
+            else:
+                kept.append(job)
+        jobs = kept
 
         if problems:
             self.log_message.emit(
