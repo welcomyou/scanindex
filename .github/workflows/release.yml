@@ -67,11 +67,16 @@ jobs:
         run: |
           $version = (Get-Content -LiteralPath VERSION -Raw).Trim()
           $archive = "dist\ScanIndex-$version.7z"
+          # Release notes = annotated tag message (changelog); fall back to the generic line.
+          git tag -l --format='%(contents)' $env:RELEASE_TAG *> release_notes.md
+          if (-not ((Get-Content -LiteralPath release_notes.md -Raw).Trim())) {
+            "Full portable Windows release with verified offline models." *> release_notes.md
+          }
           gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY *> $null
           if ($LASTEXITCODE -ne 0) {
             gh release create $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY `
               --title "ScanIndex $version" `
-              --notes "Full portable Windows release with verified offline models."
+              --notes-file release_notes.md
           }
           gh release upload $env:RELEASE_TAG $archive --clobber `
             --repo $env:GITHUB_REPOSITORY
