@@ -700,6 +700,8 @@ UI_TEXT_PAIRS: tuple[tuple[str, str], ...] = (
         "để lọc theo thông tin văn bản.",
     ),
     ("Searching…", "Đang tìm…"),
+    ("Cancelling search…", "Đang hủy tìm kiếm…"),
+    ("Building the index: {}/{} chunks", "Đang dựng chỉ mục: {}/{} đoạn văn"),
     ("{} matching documents", "{} văn bản khớp"),
     ("Error: {}", "Lỗi: {}"),
     ("Select a folder for the ZIP file", "Chọn thư mục để lưu file ZIP"),

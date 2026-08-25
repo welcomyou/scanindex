@@ -561,6 +561,13 @@ class Importer:
     def __init__(self, store: ArchiveStore, index: HybridIndex):
         self.store = store
         self.index = index
+        # Outbox job ids staged by the CURRENT import session whose
+        # Tantivy writes finished but whose batch commit has not run
+        # yet. Kept local per session: they are only acknowledged after
+        # the final commit succeeds — a failed or cancelled import
+        # simply drops them, so every job stays pending for startup
+        # replay (no mark-then-rollback needed).
+        self._staged_job_ids: list = []
 
     # ====================================================================
     # PUBLIC — Step 3 path: direct from temp/_step2_kie/ + temp/_step3_signed/
@@ -597,10 +604,15 @@ class Importer:
             raise ValueError("import_dossier: thiếu mã định danh hoặc mã phông")
         dossier_id = self._upsert_dossier_from_codes(codes)
         import_id = self._begin_import(f"step3:{codes.composite_key()}")
+        self._staged_job_ids = []
         try:
             self.index.begin_writer()
             for entry in documents:
                 if cancel_check and cancel_check():
+                    # Cancelled mid-import: staged Tantivy writes were
+                    # never committed — drop the staged acks so every
+                    # job stays pending for startup replay.
+                    self._staged_job_ids = []
                     self._end_import(import_id, "cancelled", prog)
                     return prog
                 pdf = Path(entry["pdf_path"])
@@ -631,14 +643,28 @@ class Importer:
                 if progress_cb:
                     progress_cb(prog)
             self.index.commit()
+            for job_id in self._staged_job_ids:
+                self.store.note_job_applied(job_id)
+            self._staged_job_ids = []
             self.store.refresh_counters()
             note_index_write(self.store)
             self._end_import(import_id, "completed", prog)
         except Exception as e:
+            committed = False
             try:
                 self.index.commit()
+                committed = True
             except Exception:
                 pass
+            if committed:
+                # The rescue commit made the staged writes durable after
+                # all — acknowledge them now.
+                for job_id in self._staged_job_ids:
+                    self.store.note_job_applied(job_id)
+                note_index_write(self.store)
+            # Not committed (or nothing staged): drop the ids unmarked so
+            # the jobs stay pending for startup replay.
+            self._staged_job_ids = []
             self._end_import(import_id, "failed", prog, error=str(e))
             raise
         return prog
@@ -681,11 +707,16 @@ class Importer:
         pdfs = sorted(p for p in source.glob("*.pdf") if p.is_file())
         prog = ImportProgress(total=len(pdfs))
         import_id = self._begin_import(str(source))
+        self._staged_job_ids = []
 
         try:
             self.index.begin_writer()
             for pdf in pdfs:
                 if cancel_check and cancel_check():
+                    # Cancelled mid-import: staged Tantivy writes were
+                    # never committed — drop the staged acks so every
+                    # job stays pending for startup replay.
+                    self._staged_job_ids = []
                     self._end_import(import_id, "cancelled", prog)
                     return prog
                 prog.current_file = pdf.name
@@ -713,14 +744,24 @@ class Importer:
                 if progress_cb:
                     progress_cb(prog)
             self.index.commit()
+            for job_id in self._staged_job_ids:
+                self.store.note_job_applied(job_id)
+            self._staged_job_ids = []
             self.store.refresh_counters()
             note_index_write(self.store)
             self._end_import(import_id, "completed", prog)
         except Exception as e:
+            committed = False
             try:
                 self.index.commit()
+                committed = True
             except Exception:
                 pass
+            if committed:
+                for job_id in self._staged_job_ids:
+                    self.store.note_job_applied(job_id)
+                note_index_write(self.store)
+            self._staged_job_ids = []
             self._end_import(import_id, "failed", prog, error=str(e))
             raise
 
@@ -964,7 +1005,7 @@ class Importer:
         from .reindex import _add_document_record_from_sql, enqueue_index_job
         # Outbox first: if anything below crashes before the Tantivy
         # commit, startup replay rebuilds this doc from the final truth.
-        enqueue_index_job(conn, doc_id, store=self.store)
+        job_id = enqueue_index_job(conn, doc_id, store=self.store)
         self._upsert_document_kie(
             doc_id, dossier_id, target_pdf, target_name,
             kie_fields, kie_annotation_json,
@@ -1000,10 +1041,14 @@ class Importer:
         # Indexer v3: the DOCUMENT-level phrase record (built from the now
         # final SQLite state, same session as the chunk writes above).
         _add_document_record_from_sql(self.index, conn, doc_id)
-        # Outbox acknowledge: this doc's Tantivy writes are complete. A
-        # doc that throws anywhere above never reaches this line, so its
-        # job survives for startup replay.
-        self.store.note_job_applied(doc_id)
+        # Stage this doc's outbox job id locally: its Tantivy writes are
+        # complete, but the batch commit happens later in
+        # import_dossier/import_folder, which acknowledges the id only
+        # after that commit succeeds. A doc that throws anywhere above
+        # never reaches this line, so its job survives for startup
+        # replay untouched.
+        if job_id is not None:
+            self._staged_job_ids.append(job_id)
         return True, duplicate
 
     # ---------- Per-chunk insert helpers (v2) ----------

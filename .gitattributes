@@ -1,0 +1,3 @@
+# Normalize text files: LF in the repository and on checkout.
+*.py text eol=lf
+.gitignore text eol=lf

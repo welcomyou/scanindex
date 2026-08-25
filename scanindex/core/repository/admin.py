@@ -50,6 +50,11 @@ class DeleteStats:
     deleted_chunks: int = 0
     freed_bytes: int = 0
     errors: List[str] = None
+    # Outbox job ids this operation enqueued and fully performed (SQL +
+    # Tantivy delete) but has NOT acknowledged yet. In commit=False mode
+    # the caller owns the batch commit and must only call
+    # store.note_job_applied(id) AFTER that commit succeeds.
+    staged_job_ids: List[int] = None
 
 
 @dataclass
@@ -243,11 +248,10 @@ def delete_document(store: ArchiveStore, index: HybridIndex,
     # Outbox: if the flow dies between the tantivy delete above and the
     # commit below, startup replay re-runs the (idempotent) purge.
     from .reindex import enqueue_index_job
-    enqueue_index_job(conn, doc_id, op="delete", store=store)
+    job_id = enqueue_index_job(conn, doc_id, op="delete", store=store)
 
     # Tantivy delete-by-doc (removes chunks AND the document record).
     index.delete_tantivy_by_doc(doc_id)
-    store.note_job_applied(doc_id)   # outbox acknowledge (per-doc)
 
     # Hard-delete SQL row: CASCADE wipes chunks.
     conn.execute("DELETE FROM documents WHERE doc_id = ?", (doc_id,))
@@ -264,9 +268,15 @@ def delete_document(store: ArchiveStore, index: HybridIndex,
 
     stats.deleted_docs = 1
     stats.deleted_chunks = int(n_chunks or 0)
+    stats.staged_job_ids = [job_id] if job_id is not None else []
     if commit:
         index.begin_writer()  # no-op if already open
         index.commit()
+        # Acknowledge only AFTER the commit succeeded: a commit failure
+        # must leave the job pending for startup replay, and a mark
+        # placed before the commit could be flushed by a LATER
+        # note_index_write from any other operation on this store.
+        store.note_job_applied(job_id)
         store.refresh_counters()
         note_index_write(store)
     return stats
@@ -274,17 +284,26 @@ def delete_document(store: ArchiveStore, index: HybridIndex,
 
 def delete_documents_bulk(store: ArchiveStore, index: HybridIndex,
                           doc_ids: Iterable[str]) -> DeleteStats:
-    """Batch the per-doc deletes into one Tantivy commit at the end."""
+    """Batch the per-doc deletes into one Tantivy commit at the end.
+
+    The per-doc job ids stay in a LOCAL list until the batch commit
+    succeeds — only then are they acknowledged, so a failed commit
+    leaves every job pending for startup replay without any
+    mark-then-rollback dance."""
     total = DeleteStats(errors=[])
+    staged: List[int] = []
     index.begin_writer()
     for did in doc_ids:
         s = delete_document(store, index, did, commit=False)
         total.deleted_docs += s.deleted_docs
         total.deleted_chunks += s.deleted_chunks
         total.freed_bytes += s.freed_bytes
+        staged.extend(s.staged_job_ids or [])
         if s.errors:
             total.errors.extend(s.errors)
     index.commit()
+    for job_id in staged:
+        store.note_job_applied(job_id)
     store.refresh_counters()
     note_index_write(store)
     return total
@@ -396,7 +415,7 @@ def update_document_metadata(store: ArchiveStore, index: HybridIndex,
     # Outbox: a crash between this UPDATE and the Tantivy commit must not
     # leave the derived index silently stale.
     from .reindex import enqueue_index_job
-    enqueue_index_job(conn, doc_id, store=store)
+    job_id = enqueue_index_job(conn, doc_id, store=store)
     conn.execute(
         f"UPDATE documents SET {sets}, updated_at = :now WHERE doc_id = :doc_id",
         params,
@@ -512,8 +531,8 @@ def update_document_metadata(store: ArchiveStore, index: HybridIndex,
     # edited truth (delete_tantivy_by_doc above removed the old one).
     from .reindex import _add_document_record_from_sql
     _add_document_record_from_sql(index, conn, doc_id)
-    store.note_job_applied(doc_id)   # outbox acknowledge (per-doc)
     index.commit()
+    store.note_job_applied(job_id)   # outbox acknowledge — AFTER commit
     note_index_write(store)
 
 
@@ -989,7 +1008,7 @@ def add_document(store: ArchiveStore, index: HybridIndex, *,
     # Outbox: enqueue BEFORE any write so a crash mid-flow leaves a job
     # that startup replay converges from the final SQLite truth.
     from .reindex import enqueue_index_job
-    enqueue_index_job(conn, doc_id, store=store)
+    job_id = enqueue_index_job(conn, doc_id, store=store)
     cols_kie = {col: (kie_fields.get(col) or "") for col in KIE_COLUMNS}
     params = {
         "doc_id": doc_id, "dossier_id": dossier_id,
@@ -1094,8 +1113,8 @@ def add_document(store: ArchiveStore, index: HybridIndex, *,
     # Indexer v3: document-level phrase record from the final SQLite state.
     from .reindex import _add_document_record_from_sql
     _add_document_record_from_sql(index, conn, doc_id)
-    store.note_job_applied(doc_id)   # outbox acknowledge (per-doc)
     index.commit()
+    store.note_job_applied(job_id)   # outbox acknowledge — AFTER commit
     store.refresh_counters()
     note_index_write(store)
     return doc_id

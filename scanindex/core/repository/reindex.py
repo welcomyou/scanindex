@@ -15,11 +15,12 @@ release keeps reading its own folder, at worst with stale search results.
 """
 from __future__ import annotations
 
+import json
 import logging
 import shutil
 import time
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, NamedTuple, Optional
 
 from . import constants as C
 from .indexer import HybridIndex
@@ -50,22 +51,82 @@ _DOC_RECORD_META_SQL = (
 # naively concatenating a page's chunks duplicates the overlap and creates
 # ARTIFICIAL phrases at the join ("delta" + "gamma" from two chunks
 # matching a query that never existed in the document). De-overlap before
-# building the page stream: strip an exact suffix==prefix repeat (the
-# chunker always re-emits the overlap verbatim).
-_DEOVERLAP_MAX_TOKENS = 40   # chunker overlap is 30; slack for safety
-_DEOVERLAP_MIN_TOKENS = 2
+# building the page stream — but ONLY between two chunks whose provenance
+# proves they are consecutive parts of the SAME chunker split. Two
+# INDEPENDENT chunks that merely happen to end and start with the same
+# words keep their honest duplication: stripping there would DELETE a
+# phrase that truly exists and CREATE a fake join phrase instead
+# (expert round-4 repro: two body_single chunks sharing "repeat phrase").
+#
+# The overlap length is measured in RAW WHITESPACE WORDS — the exact unit
+# the chunker slices with (``cur[-CHUNK_OVERLAP_WORDS:]`` / 220-word
+# steps) — and only THEN is the stitched stream normalized. Measuring in
+# normalized tokens with an estimated cap is wrong: one raw word like
+# "x0-y0" splits into 2+ tokens, so a 30-word overlap can exceed any
+# token cap and silently defeat the strip (expert round-5 repro).
+_DEOVERLAP_MIN_WORDS = 2
 
 
-def _deoverlap_page_tokens(token_lists: list) -> list:
+class _PageChunk(NamedTuple):
+    """One body chunk's RAW whitespace words plus the provenance needed
+    to tell a chunker split continuation apart from an independent
+    neighbour. Words (not normalized tokens) because that is the unit
+    the chunker's overlap is defined in."""
+    words: list
+    block_idx: int
+    merge_reason: str
+    source_blocks: tuple
+
+
+def _split_part_no(merge_reason: Optional[str]) -> Optional[int]:
+    """'body_split_3' → 3; anything else (incl. NULL / other reasons) →
+    None."""
+    if not merge_reason or not merge_reason.startswith("body_split_"):
+        return None
+    try:
+        return int(merge_reason[len("body_split_"):])
+    except ValueError:
+        return None
+
+
+def _is_split_continuation(prev: _PageChunk, cur: _PageChunk) -> bool:
+    """Provenance check: `cur` is the next part of the SAME chunker split
+    that produced `prev`. Split parts share their parent paragraph's
+    block_idx and source_blocks and carry consecutive body_split_N
+    numbers; chunks from different paragraphs never satisfy all three
+    conditions at once."""
+    a = _split_part_no(prev.merge_reason)
+    b = _split_part_no(cur.merge_reason)
+    if a is None or b is None or b != a + 1:
+        return False
+    return (prev.block_idx == cur.block_idx
+            and prev.source_blocks == cur.source_blocks)
+
+
+def _deoverlap_page_words(chunks: list) -> list:
+    """Concatenate one page's _PageChunk items into one RAW-word stream,
+    dropping the chunker's deliberate overlap at split joins only. The
+    chunker re-emits the overlap verbatim as whole words, so an exact
+    suffix==prefix match of up to CHUNK_OVERLAP_WORDS raw words is safe
+    to strip exactly there — and nowhere else. The caller normalizes the
+    stitched stream afterwards."""
     out: list = []
-    for toks in token_lists:
-        if out and len(toks) >= _DEOVERLAP_MIN_TOKENS:
-            max_n = min(len(out), len(toks), _DEOVERLAP_MAX_TOKENS)
-            for n in range(max_n, _DEOVERLAP_MIN_TOKENS - 1, -1):
-                if out[-n:] == toks[:n]:
-                    toks = toks[n:]
+    prev: Optional[_PageChunk] = None
+    for ch in chunks:
+        words = ch.words
+        if (out and prev is not None
+                and _is_split_continuation(prev, ch)
+                and len(words) >= _DEOVERLAP_MIN_WORDS):
+            # n0 is the guaranteed overlap size: min(30, words the
+            # previous part can offer, words this part starts with).
+            # Shorter matches below n0 only cover degenerate tails.
+            n0 = min(C.CHUNK_OVERLAP_WORDS, len(out), len(words))
+            for n in range(n0, _DEOVERLAP_MIN_WORDS - 1, -1):
+                if out[-n:] == words[:n]:
+                    words = words[n:]
                     break
-        out.extend(toks)
+        out.extend(words)
+        prev = ch
     return out
 
 
@@ -96,20 +157,31 @@ def document_norm_payload(conn, doc_id: str):
     ).fetchone()
     dossier_id = int(did_row["dossier_id"]) if did_row and did_row["dossier_id"] is not None else None
     rows = conn.execute(
-        "SELECT page, text_original FROM chunks "
+        "SELECT page, block_idx, merge_reason, source_blocks, text_original "
+        "FROM chunks "
         "WHERE doc_id = ? AND chunk_type = 'body' "
         "AND indexed_status = 'indexed' ORDER BY page, chunk_id",
         (doc_id,),
     ).fetchall()
-    pages: dict[int, list[list]] = {}
+    pages: dict[int, list[_PageChunk]] = {}
     for r in rows:
-        pages.setdefault(int(r["page"] or 1), []).append(
-            norm_tokens(r["text_original"] or "")
-        )
+        try:
+            sources = tuple(json.loads(r["source_blocks"] or "[]"))
+        except Exception:
+            sources = ()
+        pages.setdefault(int(r["page"] or 1), []).append(_PageChunk(
+            words=(r["text_original"] or "").split(),
+            block_idx=int(r["block_idx"] or 0),
+            merge_reason=r["merge_reason"] or "",
+            source_blocks=sources,
+        ))
+    # Stitch each page in RAW words (dropping split overlaps), and only
+    # then normalize the whole stream — same token boundary the phrase
+    # verifier uses, applied once to the final text.
     body_pages = [
-        " ".join(_deoverlap_page_tokens(token_lists))
-        for _page, token_lists in sorted(pages.items())
-        if any(token_lists)
+        " ".join(norm_tokens(" ".join(_deoverlap_page_words(page_chunks))))
+        for _page, page_chunks in sorted(pages.items())
+        if any(ch.words for ch in page_chunks)
     ]
     return dossier_id, meta_norm, body_pages
 
@@ -139,10 +211,13 @@ def enqueue_index_job(conn, doc_id: str, op: str = "reindex", *,
     Called BEFORE the SQLite mutation: the connection is autocommit, so
     the job may outlive a partially-applied mutation — which is fine,
     because replay rebuilds from the FINAL SQLite truth (idempotent).
-    The job is acknowledged later, per document, via
-    ``store.note_job_applied(doc_id)`` once that doc's Tantivy writes
-    succeeded — never wholesale at session level. Returns the job id (or
-    None on a pre-v11 schema, where replay is unavailable by design).
+    The job is acknowledged later, BY JOB ID, via
+    ``store.note_job_applied(job_id)`` once that doc's Tantivy writes
+    succeeded — never wholesale at session level, and never by doc_id
+    (a doc_id sweep would delete a NEWER job another worker just
+    enqueued for the same document). Callers MUST keep the returned id
+    and pass it to note_job_applied. Returns None on a pre-v11 schema,
+    where replay is unavailable by design.
     """
     try:
         cur = conn.execute(
@@ -161,21 +236,23 @@ def replay_pending_index_jobs(store: ArchiveStore, index: HybridIndex) -> dict:
 
     Runs at startup AFTER run_startup_repair. For each pending doc:
     doc still in SQLite → delete + re-add its chunks + document record;
-    doc gone → tantivy delete only. Both paths are idempotent.
+    doc gone → tantivy delete only. Both paths are idempotent. Only the
+    job ids that existed when replay started are acknowledged — a job
+    enqueued by another worker DURING replay survives for the next run.
     """
     conn = store.connect()
     try:
         rows = conn.execute(
-            "SELECT DISTINCT doc_id FROM index_jobs"
+            "SELECT job_id, doc_id FROM index_jobs"
         ).fetchall()
     except Exception:
         return {"replayed": 0, "deleted": 0}
     if not rows:
         return {"replayed": 0, "deleted": 0}
+    job_ids = [int(r["job_id"]) for r in rows]
     replayed = deleted = 0
     index.begin_writer()
-    for r in rows:
-        doc_id = str(r["doc_id"])
+    for doc_id in dict.fromkeys(str(r["doc_id"]) for r in rows):
         alive = conn.execute(
             "SELECT 1 FROM documents WHERE doc_id = ? "
             "AND indexed_status != 'deleted'", (doc_id,),
@@ -189,7 +266,14 @@ def replay_pending_index_jobs(store: ArchiveStore, index: HybridIndex) -> dict:
         _add_document_record_from_sql(index, conn, doc_id)
         replayed += 1
     index.commit()
-    conn.execute("DELETE FROM index_jobs")
+    for start in range(0, len(job_ids), 4000):
+        batch = job_ids[start:start + 4000]
+        try:
+            ph = ",".join("?" * len(batch))
+            conn.execute(
+                f"DELETE FROM index_jobs WHERE job_id IN ({ph})", batch)
+        except Exception:
+            break
     _log.info("index_jobs replayed: %d reindexed, %d purged", replayed, deleted)
     return {"replayed": replayed, "deleted": deleted}
 
@@ -305,28 +389,29 @@ def _count_indexable_chunks(store: ArchiveStore) -> int:
 def note_index_write(store: ArchiveStore) -> None:
     """Refresh the built-chunks watermark after any index-writing session
     (import / admin edit / repair) so staleness detection stays accurate.
-    Acknowledges the outbox for EXACTLY the documents whose Tantivy writes
-    this session completed (store.note_job_applied) — a document that
-    failed mid-import keeps its job for startup replay, and another
-    concurrent worker's pending jobs are never touched."""
+    Acknowledges the outbox for EXACTLY the job ids whose Tantivy writes
+    this session completed (store.note_job_applied(job_id)) — a document
+    that failed mid-import keeps its job for startup replay, and jobs
+    enqueued by other workers, INCLUDING a newer job for the same doc_id,
+    are never touched (DELETE ... WHERE job_id IN, never by doc_id)."""
     try:
         store.set_meta("indexer_built_chunks", str(_count_indexable_chunks(store)))
         store.set_meta("indexer_version", C.INDEXER_VERSION)
     except Exception:
         pass  # bookkeeping only; never fail the caller's commit path
-    docs = list(getattr(store, "_applied_job_docs", set()) or ())
-    if not docs:
+    jobs = list(getattr(store, "_acked_job_ids", set()) or ())
+    if not jobs:
         return
     conn = store.connect()
-    for start in range(0, len(docs), 4000):
-        batch = docs[start:start + 4000]
+    for start in range(0, len(jobs), 4000):
+        batch = jobs[start:start + 4000]
         try:
             ph = ",".join("?" * len(batch))
             conn.execute(
-                f"DELETE FROM index_jobs WHERE doc_id IN ({ph})", batch)
+                f"DELETE FROM index_jobs WHERE job_id IN ({ph})", batch)
         except Exception:
             break  # never fail the caller's commit path
-    store._applied_job_docs.clear()
+    store._acked_job_ids.clear()
 
 
 def rebuild_search_index(store: ArchiveStore,

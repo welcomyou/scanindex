@@ -39,18 +39,26 @@ class ArchiveStore:
         # any call site that hasn't been migrated yet.
         self.db_path = self.archive_path / (db_filename or C.SQLITE_FILE)
         self._conn: Optional[sqlite3.Connection] = None
-        # Outbox bookkeeping: doc_ids whose Tantivy writes THIS session
-        # completed successfully (chunks + document record handed to the
-        # writer). note_index_write acknowledges exactly these — a
-        # document that FAILED mid-import keeps its job for startup
-        # replay, and another concurrent worker's jobs are never touched.
-        self._applied_job_docs: set[str] = set()
+        # Outbox bookkeeping: JOB IDS whose Tantivy writes THIS session
+        # completed successfully AND whose commit already succeeded.
+        # Callers only mark a job after their index.commit() returned
+        # (or after staging, for session flows that commit in bulk and
+        # keep the ids in a local list until then). note_index_write
+        # acknowledges exactly these ids — a document that FAILED
+        # mid-import keeps its job for startup replay, and jobs
+        # enqueued by other workers (including a NEWER job for the same
+        # doc_id) are never touched, because the flush deletes by
+        # job_id, not by doc_id.
+        self._acked_job_ids: set = set()
 
-    def note_job_applied(self, doc_id: str) -> None:
-        """Mark `doc_id`'s outbox job as applied (called right after the
-        doc's Tantivy writes succeeded, before the batch commit)."""
-        if doc_id:
-            self._applied_job_docs.add(doc_id)
+    def note_job_applied(self, job_id) -> None:
+        """Mark THIS outbox job (by the job_id enqueue_index_job returned)
+        as applied — call only after the doc's Tantivy writes succeeded
+        AND the surrounding commit did too. Acknowledging by job id means
+        the eventual flush cannot sweep up a newer job another worker
+        enqueued for the same document."""
+        if job_id:
+            self._acked_job_ids.add(int(job_id))
 
     # ---------- Folder + connection ----------
 
