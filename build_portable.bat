@@ -24,6 +24,11 @@ set "MODE=%~1"
 set "INTERACTIVE=0"
 if "%INCLUDE_CORRECTION%"=="" set "INCLUDE_CORRECTION=1"
 if "%INCLUDE_LEGACY_CHROME%"=="" set "INCLUDE_LEGACY_CHROME=0"
+REM INCLUDE_SCREENAI: bundle Google's ScreenAI DLL/models into the portable
+REM dist (personal/internal use ONLY — never publish such a build). Default 0:
+REM release-safe dist that downloads ScreenAI from Google CDN on first run via
+REM scanindex/core/ocr/screen_ai_downloader.py.
+if "%INCLUDE_SCREENAI%"=="" set "INCLUDE_SCREENAI=0"
 
 echo ===================================================
 echo   SCANINDEX - PORTABLE BUILD
@@ -83,14 +88,13 @@ if "%MODE%"=="1" (
 
     echo.
     echo [FULL] Checking offline runtime assets...
-    call :check_dir "models\screen_ai" "ScreenAI models"
+    if "%INCLUDE_SCREENAI%"=="1" call :check_dir "models\screen_ai" "ScreenAI models"
     call :check_dir "models\orientation" "Orientation ONNX"
     call :check_dir "models\doclayout_yolo_onnx_dynamic" "DocLayout-YOLO dynamic ONNX"
     call :check_dir "models\doclayout_yolo_doclaynet_onnx_dynamic" "DocLayout-YOLO DocLayNet auxiliary ONNX"
     call :check_dir "models\lightgbm_splitter" "Archive page splitter"
     call :check_dir "models\layoutlmv3_fontgray_norm_final_epoch25" "LayoutLMv3 text KIE"
     if "%INCLUDE_CORRECTION%"=="1" call :check_dir "models\distilled_ct2" "Distilled Proton CT2"
-    call :check_dir "models\translate" "***REMOVED*** EN-VI"
 )
 
 echo.
@@ -145,7 +149,7 @@ echo.
 echo Copying portable runtime resources...
 echo   Filter: ONNX/current pipeline assets only. Legacy caches and training outputs are skipped.
 
-powershell -NoProfile -ExecutionPolicy Bypass -File "scripts\copy_portable_runtime.ps1" -DistDir "%CD%\%DIST_DIR%" -IncludeCorrection "%INCLUDE_CORRECTION%" -IncludeLegacyChrome "%INCLUDE_LEGACY_CHROME%"
+powershell -NoProfile -ExecutionPolicy Bypass -File "scripts\copy_portable_runtime.ps1" -DistDir "%CD%\%DIST_DIR%" -IncludeCorrection "%INCLUDE_CORRECTION%" -IncludeLegacyChrome "%INCLUDE_LEGACY_CHROME%" -IncludeScreenAI "%INCLUDE_SCREENAI%"
 if errorlevel 1 goto :fail
 
 echo.

@@ -42,7 +42,12 @@ jobs:
         run: python scripts/download_offline_models.py --validate-config
 
       - name: Download and verify offline models
-        run: python scripts/download_offline_models.py
+        # --skip-screen-ai: release dist is downloader-only (INCLUDE_SCREENAI=0
+        # by default in build_portable.bat). The ScreenAI DLL/models are
+        # Google's proprietary assets — they must NOT be bundled into release
+        # archives. End users get them from Google CDN on first app run via
+        # scanindex/core/ocr/screen_ai_downloader.py.
+        run: python scripts/download_offline_models.py --skip-screen-ai
 
       - name: Build full portable app
         shell: cmd

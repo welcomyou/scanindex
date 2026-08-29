@@ -679,6 +679,10 @@ class ScreenAIOCR:
         self._FreeInt32Array.restype = None
 
         # UninitializeOCR()
+        # Provenance note: this symbol is NOT loaded by Chromium's public
+        # screen_ai_library_wrapper_impl.cc; it was observed in the DLL's
+        # export table (pefile). Purely optional cleanup — Chromium itself
+        # never calls it, and process exit frees everything anyway.
         try:
             self._UninitializeOCR = self._dll.UninitializeOCR
             self._UninitializeOCR.argtypes = []

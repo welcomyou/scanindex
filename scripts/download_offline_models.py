@@ -20,12 +20,19 @@ Separate trust anchors:
   - Chrome ScreenAI: fetched from Google CDN by
     scanindex.core.ocr.screen_ai_downloader. Trusted via a pinned Google CDN
     fallback or the SHA256 announced by Google's updater XML, plus Authenticode
-    verification of the extracted DLL.
-  - Chrome ***REMOVED*** bootstrap: downloaded from a versioned GitHub Release
-    asset and verified against the archive SHA256 plus per-file SHA256 pins.
+    verification of the extracted DLL. ScreenAI is NOT bundled into portable
+    releases — end users fetch it from Google CDN on first run (same trust
+    path as this script). CI builds skip it via `--skip-screen-ai` because the
+    release dist is downloader-only.
 Failure modes are loud: any hash mismatch, missing file, or HF error
 halts the script with a non-zero exit. Better to fail than to leave the
 app loading a tampered model.
+
+NOTE (2026-08): the ***REMOVED*** EN<->VI runtime was removed from the app.
+Its direct-download entry was deleted from DIRECT_DOWNLOADS_CONFIG below,
+and the old `***REMOVED***` GitHub release asset that carried Google's
+***REMOVED*** binaries must be deleted from the repo's Releases page —
+Google's proprietary DLL/models must not be redistributed.
 """
 from __future__ import annotations
 
@@ -172,45 +179,11 @@ MODELS_CONFIG = [
 
 
 # ── verification helpers (mirrors d:/App/asr-vn pattern) ────────────
-DIRECT_DOWNLOADS_CONFIG = [
-    {
-        "model_id": "***REMOVED***-en-vi-windows-x64",
-        "type": "zip",
-        "source_url": (
-            "https://github.com/welcomyou/scanindex/releases/download/"
-            "***REMOVED***/"
-            "ScanIndex-***REMOVED***-win-x64-2025.11.24.0-en_vi-2024.10.8.1.zip"
-        ),
-        "archive_sha256": "***REMOVED***",
-        "description": "Chrome ***REMOVED*** runtime + EN<->VI language pack bootstrap",
-        "integrity_files": {
-            "translate/en_vi/_metadata/verified_contents.json": "***REMOVED***",
-            "translate/en_vi/en_vi_dictionary/dictionary.bin": "***REMOVED***",
-            "translate/en_vi/en_vi_nmt/decoder_init_0.tflite": "***REMOVED***",
-            "translate/en_vi/en_vi_nmt/decoder_step_0.tflite": "cc65767453aba9f21eae4b498e4e187fe93deefeb6609d7a3d3b55797b6b4c5d",
-            "translate/en_vi/en_vi_nmt/encoder_0.tflite": "***REMOVED***",
-            "translate/en_vi/en_vi_nmt/processor_spec.pb": "***REMOVED***",
-            "translate/en_vi/en_vi_nmt/src_spm_model.model": "***REMOVED***",
-            "translate/en_vi/en_vi_nmt/src_spm_model.vocab": "***REMOVED***",
-            "translate/en_vi/en_vi_nmt/tgt_spm_model.model": "***REMOVED***",
-            "translate/en_vi/en_vi_nmt/tgt_spm_model.vocab": "***REMOVED***",
-            "translate/en_vi/en_vi_nmt/translation_model.pb": "***REMOVED***",
-            "translate/en_vi/manifest.json": "***REMOVED***",
-            "translate/en_vi/vi_en_nmt/decoder_init_0.tflite": "2d7b0a67592a6b2cf3bc17378d9c1fced057664f819c4b90b8ddf39b519ef2b9",
-            "translate/en_vi/vi_en_nmt/decoder_step_0.tflite": "***REMOVED***",
-            "translate/en_vi/vi_en_nmt/encoder_0.tflite": "***REMOVED***",
-            "translate/en_vi/vi_en_nmt/processor_spec.pb": "***REMOVED***",
-            "translate/en_vi/vi_en_nmt/src_spm_model.model": "***REMOVED***",
-            "translate/en_vi/vi_en_nmt/src_spm_model.vocab": "***REMOVED***",
-            "translate/en_vi/vi_en_nmt/tgt_spm_model.model": "***REMOVED***",
-            "translate/en_vi/vi_en_nmt/tgt_spm_model.vocab": "***REMOVED***",
-            "translate/en_vi/vi_en_nmt/translation_model.pb": "5963761a28c3fb6e4375f8ed6a2282b5db6a55042046a15f0e31940bc8aea856",
-            "translate/lib***REMOVED***/arch_x64": "***REMOVED***",
-            "translate/lib***REMOVED***/lib***REMOVED***.dll": "***REMOVED***",
-            "translate/***REMOVED***.dll": "***REMOVED***",
-        },
-    },
-]
+# ***REMOVED*** entry removed 2026-08: the EN<->VI translation feature was
+# dropped from the app. Do NOT re-add direct downloads of Google's
+# ***REMOVED***/lib***REMOVED*** binaries here or as GitHub release assets —
+# they are Google proprietary and must not be redistributed.
+DIRECT_DOWNLOADS_CONFIG = []
 
 
 class ModelIntegrityError(RuntimeError):

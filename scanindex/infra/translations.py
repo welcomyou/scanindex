@@ -148,10 +148,6 @@ The software prioritizes local processing when models and dependencies are insta
         "en": "Enable text correction (load model on demand)",
         "vi": "Bật sửa chính tả (tải model khi cần)"
     },
-    "chk_translate_vi": {
-        "en": "Translate to Vietnamese",
-        "vi": "Dịch sang tiếng Việt"
-    },
     "chk_zip_include_canonical": {
         "en": "Include OCR/KIE data (.json.zst) inside exported ZIP",
         "vi": "Kèm dữ liệu OCR/KIE (.json.zst) trong file ZIP xuất ra"
@@ -183,10 +179,6 @@ The software prioritizes local processing when models and dependencies are insta
               "trùng thừa). Khi tắt, các bản trùng vẫn được lưu — dành cho "
               "hồ sơ có chủ đích chứa cả bản gốc lẫn bản sao y — và tổng "
               "kết sau nhập sẽ báo đã lưu bao nhiêu bản trùng.",
-    },
-    "tooltip_translate_vi": {
-        "en": "Also export a Vietnamese translation as {name}_vi.docx after the Word export completes.",
-        "vi": "Sau khi xuất Word, xuất thêm bản dịch tiếng Việt {name}_vi.docx."
     },
     "chk_export": {
         "en": "Word export",

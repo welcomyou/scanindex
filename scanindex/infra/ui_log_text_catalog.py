@@ -45,7 +45,6 @@ UI_LOG_TEXT_PAIRS: tuple[tuple[str, str], ...] = (
     ("Output exists {}. Skipping OCR.", "Đầu ra {} đã tồn tại. Bỏ qua OCR."),
     ("OCR Success: {} ({}s)", "OCR thành công: {} ({} giây)"),
     ("Correction Success: {} ({}s)", "Sửa lỗi thành công: {} ({} giây)"),
-    ("Could not persist translate toggle: {}", "Không lưu được tùy chọn dịch: {}"),
     ("[digitization-warmup] LightGBM splitter ready in {}s", "[khởi động-số-hóa] bộ tách LightGBM sẵn sàng sau {} giây"),
     ("Correction: loading", "Sửa lỗi: đang tải"),
     ("LightGBM: ready", "LightGBM: sẵn sàng"),

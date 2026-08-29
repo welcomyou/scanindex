@@ -163,13 +163,6 @@ class SettingsTab(QWidget):
         self.chk_correct_enabled.setChecked(False)
         card.content_layout().addWidget(self.chk_correct_enabled)
 
-        # EN→VI translation toggle. When on, _export_single writes an extra
-        # *_vi.docx alongside the regular Word output using the bundled
-        # ***REMOVED*** shim. Default off — translation adds 2-30s per file.
-        self.chk_translate_vi = QCheckBox(translations.get_text("chk_translate_vi"))
-        self.chk_translate_vi.setChecked(False)
-        card.content_layout().addWidget(self.chk_translate_vi)
-
         form = QFormLayout()
         form.setSpacing(SP[1])
         form.setContentsMargins(0, 0, 0, 0)
@@ -559,7 +552,6 @@ class SettingsTab(QWidget):
                    doc_types: list[str] | None = None,
                    catalogs: dict | None = None,
                    theme: str = "dark",
-                   translate_vi: bool = False,
                    zip_include_canonical: bool = True,
                    skip_duplicate_docs: bool = True):
         self._wait_page_value = wait_page
@@ -572,7 +564,6 @@ class SettingsTab(QWidget):
             self.combo_model.setCurrentText(model)
         self.combo_model.blockSignals(False)
         self.chk_correct_enabled.setChecked(bool(correct))
-        self.chk_translate_vi.setChecked(bool(translate_vi))
         self.chk_zip_include_canonical.setChecked(bool(zip_include_canonical))
         self.chk_skip_duplicate_docs.setChecked(bool(skip_duplicate_docs))
         self.chk_verbose.setChecked(verbose)
@@ -608,7 +599,6 @@ class SettingsTab(QWidget):
             "export_workers": "1",
             "model": self.combo_model.currentText(),
             "correct": self.chk_correct_enabled.isChecked(),
-            "translate_vi": self.chk_translate_vi.isChecked(),
             "zip_include_canonical": self.chk_zip_include_canonical.isChecked(),
             "skip_duplicate_docs": self.chk_skip_duplicate_docs.isChecked(),
             "verbose": self.chk_verbose.isChecked(),
@@ -631,7 +621,6 @@ class SettingsTab(QWidget):
     def update_texts(self):
         self.btn_save.setText(translations.get_text("btn_save_settings"))
         self.chk_correct_enabled.setText(translations.get_text("chk_correct_enabled"))
-        self.chk_translate_vi.setText(translations.get_text("chk_translate_vi"))
         self.chk_zip_include_canonical.setText(
             translations.get_text("chk_zip_include_canonical")
         )

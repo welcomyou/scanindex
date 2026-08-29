@@ -2,7 +2,12 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$DistDir,
     [string]$IncludeCorrection = "1",
-    [string]$IncludeLegacyChrome = "0"
+    [string]$IncludeLegacyChrome = "0",
+    # Bundle Google's ScreenAI DLL + models into the dist. OFF by default:
+    # the default dist is release-safe (users fetch ScreenAI from Google's
+    # CDN on first run via screen_ai_downloader.py). Only enable for
+    # personal/internal builds - never publish a dist with this enabled.
+    [string]$IncludeScreenAI = "0"
 )
 
 $ErrorActionPreference = "Stop"
@@ -203,7 +208,11 @@ Copy-FileIfExists "config\sign_templates.json.example" "config\sign_templates.js
 Copy-DirIfExists "assets" "assets" "assets"
 Copy-DirIfExists "dictionaries" "dictionaries" "dictionaries"
 
-Copy-ScreenAiRuntime
+if (Is-Enabled $IncludeScreenAI) {
+    Copy-ScreenAiRuntime
+} else {
+    Write-Host "  [-] Skipped ScreenAI runtime (release-safe; set INCLUDE_SCREENAI=1 for personal/internal builds - app downloads it from Google CDN on first run)"
+}
 Copy-DirIfExists "models\orientation" "models\orientation" "orientation ONNX"
 Copy-DirIfExists "models\gmft_onnx" "models\gmft_onnx" "GMFT table ONNX"
 Copy-DirIfExists "models\docling_tableformer_v1_stepcache_onnx" "models\docling_tableformer_v1_stepcache_onnx" "Docling TableFormer v1 step-cache ONNX"
@@ -216,9 +225,6 @@ if (Is-Enabled $IncludeCorrection) {
 } else {
     Write-Host "  [-] Skipped optional CT2 correction model (set INCLUDE_CORRECTION=1 to include)"
 }
-
-# Google ***REMOVED*** (EN<->VI) — ***REMOVED***.dll + lib***REMOVED*** + en_vi NMT (~96 MB)
-Copy-DirIfExists "models\translate" "models\translate" "***REMOVED*** EN<->VI"
 
 if (Is-Enabled $IncludeLegacyChrome) {
     Copy-FileIfExists "drivers\chromedriver.exe" "drivers\chromedriver.exe" "chromedriver"

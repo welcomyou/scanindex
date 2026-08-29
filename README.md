@@ -26,28 +26,37 @@ Các màn hình UI chính:
 - **Phát hiện file mật** — quét folder, OCR trang đầu, nhận dạng dấu MẬT/TỐI MẬT/TUYỆT MẬT
 - **Công cụ hỗ trợ** — utilities khác
 
-## Lưu ý bản quyền: Google ScreenAI và ***REMOVED***
+## Lưu ý bản quyền: Google ScreenAI
 
-ScanIndex hiện dựa vào hai runtime component thuộc hệ sinh thái Google/Chrome:
+ScanIndex hiện dựa vào một runtime component thuộc hệ sinh thái Google/Chrome:
 
-- **Chrome ScreenAI** — DLL/runtime OCR tải từ Google CDN hoặc copy từ thư mục
-  Chrome local, dùng để OCR offline.
-- **Google/Chrome ***REMOVED***** — runtime + language pack EN↔VI dùng cho tính
-  năng dịch DOCX offline.
+- **Chrome ScreenAI** — DLL/runtime OCR, được lấy qua
+  [scanindex/core/ocr/screen_ai_downloader.py](scanindex/core/ocr/screen_ai_downloader.py)
+  (tải trực tiếp từ Google CDN, verify SHA256 theo updater XML của Google + chữ ký
+  Authenticode) hoặc copy từ thư mục Chrome local, dùng để OCR offline.
 
-Các component này **không thuộc sở hữu của dự án ScanIndex** và không được cấp
-license bởi README này. Google, Chrome, ScreenAI, ***REMOVED*** và các binary/model
-liên quan thuộc quyền sở hữu/điều khoản của Google LLC hoặc các bên cấp phép
-tương ứng. Cơ chế tải/copy trong repo chỉ kiểm tra nguồn gốc và tính toàn vẹn
-file; việc verify SHA256 hoặc Authenticode **không tạo thêm quyền sử dụng, phân
-phối hoặc thương mại hóa** các component đó.
+Component này **không thuộc sở hữu của dự án ScanIndex** và không được cấp
+license bởi README này. Google, Chrome, ScreenAI và các binary/model liên quan
+thuộc quyền sở hữu/điều khoản của Google LLC hoặc các bên cấp phép tương ứng.
+Cơ chế tải/copy trong repo chỉ kiểm tra nguồn gốc và tính toàn vẹn file; việc
+verify SHA256 hoặc Authenticode **không tạo thêm quyền sử dụng, phân phối hoặc
+thương mại hóa** component đó.
+
+### Chính sách phân phối (bắt buộc)
+
+- **Repo GitHub và bản release chỉ chứa source code + downloader.** KHÔNG đính
+  kèm `chrome_screen_ai.dll`, model ScreenAI, hay bất kỳ binary/model nào của
+  Google vào release assets, archive portable, hoặc kho khác. Người dùng cuối
+  tự tải component từ Google CDN qua downloader khi chạy lần đầu (giống cơ chế
+  component updater của Chrome).
+- Bản portable build cục bộ (có sẵn ScreenAI) chỉ dùng **cá nhân/nội bộ**.
 
 Dự án này được dùng cho **quy trình số hóa tài liệu nội bộ, không thương mại**.
-Không dùng bản portable/release chứa ScreenAI hoặc ***REMOVED*** để bán lại, cung
-cấp dịch vụ thương mại, SaaS, hoặc phân phối như một sản phẩm công khai khi chưa
-có đánh giá pháp lý và quyền sử dụng/phân phối phù hợp từ Google hoặc chủ sở hữu
-liên quan. Nếu cần triển khai thương mại, hãy thay thế các component Google/Chrome
-bằng engine có license rõ ràng cho mục đích đó, hoặc xin quyền sử dụng riêng.
+Không dùng bản portable/release chứa ScreenAI để bán lại, cung cấp dịch vụ
+thương mại, SaaS, hoặc phân phối như một sản phẩm công khai khi chưa có đánh
+giá pháp lý và quyền sử dụng/phân phối phù hợp từ Google. Nếu cần triển khai
+thương mại, hãy thay engine Google/Chrome bằng engine có license rõ ràng cho
+mục đích đó, hoặc xin quyền sử dụng riêng.
 
 Người vận hành cần tự bảo đảm việc sử dụng phù hợp với
 [Google Terms of Service](https://policies.google.com/terms) và
@@ -210,7 +219,7 @@ Model weights của ScanIndex: xem từng subdir/repo tương ứng trong
 và các repo Hugging Face được liệt kê ở trên; một số model upstream/base có thể
 có giới hạn non-commercial riêng.
 
-Google/Chrome ScreenAI và Google/Chrome ***REMOVED***: không nằm trong license của
-ScanIndex. Mọi quyền, nhãn hiệu, binary/runtime/model và điều khoản sử dụng thuộc
-Google LLC hoặc chủ sở hữu tương ứng. README này không cấp quyền phân phối,
-thương mại hóa, sublicensing, hoặc sử dụng ngoài phạm vi nội bộ/không thương mại.
+Google/Chrome ScreenAI: không nằm trong license của ScanIndex. Mọi quyền, nhãn
+hiệu, binary/runtime/model và điều khoản sử dụng thuộc Google LLC hoặc chủ sở
+hữu tương ứng. README này không cấp quyền phân phối, thương mại hóa,
+sublicensing, hoặc sử dụng ngoài phạm vi nội bộ/không thương mại.
