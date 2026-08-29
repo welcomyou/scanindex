@@ -78,13 +78,10 @@ pip install -r requirements.txt
 python scripts\download_offline_models.py
 ```
 
-Script kéo từng repo HF về `models/`, tải bootstrap ***REMOVED*** từ GitHub
-Release, sau đó **verify SHA256 từng file** theo bảng cứng trong
-[scripts/download_offline_models.py](scripts/download_offline_models.py). Mỗi
-repo HF cũng pin `revision=<commit_sha>`; bootstrap ***REMOVED*** pin URL asset,
-SHA256 archive và SHA256 từng file. ***REMOVED*** là component Google/Chrome; phần
-verify này chỉ xác nhận đúng artifact đã pin, không phải giấy phép phân phối hay
-thương mại hóa. Hash mismatch → script raise `ModelIntegrityError` và dừng.
+Script kéo từng repo HF về `models/`, sau đó **verify SHA256 từng file** theo bảng
+cứng trong [scripts/download_offline_models.py](scripts/download_offline_models.py).
+Mỗi repo HF cũng pin `revision=<commit_sha>`. Hash mismatch → script raise
+`ModelIntegrityError` và dừng.
 
 ScreenAI tải từ Google CDN qua [scanindex/core/ocr/screen_ai_downloader.py](scanindex/core/ocr/screen_ai_downloader.py). Downloader kiểm tra host Google + URL HTTPS, SHA256 64 ký tự do Google updater XML công bố hoặc fallback Google CDN được pin cứng, và chữ ký Authenticode của DLL Google.
 Đây cũng chỉ là kiểm tra provenance/tamper-resistance; quyền sử dụng ScreenAI vẫn
@@ -177,7 +174,6 @@ Tổng hợp ở Collection [welcomyou/scanindex](https://huggingface.co/collect
 | [welcomyou/gmft-tatr-onnx](https://huggingface.co/welcomyou/gmft-tatr-onnx) | Bảng — TATR detection + structure | active |
 | [welcomyou/docling-tableformer-v1-onnx-stepcache](https://huggingface.co/welcomyou/docling-tableformer-v1-onnx-stepcache) | Bảng — Docling TableFormer (stepcache) | active |
 | [welcomyou/scanindex-models](https://huggingface.co/welcomyou/scanindex-models) | Bundle nhỏ: PaddleOCR orientation classifier | active |
-| [ScanIndex ***REMOVED***](https://github.com/welcomyou/scanindex/releases/tag/***REMOVED***) | ***REMOVED*** EN↔VI bootstrap, pin SHA256 archive + từng file | active |
 | [welcomyou/e5-small-vn-archive-mix50](https://huggingface.co/welcomyou/e5-small-vn-archive-mix50) | Multilingual E5 embedder (semantic search) | **dormant** — code search đã chuyển sang Tantivy + SQLite, model giữ trên HF cho lần revive |
 | `BAAI/bge-reranker-v2-m3` (upstream) | Cross-encoder rerank cho semantic search | **dormant** — không wire trong UI hiện tại |
 

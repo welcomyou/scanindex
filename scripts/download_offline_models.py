@@ -28,11 +28,11 @@ Failure modes are loud: any hash mismatch, missing file, or HF error
 halts the script with a non-zero exit. Better to fail than to leave the
 app loading a tampered model.
 
-NOTE (2026-08): the ***REMOVED*** EN<->VI runtime was removed from the app.
+NOTE (2026-08): the EN<->VI translation runtime was removed from the app.
 Its direct-download entry was deleted from DIRECT_DOWNLOADS_CONFIG below,
-and the old `***REMOVED***` GitHub release asset that carried Google's
-***REMOVED*** binaries must be deleted from the repo's Releases page —
-Google's proprietary DLL/models must not be redistributed.
+and the old GitHub release asset that carried the third-party binaries
+was deleted from the repo's Releases page — proprietary vendor
+binaries/models must not be redistributed.
 """
 from __future__ import annotations
 
@@ -179,10 +179,9 @@ MODELS_CONFIG = [
 
 
 # ── verification helpers (mirrors d:/App/asr-vn pattern) ────────────
-# ***REMOVED*** entry removed 2026-08: the EN<->VI translation feature was
-# dropped from the app. Do NOT re-add direct downloads of Google's
-# ***REMOVED***/lib***REMOVED*** binaries here or as GitHub release assets —
-# they are Google proprietary and must not be redistributed.
+# EN<->VI translation entry removed 2026-08: the feature was dropped from
+# the app. Do NOT re-add direct downloads of the vendor's proprietary
+# translation binaries here or as GitHub release assets.
 DIRECT_DOWNLOADS_CONFIG = []
 
 
