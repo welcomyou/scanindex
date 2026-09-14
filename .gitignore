@@ -121,6 +121,7 @@ tests/*
 !tests/test_data_versioning.py
 !tests/test_secret_scan_excel_export.py
 !tests/test_secret_scan_progress.py
+!tests/test_secrecy_detection.py
 /scan_progress/
 !tests/test_portable_config_bootstrap.py
 !tests/test_ui_i18n.py

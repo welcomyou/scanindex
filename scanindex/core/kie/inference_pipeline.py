@@ -753,6 +753,46 @@ def _line_center(line: dict, page_width: float, page_height: float) -> tuple[flo
     return cx, cy
 
 
+def _normalised_page_text(page: dict) -> str:
+    return " ".join(
+        _strip_accents_upper(line.get("text", "") or "")
+        for line in page.get("lines") or []
+    )
+
+
+def _page_issued_by_mattran(page: dict) -> bool:
+    """True iff the page carries a Mặt trận Tổ quốc organisation identifier.
+
+    Front-issued documents head with "ỦY BAN MTTQ VIỆT NAM" (or the spelled-out
+    "Mặt trận Tổ quốc"), and their round seal repeats "MẶT TRẬN TỔ QUỐC". The
+    seal's curvy outer text is routinely shredded by OCR, including a
+    standalone "MAT" line that token-equals the accent-stripped keyword
+    "MẬT" — the exact false positive the lower-half guard suppresses.
+    """
+    text = _normalised_page_text(page)
+    return "MTTQ" in text or "MAT TRAN TO QUOC" in text
+
+
+def _is_likely_mattran_seal_fragment(
+    page: dict,
+    line: dict,
+    page_width: float,
+    page_height: float,
+) -> bool:
+    """Lower-half keyword hit on a Front-issued page is the org seal, not a mark.
+
+    Real secrecy stamps sit in the top corners; the Mặt trận seal sits next to
+    the signatures at the bottom. A keyword match in the lower half of a
+    Front-issued page is therefore almost certainly the seal fragment, while
+    the same match on any other organisation's page keeps flagging (e.g. "Số
+    12/MẬT" number lines are usually mid-page and must stay detectable).
+    """
+    if not _page_issued_by_mattran(page):
+        return False
+    _, cy = _line_center(line, page_width, page_height)
+    return cy > 0.5
+
+
 def _detect_secrecy_mark_on_page(page: dict, *, require_roi: bool) -> str | None:
     page_width = page.get("width") or 595.28
     page_height = page.get("height") or 841.89
@@ -771,8 +811,16 @@ def _detect_secrecy_mark_on_page(page: dict, *, require_roi: bool) -> str | None
         # Longest keyword first because "TUYỆT MẬT" also contains "MẬT" as
         # tokens and we want the more specific classification.
         for kw in _SECRECY_KEYWORDS:
-            if matcher(text, kw):
-                return kw
+            if not matcher(text, kw):
+                continue
+            if not require_roi and _is_likely_mattran_seal_fragment(
+                page, line, page_width, page_height
+            ):
+                # Coordinate-free fallback: a lower-half hit on a Front-issued
+                # page is the round "MẶT TRẬN" seal shredding into "MAT", not
+                # a secrecy stamp (those live in the top corners).
+                continue
+            return kw
     return None
 
 
@@ -789,6 +837,12 @@ def detect_secrecy_mark(canonical_doc: dict, *, text_fallback: bool = True) -> s
     by archive splitting, KIE viewer highlighting, and the support tool.
     Pass ``text_fallback=False`` only when a caller needs exact KIE-field
     parity with :func:`apply_rule_based_marks`.
+
+    Within the coordinate-free fallback, a keyword hit in the lower half of a
+    Mặt trận Tổ quốc-issued page is suppressed: the Front's round seal ("MẶT
+    TRẬN TỔ QUỐC") OCR-shreds into lines like "MAT" that token-equal the
+    stripped "MẬT" keyword, and genuine secrecy stamps never sit at the
+    bottom of the page.
     """
     if not isinstance(canonical_doc, dict):
         return None
