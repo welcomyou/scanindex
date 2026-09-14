@@ -13,6 +13,15 @@ template from left to right.
 """
 
 UI_TEXT_PAIRS: tuple[tuple[str, str], ...] = (
+    ("Reuse previous scan results", "Tận dụng kết quả đã quét"),
+    ("Enabled: successfully scanned files that have NOT changed (same size\nand modification time) are skipped in subsequent scans, including scans\nof a parent folder or resumed scans. Changed or new files are always\nscanned. Upgrading the app automatically rescans everything.", "Bật: file đã quét thành công mà KHÔNG đổi (kích thước, ngày sửa\ngiữ nguyên) sẽ được bỏ qua ở mọi lượt quét sau — kể cả khi quét\nthư mục cha chứa nó, hay quét lại sau khi quét dở. File đổi hoặc\nmới luôn được quét. Nâng cấp phần mềm sẽ tự quét lại toàn bộ."),
+    ("Clear scan history", "Xóa lịch sử quét"),
+    ("Clear all unfinished scan progress and scan history — the next scan will process every file from scratch.", "Xóa toàn bộ tiến độ quét dở và lịch sử \"đã quét\" — lượt quét sau sẽ quét lại mọi file từ đầu."),
+    ("Resume scan?", "Tiếp tục quét?"),
+    ("This folder has an unfinished scan:\n• Completed: {} files\n• Previous errors (will retry): {} files\n• Classified matches found: {}\n\nResume where it stopped?\nChoose \"No\" to scan everything from scratch.", "Thư mục này có lượt quét chưa hoàn tất:\n• Đã quét xong: {} file\n• Lỗi lần trước (sẽ thử lại): {} file\n• Dòng mật đã phát hiện: {}\n\nTiếp tục từ nơi dừng không?\nChọn \"No\" để quét lại toàn bộ từ đầu."),
+    ("Clear scan history?", "Xóa lịch sử quét?"),
+    ("This will delete all:\n• Unfinished scan progress (cannot be resumed)\n• Scan history — the next scan will process every file from scratch\n\nExported Excel results and logs in logs/ are unaffected.\nDelete now?", "Sẽ xóa toàn bộ:\n• Tiến độ các lượt quét chưa hoàn tất (không tiếp tục được nữa)\n• Lịch sử \"đã quét\" — lượt quét sau sẽ quét lại mọi file từ đầu\n\nKết quả đã xuất Excel và log trong logs/ không bị ảnh hưởng.\nXóa ngay?"),
+    ("Cannot clear scan history:\n{}", "Không xóa được lịch sử quét:\n{}"),
     ("Export Excel", "Xuất Excel"),
     ("Export the displayed classified document list to Excel (.xlsx)", "Xuất danh sách văn bản mật đang hiển thị ra file Excel (.xlsx)"),
     ("Excel exported", "Đã xuất Excel"),

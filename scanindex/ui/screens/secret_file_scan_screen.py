@@ -10,7 +10,7 @@ import subprocess
 import textwrap
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
 )
 
 from scanindex.infra.paths import get_base_dir
+from scanindex.core import secret_scan_progress as ssp
 from scanindex.ui.screens.screen_base import ScreenContent
 from scanindex.ui.theme import (
     COLOR_ACCENT,
@@ -1458,6 +1459,27 @@ def export_matches_to_excel(matches: list[SecretScanMatch], output_path: str) ->
     return output_path
 
 
+def _split_pending(
+    files: list[str],
+    folder: str,
+    done_rel: set[str],
+) -> tuple[list[tuple[int, str]], int]:
+    """Split the folder listing into (pending, skipped) for a resumed scan.
+
+    ``files`` keeps its enumerate-from-1 index so progress display and the
+    per-file workdir naming stay stable; a file whose relative path is in
+    ``done_rel`` is counted as skipped instead of queued.
+    """
+    pending: list[tuple[int, str]] = []
+    skipped = 0
+    for idx, path in enumerate(files, start=1):
+        if os.path.relpath(path, folder) in done_rel:
+            skipped += 1
+        else:
+            pending.append((idx, path))
+    return pending, skipped
+
+
 class SecretFileScanScreen(ScreenContent):
     """Find classified-document stamps in supported files inside a folder."""
 
@@ -1570,6 +1592,22 @@ class SecretFileScanScreen(ScreenContent):
         opts = QHBoxLayout()
         opts.addStretch(1)
 
+        self.history_checkbox = QCheckBox("Tận dụng kết quả đã quét")
+        self.history_checkbox.setChecked(True)
+        self.history_checkbox.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.history_checkbox.setStyleSheet(
+            f"QCheckBox {{ color: {COLOR_TEXT}; font: 13px '{FONT_UI}';"
+            f" padding: 4px 8px; }}"
+            f"QCheckBox::indicator {{ width: 16px; height: 16px; }}"
+        )
+        self.history_checkbox.setToolTip(
+            "Bật: file đã quét thành công mà KHÔNG đổi (kích thước, ngày sửa\n"
+            "giữ nguyên) sẽ được bỏ qua ở mọi lượt quét sau — kể cả khi quét\n"
+            "thư mục cha chứa nó, hay quét lại sau khi quét dở. File đổi hoặc\n"
+            "mới luôn được quét. Nâng cấp phần mềm sẽ tự quét lại toàn bộ."
+        )
+        opts.addWidget(self.history_checkbox)
+
         self.fast_checkbox = QCheckBox("Tìm nhanh — chỉ trang đầu")
         self.fast_checkbox.setChecked(True)
         self.fast_checkbox.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1620,6 +1658,15 @@ class SecretFileScanScreen(ScreenContent):
         self.progress.setValue(0)
         self.progress.setFixedWidth(220)
         status_row.addWidget(self.progress)
+        self.btn_clear_history = QPushButton("Xóa lịch sử quét")
+        self.btn_clear_history.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_clear_history.setStyleSheet(self._secondary_btn_qss())
+        self.btn_clear_history.setToolTip(
+            "Xóa toàn bộ tiến độ quét dở và lịch sử \"đã quét\" — lượt quét sau "
+            "sẽ quét lại mọi file từ đầu."
+        )
+        self.btn_clear_history.clicked.connect(self._clear_history_clicked)
+        status_row.addWidget(self.btn_clear_history)
         layout.addLayout(status_row)
 
         self.table = QTableWidget(0, 5)
@@ -1689,23 +1736,70 @@ class SecretFileScanScreen(ScreenContent):
         if self._busy:
             return
 
+        first_page_only = self.fast_checkbox.isChecked()
+        resume_prog = self._offer_resume(folder, first_page_only)
+
         self._busy = True
         self._cancel_event.clear()
         self._results = []
         self.table.setRowCount(0)
+        if resume_prog is not None:
+            # Khôi phục các dòng mật đã phát hiện ở lượt trước lên bảng.
+            for match_dict in resume_prog.matches:
+                try:
+                    self._add_result(SecretScanMatch(**match_dict))
+                except (TypeError, ValueError):
+                    continue
         self._set_running_ui(True)
         self._set_status("Đang chuẩn bị...")
         self.progress.setValue(0)
         self.progress.setMaximum(1)
 
-        first_page_only = self.fast_checkbox.isChecked()
         thread = threading.Thread(
             target=self._run_worker,
-            args=(folder, first_page_only),
+            args=(folder, first_page_only, resume_prog),
             daemon=True,
             name="secret-file-scan",
         )
         thread.start()
+
+    def _offer_resume(
+        self, folder: str, first_page_only: bool
+    ) -> "ssp.SecretScanProgress | None":
+        """Detect an unfinished scan for this folder+mode and ask the user.
+
+        Returns the progress object to resume from, or None for a fresh
+        scan. Also prunes abandoned journals older than 30 days.
+        """
+        try:
+            ssp.prune_stale()
+        except Exception:
+            pass
+        mode_key = "fast" if first_page_only else "thorough"
+        try:
+            prog = ssp.SecretScanProgress.load(folder, mode_key)
+        except Exception:
+            return None
+        if prog is None:
+            return None
+        done_count, error_count, found = prog.stats()
+        if done_count == 0 and error_count == 0 and found == 0:
+            return None
+        answer = QMessageBox.question(
+            self,
+            "Tiếp tục quét?",
+            (
+                "Thư mục này có lượt quét chưa hoàn tất:\n"
+                f"• Đã quét xong: {done_count} file\n"
+                f"• Lỗi lần trước (sẽ thử lại): {error_count} file\n"
+                f"• Dòng mật đã phát hiện: {found}\n\n"
+                "Tiếp tục từ nơi dừng không?\n"
+                "Chọn \"No\" để quét lại toàn bộ từ đầu."
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        return prog if answer == QMessageBox.StandardButton.Yes else None
 
     def _stop_clicked(self) -> None:
         self._cancel_event.set()
@@ -1715,21 +1809,58 @@ class SecretFileScanScreen(ScreenContent):
         self.btn_browse.setEnabled(not running)
         self.folder_edit.setEnabled(not running)
         self.fast_checkbox.setEnabled(not running)
+        self.history_checkbox.setEnabled(not running)
+        self.btn_clear_history.setEnabled(not running)
         # Chỉ bật lại nút xuất khi hết bận VÀ đang có kết quả để xuất.
         self.btn_export.setEnabled(not running and bool(self._results))
         self.btn_run.setVisible(not running)
         self.btn_stop.setVisible(running)
 
-    def _run_worker(self, folder: str, first_page_only: bool) -> None:
+    def _run_worker(
+        self,
+        folder: str,
+        first_page_only: bool,
+        resume_prog: "ssp.SecretScanProgress | None" = None,
+    ) -> None:
         from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 
         started = time.strftime("%Y%m%d_%H%M%S")
         work_root = os.path.join(get_base_dir(), "temp", f"secret_scan_{started}")
         os.makedirs(work_root, exist_ok=True)
+        mode_key = "fast" if first_page_only else "thorough"
+        # resume_prog tới từ _offer_resume (đã hỏi người dùng); None = quét mới.
+        # Journal ghi tiếp theo từng file nên chi phí không đổi dù 1 triệu file.
+        prog = resume_prog if resume_prog is not None else ssp.SecretScanProgress.create(
+            folder, mode_key
+        )
+
         files = list(_iter_supported_files(folder))
         total = len(files)
-        self._progress_changed.emit(0, max(1, total))
-        self.log_message.emit(f"Quét file mật: tìm thấy {total} file hỗ trợ", "info")
+        pending, skipped = _split_pending(files, folder, prog.done_files())
+
+        # Sổ file toàn cục: file đã quét thành công mà không đổi (size +
+        # mtime + version + cùng chế độ) được bỏ qua ở MỌI lượt quét sau,
+        # kể cả khi quét thư mục cha chứa nó.
+        use_history = self.history_checkbox.isChecked()
+        registry = ssp.FileRegistry.load() if use_history else None
+        from scanindex.infra.version import get_version
+
+        app_version = get_version()
+        if registry is None:
+            self.log_message.emit("Lịch sử quét: TẮT — quét lại toàn bộ", "info")
+        cache_skipped = [0]
+
+        if skipped:
+            self._progress_changed.emit(skipped, max(1, total))
+            self._status_changed.emit(f"Tiếp tục: còn {len(pending)} file cần quét")
+            self.log_message.emit(
+                f"Tiếp tục quét: bỏ qua {skipped} file đã quét lần trước, "
+                f"còn {len(pending)} file cần quét (tổng {total} file)",
+                "info",
+            )
+        else:
+            self._progress_changed.emit(0, max(1, total))
+            self.log_message.emit(f"Quét file mật: tìm thấy {total} file hỗ trợ", "info")
 
         # File-level parallelism: each worker thread processes one file. The
         # OCR pool (when used inside _process_pdf_per_page) is a shared global,
@@ -1739,7 +1870,10 @@ class SecretFileScanScreen(ScreenContent):
         # are OCR'd concurrently.
         max_file_workers = max(1, min(2, total))
         progress_lock = threading.Lock()
-        done = [0]
+        # state_lock: record_*/save trên prog dùng chung phải nguyên tố —
+        # hai worker ghi xen kẽ vào cùng file handle sẽ làm hỏng dòng journal.
+        state_lock = threading.Lock()
+        done = [skipped]
         scanned = [0]
         failures = [0]
         cancelled = [False]
@@ -1755,6 +1889,38 @@ class SecretFileScanScreen(ScreenContent):
                 self.log_message.emit(f"[{rel_path}] {message}", "info")
 
             try:
+                # Lookup lịch sử TRƯỚC khi quét: file không đổi → dùng lại
+                # kết quả cũ, không tốn OCR.
+                cached_dicts: list[dict] | None = None
+                if registry is not None:
+                    try:
+                        st = os.stat(path)
+                        cached_dicts = registry.lookup(
+                            path,
+                            st.st_size,
+                            st.st_mtime,
+                            mode_key,
+                            app_version,
+                        )
+                    except OSError:
+                        cached_dicts = None
+                if cached_dicts is not None:
+                    for match_dict in cached_dicts:
+                        try:
+                            self._result_found.emit(
+                                SecretScanMatch(**match_dict)
+                            )
+                        except (TypeError, ValueError):
+                            continue
+                    with state_lock:
+                        prog.record_file(rel, "ok")
+                        prog.record_matches(cached_dicts)
+                        cache_skipped[0] += 1
+                    self._status_changed.emit(
+                        f"Đã quét trước đây, bỏ qua: {rel}"
+                    )
+                    return
+
                 matches = scan_one_file_for_secret(
                     path,
                     rel,
@@ -1763,19 +1929,42 @@ class SecretFileScanScreen(ScreenContent):
                     self._cancel_event,
                     file_log,
                 )
+                match_dicts = [asdict(m) for m in matches]
                 for match in matches:
                     self._result_found.emit(match)
+                with state_lock:
+                    prog.record_file(rel, "ok")
+                    prog.record_matches(match_dicts)
+                    if registry is not None:
+                        try:
+                            st = os.stat(path)
+                            registry.record(
+                                path,
+                                st.st_size,
+                                st.st_mtime,
+                                mode_key,
+                                app_version,
+                                match_dicts,
+                            )
+                        except OSError:
+                            pass
                 with progress_lock:
                     scanned[0] += 1
             except _ScanCancelled:
                 cancelled[0] = True
             except Exception as exc:
+                with state_lock:
+                    prog.record_file(rel, "err", str(exc))
                 with progress_lock:
                     failures[0] += 1
                 self.log_message.emit(f"[{rel}] Lỗi: {exc}", "err")
             finally:
                 if os.path.isdir(file_work):
                     shutil.rmtree(file_work, ignore_errors=True)
+                with state_lock:
+                    prog.save()
+                    if registry is not None:
+                        registry.save()
                 with progress_lock:
                     done[0] += 1
                     self._progress_changed.emit(done[0], max(1, total))
@@ -1786,12 +1975,12 @@ class SecretFileScanScreen(ScreenContent):
             ) as executor:
                 futures = {
                     executor.submit(process_one, idx, path): idx
-                    for idx, path in enumerate(files, start=1)
+                    for idx, path in pending
                 }
-                pending = set(futures)
+                pending_futures = set(futures)
                 try:
-                    while pending and not self._cancel_event.is_set():
-                        done_set, pending = wait(pending, timeout=0.2, return_when=FIRST_COMPLETED)
+                    while pending_futures and not self._cancel_event.is_set():
+                        done_set, pending_futures = wait(pending_futures, timeout=0.2, return_when=FIRST_COMPLETED)
                         for fut in done_set:
                             # Re-raise any exception from the worker (except
                             # _ScanCancelled, which only flags cancellation).
@@ -1806,10 +1995,27 @@ class SecretFileScanScreen(ScreenContent):
                     for fut in futures:
                         fut.cancel()
         finally:
+            with state_lock:
+                done_n, err_n, found_n = prog.stats()
+                if (done_n or err_n or found_n) and (cancelled[0] or failures[0]):
+                    # Chưa xong hẳn (dừng tay hoặc còn file lỗi) → giữ journal
+                    # để lần sau chọn lại thư mục này được hỏi tiếp tục;
+                    # file lỗi sẽ được thử lại.
+                    prog.save()
+                else:
+                    # Hoàn tất sạch (hoặc không có gì đáng tiếp) → xóa journal.
+                    prog.discard()
+                # Đóng handle ngay — file mở để lâu sẽ chặn "Xóa lịch sử
+                # quét" và backup trên Windows.
+                prog.close()
+                if registry is not None:
+                    registry.close()
             self._scan_finished.emit(
                 {
                     "total": total,
                     "scanned": scanned[0],
+                    "skipped": skipped,
+                    "cache_skipped": cache_skipped[0],
                     "failures": failures[0],
                     "cancelled": cancelled[0],
                     "work_root": work_root,
@@ -1857,28 +2063,69 @@ class SecretFileScanScreen(ScreenContent):
         self._set_running_ui(False)
         total = int(payload.get("total") or 0)
         scanned = int(payload.get("scanned") or 0)
+        skipped = int(payload.get("skipped") or 0)
+        cache_skipped = int(payload.get("cache_skipped") or 0)
         failures = int(payload.get("failures") or 0)
         cancelled = bool(payload.get("cancelled"))
         found = len(self._results)
         prefix = "Đã dừng" if cancelled else "Hoàn tất"
+        detail = f"quét {scanned + skipped + cache_skipped}/{total} file"
+        notes = []
+        if skipped:
+            notes.append(f"bỏ qua {skipped} file đã quét lần trước")
+        if cache_skipped:
+            notes.append(f"tận dụng {cache_skipped} file không đổi")
+        if notes:
+            detail += " (" + "; ".join(notes) + ")"
         self._set_status(
-            f"{prefix}: quét {scanned}/{total} file, phát hiện {found} dòng mật, lỗi {failures}"
+            f"{prefix}: {detail}, phát hiện {found} dòng mật, lỗi {failures}"
         )
         self.log_message.emit(
-            f"Quét file mật: {prefix.lower()} - {scanned}/{total} file, "
+            f"Quét file mật: {prefix.lower()} - {detail}, "
             f"{found} dòng mật, lỗi {failures}.",
             "success" if not cancelled else "info",
         )
+        if cancelled:
+            self.log_message.emit(
+                "Tiến độ quét đã được lưu — chọn lại đúng thư mục này rồi bấm "
+                "\"Bắt đầu quét\" để tiếp tục từ nơi dừng.",
+                "info",
+            )
 
-        # Wipe per-run workdir — UI keeps results in memory; nothing on disk
-        # in temp/secret_scan_<ts>/ is needed after the scan completes. Match
-        # behavior of cleanup_stale_temp_dirs() at startup.
-        work_root = payload.get("work_root") if isinstance(payload, dict) else None
+        work_root = payload.get("work_root")
         if work_root and os.path.isdir(work_root):
-            try:
-                shutil.rmtree(work_root, ignore_errors=True)
-            except Exception:
-                pass
+            shutil.rmtree(work_root, ignore_errors=True)
+
+    def _clear_history_clicked(self) -> None:
+        if self._busy:
+            return
+        answer = QMessageBox.question(
+            self,
+            "Xóa lịch sử quét?",
+            (
+                "Sẽ xóa toàn bộ:\n"
+                "• Tiến độ các lượt quét chưa hoàn tất (không tiếp tục được nữa)\n"
+                "• Lịch sử \"đã quét\" — lượt quét sau sẽ quét lại mọi file từ đầu\n\n"
+                "Kết quả đã xuất Excel và log trong logs/ không bị ảnh hưởng.\n"
+                "Xóa ngay?"
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            removed = ssp.clear_all()
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Lỗi", f"Không xóa được lịch sử quét:\n{exc}"
+            )
+            return
+        self._set_status(f"Đã xóa {removed} file lịch sử quét")
+        self.log_message.emit(
+            f"Đã xóa lịch sử quét văn bản mật ({removed} file trong scan_progress/).",
+            "success",
+        )
 
     def _open_result_file(self, item: QTableWidgetItem) -> None:
         source_path = item.data(Qt.ItemDataRole.UserRole)
