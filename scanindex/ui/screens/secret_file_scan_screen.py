@@ -1399,6 +1399,65 @@ def scan_one_file_for_secret(
     ).matches
 
 
+EXCEL_HEADERS = [
+    "STT",
+    "Độ mật",
+    "Tên tệp",
+    "File (trong thư mục quét)",
+    "Đường dẫn đầy đủ",
+    "Trang",
+    "Chế độ",
+    "Ghi chú",
+]
+
+_EXCEL_COL_WIDTHS = [6, 12, 30, 42, 62, 8, 12, 42]
+
+
+def export_matches_to_excel(matches: list[SecretScanMatch], output_path: str) -> str:
+    """Write the scan results to a one-sheet .xlsx workbook.
+
+    One row per detected stamp — the same rows shown in the results table —
+    plus the absolute path and bare file name so the list stays usable when
+    shared outside the app.
+    """
+    import openpyxl
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Van ban mat"
+
+    header_font = Font(bold=True, color="FFFFFF")
+    header_fill = PatternFill("solid", fgColor="C0392B")
+    center = Alignment(horizontal="center", vertical="center")
+    for col, name in enumerate(EXCEL_HEADERS, start=1):
+        cell = ws.cell(row=1, column=col, value=name)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = center
+
+    for idx, match in enumerate(matches, start=1):
+        row = idx + 1
+        ws.cell(row=row, column=1, value=idx).alignment = center
+        ws.cell(row=row, column=2, value=match.keyword)
+        ws.cell(row=row, column=3, value=os.path.basename(match.source_path))
+        ws.cell(row=row, column=4, value=match.relative_path)
+        ws.cell(row=row, column=5, value=match.source_path)
+        ws.cell(row=row, column=6, value=int(match.page_number)).alignment = center
+        ws.cell(row=row, column=7, value=match.mode)
+        ws.cell(row=row, column=8, value=match.note)
+
+    for col, width in enumerate(_EXCEL_COL_WIDTHS, start=1):
+        ws.column_dimensions[get_column_letter(col)].width = width
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:H{max(1, len(matches) + 1)}"
+
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    wb.save(output_path)
+    return output_path
+
+
 class SecretFileScanScreen(ScreenContent):
     """Find classified-document stamps in supported files inside a folder."""
 
@@ -1532,6 +1591,14 @@ class SecretFileScanScreen(ScreenContent):
         self.btn_run.clicked.connect(self._run_clicked)
         opts.addWidget(self.btn_run)
 
+        self.btn_export = QPushButton("Xuất Excel")
+        self.btn_export.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_export.setStyleSheet(self._secondary_btn_qss())
+        self.btn_export.setEnabled(False)
+        self.btn_export.setToolTip("Xuất danh sách văn bản mật đang hiển thị ra file Excel (.xlsx)")
+        self.btn_export.clicked.connect(self._export_clicked)
+        opts.addWidget(self.btn_export)
+
         self.btn_stop = QPushButton("Dừng")
         self.btn_stop.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_stop.setStyleSheet(self._danger_btn_qss())
@@ -1648,6 +1715,8 @@ class SecretFileScanScreen(ScreenContent):
         self.btn_browse.setEnabled(not running)
         self.folder_edit.setEnabled(not running)
         self.fast_checkbox.setEnabled(not running)
+        # Chỉ bật lại nút xuất khi hết bận VÀ đang có kết quả để xuất.
+        self.btn_export.setEnabled(not running and bool(self._results))
         self.btn_run.setVisible(not running)
         self.btn_stop.setVisible(running)
 
@@ -1756,6 +1825,7 @@ class SecretFileScanScreen(ScreenContent):
 
     def _add_result(self, match: SecretScanMatch) -> None:
         self._results.append(match)
+        self.btn_export.setEnabled(True)
         row = self.table.rowCount()
         self.table.insertRow(row)
         values = [
@@ -1814,3 +1884,42 @@ class SecretFileScanScreen(ScreenContent):
         source_path = item.data(Qt.ItemDataRole.UserRole)
         if source_path and os.path.exists(source_path):
             QDesktopServices.openUrl(QUrl.fromLocalFile(source_path))
+
+    def _export_clicked(self) -> None:
+        if not self._results:
+            QMessageBox.information(
+                self,
+                "Chưa có kết quả",
+                "Chưa có văn bản mật nào được phát hiện để xuất.",
+            )
+            return
+        folder = self.folder_edit.text().strip()
+        start_dir = folder if folder and os.path.isdir(folder) else os.path.expanduser("~")
+        default_name = f"DanhSachVanBanMat_{time.strftime('%Y%m%d_%H%M%S')}.xlsx"
+        dest, _ = QFileDialog.getSaveFileName(
+            self,
+            translations.localize_text("Xuất danh sách văn bản mật"),
+            os.path.join(start_dir, default_name),
+            translations.localize_text("Excel (*.xlsx)"),
+        )
+        if not dest:
+            return
+        if not dest.lower().endswith(".xlsx"):
+            dest += ".xlsx"
+        try:
+            export_matches_to_excel(self._results, dest)
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Lỗi", f"Không thể xuất file Excel:\n{exc}"
+            )
+            return
+        self._set_status(f"Đã xuất {len(self._results)} dòng mật ra: {dest}")
+        self.log_message.emit(
+            f"Đã xuất danh sách văn bản mật ({len(self._results)} dòng): {dest}",
+            "success",
+        )
+        QMessageBox.information(
+            self,
+            "Đã xuất Excel",
+            f"Đã lưu danh sách {len(self._results)} văn bản mật vào:\n{dest}",
+        )

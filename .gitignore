@@ -119,6 +119,7 @@ tests/*
 !tests/test_archive_runner_ocr_reuse.py
 !tests/test_kie_doc_subject_postprocess.py
 !tests/test_data_versioning.py
+!tests/test_secret_scan_excel_export.py
 !tests/test_portable_config_bootstrap.py
 !tests/test_ui_i18n.py
 !tests/test_search_correctness.py

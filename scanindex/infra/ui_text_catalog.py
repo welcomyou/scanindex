@@ -13,6 +13,17 @@ template from left to right.
 """
 
 UI_TEXT_PAIRS: tuple[tuple[str, str], ...] = (
+    ("Export Excel", "Xuất Excel"),
+    ("Export the displayed classified document list to Excel (.xlsx)", "Xuất danh sách văn bản mật đang hiển thị ra file Excel (.xlsx)"),
+    ("Excel exported", "Đã xuất Excel"),
+    ("Saved {} classified documents to:\n{}", "Đã lưu danh sách {} văn bản mật vào:\n{}"),
+    ("No results", "Chưa có kết quả"),
+    ("No classified documents have been detected to export.", "Chưa có văn bản mật nào được phát hiện để xuất."),
+    ("Cannot export Excel file:\n{}", "Không thể xuất file Excel:\n{}"),
+    ("Export classified document list", "Xuất danh sách văn bản mật"),
+    ("Excel (*.xlsx)", "Excel (*.xlsx)"),
+    ("Exported {} classified rows to: {}", "Đã xuất {} dòng mật ra: {}"),
+    ("Exported classified document list ({} rows): {}", "Đã xuất danh sách văn bản mật ({} dòng): {}"),
     # Qt/common actions and messages
     ("Accept", "Đồng ý"),
     ("Add", "Thêm"),
