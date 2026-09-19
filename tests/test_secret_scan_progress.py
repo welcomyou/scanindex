@@ -37,10 +37,59 @@ def test_create_save_load_roundtrip() -> None:
     loaded = ssp.SecretScanProgress.load(FOLDER, "fast")
     assert loaded is not None
     assert loaded.done_files() == {"a.pdf"}
-    done, errors, found = loaded.stats()
-    assert (done, errors, found) == (1, 1, 1)
+    done, errors, skipped, found = loaded.stats()
+    assert (done, errors, skipped, found) == (1, 1, 0, 1)
     assert loaded.matches == [{"keyword": "Mật", "page_number": 1}]
     prog.discard()
+
+
+def test_skip_state_is_not_retried_on_resume() -> None:
+    """File hỏng (0 byte / không phải PDF) ghi trạng thái "skip": tính vào
+    done_files() để resume bỏ qua luôn, tách khỏi _errors, giữ nguyên lý do."""
+    prog = _make()
+    prog.record_file("ok.pdf", "ok")
+    prog.record_file("rac.pdf", "skip", "Không phải PDF hợp lệ (nội dung hỏng)")
+    prog.record_file("trong.pdf", "skip", "File rỗng (0 byte)")
+    prog.record_file("loi.pdf", "err", "OCR thất bại")
+    assert prog.done_files() == {"ok.pdf", "rac.pdf", "trong.pdf"}
+    assert prog.stats() == (1, 1, 2, 0)
+
+    prog.save()
+    loaded = ssp.SecretScanProgress.load(FOLDER, "fast")
+    assert loaded is not None
+    assert loaded.done_files() == {"ok.pdf", "rac.pdf", "trong.pdf"}
+    assert loaded._skipped == {
+        "rac.pdf": "Không phải PDF hợp lệ (nội dung hỏng)",
+        "trong.pdf": "File rỗng (0 byte)",
+    }
+    assert loaded._errors == {"loi.pdf": "OCR thất bại"}
+
+    # File hỏng sau đó "ok" (được sửa/chép lại) → phải rời khỏi skip.
+    loaded.record_file("rac.pdf", "ok")
+    assert loaded.done_files() == {"ok.pdf", "rac.pdf", "trong.pdf"}
+    assert loaded._skipped == {"trong.pdf": "File rỗng (0 byte)"}
+    prog.discard()
+    loaded.discard()
+
+
+def test_skip_state_survives_compaction() -> None:
+    prog = _make()
+    prog.record_file("rac.pdf", "skip", "PDF không có trang")
+    prog.record_file("ok.pdf", "ok")
+    prog.save()
+    prog.close()
+
+    loaded = ssp.SecretScanProgress.load(FOLDER, "fast")
+    assert loaded is not None
+    # Nén ngay: snapshot phải giữ đủ dòng skip.
+    loaded._compact()
+    reloaded = ssp.SecretScanProgress.load(FOLDER, "fast")
+    assert reloaded is not None
+    assert reloaded.done_files() == {"ok.pdf", "rac.pdf"}
+    assert reloaded._skipped == {"rac.pdf": "PDF không có trang"}
+    prog.discard()
+    loaded.discard()
+    reloaded.discard()
 
 
 def test_error_overrides_ok_for_same_file() -> None:
@@ -219,7 +268,7 @@ def test_scale_record_then_load_100k_files() -> None:
     load_secs = time.perf_counter() - t0
 
     assert loaded.done_files() == {f"thu_muc_con/file_{i:06d}.pdf" for i in range(100_000)}
-    assert loaded.stats() == (100_000, 1, 0)
+    assert loaded.stats() == (100_000, 1, 0, 0)
     # Ghi tiếp phải nhanh (nếu vẫn là ghi-lại-toàn-bộ thì 100k lần ghi
     # sẽ mất hàng phút). Nới lỏng để tránh test giật theo máy chậm.
     assert record_secs < 30, f"ghi {record_secs:.1f}s quá chậm"

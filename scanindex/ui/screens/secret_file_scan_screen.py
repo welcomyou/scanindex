@@ -35,6 +35,8 @@ from PySide6.QtWidgets import (
 )
 
 from scanindex.infra.paths import get_base_dir
+from scanindex.infra.app_log import write as app_log_write
+from scanindex.infra.mem_stats import memory_snapshot_text
 from scanindex.core import secret_scan_progress as ssp
 from scanindex.ui.screens.screen_base import ScreenContent
 from scanindex.ui.theme import (
@@ -65,6 +67,21 @@ _SECRET_SCAN_DPI = 200
 
 class _ScanCancelled(Exception):
     pass
+
+
+class _ScanSkip(Exception):
+    """File không bao giờ quét được (rỗng / không phải PDF / 0 trang).
+
+    Khác với lỗi tạm thời: ghi journal với trạng thái "skip" để resume
+    bỏ qua luôn, không thử lại mỗi lượt quét và không đếm là Lỗi."""
+    pass
+
+
+# Số file tối đa được submit vào ThreadPoolExecutor cùng lúc. Queuing mọi
+# file của một thư mục 300k+ file một thể tạo hàng trăm nghìn đối tượng
+# Future trong process chính — cửa sổ trượt giữ RAM phẳng trong khi 2
+# file-worker vẫn luôn có việc.
+_SCAN_MAX_INFLIGHT_FILES = 32
 
 
 @dataclass
@@ -1207,6 +1224,76 @@ def _filter_matches_by_doc_start(
     return accepted
 
 
+# File "mới" hơn nảy giây → có thể đang được copy/ghi dở trên share:
+# không kết luận vĩnh viễn (skip) mà ghi Lỗi để lượt resume sau thử lại.
+_SCAN_FRESH_FILE_GRACE_SEC = 120
+
+
+def _precheck_source_readable(source_path: str) -> None:
+    """Chặn trước các file không bao giờ quét được, phân loại 2 nhánh:
+
+    - **Lỗi tạm thời** → để ngoại lệ gốc bọt lên (không đổi thành _ScanSkip):
+      process_one ghi trạng thái "err" → resume THỬ LẠI. Gồm: OSError
+      (mất quyền/mạng/đang dời), file biến mất giữa chừng, và mọi kết luận
+      hỏng trên file còn "mới" (mtime trong grace window — có thể đang copy dở).
+    - **Rác vĩnh viễn** → raise _ScanSkip: ghi trạng thái "skip" — resume
+      bỏ qua luôn, không thử lại, không đếm là Lỗi. Gồm: file cũ 0 byte,
+      nội dung không phải PDF (FileDataError, kiểu file rác "._*" macOS),
+      PDF 0 trang (file cũ).
+
+    PDF thật dù tên có dạng nào (kể cả "._...") vẫn mở được ở đây vì fitz
+    mở theo nội dung, không theo tên.
+    """
+    try:
+        st = os.stat(source_path)
+    except OSError:
+        raise
+    fresh = (time.time() - st.st_mtime) < _SCAN_FRESH_FILE_GRACE_SEC
+
+    def verdict(reason: str, exc: BaseException | None = None) -> None:
+        if fresh:
+            raise RuntimeError(f"File mới/chưa ổn định, thử lại lần sau: {reason}") from exc
+        raise _ScanSkip(reason) from exc
+
+    if st.st_size == 0:
+        verdict("File rỗng (0 byte)")
+    ext = os.path.splitext(source_path)[1].lower()
+    if ext != ".pdf":
+        return
+
+    import fitz
+
+    try:
+        doc = fitz.open(source_path)
+    except FileNotFoundError:
+        # Biến mất giữa chừng (đang dời/đổi tên) → tạm thời, thử lại.
+        raise
+    except fitz.EmptyFileError as exc:
+        verdict("File rỗng (0 byte)", exc)
+    except fitz.FileDataError as exc:
+        verdict(f"Không phải PDF hợp lệ (nội dung hỏng): {exc}", exc)
+    with doc:
+        if len(doc) == 0:
+            verdict("PDF không có trang")
+
+
+def _file_worker_count(total: int) -> int:
+    """Số thread xử lý file song song (mặc định 2, clamp 1..total).
+
+    Mỗi thread tự mở PDF riêng bằng PyMuPDF trong cùng process (Document
+    không chia sẻ chéo thread). Stress-test trên wheel 1.26.7 ổn định,
+    nhưng nếu cần loại trừ nghi vấn xung đột PyMuPDF đa luồng (vd máy
+    đang crash 0xc0000409), đặt biến môi trường
+    SECRET_SCAN_MAX_FILE_WORKERS=1 — scan chạy tuần hoàn toàn, chậm hơn
+    nhưng không còn fitz đa luồng nào.
+    """
+    try:
+        want = int(os.environ.get("SECRET_SCAN_MAX_FILE_WORKERS", "2"))
+    except ValueError:
+        want = 2
+    return max(1, min(want, total if total > 0 else 1))
+
+
 def scan_one_file_for_secret_artifact(
     source_path: str,
     relative_path: str,
@@ -1233,6 +1320,7 @@ def scan_one_file_for_secret_artifact(
         (the common case) there are no candidates, so LightGBM is skipped.
     """
     os.makedirs(file_work_dir, exist_ok=True)
+    _precheck_source_readable(source_path)
     ext = os.path.splitext(source_path)[1].lower()
     word_document = ext in {".doc", ".docx"}
     mode = "Trang đầu" if first_page_only else "Tìm kỹ"
@@ -1782,8 +1870,8 @@ class SecretFileScanScreen(ScreenContent):
             return None
         if prog is None:
             return None
-        done_count, error_count, found = prog.stats()
-        if done_count == 0 and error_count == 0 and found == 0:
+        done_count, error_count, skip_count, found = prog.stats()
+        if done_count == 0 and error_count == 0 and skip_count == 0 and found == 0:
             return None
         answer = QMessageBox.question(
             self,
@@ -1792,6 +1880,7 @@ class SecretFileScanScreen(ScreenContent):
                 "Thư mục này có lượt quét chưa hoàn tất:\n"
                 f"• Đã quét xong: {done_count} file\n"
                 f"• Lỗi lần trước (sẽ thử lại): {error_count} file\n"
+                f"• File hỏng (sẽ bỏ qua): {skip_count} file\n"
                 f"• Dòng mật đã phát hiện: {found}\n\n"
                 "Tiếp tục từ nơi dừng không?\n"
                 "Chọn \"No\" để quét lại toàn bộ từ đầu."
@@ -1868,7 +1957,7 @@ class SecretFileScanScreen(ScreenContent):
         # automatically — this is what makes "2 pages at a time regardless of
         # file" work in Tìm kỹ mode. In Tìm nhanh mode, two files' first pages
         # are OCR'd concurrently.
-        max_file_workers = max(1, min(2, total))
+        max_file_workers = _file_worker_count(total)
         progress_lock = threading.Lock()
         # state_lock: record_*/save trên prog dùng chung phải nguyên tố —
         # hai worker ghi xen kẽ vào cùng file handle sẽ làm hỏng dòng journal.
@@ -1876,6 +1965,7 @@ class SecretFileScanScreen(ScreenContent):
         done = [skipped]
         scanned = [0]
         failures = [0]
+        junk = [0]
         cancelled = [False]
 
         def process_one(idx: int, path: str) -> None:
@@ -1952,6 +2042,12 @@ class SecretFileScanScreen(ScreenContent):
                     scanned[0] += 1
             except _ScanCancelled:
                 cancelled[0] = True
+            except _ScanSkip as exc:
+                with state_lock:
+                    prog.record_file(rel, "skip", str(exc))
+                with progress_lock:
+                    junk[0] += 1
+                self.log_message.emit(f"[{rel}] Bỏ qua: {exc}", "info")
             except Exception as exc:
                 with state_lock:
                     prog.record_file(rel, "err", str(exc))
@@ -1968,19 +2064,42 @@ class SecretFileScanScreen(ScreenContent):
                 with progress_lock:
                     done[0] += 1
                     self._progress_changed.emit(done[0], max(1, total))
+                    periodic_mem = done[0] % 500 == 0
+                if periodic_mem:
+                    # Đo RAM định kỳ: bằng chứng cho các lần crash native
+                    # (0xc0000409) — xem RAM có phình trước lúc chết không.
+                    mem = memory_snapshot_text()
+                    if mem:
+                        app_log_write(f"[mem] {mem}", "info")
 
+        mem = memory_snapshot_text()
+        if mem:
+            app_log_write(f"[mem] đầu lượt quét: {mem}", "info")
         try:
             with ThreadPoolExecutor(
                 max_workers=max_file_workers, thread_name_prefix="secret-scan-file"
             ) as executor:
-                futures = {
-                    executor.submit(process_one, idx, path): idx
-                    for idx, path in pending
-                }
-                pending_futures = set(futures)
+                # Cửa sổ trượt: chỉ giữ tối đa _SCAN_MAX_INFLIGHT_FILES future
+                # thay vì submit toàn bộ `pending` (có thể là 300k+ file) —
+                # chặn việc process chính phình RAM chỉ vì hàng đợi.
+                futures: set = set()
+                next_task = 0
+
+                def submit_window() -> None:
+                    nonlocal next_task
+                    while (
+                        next_task < len(pending)
+                        and len(futures) < _SCAN_MAX_INFLIGHT_FILES
+                    ):
+                        futures.add(
+                            executor.submit(process_one, *pending[next_task])
+                        )
+                        next_task += 1
+
+                submit_window()
                 try:
-                    while pending_futures and not self._cancel_event.is_set():
-                        done_set, pending_futures = wait(pending_futures, timeout=0.2, return_when=FIRST_COMPLETED)
+                    while futures and not self._cancel_event.is_set():
+                        done_set, futures = wait(futures, timeout=0.2, return_when=FIRST_COMPLETED)
                         for fut in done_set:
                             # Re-raise any exception from the worker (except
                             # _ScanCancelled, which only flags cancellation).
@@ -1988,6 +2107,7 @@ class SecretFileScanScreen(ScreenContent):
                                 fut.result()
                             except _ScanCancelled:
                                 cancelled[0] = True
+                        submit_window()
                 except _ScanCancelled:
                     cancelled[0] = True
                 if self._cancel_event.is_set():
@@ -1996,11 +2116,14 @@ class SecretFileScanScreen(ScreenContent):
                         fut.cancel()
         finally:
             with state_lock:
-                done_n, err_n, found_n = prog.stats()
-                if (done_n or err_n or found_n) and (cancelled[0] or failures[0]):
+                done_n, err_n, skip_n, found_n = prog.stats()
+                if (
+                    (done_n or err_n or skip_n or found_n)
+                    and (cancelled[0] or failures[0])
+                ):
                     # Chưa xong hẳn (dừng tay hoặc còn file lỗi) → giữ journal
                     # để lần sau chọn lại thư mục này được hỏi tiếp tục;
-                    # file lỗi sẽ được thử lại.
+                    # file lỗi sẽ được thử lại, file hỏng thì không.
                     prog.save()
                 else:
                     # Hoàn tất sạch (hoặc không có gì đáng tiếp) → xóa journal.
@@ -2010,12 +2133,16 @@ class SecretFileScanScreen(ScreenContent):
                 prog.close()
                 if registry is not None:
                     registry.close()
+            mem = memory_snapshot_text()
+            if mem:
+                app_log_write(f"[mem] cuối lượt quét: {mem}", "info")
             self._scan_finished.emit(
                 {
                     "total": total,
                     "scanned": scanned[0],
                     "skipped": skipped,
                     "cache_skipped": cache_skipped[0],
+                    "junk": junk[0],
                     "failures": failures[0],
                     "cancelled": cancelled[0],
                     "work_root": work_root,
@@ -2065,6 +2192,7 @@ class SecretFileScanScreen(ScreenContent):
         scanned = int(payload.get("scanned") or 0)
         skipped = int(payload.get("skipped") or 0)
         cache_skipped = int(payload.get("cache_skipped") or 0)
+        junk = int(payload.get("junk") or 0)
         failures = int(payload.get("failures") or 0)
         cancelled = bool(payload.get("cancelled"))
         found = len(self._results)
@@ -2075,6 +2203,8 @@ class SecretFileScanScreen(ScreenContent):
             notes.append(f"bỏ qua {skipped} file đã quét lần trước")
         if cache_skipped:
             notes.append(f"tận dụng {cache_skipped} file không đổi")
+        if junk:
+            notes.append(f"bỏ qua {junk} file hỏng")
         if notes:
             detail += " (" + "; ".join(notes) + ")"
         self._set_status(

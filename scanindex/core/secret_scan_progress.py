@@ -8,7 +8,12 @@ Journal design (append-only JSONL, one file per (folder, mode) under
     line 1:  {"t":"h","v":1,"folder":...,"mode":...,"started_at":...}
     then:    {"t":"f","p":"rel/path.pdf","s":"ok"}
              {"t":"f","p":"rel/path.pdf","s":"err","e":"message"}
+             {"t":"f","p":"rel/path.pdf","s":"skip","e":"reason"}
              {"t":"m","d":{...SecretScanMatch fields...}}
+
+"skip" marks files that can NEVER be scanned (0 byte, not a real PDF,
+PDF with no pages): unlike "err" they are not retried on resume, they
+just stop costing time and log noise.
 
 Each processed file appends one or two short lines and fsyncs — O(1) per
 file, so a million-file folder costs the same per file as a hundred-file
@@ -88,8 +93,8 @@ class SecretScanProgress:
     """In-memory scan state backed by an append-only journal file.
 
     Memory layout is lean on purpose (a million-file folder must fit
-    comfortably): done files in a set, errored files in a dict, matches
-    in a list — no per-file sub-dicts.
+    comfortably): done files in a set, errored/skipped files in dicts,
+    matches in a list — no per-file sub-dicts.
     """
 
     def __init__(self, folder: str, mode: str):
@@ -98,6 +103,7 @@ class SecretScanProgress:
         self.started_at = _now()
         self._done: set[str] = set()
         self._errors: dict[str, str] = {}
+        self._skipped: dict[str, str] = {}
         self.matches: list[dict] = []
         self._fh = None
         # Lines the journal contained as of the last compaction/load (the
@@ -189,9 +195,15 @@ class SecretScanProgress:
                 if status == "ok":
                     prog._done.add(rel)
                     prog._errors.pop(rel, None)
+                    prog._skipped.pop(rel, None)
+                elif status == "skip":
+                    prog._skipped[rel] = str(event.get("e") or "")
+                    prog._done.discard(rel)
+                    prog._errors.pop(rel, None)
                 elif status == "err":
                     prog._errors[rel] = str(event.get("e") or "")
                     prog._done.discard(rel)
+                    prog._skipped.pop(rel, None)
             elif kind == "m" and isinstance(event.get("d"), dict):
                 prog.matches.append(event["d"])
         if header is None:
@@ -231,9 +243,15 @@ class SecretScanProgress:
         if status == "ok":
             self._done.add(rel_path)
             self._errors.pop(rel_path, None)
+            self._skipped.pop(rel_path, None)
+        elif status == "skip":
+            self._skipped[rel_path] = error
+            self._done.discard(rel_path)
+            self._errors.pop(rel_path, None)
         else:
             self._errors[rel_path] = error
             self._done.discard(rel_path)
+            self._skipped.pop(rel_path, None)
         event: dict = {"t": "f", "p": rel_path, "s": status}
         if error:
             event["e"] = error
@@ -256,14 +274,19 @@ class SecretScanProgress:
             self._compact()
 
     def done_files(self) -> set[str]:
-        """Files that completed successfully — what a resume must skip.
-        Errored files are NOT included: resume retries them in case the
-        failure was transient."""
-        return set(self._done)
+        """Files a resume must skip: completed successfully, plus skipped
+        as permanently unscannable (0 byte / not a PDF / no pages) — the
+        latter are NOT retried, unlike errored files."""
+        return set(self._done) | set(self._skipped)
 
-    def stats(self) -> tuple[int, int, int]:
-        """(done, error, found) counts for the resume prompt."""
-        return len(self._done), len(self._errors), len(self.matches)
+    def stats(self) -> tuple[int, int, int, int]:
+        """(done, error, skipped, found) counts for the resume prompt."""
+        return (
+            len(self._done),
+            len(self._errors),
+            len(self._skipped),
+            len(self.matches),
+        )
 
     # ── internals ─────────────────────────────────────────────────────────
     def _open_fh(self) -> None:
@@ -311,6 +334,11 @@ class SecretScanProgress:
                 if error:
                     event["e"] = error
                 f.write(json.dumps(event, ensure_ascii=False) + "\n")
+            for rel, reason in sorted(self._skipped.items()):
+                event = {"t": "f", "p": rel, "s": "skip"}
+                if reason:
+                    event["e"] = reason
+                f.write(json.dumps(event, ensure_ascii=False) + "\n")
             for match_dict in self.matches:
                 f.write(
                     json.dumps({"t": "m", "d": match_dict}, ensure_ascii=False)
@@ -318,7 +346,11 @@ class SecretScanProgress:
                 )
         os.replace(tmp, path)
         self._lines_at_compact = (
-            1 + len(self._done) + len(self._errors) + len(self.matches)
+            1
+            + len(self._done)
+            + len(self._errors)
+            + len(self._skipped)
+            + len(self.matches)
         )
         self._appended_lines = 0
 
