@@ -83,6 +83,18 @@ class _ScanSkip(Exception):
 # file-worker vẫn luôn có việc.
 _SCAN_MAX_INFLIGHT_FILES = 32
 
+# PyMuPDF 1.26 (rebased bindings) khởi tạo MuPDF ở chế độ single-context
+# (reinit_singlethreaded) — các thread chia sẻ 1 context. Stress-test đã
+# tái hiện crash native (0xC00000FF) khi 2 thread ĐỒNG THỜI fitz.open()
+# các file HỎNG (race trên đường báo lỗi fz_throw của shared context),
+# trong khi 1 thread chạy 20s với 45k lượt gọi thì sống, và file HỢP LỆ
+# đa luồng thì ổn định. Mọi thao tác fitz trong process chính (2 file-
+# worker thread) đều phải giữ lock này; phần chờ OCR pool KHÔNG giữ lock
+# (OCR chạy ở process con) nên throughput song song vẫn giữ được.
+# Đây là nguyên nhân crash 0xc0000409 trên máy quét (crash lúc 2s sau đợt
+# sweep file rác _._/0-byte đầu lượt resume, pid = process chính).
+_FITZ_LOCK = threading.RLock()
+
 
 @dataclass
 class SecretScanMatch:
@@ -130,19 +142,20 @@ def _windows_font_path() -> str | None:
 def _extract_pdf_pages(src_pdf: str, dst_pdf: str, page_indices: list[int]) -> str:
     import fitz
 
-    with fitz.open(src_pdf) as src:
-        if len(src) == 0:
-            raise RuntimeError("PDF không có trang")
-        doc = fitz.open()
-        try:
-            for idx in page_indices:
-                if 0 <= idx < len(src):
-                    doc.insert_pdf(src, from_page=idx, to_page=idx)
-            if len(doc) == 0:
-                raise RuntimeError("Không trích xuất được trang PDF")
-            doc.save(dst_pdf, deflate=True, garbage=4)
-        finally:
-            doc.close()
+    with _FITZ_LOCK:
+        with fitz.open(src_pdf) as src:
+            if len(src) == 0:
+                raise RuntimeError("PDF không có trang")
+            doc = fitz.open()
+            try:
+                for idx in page_indices:
+                    if 0 <= idx < len(src):
+                        doc.insert_pdf(src, from_page=idx, to_page=idx)
+                if len(doc) == 0:
+                    raise RuntimeError("Không trích xuất được trang PDF")
+                doc.save(dst_pdf, deflate=True, garbage=4)
+            finally:
+                doc.close()
     return dst_pdf
 
 
@@ -178,21 +191,22 @@ def _convert_docx_text_fallback(
         wrapped.append("")
 
     font_path = _windows_font_path()
-    doc = fitz.open()
-    try:
-        page_lines: list[str] = []
-        for line in wrapped:
-            page_lines.append(line)
-            if len(page_lines) >= 48:
+    with _FITZ_LOCK:
+        doc = fitz.open()
+        try:
+            page_lines: list[str] = []
+            for line in wrapped:
+                page_lines.append(line)
+                if len(page_lines) >= 48:
+                    _append_text_page(doc, page_lines, font_path)
+                    if first_page_only:
+                        break
+                    page_lines = []
+            if (page_lines and not first_page_only) or len(doc) == 0:
                 _append_text_page(doc, page_lines, font_path)
-                if first_page_only:
-                    break
-                page_lines = []
-        if (page_lines and not first_page_only) or len(doc) == 0:
-            _append_text_page(doc, page_lines, font_path)
-        doc.save(out_pdf, deflate=True, garbage=4)
-    finally:
-        doc.close()
+            doc.save(out_pdf, deflate=True, garbage=4)
+        finally:
+            doc.close()
     return out_pdf
 
 
@@ -220,23 +234,24 @@ def _iter_docx_body_texts(document) -> Iterable[str]:
 def _append_text_page(doc, lines: list[str], font_path: str | None) -> None:
     import fitz
 
-    page = doc.new_page(width=595, height=842)
-    text = "\n".join(lines)
-    rect = fitz.Rect(50, 50, 545, 792)
-    if font_path:
-        try:
-            page.insert_textbox(
-                rect,
-                text,
-                fontsize=11,
-                fontname="SecretScanFont",
-                fontfile=font_path,
-                color=(0, 0, 0),
-            )
-            return
-        except Exception:
-            pass
-    page.insert_textbox(rect, text, fontsize=11, fontname="helv", color=(0, 0, 0))
+    with _FITZ_LOCK:
+        page = doc.new_page(width=595, height=842)
+        text = "\n".join(lines)
+        rect = fitz.Rect(50, 50, 545, 792)
+        if font_path:
+            try:
+                page.insert_textbox(
+                    rect,
+                    text,
+                    fontsize=11,
+                    fontname="SecretScanFont",
+                    fontfile=font_path,
+                    color=(0, 0, 0),
+                )
+                return
+            except Exception:
+                pass
+        page.insert_textbox(rect, text, fontsize=11, fontname="helv", color=(0, 0, 0))
 
 
 def _export_word_pdf(doc, out_pdf: str, *, first_page_only: bool) -> None:
@@ -463,58 +478,59 @@ def _canonical_from_pdf_text(
         text_normalization="native",
         raw_text_preserved=True,
     )
-    with fitz.open(pdf_path) as doc:
-        for page_idx in page_indices:
-            if page_idx < 0 or page_idx >= len(doc):
-                continue
-            page = doc[page_idx]
-            page_record = make_page_record(
-                page_index=page_idx,
-                width=float(page.rect.width),
-                height=float(page.rect.height),
-                render_width=int(page.rect.width),
-                render_height=int(page.rect.height),
-            )
-            page_record["coord_origin"] = "top-left"
-            line_index = 0
-            data = page.get_text("dict") or {}
-            for block_index, block in enumerate(data.get("blocks") or []):
-                if block.get("type", 0) != 0:
+    with _FITZ_LOCK:
+        with fitz.open(pdf_path) as doc:
+            for page_idx in page_indices:
+                if page_idx < 0 or page_idx >= len(doc):
                     continue
-                for raw_line in block.get("lines") or []:
-                    spans = raw_line.get("spans") or []
-                    text = "".join(span.get("text") or "" for span in spans).strip()
-                    if not text:
+                page = doc[page_idx]
+                page_record = make_page_record(
+                    page_index=page_idx,
+                    width=float(page.rect.width),
+                    height=float(page.rect.height),
+                    render_width=int(page.rect.width),
+                    render_height=int(page.rect.height),
+                )
+                page_record["coord_origin"] = "top-left"
+                line_index = 0
+                data = page.get_text("dict") or {}
+                for block_index, block in enumerate(data.get("blocks") or []):
+                    if block.get("type", 0) != 0:
                         continue
-                    bbox = raw_line.get("bbox") or (0, 0, 0, 0)
-                    x0, y0, x1, y1 = [float(v or 0) for v in bbox[:4]]
-                    font_size = 11.0
-                    for span in spans:
-                        try:
-                            font_size = max(font_size, float(span.get("size") or 0))
-                        except Exception:
-                            pass
-                    page_record["lines"].append(
-                        make_line_record(
-                            page_idx,
-                            line_index,
-                            text,
-                            x0,
-                            y0,
-                            max(0.0, x1 - x0),
-                            max(0.0, y1 - y0),
-                            font_size,
-                            f"b{block_index}",
-                            f"p{block_index}",
-                            1.0,
-                            "native_text",
-                            0,
-                            [],
-                            ocr_text=text,
+                    for raw_line in block.get("lines") or []:
+                        spans = raw_line.get("spans") or []
+                        text = "".join(span.get("text") or "" for span in spans).strip()
+                        if not text:
+                            continue
+                        bbox = raw_line.get("bbox") or (0, 0, 0, 0)
+                        x0, y0, x1, y1 = [float(v or 0) for v in bbox[:4]]
+                        font_size = 11.0
+                        for span in spans:
+                            try:
+                                font_size = max(font_size, float(span.get("size") or 0))
+                            except Exception:
+                                pass
+                        page_record["lines"].append(
+                            make_line_record(
+                                page_idx,
+                                line_index,
+                                text,
+                                x0,
+                                y0,
+                                max(0.0, x1 - x0),
+                                max(0.0, y1 - y0),
+                                font_size,
+                                f"b{block_index}",
+                                f"p{block_index}",
+                                1.0,
+                                "native_text",
+                                0,
+                                [],
+                                ocr_text=text,
+                            )
                         )
-                    )
-                    line_index += 1
-            canonical["pages"].append(page_record)
+                        line_index += 1
+                canonical["pages"].append(page_record)
     return _finalize_canonical(canonical, json_path)
 
 
@@ -684,10 +700,11 @@ def _native_canonical_for_source(
     if ext == ".pdf":
         import fitz
 
-        with fitz.open(source_path) as doc:
-            if len(doc) == 0:
-                return None, "PDF không có trang"
-            page_indices = list(range(len(doc))) if thorough else [0]
+        with _FITZ_LOCK:
+            with fitz.open(source_path) as doc:
+                if len(doc) == 0:
+                    return None, "PDF không có trang"
+                page_indices = list(range(len(doc))) if thorough else [0]
         return (
             _canonical_from_pdf_text(
                 source_path,
@@ -763,14 +780,17 @@ def _ocr_one_page_single_worker(
     import fitz
     from PIL import Image
 
-    with fitz.open(input_pdf) as doc:
-        page = doc[page_idx]
-        page_w = float(page.rect.width)
-        page_h = float(page.rect.height)
-        mat = fitz.Matrix(dpi / 72, dpi / 72)
-        pix = page.get_pixmap(matrix=mat, annots=True)
-        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+    with _FITZ_LOCK:
+        with fitz.open(input_pdf) as doc:
+            page = doc[page_idx]
+            page_w = float(page.rect.width)
+            page_h = float(page.rect.height)
+            mat = fitz.Matrix(dpi / 72, dpi / 72)
+            pix = page.get_pixmap(matrix=mat, annots=True)
+            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
 
+    # perform_ocr NẰM NGOÀI _FITZ_LOCK: DLL OCR chạy chậm (giây/trang),
+    # giữ lock ở đây sẽ triệt tiêu song song giữa 2 file-worker.
     scale_x = page_w / pix.width if pix.width else 1.0
     scale_y = page_h / pix.height if pix.height else 1.0
     ocr = direct_ocr_engine._get_ocr()
@@ -809,12 +829,13 @@ def _ocr_pdf_to_canonical(
     )
     from scanindex.core.ocr.text_normalizer import OCR_TEXT_NORMALIZATION
 
-    with fitz.open(input_pdf) as doc:
-        page_count = len(doc)
-        page_rects = [
-            (float(page.rect.width), float(page.rect.height))
-            for page in doc
-        ]
+    with _FITZ_LOCK:
+        with fitz.open(input_pdf) as doc:
+            page_count = len(doc)
+            page_rects = [
+                (float(page.rect.width), float(page.rect.height))
+                for page in doc
+            ]
     if page_count <= 0:
         raise RuntimeError("PDF không có trang để OCR")
 
@@ -978,22 +999,23 @@ def _process_pdf_per_page(
     from scanindex.core.ocr.text_normalizer import OCR_TEXT_NORMALIZATION
     from scanindex.core.pdf.docx_page_manifest import classify_pdf_page
 
-    with fitz.open(pdf_path) as doc:
-        total = len(doc)
-        page_rects = [
-            (float(page.rect.width), float(page.rect.height)) for page in doc
-        ]
-        # Pre-open pages we need; classify once.
-        classifications: dict[int, str] = {}
-        for page_idx in page_indices:
-            if page_idx < 0 or page_idx >= total:
-                continue
-            try:
-                info = classify_pdf_page(doc, page_idx)
-                classifications[page_idx] = info.get("source_mode") or "scan"
-            except Exception as exc:
-                log_cb(f"Phân loại trang {page_idx + 1} lỗi: {exc} → OCR")
-                classifications[page_idx] = "scan"
+    with _FITZ_LOCK:
+        with fitz.open(pdf_path) as doc:
+            total = len(doc)
+            page_rects = [
+                (float(page.rect.width), float(page.rect.height)) for page in doc
+            ]
+            # Pre-open pages we need; classify once.
+            classifications: dict[int, str] = {}
+            for page_idx in page_indices:
+                if page_idx < 0 or page_idx >= total:
+                    continue
+                try:
+                    info = classify_pdf_page(doc, page_idx)
+                    classifications[page_idx] = info.get("source_mode") or "scan"
+                except Exception as exc:
+                    log_cb(f"Phân loại trang {page_idx + 1} lỗi: {exc} → OCR")
+                    classifications[page_idx] = "scan"
 
     canonical = make_document_stub(
         input_path=pdf_path,
@@ -1054,9 +1076,10 @@ def _process_pdf_per_page(
         source_mode = classifications.get(page_idx, "scan")
 
         if source_mode == "digital":
-            with fitz.open(pdf_path) as doc:
-                page = doc[page_idx]
-                page_record = _build_native_page_record_from_pdf(page, page_idx)
+            with _FITZ_LOCK:
+                with fitz.open(pdf_path) as doc:
+                    page = doc[page_idx]
+                    page_record = _build_native_page_record_from_pdf(page, page_idx)
             page_record["source_mode"] = "digital"
             canonical["pages"].append(page_record)
             continue
@@ -1261,20 +1284,36 @@ def _precheck_source_readable(source_path: str) -> None:
     if ext != ".pdf":
         return
 
+    # Lớp chặn thứ nhất bằng sniffing thuần Python: PDF (theo spec) phải có
+    # header %PDF trong 1KB đầu. File rác không có header (kiểu AppleDouble
+    # "._*" của macOS) bị loại NGAY TẠI ĐÂY — không bao giờ chạm vào MuPDF,
+    # tránh cả đường lỗi lẫn race đa luồng trong MuPDF.
+    try:
+        with open(source_path, "rb") as fh:
+            head = fh.read(1024)
+    except OSError:
+        raise
+    if b"%PDF" not in head:
+        verdict("Không phải PDF hợp lệ (thiếu header %PDF)")
+
+    # Lớp chặn thứ hai: fitz.open thật (bắt lỗi nội dung hỏng dạng PDF-truncated,
+    # đếm trang) — LUÔN giữ _FITZ_LOCK: MuPDF single-context, 2 thread đồng
+    # thời mở file (đặc biệt file lỗi) làm crash process (đã tái hiện).
     import fitz
 
-    try:
-        doc = fitz.open(source_path)
-    except FileNotFoundError:
-        # Biến mất giữa chừng (đang dời/đổi tên) → tạm thời, thử lại.
-        raise
-    except fitz.EmptyFileError as exc:
-        verdict("File rỗng (0 byte)", exc)
-    except fitz.FileDataError as exc:
-        verdict(f"Không phải PDF hợp lệ (nội dung hỏng): {exc}", exc)
-    with doc:
-        if len(doc) == 0:
-            verdict("PDF không có trang")
+    with _FITZ_LOCK:
+        try:
+            doc = fitz.open(source_path)
+        except FileNotFoundError:
+            # Biến mất giữa chừng (đang dời/đổi tên) → tạm thời, thử lại.
+            raise
+        except fitz.EmptyFileError as exc:
+            verdict("File rỗng (0 byte)", exc)
+        except fitz.FileDataError as exc:
+            verdict(f"Không phải PDF hợp lệ (nội dung hỏng): {exc}", exc)
+        with doc:
+            if len(doc) == 0:
+                verdict("PDF không có trang")
 
 
 def _file_worker_count(total: int) -> int:
@@ -1370,8 +1409,9 @@ def scan_one_file_for_secret_artifact(
     # Determine which pages to process.
     import fitz
 
-    with fitz.open(source_pdf) as doc:
-        total_pages = len(doc)
+    with _FITZ_LOCK:
+        with fitz.open(source_pdf) as doc:
+            total_pages = len(doc)
     if total_pages <= 0:
         raise RuntimeError("PDF không có trang")
     if first_page_only:
