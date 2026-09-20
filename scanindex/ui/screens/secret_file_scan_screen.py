@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
+import math
 import os
 import re
 import shutil
+import stat
 import subprocess
 import textwrap
 import threading
@@ -14,20 +17,25 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable, Iterable
 
-from PySide6.QtCore import Qt, QUrl, Signal
-from PySide6.QtGui import QColor, QDesktopServices
+from PySide6.QtCore import Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import QColor, QDesktopServices, QPainter
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
     QFileDialog,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QHeaderView,
     QLabel,
     QLineEdit,
+    QListWidget,
     QMessageBox,
+    QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QSplitter,
+    QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -39,11 +47,14 @@ from scanindex.infra.app_log import write as app_log_write
 from scanindex.infra.mem_stats import memory_snapshot_text
 from scanindex.core import secret_scan_progress as ssp
 from scanindex.ui.screens.screen_base import ScreenContent
+from scanindex.ui.widgets.pdf_viewer_widget import PdfViewerWidget
 from scanindex.ui.theme import (
     COLOR_ACCENT,
     COLOR_ACCENT_HOVER,
     COLOR_BG,
     COLOR_BORDER,
+    COLOR_GREEN,
+    COLOR_GREEN_HOVER,
     COLOR_INPUT,
     COLOR_PANEL,
     COLOR_RED,
@@ -1587,6 +1598,150 @@ def export_matches_to_excel(matches: list[SecretScanMatch], output_path: str) ->
     return output_path
 
 
+def _norm(path: str) -> str:
+    """Chuẩn hóa key so sánh đường dẫn (cột checkbox / xóa theo file)."""
+    return os.path.normpath(os.path.abspath(path))
+
+
+def _permanent_delete(path: str) -> None:
+    """Xóa vĩnh viễn MỘT file: không qua thùng rác, gỡ read-only, chịu
+    đường dẫn dài (>260 ký tự) qua tiền tố \\\\?\\ ."""
+    p = os.path.abspath(path)
+    long_p = "\\\\?\\" + p
+    if not os.path.exists(p) and not os.path.exists(long_p):
+        raise FileNotFoundError("file không còn tồn tại trên đĩa")
+    try:
+        os.remove(p)
+        return
+    except PermissionError:
+        # Windows: file read-only → gỡ thuộc tính rồi thử lại.
+        try:
+            os.chmod(p, stat.S_IWRITE)
+        except OSError:
+            pass
+    except OSError:
+        pass
+    # Lần hai: sau khi gỡ read-only, hoặc qua \\?\ cho đường dẫn dài.
+    try:
+        os.remove(p)
+    except OSError:
+        os.remove(long_p)
+
+
+def _preview_cache_dir() -> str:
+    d = os.path.join(get_base_dir(), "temp", "secret_scan_preview")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _ensure_check_mark_png() -> str:
+    """Tạo file PNG dấu ✓ trắng (runtime) cho QSS ``::indicator:checked``.
+
+    QSS thuần không vẽ được glyph; dùng image: url() với PNG tự sinh bằng
+    QPainter để ô check hiển thị DẤU CHECK thay vì chỉ đổ đầy màu ô.
+    """
+    from PySide6.QtGui import QImage, QPen
+
+    out_dir = os.path.join(get_base_dir(), "temp", "secret_scan_ui")
+    os.makedirs(out_dir, exist_ok=True)
+    out = os.path.join(out_dir, "check_mark.png")
+    size = 32
+    img = QImage(size, size, QImage.Format.Format_ARGB32)
+    img.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(img)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    pen = QPen(QColor("#ffffff"), 5)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    painter.setPen(pen)
+    painter.drawLine(8, 17, 14, 23)
+    painter.drawLine(14, 23, 24, 10)
+    painter.end()
+    img.save(out, "PNG")
+    return out
+
+
+def _derive_scan_root(matches: list[SecretScanMatch]) -> str:
+    """Suy thư mục quét gốc từ dòng đầu của danh sách đã xuất:
+    "Đường dẫn đầy đủ" = gốc + sep + "File (trong thư mục quét)".
+    Trả "" nếu không suy được (thiếu cột quan hệ / đường dẫn ngoài thư mục).
+    """
+    for m in matches:
+        full = os.path.normpath(m.source_path)
+        rel = os.path.normpath(m.relative_path or "")
+        if rel and full != rel and full.lower().endswith("\\" + rel.lower()):
+            return full[: len(full) - len(rel) - 1]
+        return ""
+    return ""
+
+
+def load_secret_matches_from_excel(xlsx_path: str) -> list[SecretScanMatch]:
+    """Đọc lại danh sách do ``export_matches_to_excel`` ghi ra.
+
+    Chấp nhận thiếu cột "Chế độ"/"Ghi chú" (đặt giá trị mặc định), nhưng
+    bắt buộc có "STT" + "Đường dẫn đầy đủ" để tránh nạp nhầm file Excel
+    khác. Trả về danh sách match theo đúng thứ tự trong file.
+    """
+    import openpyxl
+
+    wb = openpyxl.load_workbook(xlsx_path, read_only=True, data_only=True)
+    try:
+        ws = wb.active
+        rows = ws.iter_rows(values_only=True)
+        header = next(rows, None)
+        if not header:
+            raise ValueError("File rỗng.")
+        names = [str(h).strip() if h is not None else "" for h in header]
+        if "STT" not in names or "Đường dẫn đầy đủ" not in names:
+            raise ValueError(
+                "File không đúng định dạng danh sách văn bản mật "
+                "(cần cột 'STT' và 'Đường dẫn đầy đủ')."
+            )
+
+        def col(name: str, default: int | None = None) -> int | None:
+            return names.index(name) if name in names else default
+
+        c_path = names.index("Đường dẫn đầy đủ")
+        c_key = col("Độ mật", 1)
+        c_rel = col("File (trong thư mục quét)")
+        c_page = col("Trang", 5)
+        c_mode = col("Chế độ", 6)
+        c_note = col("Ghi chú", 7)
+
+        def cell(row_values, idx):
+            if idx is None or idx >= len(row_values):
+                return None
+            return row_values[idx]
+
+        matches: list[SecretScanMatch] = []
+        for r in rows:
+            if r is None:
+                continue
+            raw_path = cell(r, c_path)
+            if raw_path is None or not str(raw_path).strip():
+                continue
+            source = str(raw_path).strip()
+            try:
+                page = int(float(cell(r, c_page) or 1))
+            except (TypeError, ValueError):
+                page = 1
+            rel = str(cell(r, c_rel) or source).strip() or source
+            matches.append(
+                SecretScanMatch(
+                    source_path=source,
+                    relative_path=rel,
+                    keyword=str(cell(r, c_key) or "").strip(),
+                    page_number=max(1, page),
+                    mode=str(cell(r, c_mode) or "load").strip() or "load",
+                    ocr_pdf_path="",
+                    note=str(cell(r, c_note) or "").strip(),
+                )
+            )
+        return matches
+    finally:
+        wb.close()
+
+
 def _split_pending(
     files: list[str],
     folder: str,
@@ -1608,6 +1763,45 @@ def _split_pending(
     return pending, skipped
 
 
+class _BusySpinner(QWidget):
+    """Icon "đang tải" xoay — hiển thị trong vùng xem trước khi convert."""
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._angle = 0
+        self._timer = QTimer(self)
+        self._timer.setInterval(70)
+        self._timer.timeout.connect(self._tick)
+        self.setFixedSize(44, 44)
+
+    def start(self) -> None:
+        self._timer.start()
+
+    def stop(self) -> None:
+        self._timer.stop()
+        self.update()
+
+    def _tick(self) -> None:
+        self._angle = (self._angle + 30) % 360
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        center_x = self.width() / 2
+        center_y = self.height() / 2
+        for i in range(12):
+            angle = math.radians((self._angle + i * 30) % 360)
+            alpha = int(255 * (i + 1) / 12)
+            dot = QColor(235, 235, 235, alpha)
+            painter.setPen(dot)
+            painter.setBrush(dot)
+            x = center_x + 17 * math.cos(angle) - 2
+            y = center_y + 17 * math.sin(angle) - 2
+            painter.drawEllipse(int(x), int(y), 4, 4)
+        painter.end()
+
+
 class SecretFileScanScreen(ScreenContent):
     """Find classified-document stamps in supported files inside a folder."""
 
@@ -1619,21 +1813,35 @@ class SecretFileScanScreen(ScreenContent):
     # Emitted from the background warm-up thread once the OCR pool is ready
     # (or failed); handled on the main thread by _on_pool_ready.
     _pool_ready = Signal(bool, str)
+    # Kết quả convert preview từ thread nền: dict {gen, key, out_pdf, error, note}
+    _preview_ready = Signal(object)
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self.setStyleSheet(f"background: {COLOR_BG};")
         self._busy = False
         self._cancel_event = threading.Event()
-        self._results: list[SecretScanMatch] = []
         self._pool_warm_started = False
         self._pool_ready_flag = False
+        # Dấu "không phải mật" tồn tại qua các phiên app: load 1 lần, dùng chung.
+        self._not_secret = ssp.NotSecretMarks.load()
+        self._loaded_from: str | None = None
+        self._checked_paths: set[str] = set()
+        self._preview_current: SecretScanMatch | None = None
+        self._preview_convert_gen = 0
+        self._preview_cache: dict[tuple, str] = {}
+        # PDF tạm cho preview chỉ là cache phiên — xoá sạch của lần chạy trước.
+        shutil.rmtree(
+            os.path.join(get_base_dir(), "temp", "secret_scan_preview"),
+            ignore_errors=True,
+        )
         self._build_ui()
         self._status_changed.connect(self._set_status)
         self._progress_changed.connect(self._set_progress)
         self._result_found.connect(self._add_result)
         self._scan_finished.connect(self._on_finished)
         self._pool_ready.connect(self._on_pool_ready)
+        self._preview_ready.connect(self._on_preview_ready)
 
     def is_busy(self) -> bool:
         return self._busy
@@ -1710,15 +1918,69 @@ class SecretFileScanScreen(ScreenContent):
         )
         row.addWidget(self.folder_edit, 1)
 
-        self.btn_browse = QPushButton("Chọn thư mục")
+        self.btn_browse = QPushButton("📁  Chọn thư mục")
         self.btn_browse.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_browse.setStyleSheet(self._secondary_btn_qss())
         self.btn_browse.clicked.connect(self._browse_folder)
         row.addWidget(self.btn_browse)
+
+        self.btn_load_file = QPushButton("📊  Load từ file")
+        self.btn_load_file.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_load_file.setStyleSheet(self._secondary_btn_qss())
+        self.btn_load_file.setToolTip(
+            "Nạp lại danh sách đã xuất ra file Excel (.xlsx) để tiếp tục xem,\n"
+            "xóa file hoặc xác nhận \"không phải mật\", rồi xuất ra file MỚI\n"
+            "(file đang load không bao giờ bị ghi đè)."
+        )
+        self.btn_load_file.clicked.connect(self._load_from_file_clicked)
+        row.addWidget(self.btn_load_file)
+
+        self.btn_run = QPushButton("Bắt đầu quét")
+        self.btn_run.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_run.setStyleSheet(self._primary_btn_qss())
+        self.btn_run.clicked.connect(self._run_clicked)
+        row.addWidget(self.btn_run)
+
+        self.btn_export = QPushButton("📊  Xuất Excel")
+        self.btn_export.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_export.setStyleSheet(self._secondary_btn_qss())
+        self.btn_export.setEnabled(False)
+        self.btn_export.setToolTip("Xuất danh sách văn bản mật đang hiển thị ra file Excel (.xlsx)")
+        self.btn_export.clicked.connect(self._export_clicked)
+        row.addWidget(self.btn_export)
+
+        self.btn_stop = QPushButton("Dừng")
+        self.btn_stop.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_stop.setStyleSheet(self._danger_btn_qss())
+        self.btn_stop.clicked.connect(self._stop_clicked)
+        self.btn_stop.setVisible(False)
+        row.addWidget(self.btn_stop)
+
+        self.btn_clear_history = QPushButton("Xóa lịch sử quét")
+        self.btn_clear_history.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_clear_history.setStyleSheet(self._secondary_btn_qss())
+        self.btn_clear_history.setToolTip(
+            "Xóa toàn bộ tiến độ quét dở và lịch sử \"đã quét\" — lượt quét sau "
+            "sẽ quét lại mọi file từ đầu."
+        )
+        self.btn_clear_history.clicked.connect(self._clear_history_clicked)
+        row.addWidget(self.btn_clear_history)
         picker_layout.addLayout(row)
 
-        opts = QHBoxLayout()
-        opts.addStretch(1)
+        # Hàng 2 (gọn): trạng thái + tiến độ + tuỳ chọn quét — đúng theo
+        # mockup: bớt một hàng riêng cho checkbox, tiết kiệm chiều cao.
+        status_row = QHBoxLayout()
+        self.status_label = QLabel("Chưa chạy")
+        self.status_label.setStyleSheet(
+            f"color: {COLOR_TEXT_SECONDARY}; font: 13px '{FONT_UI}';"
+        )
+        status_row.addWidget(self.status_label, 1)
+        self.progress = QProgressBar()
+        self.progress.setMinimum(0)
+        self.progress.setMaximum(1)
+        self.progress.setValue(0)
+        self.progress.setFixedWidth(220)
+        status_row.addWidget(self.progress)
 
         self.history_checkbox = QCheckBox("Tận dụng kết quả đã quét")
         self.history_checkbox.setChecked(True)
@@ -1734,9 +1996,9 @@ class SecretFileScanScreen(ScreenContent):
             "thư mục cha chứa nó, hay quét lại sau khi quét dở. File đổi hoặc\n"
             "mới luôn được quét. Nâng cấp phần mềm sẽ tự quét lại toàn bộ."
         )
-        opts.addWidget(self.history_checkbox)
+        status_row.addWidget(self.history_checkbox)
 
-        self.fast_checkbox = QCheckBox("Tìm nhanh — chỉ trang đầu")
+        self.fast_checkbox = QCheckBox("Tìm nhanh (trang đầu)")
         self.fast_checkbox.setChecked(True)
         self.fast_checkbox.setCursor(Qt.CursorShape.PointingHandCursor)
         self.fast_checkbox.setStyleSheet(
@@ -1749,69 +2011,30 @@ class SecretFileScanScreen(ScreenContent):
             "Tắt: Tìm kỹ — quét toàn bộ trang, phát hiện dấu mật trên mọi trang "
             "rồi chạy LightGBM để lọc các trang không phải trang đầu văn bản."
         )
-        opts.addWidget(self.fast_checkbox)
-
-        self.btn_run = QPushButton("Bắt đầu quét")
-        self.btn_run.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_run.setStyleSheet(self._primary_btn_qss())
-        self.btn_run.clicked.connect(self._run_clicked)
-        opts.addWidget(self.btn_run)
-
-        self.btn_export = QPushButton("Xuất Excel")
-        self.btn_export.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_export.setStyleSheet(self._secondary_btn_qss())
-        self.btn_export.setEnabled(False)
-        self.btn_export.setToolTip("Xuất danh sách văn bản mật đang hiển thị ra file Excel (.xlsx)")
-        self.btn_export.clicked.connect(self._export_clicked)
-        opts.addWidget(self.btn_export)
-
-        self.btn_stop = QPushButton("Dừng")
-        self.btn_stop.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_stop.setStyleSheet(self._danger_btn_qss())
-        self.btn_stop.clicked.connect(self._stop_clicked)
-        self.btn_stop.setVisible(False)
-        opts.addWidget(self.btn_stop)
-        picker_layout.addLayout(opts)
+        status_row.addWidget(self.fast_checkbox)
+        picker_layout.addLayout(status_row)
         layout.addWidget(picker)
 
-        status_row = QHBoxLayout()
-        self.status_label = QLabel("Chưa chạy")
-        self.status_label.setStyleSheet(
-            f"color: {COLOR_TEXT_SECONDARY}; font: 13px '{FONT_UI}';"
-        )
-        status_row.addWidget(self.status_label, 1)
-        self.progress = QProgressBar()
-        self.progress.setMinimum(0)
-        self.progress.setMaximum(1)
-        self.progress.setValue(0)
-        self.progress.setFixedWidth(220)
-        status_row.addWidget(self.progress)
-        self.btn_clear_history = QPushButton("Xóa lịch sử quét")
-        self.btn_clear_history.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_clear_history.setStyleSheet(self._secondary_btn_qss())
-        self.btn_clear_history.setToolTip(
-            "Xóa toàn bộ tiến độ quét dở và lịch sử \"đã quét\" — lượt quét sau "
-            "sẽ quét lại mọi file từ đầu."
-        )
-        self.btn_clear_history.clicked.connect(self._clear_history_clicked)
-        status_row.addWidget(self.btn_clear_history)
-        layout.addLayout(status_row)
-
-        self.table = QTableWidget(0, 5)
+        self.table = QTableWidget(0, 6)
         self.table.setHorizontalHeaderLabels(
-            ["Độ mật", "File", "Trang", "Chế độ", "Ghi chú"]
+            ["", "Độ mật", "File", "Trang", "Chế độ", "Ghi chú"]
         )
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.table.itemDoubleClicked.connect(self._open_result_file)
+        # Click thường (không vào cột checkbox) → xem trước bên phải;
+        # double-click vẫn mở file bằng app ngoài như trước.
+        self.table.itemClicked.connect(self._on_row_clicked)
+        self.table.itemChanged.connect(self._on_item_changed)
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
         self.table.setStyleSheet(
             f"QTableWidget {{ background-color: {COLOR_SURFACE}; color: {COLOR_TEXT};"
             f" border: 1px solid {COLOR_BORDER}; border-radius: {RADIUS_MD}px;"
@@ -1820,8 +2043,162 @@ class SecretFileScanScreen(ScreenContent):
             f" border: 1px solid {COLOR_BORDER}; padding: 6px;"
             f" font-size: 12px; font-weight: 600; font-family: '{FONT_UI}'; }}"
             f"QTableWidget::item:selected {{ background-color: {COLOR_ACCENT}; }}"
+            # Ô check có viền nổi ở cả hai theme (mặc định gần như vô hình);
+            # khi check: nền accent + dấu ✓ trắng (PNG tự sinh ở runtime).
+            f"QTableWidget::indicator {{ width: 15px; height: 15px;"
+            f" background: {COLOR_INPUT}; border: 1px solid #9a9a9a;"
+            f" border-radius: 3px; }}"
+            f"QTableWidget::indicator:checked {{ background: {COLOR_ACCENT};"
+            f" border: 1px solid white;"
+            f' image: url("{_ensure_check_mark_png().replace(os.sep, "/")}"); }}'
         )
-        layout.addWidget(self.table, 1)
+
+        left = QWidget()
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(SP[2])
+
+        results_header = QHBoxLayout()
+        self.lbl_total = QLabel("Tổng: 0 văn bản mật")
+        self.lbl_total.setStyleSheet(
+            f"color: {COLOR_TEXT}; font: 600 13px '{FONT_UI}';"
+        )
+        results_header.addWidget(self.lbl_total)
+        results_header.addStretch(1)
+        self.btn_batch_not_secret = QPushButton("Không phải mật (đã chọn)")
+        self.btn_batch_not_secret.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_batch_not_secret.setStyleSheet(self._success_btn_qss())
+        self.btn_batch_not_secret.setEnabled(False)
+        self.btn_batch_not_secret.setToolTip(
+            "Loại các file đã check (theo file, không theo từng dòng) khỏi danh sách.\n"
+            "KHÔNG xóa file trên đĩa. Các lượt quét sau sẽ tự bỏ qua chúng\n"
+            "cho đến khi file thay đổi nội dung."
+        )
+        self.btn_batch_not_secret.clicked.connect(self._batch_not_secret_clicked)
+        results_header.addWidget(self.btn_batch_not_secret)
+        self.btn_batch_delete = QPushButton("🗑  Xóa file (đã chọn)")
+        self.btn_batch_delete.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_batch_delete.setStyleSheet(self._danger_btn_qss())
+        self.btn_batch_delete.setEnabled(False)
+        self.btn_batch_delete.setToolTip(
+            "Xóa vĩnh viễn các file đã check khỏi đĩa — KHÔNG qua thùng rác,\n"
+            "không thể hoàn tác."
+        )
+        self.btn_batch_delete.clicked.connect(self._batch_delete_clicked)
+        results_header.addWidget(self.btn_batch_delete)
+        left_layout.addLayout(results_header)
+        left_layout.addWidget(self.table, 1)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.addWidget(left)
+        splitter.addWidget(self._build_preview_panel())
+        splitter.setCollapsible(0, False)
+        splitter.setCollapsible(1, False)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+        splitter.setSizes([760, 440])
+        layout.addWidget(splitter, 1)
+
+    def _build_preview_panel(self) -> QWidget:
+        panel = QFrame()
+        panel.setStyleSheet(
+            f"QFrame {{ background: {COLOR_PANEL}; border: 1px solid {COLOR_BORDER};"
+            f" border-radius: {RADIUS_MD}px; }}"
+        )
+        vbox = QVBoxLayout(panel)
+        vbox.setContentsMargins(SP[3], SP[3], SP[3], SP[3])
+        vbox.setSpacing(SP[2])
+
+        head = QHBoxLayout()
+        self.lbl_preview_title = QLabel("Xem trước")
+        self.lbl_preview_title.setStyleSheet(
+            f"color: {COLOR_TEXT}; font: 600 13px '{FONT_UI}';"
+        )
+        head.addWidget(self.lbl_preview_title, 1)
+        self.btn_preview_not_secret = QPushButton("Không phải mật")
+        self.btn_preview_not_secret.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_preview_not_secret.setStyleSheet(self._success_btn_qss())
+        self.btn_preview_not_secret.setEnabled(False)
+        self.btn_preview_not_secret.setToolTip(
+            "Xác nhận file đang xem là KHÔNG phải văn bản mật:\n"
+            "loại khỏi danh sách, KHÔNG xóa file trên đĩa, lượt quét sau\n"
+            "tự bỏ qua (đến khi file thay đổi nội dung)."
+        )
+        self.btn_preview_not_secret.clicked.connect(self._preview_not_secret_clicked)
+        head.addWidget(self.btn_preview_not_secret)
+        self.btn_preview_delete = QPushButton("🗑  Xóa file")
+        self.btn_preview_delete.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_preview_delete.setStyleSheet(self._danger_btn_qss())
+        self.btn_preview_delete.setEnabled(False)
+        self.btn_preview_delete.setToolTip(
+            "Xóa vĩnh viễn file đang xem khỏi đĩa — KHÔNG qua thùng rác,\n"
+            "không thể hoàn tác. Tự chuyển sang dòng kế sau khi xóa."
+        )
+        self.btn_preview_delete.clicked.connect(self._preview_delete_clicked)
+        head.addWidget(self.btn_preview_delete)
+        vbox.addLayout(head)
+
+        self.lbl_preview_path = QLabel("")
+        self.lbl_preview_path.setStyleSheet(
+            f"color: {COLOR_TEXT_SECONDARY}; font: 12px '{FONT_UI}';"
+        )
+        self.lbl_preview_path.setWordWrap(True)
+        vbox.addWidget(self.lbl_preview_path)
+
+        self.lbl_preview_banner = QLabel("")
+        self.lbl_preview_banner.setWordWrap(True)
+        self.lbl_preview_banner.setVisible(False)
+        vbox.addWidget(self.lbl_preview_banner)
+
+        self.preview_stack = QStackedWidget()
+        self.lbl_preview_empty = QLabel(
+            "Chọn một dòng trong bảng để xem trước nội dung file."
+        )
+        self.lbl_preview_empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_preview_empty.setStyleSheet(
+            f"color: {COLOR_TEXT_SECONDARY}; font: 13px '{FONT_UI}';"
+        )
+        self.lbl_preview_empty.setWordWrap(True)
+        self.preview_stack.addWidget(self.lbl_preview_empty)  # trang 0
+        self.pdf_viewer = PdfViewerWidget()
+        self.preview_stack.addWidget(self.pdf_viewer)  # trang 1
+
+        # Lớp phủ "đang chuyển đổi" đè lên đúng vùng xem PDF: nền tối mờ +
+        # icon xoay + dòng chữ. Màu tự thân (không theo theme sáng/tối) để
+        # luôn tương phản: theme sáng từng làm chữ COLOR_TEXT đen-on-đen.
+        self.preview_overlay = QFrame()
+        self.preview_overlay.setObjectName("previewBusyOverlay")
+        self.preview_overlay.setStyleSheet(
+            "QFrame#previewBusyOverlay { background: rgba(20, 20, 20, 170); }"
+        )
+        overlay_layout = QVBoxLayout(self.preview_overlay)
+        overlay_layout.addStretch(1)
+        self.preview_spinner = _BusySpinner()
+        overlay_layout.addWidget(
+            self.preview_spinner, 0, Qt.AlignmentFlag.AlignHCenter
+        )
+        self.lbl_preview_busy = QLabel(
+            translations.localize_text(
+                "Đang chuyển đổi để xem trước, vui lòng chờ..."
+            )
+        )
+        self.lbl_preview_busy.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        self.lbl_preview_busy.setStyleSheet(
+            f"QLabel {{ color: #ffffff; font: 14px '{FONT_UI}';"
+            f" background: transparent; }}"
+        )
+        overlay_layout.addWidget(self.lbl_preview_busy)
+        overlay_layout.addStretch(1)
+        self.preview_overlay.setVisible(False)
+
+        stack_wrap = QWidget()
+        stack_grid = QGridLayout(stack_wrap)
+        stack_grid.setContentsMargins(0, 0, 0, 0)
+        stack_grid.setSpacing(0)
+        stack_grid.addWidget(self.preview_stack, 0, 0)
+        stack_grid.addWidget(self.preview_overlay, 0, 0)
+        vbox.addWidget(stack_wrap, 1)
+        return panel
 
     def _primary_btn_qss(self) -> str:
         return (
@@ -1847,6 +2224,16 @@ class SecretFileScanScreen(ScreenContent):
             f" border: none; padding: 8px 16px; border-radius: {RADIUS_MD}px;"
             f" font: 600 13px '{FONT_UI}'; }}"
             "QPushButton:hover { background: #bd2130; }"
+            "QPushButton:disabled { background: #555; color: #aaa; }"
+        )
+
+    def _success_btn_qss(self) -> str:
+        return (
+            f"QPushButton {{ background: {COLOR_GREEN}; color: white;"
+            f" border: none; padding: 8px 16px; border-radius: {RADIUS_MD}px;"
+            f" font: 600 13px '{FONT_UI}'; }}"
+            f"QPushButton:hover {{ background: {COLOR_GREEN_HOVER}; }}"
+            f"QPushButton:disabled {{ background: #555; color: #aaa; }}"
         )
 
     def _browse_folder(self) -> None:
@@ -1867,10 +2254,28 @@ class SecretFileScanScreen(ScreenContent):
         first_page_only = self.fast_checkbox.isChecked()
         resume_prog = self._offer_resume(folder, first_page_only)
 
+        if (
+            resume_prog is None
+            and self._loaded_from
+            and self.table.rowCount() > 0
+        ):
+            answer = QMessageBox.question(
+                self,
+                "Thay danh sách đang load?",
+                (
+                    "Danh sách đang hiển thị được load từ file Excel.\n"
+                    "Bắt đầu quét mới sẽ thay nó — các chỉnh sửa chưa xuất\n"
+                    "ra Excel sẽ mất. Tiếp tục?"
+                ),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+
         self._busy = True
         self._cancel_event.clear()
-        self._results = []
-        self.table.setRowCount(0)
+        self._reset_results()
         if resume_prog is not None:
             # Khôi phục các dòng mật đã phát hiện ở lượt trước lên bảng.
             for match_dict in resume_prog.matches:
@@ -1940,10 +2345,14 @@ class SecretFileScanScreen(ScreenContent):
         self.fast_checkbox.setEnabled(not running)
         self.history_checkbox.setEnabled(not running)
         self.btn_clear_history.setEnabled(not running)
+        self.btn_load_file.setEnabled(not running)
         # Chỉ bật lại nút xuất khi hết bận VÀ đang có kết quả để xuất.
-        self.btn_export.setEnabled(not running and bool(self._results))
+        self.btn_export.setEnabled(not running and self.table.rowCount() > 0)
         self.btn_run.setVisible(not running)
         self.btn_stop.setVisible(running)
+        # Xóa file / "không phải mật" cấm chạy trong lúc quét (file đang bị
+        # engine đọc); xem trước thì vẫn cho phép.
+        self._refresh_action_buttons()
 
     def _run_worker(
         self,
@@ -2189,6 +2598,441 @@ class SecretFileScanScreen(ScreenContent):
                 }
             )
 
+    # ------------------------------------------------------------------
+    # Xem trước (panel phải)
+    # ------------------------------------------------------------------
+
+    def _set_preview_banner(self, text: str, kind: str | None) -> None:
+        if not text or not kind:
+            self.lbl_preview_banner.setVisible(False)
+            self.lbl_preview_banner.setText("")
+            return
+        if kind == "warn":
+            bg, border = "#3a3120", "#b8860b"
+        else:
+            bg, border = "#1f2c3d", COLOR_BORDER
+        self.lbl_preview_banner.setText(text)
+        # Chữ trắng cố định: cả hai nền banner đều tối, và COLOR_TEXT ở
+        # theme sáng là màu đen → sợ lại ra chữ đen trên nền đen.
+        self.lbl_preview_banner.setStyleSheet(
+            f"QLabel {{ background: {bg}; border: 1px solid {border};"
+            f" border-radius: {RADIUS_MD}px; padding: 6px 8px;"
+            f" color: #ffffff; font: 12px '{FONT_UI}'; }}"
+        )
+        self.lbl_preview_banner.setVisible(True)
+
+    def _set_preview_busy(self, busy: bool) -> None:
+        """Bật/tắt lớp phủ icon xoay trên vùng xem trong lúc convert."""
+        self.preview_overlay.setVisible(busy)
+        if busy:
+            self.preview_spinner.start()
+        else:
+            self.preview_spinner.stop()
+
+    def _show_preview(self, row: int) -> None:
+        item = self.table.item(row, 0)
+        if item is None:
+            return
+        match = item.data(Qt.ItemDataRole.UserRole + 1)
+        if not isinstance(match, SecretScanMatch):
+            return
+        self._preview_current = match
+        self.lbl_preview_title.setText("Xem trước")
+        self.lbl_preview_path.setText(match.source_path)
+        self.lbl_preview_path.setToolTip(match.source_path)
+        self._refresh_action_buttons()
+        self._set_preview_busy(False)
+
+        path = match.source_path
+        ext = os.path.splitext(path)[1].lower()
+        if not os.path.exists(path):
+            self.pdf_viewer.clear()
+            self.lbl_preview_empty.setText(
+                translations.localize_text(
+                    f"File không còn tồn tại trên đĩa:\n{path}"
+                )
+            )
+            self.preview_stack.setCurrentIndex(0)
+            self._set_preview_banner("", None)
+            return
+        if ext == ".pdf":
+            self._set_preview_banner("", None)
+            self.preview_stack.setCurrentIndex(1)
+            self.pdf_viewer.show_pdf(
+                path, page=max(1, int(match.page_number or 1))
+            )
+            return
+        if ext in {".png", ".jpg", ".jpeg", ".doc", ".docx"}:
+            self._preview_converted(path, match)
+            return
+        self.lbl_preview_empty.setText(
+            translations.localize_text(
+                f"Không hỗ trợ xem trước định dạng: {ext}"
+            )
+        )
+        self.preview_stack.setCurrentIndex(0)
+        self._set_preview_banner("", None)
+
+    def _preview_converted(self, path: str, match: SecretScanMatch) -> None:
+        """Ảnh/doc/docx: chuyển sang PDF tạm (cache theo size+mtime) rồi xem.
+
+        Convert chạy trong thread nền với số generation — bấm sang file khác
+        thì kết quả cũ bị vứt bỏ. .docx không có Word/LibreOffice rơi vào
+        nhánh text fallback (đúng như engine đã quét) và hiện banner cảnh báo.
+        """
+        try:
+            st = os.stat(path)
+            key = (_norm(path), int(st.st_size), int(st.st_mtime))
+        except OSError:
+            return
+        cached = self._preview_cache.get(key)
+        if cached and os.path.exists(cached):
+            self._set_preview_banner("", None)
+            self.preview_stack.setCurrentIndex(1)
+            self.pdf_viewer.show_pdf(
+                cached, page=max(1, int(match.page_number or 1))
+            )
+            return
+        gen = self._preview_convert_gen = self._preview_convert_gen + 1
+        digest = hashlib.sha1("|".join(map(str, key)).encode("utf-8")).hexdigest()
+        out_pdf = os.path.join(_preview_cache_dir(), f"{digest}.pdf")
+        ext = os.path.splitext(path)[1].lower()
+        self.preview_stack.setCurrentIndex(1)
+        self.pdf_viewer.clear()
+        self._set_preview_busy(True)
+
+        def work(
+            gen=gen, path=path, out_pdf=out_pdf, key=key, ext=ext
+        ) -> None:
+            pythoncom = None
+            try:
+                import pythoncom  # type: ignore
+
+                pythoncom.CoInitialize()  # trả HRESULT — không gán lại biến
+            except Exception:
+                pythoncom = None
+            error = ""
+            note = ""
+            try:
+                if ext in {".png", ".jpg", ".jpeg"}:
+                    _image_to_pdf(path, out_pdf)
+                    note = "image"
+                elif _convert_doc_with_word(
+                    path, out_pdf, first_page_only=False
+                ) or _convert_doc_with_soffice(path, out_pdf):
+                    note = "doc-render"
+                elif ext == ".docx":
+                    # Thứ tự fallback y hệt _convert_document_to_pdf của
+                    # engine: bản text này chính là cái engine đã dùng để
+                    # tìm từ khóa khi máy không có Word/LibreOffice.
+                    _convert_docx_text_fallback(
+                        path, out_pdf, first_page_only=False
+                    )
+                    note = "doc-text"
+                else:
+                    raise RuntimeError(
+                        "Cần Microsoft Word hoặc LibreOffice để xem trước "
+                        "file .doc trên máy này."
+                    )
+                if not os.path.exists(out_pdf):
+                    raise RuntimeError("Không tạo được file PDF tạm")
+            except Exception as exc:
+                error = str(exc) or type(exc).__name__
+            finally:
+                if pythoncom is not None:
+                    try:
+                        pythoncom.CoUninitialize()
+                    except Exception:
+                        pass
+            self._preview_ready.emit(
+                {"gen": gen, "key": key, "out_pdf": out_pdf,
+                 "error": error, "note": note}
+            )
+
+        threading.Thread(
+            target=work, daemon=True, name="secret-preview-convert"
+        ).start()
+
+    def _on_preview_ready(self, payload: dict) -> None:
+        if payload.get("gen") != self._preview_convert_gen:
+            return  # người dùng đã bấm sang file khác
+        self._set_preview_busy(False)
+        if payload.get("error"):
+            self._set_preview_banner("", None)
+            self.lbl_preview_empty.setText(
+                translations.localize_text(
+                    f"Không xem trước được file này:\n{payload['error']}"
+                )
+            )
+            self.preview_stack.setCurrentIndex(0)
+            return
+        if payload.get("key"):
+            self._preview_cache[payload["key"]] = payload["out_pdf"]
+        if payload.get("note") == "doc-text":
+            self._set_preview_banner(
+                translations.localize_text(
+                    "⚠ Bản xem trước dạng TEXT (trích từ .docx, máy không có "
+                    "Word/LibreOffice) — KHÔNG hiển thị ảnh, mộc, con dấu. "
+                    "Không căn cứ vào đây để kết luận \"không phải mật\" khi dấu "
+                    "mật nghi ở dạng hình."
+                ),
+                "warn",
+            )
+        else:
+            self._set_preview_banner("", None)
+        page = 1
+        if self._preview_current is not None:
+            page = max(1, int(self._preview_current.page_number or 1))
+        self.preview_stack.setCurrentIndex(1)
+        self.pdf_viewer.show_pdf(payload["out_pdf"], page=page)
+
+    # ------------------------------------------------------------------
+    # Xóa file vĩnh viễn / Không phải mật
+    # ------------------------------------------------------------------
+
+    def _batch_delete_clicked(self) -> None:
+        self._delete_files(sorted(self._checked_paths))
+
+    def _batch_not_secret_clicked(self) -> None:
+        self._mark_not_secret(sorted(self._checked_paths))
+
+    def _preview_delete_clicked(self) -> None:
+        if self._busy or self._preview_current is None:
+            return
+        path = self._preview_current.source_path
+        row = self._first_row_of(path)
+        self._delete_files([path])
+        # Tự chuyển sang dòng kế (hoặc dòng cuối) như đã hứa trong tooltip.
+        if row is not None and self.table.rowCount() > 0:
+            self._show_preview(min(row, self.table.rowCount() - 1))
+
+    def _preview_not_secret_clicked(self) -> None:
+        if self._busy or self._preview_current is None:
+            return
+        path = self._preview_current.source_path
+        row = self._first_row_of(path)
+        self._mark_not_secret([path])
+        if row is not None and self.table.rowCount() > 0:
+            self._show_preview(min(row, self.table.rowCount() - 1))
+
+    def _first_row_of(self, path: str) -> int | None:
+        key = _norm(path)
+        for r in range(self.table.rowCount()):
+            if _norm(self._row_path(r)) == key:
+                return r
+        return None
+
+    def _delete_files(self, paths: list[str]) -> None:
+        if self._busy:
+            return
+        targets = list(dict.fromkeys(p for p in paths if p))
+        if not targets:
+            return
+        if not self._confirm_paths(
+            "Xóa vĩnh viễn file?",
+            translations.localize_text(
+                f"Sẽ XÓA VĨNH VIỄN {len(targets)} file khỏi đĩa:\n"
+                "• KHÔNG qua thùng rác — KHÔNG thể hoàn tác.\n"
+                "• File đang bị chương trình khác khóa sẽ báo lỗi và giữ nguyên dòng."
+            ),
+            targets,
+            "Xóa vĩnh viễn",
+        ):
+            return
+        deleted = 0
+        errors: list[str] = []
+        for path in targets:
+            # fitz giữ handle file đang xem → phải thả trước khi xóa.
+            if (
+                self._preview_current is not None
+                and _norm(self._preview_current.source_path) == _norm(path)
+            ):
+                self.pdf_viewer.release_file_handles()
+            try:
+                _permanent_delete(path)
+            except OSError as exc:
+                errors.append(f"{path}\n→ {exc}")
+            else:
+                deleted += 1
+                self._remove_file_rows(path)
+        if deleted:
+            self.log_message.emit(
+                f"Quét file mật: đã xóa vĩnh viễn {deleted} file khỏi đĩa.",
+                "success",
+            )
+        if errors:
+            self._show_path_errors(
+                translations.localize_text(
+                    f"Không xóa được {len(errors)}/{len(targets)} file "
+                    "(dòng tương ứng được giữ lại):"
+                ),
+                errors,
+            )
+            self.log_message.emit(
+                f"Quét file mật: {len(errors)} file xóa lỗi — "
+                + " | ".join(e.replace("\n", " ") for e in errors),
+                "err",
+            )
+        self._refresh_totals()
+
+    def _mark_not_secret(self, paths: list[str]) -> None:
+        if self._busy:
+            return
+        targets = list(dict.fromkeys(p for p in paths if p))
+        if not targets:
+            return
+        if not self._confirm_paths(
+            "Xác nhận không phải văn bản mật?",
+            translations.localize_text(
+                f"Xác nhận {len(targets)} file dưới đây là KHÔNG phải văn bản mật?\n"
+                "• Chỉ loại khỏi danh sách — KHÔNG xóa file trên đĩa.\n"
+                "• Các lượt quét sau sẽ tự bỏ qua các file này; đến khi file\n"
+                "  thay đổi nội dung thì dòng sẽ hiện lại để xem xét lại."
+            ),
+            targets,
+            "Xác nhận không phải mật",
+        ):
+            return
+        for path in targets:
+            self._not_secret.mark(path)
+            self._remove_file_rows(path)
+        self.log_message.emit(
+            f"Quét file mật: xác nhận không phải mật, loại {len(targets)} file "
+            "khỏi danh sách (file trên đĩa giữ nguyên).",
+            "success",
+        )
+        self._refresh_totals()
+
+    def _confirm_paths(
+        self, title: str, intro: str, paths: list[str], accept_label: str
+    ) -> bool:
+        """Hộp thoại xác nhận liệt kê đầy đủ đường dẫn (cuộn được khi dài)."""
+        box = QMessageBox(self)
+        box.setWindowTitle(title)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setText(intro)
+        listw = QListWidget(box)
+        listw.addItems(paths)
+        listw.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        listw.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        listw.setWordWrap(True)
+        listw.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        listw.setFixedHeight(min(220, 26 * len(paths) + 6))
+        grid = box.layout()
+        if grid is not None:
+            grid.addWidget(listw, 1, 0, 1, grid.columnCount())
+        accept = box.addButton(
+            accept_label, QMessageBox.ButtonRole.AcceptRole
+        )
+        box.addButton("Hủy", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        return box.clickedButton() is accept
+
+    def _show_path_errors(self, intro: str, errors: list[str]) -> None:
+        box = QMessageBox(self)
+        box.setWindowTitle("Có lỗi")
+        box.setIcon(QMessageBox.Icon.Critical)
+        box.setText(intro)
+        detail = QPlainTextEdit(box)
+        detail.setPlainText("\n\n".join(errors))
+        detail.setReadOnly(True)
+        detail.setFixedHeight(min(280, 22 * len(errors) + 12))
+        grid = box.layout()
+        if grid is not None:
+            grid.addWidget(detail, 1, 0, 1, grid.columnCount())
+        box.addButton("Đóng", QMessageBox.ButtonRole.AcceptRole)
+        box.exec()
+
+    # ------------------------------------------------------------------
+    # Load danh sách từ file Excel
+    # ------------------------------------------------------------------
+
+    def _load_from_file_clicked(self) -> None:
+        if self._busy:
+            return
+        last_dir = (
+            os.path.dirname(self._loaded_from)
+            if self._loaded_from
+            else ""
+        )
+        if last_dir and os.path.isdir(last_dir):
+            start_dir = last_dir
+        else:
+            folder = self.folder_edit.text().strip()
+            start_dir = (
+                folder if folder and os.path.isdir(folder)
+                else os.path.expanduser("~")
+            )
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            translations.localize_text(
+                "Load danh sách văn bản mật từ file Excel"
+            ),
+            start_dir,
+            translations.localize_text("Excel (*.xlsx)"),
+        )
+        if not path:
+            return
+        try:
+            matches = load_secret_matches_from_excel(path)
+        except Exception as exc:
+            QMessageBox.critical(self, "Không đọc được file", f"{path}\n\n{exc}")
+            return
+        if not matches:
+            QMessageBox.information(
+                self, "Không có dòng nào",
+                "File không chứa dòng văn bản mật nào.",
+            )
+            return
+        if self.table.rowCount() > 0:
+            answer = QMessageBox.question(
+                self,
+                "Thay danh sách hiện tại?",
+                (
+                    "Danh sách đang hiển thị sẽ bị thay bằng nội dung file "
+                    "vừa load.\nCác chỉnh sửa chưa xuất ra Excel sẽ mất. "
+                    "Tiếp tục?"
+                ),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        self._reset_results()
+        self._loaded_from = os.path.abspath(path)
+        # Gán lại thư mục quét gốc (suy từ chính file Excel) để nút
+        # "Bắt đầu quét" sau đó chạy trên đúng thư mục đã xuất danh sách.
+        scan_root = _derive_scan_root(matches)
+        if scan_root:
+            self.folder_edit.setText(scan_root)
+        missing = 0
+        shown = 0
+        for m in matches:
+            gone = not os.path.exists(m.source_path)
+            if gone:
+                missing += 1
+            before = self.table.rowCount()
+            self._add_result(m, missing=gone)
+            if self.table.rowCount() > before:
+                shown += 1
+        skipped = len(matches) - shown
+        bits = [f"Đã load {shown} dòng từ: {self._loaded_from}"]
+        if missing:
+            bits.append(
+                f"{missing} dòng có file không còn trên đĩa (hiển thị mờ)"
+            )
+        if skipped:
+            bits.append(
+                f"{skipped} dòng bị bỏ qua do đã xác nhận \"không phải mật\""
+            )
+        self._set_status(" • ".join(bits))
+        self.log_message.emit("Quét file mật: " + " - ".join(bits), "info")
+        QMessageBox.information(
+            self, "Đã load danh sách", "\n\n".join(bits)
+        )
+
     def _set_status(self, text: str) -> None:
         self.status_label.setText(text)
 
@@ -2196,11 +3040,24 @@ class SecretFileScanScreen(ScreenContent):
         self.progress.setMaximum(max(1, total))
         self.progress.setValue(max(0, min(current, max(1, total))))
 
-    def _add_result(self, match: SecretScanMatch) -> None:
-        self._results.append(match)
-        self.btn_export.setEnabled(True)
+    def _add_result(self, match: SecretScanMatch, missing: bool = False) -> None:
+        # Cửa chặn duy nhất cho CẢ BA nguồn dòng mật (quét mới, resume dở,
+        # cache "Tận dụng kết quả đã quét"): file đã được xác nhận "không
+        # phải mật" và chưa đổi nội dung thì không bao giờ hiện lại.
+        if self._not_secret.is_marked(match.source_path):
+            return
         row = self.table.rowCount()
         self.table.insertRow(row)
+        check_item = QTableWidgetItem()
+        check_item.setFlags(
+            Qt.ItemFlag.ItemIsUserCheckable
+            | Qt.ItemFlag.ItemIsEnabled
+            | Qt.ItemFlag.ItemIsSelectable
+        )
+        check_item.setCheckState(Qt.CheckState.Unchecked)
+        check_item.setData(Qt.ItemDataRole.UserRole, match.source_path)
+        check_item.setData(Qt.ItemDataRole.UserRole + 1, match)
+        self.table.setItem(row, 0, check_item)
         values = [
             match.keyword,
             match.relative_path,
@@ -2208,22 +3065,148 @@ class SecretFileScanScreen(ScreenContent):
             match.mode,
             match.note,
         ]
-        for col, value in enumerate(values):
+        for col, value in enumerate(values, start=1):
             item = QTableWidgetItem(value)
-            if col == 3:
+            if col == 4:
                 translations.set_translatable_item_text(
                     item, value, sync_tooltip=True
                 )
-            elif col == 4:
+            elif col == 5:
                 translations.set_translatable_item_text(
                     item, value, context="secret_note", sync_tooltip=True
                 )
             item.setData(Qt.ItemDataRole.UserRole, match.source_path)
-            if col not in (3, 4):
-                item.setToolTip(match.source_path if col == 1 else value)
-            if col == 0:
+            item.setData(Qt.ItemDataRole.UserRole + 1, match)
+            if col not in (4, 5):
+                item.setToolTip(match.source_path if col == 2 else value)
+            if col == 1:
                 item.setForeground(QColor(COLOR_RED))
+            if missing:
+                item.setForeground(QColor(COLOR_TEXT_SECONDARY))
             self.table.setItem(row, col, item)
+        if missing:
+            file_item = self.table.item(row, 2)
+            if file_item is not None:
+                file_item.setToolTip(
+                    translations.localize_text(
+                        f"{match.source_path}\n⚠ File không còn tồn tại trên đĩa"
+                    )
+                )
+        self.btn_export.setEnabled(True)
+        self._refresh_totals()
+
+    def _row_path(self, row: int) -> str:
+        item = self.table.item(row, 0)
+        if item is None:
+            return ""
+        return item.data(Qt.ItemDataRole.UserRole) or ""
+
+    def _current_matches(self) -> list[SecretScanMatch]:
+        """Danh sách match đang hiển thị — bảng là nguồn chân lý duy nhất."""
+        matches = []
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            if item is None:
+                continue
+            match = item.data(Qt.ItemDataRole.UserRole + 1)
+            if isinstance(match, SecretScanMatch):
+                matches.append(match)
+        return matches
+
+    def _refresh_totals(self) -> None:
+        rows = self.table.rowCount()
+        files = len(
+            {
+                _norm(self._row_path(r))
+                for r in range(rows)
+                if self._row_path(r)
+            }
+        )
+        if rows == 0:
+            self.lbl_total.setText(
+                translations.localize_text("Tổng: 0 văn bản mật")
+            )
+        elif rows == files:
+            self.lbl_total.setText(
+                translations.localize_text(f"Tổng: {files} văn bản mật")
+            )
+        else:
+            self.lbl_total.setText(
+                translations.localize_text(
+                    f"Tổng: {files} văn bản mật ({rows} dòng)"
+                )
+            )
+        self.btn_export.setEnabled(not self._busy and rows > 0)
+        self._refresh_action_buttons()
+
+    def _refresh_action_buttons(self) -> None:
+        busy = self._busy
+        has_check = bool(self._checked_paths)
+        self.btn_batch_delete.setEnabled(not busy and has_check)
+        self.btn_batch_not_secret.setEnabled(not busy and has_check)
+        has_preview = self._preview_current is not None
+        self.btn_preview_delete.setEnabled(not busy and has_preview)
+        self.btn_preview_not_secret.setEnabled(not busy and has_preview)
+
+    def _on_item_changed(self, item: QTableWidgetItem) -> None:
+        if item.column() != 0:
+            return
+        path = item.data(Qt.ItemDataRole.UserRole)
+        if not path:
+            return
+        if item.checkState() == Qt.CheckState.Checked:
+            self._checked_paths.add(_norm(path))
+        else:
+            self._checked_paths.discard(_norm(path))
+        self._refresh_action_buttons()
+
+    def _on_row_clicked(self, item: QTableWidgetItem) -> None:
+        if item.column() == 0:
+            return  # cột checkbox: chỉ check, không đổi preview
+        self._show_preview(item.row())
+
+    def _remove_file_rows(self, path: str) -> None:
+        key = _norm(path)
+        rows = [
+            r
+            for r in range(self.table.rowCount())
+            if _norm(self._row_path(r)) == key
+        ]
+        for r in sorted(rows, reverse=True):
+            self.table.removeRow(r)
+        self._checked_paths.discard(key)
+        if (
+            self._preview_current is not None
+            and _norm(self._preview_current.source_path) == key
+        ):
+            self._preview_current = None
+            self.pdf_viewer.clear()
+            self.preview_stack.setCurrentIndex(0)
+            self.lbl_preview_empty.setText(
+                "Chọn một dòng trong bảng để xem trước nội dung file."
+            )
+            self._set_preview_banner("", None)
+            self._set_preview_busy(False)
+        self._refresh_totals()
+
+    def _reset_results(self) -> None:
+        self._loaded_from = None
+        self._checked_paths.clear()
+        self._preview_current = None
+        self._preview_convert_gen += 1  # vô hiệu hoá kết quả convert cũ
+        self.table.setRowCount(0)
+        self.pdf_viewer.clear()
+        self.preview_stack.setCurrentIndex(0)
+        self.lbl_preview_empty.setText(
+            "Chọn một dòng trong bảng để xem trước nội dung file."
+        )
+        self.lbl_preview_path.setText("")
+        self.lbl_preview_path.setToolTip("")
+        self.lbl_preview_title.setText("Xem trước")
+        self._set_preview_banner("", None)
+        self._set_preview_busy(False)
+        self.btn_export.setEnabled(False)
+        self._refresh_totals()
 
     def _on_finished(self, payload: dict) -> None:
         self._busy = False
@@ -2235,7 +3218,7 @@ class SecretFileScanScreen(ScreenContent):
         junk = int(payload.get("junk") or 0)
         failures = int(payload.get("failures") or 0)
         cancelled = bool(payload.get("cancelled"))
-        found = len(self._results)
+        found = self.table.rowCount()
         prefix = "Đã dừng" if cancelled else "Hoàn tất"
         detail = f"quét {scanned + skipped + cache_skipped}/{total} file"
         notes = []
@@ -2276,7 +3259,8 @@ class SecretFileScanScreen(ScreenContent):
                 "Sẽ xóa toàn bộ:\n"
                 "• Tiến độ các lượt quét chưa hoàn tất (không tiếp tục được nữa)\n"
                 "• Lịch sử \"đã quét\" — lượt quét sau sẽ quét lại mọi file từ đầu\n\n"
-                "Kết quả đã xuất Excel và log trong logs/ không bị ảnh hưởng.\n"
+                "Kết quả đã xuất Excel, log trong logs/ và các xác nhận\n"
+                "\"không phải mật\" không bị ảnh hưởng.\n"
                 "Xóa ngay?"
             ),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -2298,20 +3282,31 @@ class SecretFileScanScreen(ScreenContent):
         )
 
     def _open_result_file(self, item: QTableWidgetItem) -> None:
+        if item.column() == 0:
+            return  # double-click vào ô checkbox: chỉ check, không mở file
         source_path = item.data(Qt.ItemDataRole.UserRole)
         if source_path and os.path.exists(source_path):
             QDesktopServices.openUrl(QUrl.fromLocalFile(source_path))
 
     def _export_clicked(self) -> None:
-        if not self._results:
+        matches = self._current_matches()
+        if not matches:
             QMessageBox.information(
                 self,
                 "Chưa có kết quả",
                 "Chưa có văn bản mật nào được phát hiện để xuất.",
             )
             return
+        loaded_dir = (
+            os.path.dirname(self._loaded_from) if self._loaded_from else ""
+        )
         folder = self.folder_edit.text().strip()
-        start_dir = folder if folder and os.path.isdir(folder) else os.path.expanduser("~")
+        if loaded_dir and os.path.isdir(loaded_dir):
+            start_dir = loaded_dir
+        elif folder and os.path.isdir(folder):
+            start_dir = folder
+        else:
+            start_dir = os.path.expanduser("~")
         default_name = f"DanhSachVanBanMat_{time.strftime('%Y%m%d_%H%M%S')}.xlsx"
         dest, _ = QFileDialog.getSaveFileName(
             self,
@@ -2323,20 +3318,36 @@ class SecretFileScanScreen(ScreenContent):
             return
         if not dest.lower().endswith(".xlsx"):
             dest += ".xlsx"
+        if self._loaded_from and os.path.abspath(dest) == self._loaded_from:
+            # Không bao giờ ghi đè file đang load — tự đổi tên kèm mốc giờ.
+            dest = (
+                os.path.splitext(dest)[0]
+                + f"_moi_{time.strftime('%Y%m%d_%H%M%S')}.xlsx"
+            )
+            QMessageBox.information(
+                self,
+                "Không ghi đè file đang load",
+                translations.localize_text(
+                    f"File đang load không được ghi đè.\n"
+                    f"Danh sách sẽ xuất ra:\n{dest}"
+                ),
+            )
         try:
-            export_matches_to_excel(self._results, dest)
+            export_matches_to_excel(matches, dest)
         except Exception as exc:
             QMessageBox.critical(
                 self, "Lỗi", f"Không thể xuất file Excel:\n{exc}"
             )
             return
-        self._set_status(f"Đã xuất {len(self._results)} dòng mật ra: {dest}")
+        self._set_status(f"Đã xuất {len(matches)} dòng mật ra: {dest}")
         self.log_message.emit(
-            f"Đã xuất danh sách văn bản mật ({len(self._results)} dòng): {dest}",
+            f"Đã xuất danh sách văn bản mật ({len(matches)} dòng): {dest}",
             "success",
         )
         QMessageBox.information(
             self,
             "Đã xuất Excel",
-            f"Đã lưu danh sách {len(self._results)} văn bản mật vào:\n{dest}",
+            translations.localize_text(
+                f"Đã lưu danh sách {len(matches)} dòng văn bản mật vào:\n{dest}"
+            ),
         )

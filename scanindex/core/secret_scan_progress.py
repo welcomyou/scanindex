@@ -565,3 +565,94 @@ def prune_stale(max_age_days: int = DEFAULT_MAX_AGE_DAYS) -> int:
             except OSError:
                 pass
     return removed
+
+
+# ---------------------------------------------------------------------------
+# Dấu "người dùng đã xác nhận KHÔNG phải mật"
+# ---------------------------------------------------------------------------
+# Ghi khi người dùng bấm "Không phải mật" trên một file. Mọi lượt quét sau
+# (quét mới, resume dở, cache "Tận dụng kết quả đã quét") tra dấu này trước
+# khi đưa dòng lên bảng: file bị mark và chưa đổi (size + mtime khớp) thì
+# các dòng mật của nó bị chặn. File thay đổi nội dung → dấu hết hiệu lực,
+# dòng hiện lại để người xem xét lại. Tên file cố tình không đặt tiền tố
+# "secret_scan_"/"file_registry" và không dùng đuôi .jsonl để clear_all()
+# ("Xóa lịch sử quét") và prune_stale() không quét mất — xác nhận của
+# người dùng phải sống lâu hơn lịch sử quét.
+
+NOT_SECRET_MARKS_NAME = "not_secret_marks.json"
+
+
+def not_secret_marks_path() -> str:
+    return os.path.join(progress_dir(), NOT_SECRET_MARKS_NAME)
+
+
+class NotSecretMarks:
+    """Map đường dẫn tuyệt đối (đã normalize) → {"size", "mtime", "at"}.
+
+    Toàn bộ file được nạp một lần khi mở screen; mark() ghi lại cả file
+    (dấu chỉ thêm khi người dùng bấm nút nên tần suất rất thấp, không cần
+    journal append kiểu FileRegistry).
+    """
+
+    def __init__(self):
+        self._marks: dict[str, dict] = {}
+
+    @classmethod
+    def load(cls) -> "NotSecretMarks":
+        obj = cls()
+        try:
+            with open(not_secret_marks_path(), "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (FileNotFoundError, OSError, ValueError):
+            return obj  # chưa có file / file hỏng: coi như chưa mark gì.
+        if isinstance(data, dict):
+            for key, value in data.items():
+                if isinstance(key, str) and isinstance(value, dict):
+                    obj._marks[key] = value
+        return obj
+
+    @staticmethod
+    def _key(path: str) -> str:
+        return os.path.normpath(os.path.abspath(path))
+
+    def is_marked(self, path: str) -> bool:
+        """True nếu path bị mark VÀ file trên đĩa chưa đổi từ lúc mark."""
+        info = self._marks.get(self._key(path))
+        if not info:
+            return False
+        try:
+            st = os.stat(path)
+        except OSError:
+            return False
+        return (
+            int(info.get("size", -1)) == int(st.st_size)
+            and int(info.get("mtime", -1)) == int(st.st_mtime)
+        )
+
+    def mark(self, path: str) -> bool:
+        """Ghi dấu cho path theo size+mtime hiện tại. Trả False nếu file
+        không stat được (không đánh dấu được — nhưng dòng vẫn bị bỏ khỏi
+        danh sách của phiên hiện tại)."""
+        try:
+            st = os.stat(path)
+        except OSError:
+            return False
+        self._marks[self._key(path)] = {
+            "size": int(st.st_size),
+            "mtime": int(st.st_mtime),
+            "at": _now(),
+        }
+        self._save()
+        return True
+
+    def _save(self) -> None:
+        try:
+            os.makedirs(progress_dir(), exist_ok=True)
+            tmp = not_secret_marks_path() + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self._marks, f, ensure_ascii=False, indent=1)
+            os.replace(tmp, not_secret_marks_path())
+        except OSError:
+            # Không chặn luồng người dùng chỉ vì không ghi được dấu; lượt
+            # quét sau sẽ hiện lại dòng này (an toàn hướng "hiện thừa").
+            pass

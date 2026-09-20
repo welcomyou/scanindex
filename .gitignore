@@ -122,6 +122,7 @@ tests/*
 !tests/test_secret_scan_excel_export.py
 !tests/test_secret_scan_progress.py
 !tests/test_secret_scan_precheck.py
+!tests/test_secret_scan_list_actions.py
 !tests/test_secrecy_detection.py
 /scan_progress/
 !tests/test_portable_config_bootstrap.py
