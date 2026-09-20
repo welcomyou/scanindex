@@ -215,6 +215,11 @@ UI_TEXT_PAIRS: tuple[tuple[str, str], ...] = (
         "Scan PDF, image, and Word files for MẬT, TỐI MẬT, and TUYỆT MẬT markings.",
         "Quét PDF, ảnh và Word để tìm dấu MẬT, TỐI MẬT, TUYỆT MẬT.",
     ),
+    ("Meets the declassification deadline", "Đáp ứng thời gian giải mật"),
+    (
+        "Meets the declassification deadline (issued {}, {} {} year(s))",
+        "Đáp ứng thời gian giải mật (văn bản {}, {} {} năm)",
+    ),
     ("Bulk digital signing", "Ký số hàng loạt"),
     (
         "Bulk-sign PDFs: choose input and output folders, then start.",

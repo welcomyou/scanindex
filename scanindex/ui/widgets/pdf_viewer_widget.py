@@ -656,6 +656,7 @@ class PdfViewerWidget(QWidget):
         toolbar = QHBoxLayout(tb_frame)
         toolbar.setContentsMargins(6, 0, 6, 0)
         toolbar.setSpacing(2)
+        self._toolbar_layout = toolbar
 
         # File navigation
         self._btn_prev_file = QPushButton("\u25C0")
@@ -851,6 +852,24 @@ class PdfViewerWidget(QWidget):
     def set_file_nav_enabled(self, can_prev, can_next):
         self._btn_prev_file.setEnabled(can_prev)
         self._btn_next_file.setEnabled(can_next)
+
+    def add_toolbar_widget(self, widget):
+        """Chèn widget của màn hình gọi vào thanh công cụ, ngay sau chỉ
+        số trang ("Trang x / y"). Lần gọi đầu tự kèm vạch phân cách.
+
+        Dùng để gắn thao tác tác động lên tài liệu đang xem (ví dụ màn hình
+        quét file mật gắn nút Không phải mật / Xóa file) mà không phải sửa
+        viewer cho từng màn hình.
+        """
+        if not hasattr(self, "_custom_toolbar_index"):
+            separator = QFrame()
+            separator.setFixedSize(1, 16)
+            separator.setStyleSheet(f"background: {COLOR_BORDER_DEFAULT};")
+            after_page = self._toolbar_layout.indexOf(self._lbl_page) + 1
+            self._toolbar_layout.insertWidget(after_page, separator)
+            self._custom_toolbar_index = after_page + 1
+        self._toolbar_layout.insertWidget(self._custom_toolbar_index, widget)
+        self._custom_toolbar_index += 1
 
     def scroll_to_page(self, page_idx):
         y = self._pages_widget.page_y_offset(page_idx)

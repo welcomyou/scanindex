@@ -707,21 +707,20 @@ def _line_matches_stamp_keyword(line_text: str, keyword: str) -> bool:
     return _tokenize_for_stamp_match(line_text) == _tokenize_for_stamp_match(keyword)
 
 
-def _line_matches_secrecy_keyword(line_text: str, keyword: str) -> bool:
-    """Match a secrecy file signal without trusting OCR coordinates.
+def _secrecy_match_kind(line_text: str, keyword: str) -> str | None:
+    """Phân loại cách dòng khớp từ khóa mật.
 
-    Exact standalone stamps are accepted. A short uppercase line containing a
-    document-number marker such as "So ... Mat" is also accepted because some
-    scans expose the secrecy marker in the number/symbol line instead of as a
-    separate stamp line.
+    - ``"stamp"``: dòng chính là con dấu độ mật đứng một mình (token bằng
+      keyword, ngắn, in hoa).
+    - ``"number"``: chỉ dẫn độ mật bằng chữ trong dòng số ký hiệu
+      ("Số .../MẬT") — tính chất chữ nghĩa, tồn tại ở mọi vị trí trên trang.
     """
     tokens = _tokenize_for_stamp_match(line_text)
     kw_tokens = _tokenize_for_stamp_match(keyword)
     if not tokens or not kw_tokens:
-        return False
+        return None
     if tokens == kw_tokens:
-        return _is_stamp_like_line(line_text)
-
+        return "stamp" if _is_stamp_like_line(line_text) else None
     marker_at = None
     if len(tokens) > len(kw_tokens) and tokens[-len(kw_tokens):] == kw_tokens:
         marker_at = len(tokens) - len(kw_tokens)
@@ -731,12 +730,19 @@ def _line_matches_secrecy_keyword(line_text: str, keyword: str) -> bool:
                 marker_at = idx
                 break
     if marker_at is None:
-        return False
+        return None
     if "SO" not in tokens[:marker_at]:
-        return False
+        return None
     if len(line_text or "") > 180:
-        return False
-    return _uppercase_ratio(line_text or "") > 0.6
+        return None
+    if _uppercase_ratio(line_text or "") <= 0.6:
+        return None
+    return "number"
+
+
+def _line_matches_secrecy_keyword(line_text: str, keyword: str) -> bool:
+    """Match a secrecy file signal without trusting OCR coordinates."""
+    return _secrecy_match_kind(line_text, keyword) is not None
 
 
 def _is_stamp_like_line(text: str) -> bool:
@@ -753,11 +759,21 @@ def _line_center(line: dict, page_width: float, page_height: float) -> tuple[flo
     return cx, cy
 
 
+def _line_center_pt(line: dict) -> tuple[float, float]:
+    bbox = line.get("bbox") or [0, 0, 0, 0]
+    return (float(bbox[0]) + float(bbox[2])) / 2, (float(bbox[1]) + float(bbox[3])) / 2
+
+
 def _normalised_page_text(page: dict) -> str:
     return " ".join(
         _strip_accents_upper(line.get("text", "") or "")
         for line in page.get("lines") or []
     )
+
+
+# Cụm tổ chức Mặt trận sau khi OCR xé vụn có thể thành dòng riêng lẻ ghép
+# ngang qua nhau ("UB" + "MAT TRAN"), nên so chuỗi con trên văn bản cả trang.
+_FRONT_PAGE_PHRASES = ("UBMTTQ", "MAT TRAN TO QUOC", "UB MAT TRAN", "UY BAN MAT TRAN")
 
 
 def _page_issued_by_mattran(page: dict) -> bool:
@@ -770,7 +786,9 @@ def _page_issued_by_mattran(page: dict) -> bool:
     "MẬT" — the exact false positive the lower-half guard suppresses.
     """
     text = _normalised_page_text(page)
-    return "MTTQ" in text or "MAT TRAN TO QUOC" in text
+    if "MTTQ" in text:
+        return True
+    return any(phrase in text for phrase in _FRONT_PAGE_PHRASES)
 
 
 def _is_likely_mattran_seal_fragment(
@@ -779,47 +797,115 @@ def _is_likely_mattran_seal_fragment(
     page_width: float,
     page_height: float,
 ) -> bool:
-    """Lower-half keyword hit on a Front-issued page is the org seal, not a mark.
+    """Keyword hit in the Front seal zones of a Front-issued page is the seal.
 
     Real secrecy stamps sit in the top corners; the Mặt trận seal sits next to
-    the signatures at the bottom. A keyword match in the lower half of a
-    Front-issued page is therefore almost certainly the seal fragment, while
-    the same match on any other organisation's page keeps flagging (e.g. "Số
-    12/MẬT" number lines are usually mid-page and must stay detectable).
+    the signatures at the bottom, and the dấu giáp la / con dấu mộc half-off
+    the sheet lands on the right edge of the page. A keyword match in either
+    zone of a Front-issued page is therefore almost certainly the seal
+    fragment, while the same match elsewhere keeps flagging (e.g. "Số 12/MẬT"
+    number lines are usually mid-page-left and must stay detectable).
     """
     if not _page_issued_by_mattran(page):
         return False
-    _, cy = _line_center(line, page_width, page_height)
-    return cy > 0.5
+    cx, cy = _line_center(line, page_width, page_height)
+    return cy > 0.5 or cx > 0.62
+
+
+# Dấu tròn đường kính ~4-5cm: các mảnh chữ vòng cung ("MAT", "TRAN", "TO
+# QUOC"…) nằm rải trong bán kính đó của nhau. ~170pt ≈ 6cm là đủ rộng.
+_FRONT_SEAL_RING_RADIUS_PT = 170.0
+# Chỉ nhận mảnh vòng cung có token đặc trưng của chữ dấu Mặt trận. Không
+# đưa VIET/NAM/TO/QUOC vào: "VIỆT NAM" riêng dòng là mảnh quốc hiệu rất
+# phổ biến, nằm ngay trên vị trí đóng dấu thật → sẽ bấm nhầm dấu thật.
+_FRONT_SEAL_RING_TOKENS = {"MAT", "TRAN", "MTTQ"}
+
+
+def _has_front_seal_ring_neighbour(page: dict, hit_line: dict) -> bool:
+    """Lone "MAT" hit next to a "TRAN"/"MTTQ" ring shred is the seal, not a mark.
+
+    Dấu giáp la / dấu mộc Mặt trận đóng mép giấy thường bị OCR xé thành vài
+    dòng ngắn in hoa ("MAT", "TRAN", "MTTQ"…) nằm sát nhau, trong khi dòng
+    tiêu ngữ trang lại xé nát không còn nhận ra "MTTQ"/"MAT TRAN TO QUOC" để
+    ``_page_issued_by_mattran`` bắt được. Dấu MẬT thật là con dấu chữ to đứng
+    một mình, không bao giờ có mảnh "TRAN" thuộc vòng chữ dấu tròn trong bán
+    kính một dấu. Mảnh lân cận phải gồm toàn token vòng cung (loại "TRÂN
+    TRỌNG" → TRAN TRONG) và ngắn (giới hạn của _is_stamp_like_line).
+    """
+    if _tokenize_for_stamp_match(hit_line.get("text", "")) != ["MAT"]:
+        return False
+    hit_x, hit_y = _line_center_pt(hit_line)
+    for other in page.get("lines") or []:
+        if other is hit_line:
+            continue
+        text = other.get("text", "") or ""
+        tokens = _tokenize_for_stamp_match(text)
+        if not tokens or not set(tokens) <= _FRONT_SEAL_RING_TOKENS:
+            continue
+        if not _is_stamp_like_line(text):
+            continue
+        other_x, other_y = _line_center_pt(other)
+        dx, dy = other_x - hit_x, other_y - hit_y
+        if (dx * dx + dy * dy) ** 0.5 <= _FRONT_SEAL_RING_RADIUS_PT:
+            return True
+    return False
 
 
 def _detect_secrecy_mark_on_page(page: dict, *, require_roi: bool) -> str | None:
+    """Dò dấu mật trên MỘT trang — trang phải đã được xoay đúng chiều.
+
+    Caller (quét file mật, Số hóa lưu trữ) chạy preprocess xoay hướng trang
+    trước khi OCR, nên tọa độ dòng là đáng tin cậy.
+
+    ``require_roi=True`` (lượt chính): dấu đóng phải stamp-like và nằm góc
+    trên-trái (cx ≤ 0.5, cy ≤ 0.33).
+
+    ``require_roi=False`` (fallback cho bbox OCR trôi sau khi ROI miss):
+    - "stamp" — dòng dấu đơn độc CHỈ được nhận trong vùng góc trên-trái
+      nới rộng (cx ≤ 0.6, cy ≤ 0.6); ngoài vùng đó là mảnh mộc/dấu tròn
+      khác, kèm 2 guard Mặt trận cho hit nằm trong vùng.
+    - "number" — chỉ dẫn độ mật trong dòng số ký hiệu ("Số .../MẬT") được
+      nhận ở MỌI vị trí: đây là chỉ dẫn dạng chữ, không phụ thuộc con dấu.
+    """
     page_width = page.get("width") or 595.28
     page_height = page.get("height") or 841.89
     for line in page.get("lines") or []:
         text = line.get("text", "")
-        if require_roi:
-            if not _is_stamp_like_line(text):
-                continue
-            cx, cy = _line_center(line, page_width, page_height)
-            if cx > 0.5 or cy > 0.33:
-                continue
-            matcher = _line_matches_stamp_keyword
-        else:
-            matcher = _line_matches_secrecy_keyword
-
         # Longest keyword first because "TUYỆT MẬT" also contains "MẬT" as
         # tokens and we want the more specific classification.
         for kw in _SECRECY_KEYWORDS:
-            if not matcher(text, kw):
+            if require_roi:
+                if not _is_stamp_like_line(text):
+                    continue
+                if not _line_matches_stamp_keyword(text, kw):
+                    continue
+                cx, cy = _line_center(line, page_width, page_height)
+                if cx > 0.5 or cy > 0.33:
+                    continue
+                return kw
+
+            kind = _secrecy_match_kind(text, kw)
+            if kind is None:
                 continue
-            if not require_roi and _is_likely_mattran_seal_fragment(
-                page, line, page_width, page_height
-            ):
-                # Coordinate-free fallback: a lower-half hit on a Front-issued
-                # page is the round "MẶT TRẬN" seal shredding into "MAT", not
-                # a secrecy stamp (those live in the top corners).
-                continue
+            if kind == "stamp":
+                cx, cy = _line_center(line, page_width, page_height)
+                if cx > 0.6 or cy > 0.6:
+                    # Trang đã xoay đúng chiều: dấu đóng chỉ tồn tại trong vùng
+                    # góc trên-trái nới 10% (chịu bbox OCR trôi nhẹ); ngoài
+                    # vùng đó là mảnh mộc Mặt trận giáp la / mép phải hoặc
+                    # nhiễu OCR, không phải dấu mật.
+                    continue
+                if _is_likely_mattran_seal_fragment(
+                    page, line, page_width, page_height
+                ):
+                    # Trang có dấu hiệu Mặt trận: hit trong vùng nhưng rơi
+                    # nửa dưới/mép phải là dấu tròn "MẶT TRẬN" bị OCR xé vụn.
+                    continue
+                if _has_front_seal_ring_neighbour(page, line):
+                    # "MAT" đơn độc mà sát mảnh vòng cung "TRAN"/"MTTQ"
+                    # trong bán kính một dấu tròn → chữ dấu tròn, không phải
+                    # dấu mật.
+                    continue
             return kw
     return None
 
@@ -832,17 +918,13 @@ def detect_secrecy_mark(canonical_doc: dict, *, text_fallback: bool = True) -> s
     without re-running the full auto-label pipeline.
 
     The detector first applies the same top-left ROI stamp rule used by the
-    rule-based KIE mark. By default it then falls back to coordinate-free text
-    matching so rotated pages or unreliable OCR bboxes are handled consistently
-    by archive splitting, KIE viewer highlighting, and the support tool.
-    Pass ``text_fallback=False`` only when a caller needs exact KIE-field
-    parity with :func:`apply_rule_based_marks`.
-
-    Within the coordinate-free fallback, a keyword hit in the lower half of a
-    Mặt trận Tổ quốc-issued page is suppressed: the Front's round seal ("MẶT
-    TRẬN TỔ QUỐC") OCR-shreds into lines like "MAT" that token-equal the
-    stripped "MẬT" keyword, and genuine secrecy stamps never sit at the
-    bottom of the page.
+    rule-based KIE mark. By default it then falls back to looser matching for
+    pages whose OCR bboxes drifted: standalone stamp lines are accepted only
+    inside the top-LEFT quadrant (callers rotation-correct pages first), with
+    Mặt trận Tổ quốc seal guards, while textual number-line markers
+    ("Số .../MẬT") are accepted anywhere. Pass ``text_fallback=False`` only
+    when a caller needs exact KIE-field parity with
+    :func:`apply_rule_based_marks`.
     """
     if not isinstance(canonical_doc, dict):
         return None

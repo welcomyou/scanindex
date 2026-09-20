@@ -13,6 +13,7 @@ import subprocess
 import textwrap
 import threading
 import time
+import unicodedata
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable, Iterable
@@ -116,6 +117,11 @@ class SecretScanMatch:
     mode: str
     ocr_pdf_path: str
     note: str = ""
+    # Giải mật tự động: năm ban hành (0 = không xác định được), thời hạn
+    # theo độ mật và cờ "đã quá thời hạn" để bảng/Excel tô xanh ghi chú.
+    issue_year: int = 0
+    declass_years: int = 0
+    declass_due: bool = False
 
 
 @dataclass
@@ -1160,17 +1166,6 @@ def _all_page_indices(canonical: dict) -> list[int]:
     return page_indices or [0]
 
 
-def _canonical_has_text(canonical: dict) -> bool:
-    for page in canonical.get("pages") or []:
-        for line in page.get("lines") or []:
-            if (line.get("text") or "").strip():
-                return True
-        for word in page.get("words") or []:
-            if (word.get("text") or "").strip():
-                return True
-    return False
-
-
 def page_results_from_canonical(canonical: dict) -> dict[int, dict]:
     results: dict[int, dict] = {}
     for ordinal, page in enumerate(canonical.get("pages") or []):
@@ -1256,6 +1251,198 @@ def _filter_matches_by_doc_start(
                 "LightGBM không xác định là trang đầu văn bản"
             )
     return accepted
+
+
+# ---------------------------------------------------------------------------
+# Giải mật tự động theo độ mật
+# ---------------------------------------------------------------------------
+
+# Quy định giải mật tự động: Mật 10 năm, Tối mật 20 năm, Tuyệt mật 30 năm
+# kể từ năm ban hành. Đủ thời hạn thì file VẪN nằm trong danh sách mật,
+# chỉ thêm ghi chú "Đáp ứng thời gian giải mật" (tô xanh ở bảng/Excel).
+DECLASS_YEARS_BY_KEYWORD = {"TUYỆT MẬT": 30, "TỐI MẬT": 20, "MẬT": 10}
+DECLASS_NOTE_LABEL = "Đáp ứng thời gian giải mật"
+
+# "…, ngày 15 tháng 4 năm 2026" — cho phép vài ký tự OCR rác giữa các chữ.
+_ISSUE_DATE_RE = re.compile(
+    r"NGAY\D{0,4}(\d{1,2})\D{0,4}THANG\D{0,4}(\d{1,2})\D{0,4}NAM\D{0,4}(\d{4})"
+)
+# Dòng ngày ban hành ("Hà Nội, ngày 04 tháng 4 năm 2016") ngắn và nằm ở
+# vùng tiêu đề; trích yếu / văn bản dẫn chứa ngày khác thì dài, ở giữa trang.
+_ISSUE_DATE_LINE_MAX_CHARS = 100
+
+
+def _normalise_for_date(text: str) -> str:
+    normalized = unicodedata.normalize(
+        "NFD", (text or "").replace("đ", "d").replace("Đ", "D")
+    )
+    stripped = "".join(
+        c for c in normalized if unicodedata.category(c) != "Mn"
+    ).upper()
+    return " ".join(stripped.split())
+
+
+def _page_for_index(canonical: dict, page_index: int) -> dict | None:
+    pages = canonical.get("pages") or []
+    want = int(page_index)
+    for page in pages:
+        try:
+            if int(page.get("page_index", 0) or 0) == want:
+                return page
+        except (TypeError, ValueError):
+            continue
+    return pages[0] if want == 0 and pages else None
+
+
+def _issue_date_candidates(page: dict) -> list[tuple[float, int]]:
+    """Các dòng ngày ban hành ứng viên: (tâm y, năm), sắp theo y tăng dần.
+
+    Chỉ nhận dòng ngắn (dòng ngày ban hành luôn ngắn; trích yếu / văn bản
+    dẫn chứa ngày khác thì dài) và ngày hợp lệ (ngày 1–31, tháng 1–12).
+    """
+    candidates: list[tuple[float, int]] = []
+    for line in page.get("lines") or []:
+        text = (line.get("text", "") or "").strip()
+        if not text or len(text) > _ISSUE_DATE_LINE_MAX_CHARS:
+            continue
+        found = _ISSUE_DATE_RE.search(_normalise_for_date(text))
+        if not found:
+            continue
+        day, month, year = (int(found.group(i)) for i in (1, 2, 3))
+        if not (1 <= day <= 31 and 1 <= month <= 12):
+            continue
+        bbox = line.get("bbox") or [0, 0, 0, 0]
+        try:
+            y_center = (float(bbox[1]) + float(bbox[3])) / 2
+        except (TypeError, ValueError):
+            y_center = 0.0
+        candidates.append((y_center, year))
+    candidates.sort(key=lambda item: item[0])
+    return candidates
+
+
+def _extract_issue_year(canonical: dict, page_index: int = 0) -> int:
+    """Năm ban hành suy từ dòng "ngày… tháng… năm…" ngắn gần đầu trang nhất.
+
+    Dùng đúng trang chứa dấu mật (file ghép nhiều văn bản, mỗi trang đầu
+    có dòng ngày riêng). Trong các dòng ứng viên, dòng ngày ban hành thuộc
+    vùng tiêu đề, phía trên trích yếu / văn bản dẫn có thể chứa ngày của
+    văn bản KHÁC — thứ tự dòng trong canonical không đảm bảo theo chiều
+    trên-trang nên không lấy dòng đầu tiên khớp. Trả 0 nếu không có.
+    """
+    page = _page_for_index(canonical, page_index)
+    if page is None:
+        return 0
+    candidates = _issue_date_candidates(page)
+    return candidates[0][1] if candidates else 0
+
+
+# Cascade lấy năm: regex chọn dòng trên-trái là miễn phí; chỉ khi trang có
+# NHIỀU hơn 2 dòng ngày ứng viên (nhiễu kiểu "BIÊN BẢN HỌP NGÀY 15 THÁNG 10
+# NĂM 2004") mới gọi LayoutLM — model có nhãn PLACE_DATE, gán đúng dòng
+# ngày ban hành — chi phí model chỉ phát sinh trên các trang nhiễu.
+# KIE KHÔNG dùng để xác định độ mật (model không có nhãn dấu mật).
+# Tắt bằng SECRET_SCAN_DISABLE_KIE_YEAR=1.
+_DECLASS_KIE_MIN_CANDIDATES = 3
+_KIE_YEAR_LOCK = threading.RLock()
+
+
+def _kie_issue_year(canonical_json_path: str, page_index: int) -> int | None:
+    """Năm ban hành theo field PLACE_DATE của LayoutLM trên đúng trang.
+
+    Trả None khi model không có sẵn / lỗi / không gán nhãn được — caller
+    fallback về kết quả regex. Chạy dưới lock để 2 file-worker không cùng
+    warmup/infer model song song.
+    """
+    if not canonical_json_path or not os.path.exists(canonical_json_path):
+        return None
+    try:
+        from scanindex.core.kie.engine import _run_layoutlmv3
+
+        with _KIE_YEAR_LOCK:
+            payload = _run_layoutlmv3(
+                canonical_json_path, selected_pages=[int(page_index)]
+            )
+    except Exception:
+        return None
+    for field in payload.get("field_instances") or []:
+        if str(field.get("label") or "") != "PLACE_DATE":
+            continue
+        try:
+            if int(field.get("page_index", -1)) != int(page_index):
+                continue
+        except (TypeError, ValueError):
+            continue
+        found = _ISSUE_DATE_RE.search(
+            _normalise_for_date(field.get("text") or "")
+        )
+        if not found:
+            continue
+        day, month, year = (int(found.group(i)) for i in (1, 2, 3))
+        if 1 <= day <= 31 and 1 <= month <= 12:
+            return year
+    return None
+
+
+def _match_meets_declassification(match: SecretScanMatch) -> bool:
+    return bool(match.declass_due) or DECLASS_NOTE_LABEL in (match.note or "")
+
+
+def _apply_declassification_notes(
+    matches: list[SecretScanMatch],
+    canonical: dict,
+    canonical_json_path: str | None = None,
+) -> None:
+    """Gắn ghi chú "Đáp ứng thời gian giải mật" khi đã quá thời hạn mật.
+
+    Năm ban hành lấy từ dòng ngày của CHÍNH trang chứa dấu mật (file ghép
+    nhiều văn bản), so với năm hiện tại theo độ mật (Mật 10, Tối mật 20,
+    Tuyệt mật 30 năm). Không suy được năm ban hành thì bỏ qua.
+
+    Lấy năm theo cascade: regex chọn dòng ngắn gần đầu trang (miễn phí);
+    nếu trang có nhiều hơn 2 dòng ngày ứng viên (nhiễu) thì gọi KIE
+    (LayoutLM, nhãn PLACE_DATE) chọn đúng dòng — chỉ trên các file đã
+    xác định là mật.
+    """
+    if not matches:
+        return
+    current_year = time.localtime().tm_year
+    kie_enabled = os.environ.get(
+        "SECRET_SCAN_DISABLE_KIE_YEAR", ""
+    ).lower() not in {"1", "true"}
+    year_by_page: dict[int, int] = {}
+    for match in matches:
+        page_idx = max(0, int(match.page_number or 1) - 1)
+        if page_idx not in year_by_page:
+            page = _page_for_index(canonical, page_idx)
+            candidates = _issue_date_candidates(page) if page else []
+            year = candidates[0][1] if candidates else 0
+            if (
+                kie_enabled
+                and canonical_json_path
+                and len(candidates) >= _DECLASS_KIE_MIN_CANDIDATES
+            ):
+                # Nhiều hơn 2 dòng ngày ứng viên → regex không đủ tin cậy,
+                # nhờ KIE gán nhãn PLACE_DATE chọn đúng dòng ngày ban hành.
+                kie_year = _kie_issue_year(canonical_json_path, page_idx)
+                if kie_year is not None:
+                    year = kie_year
+            year_by_page[page_idx] = year
+        year = year_by_page[page_idx]
+        if not 1900 <= year <= current_year:
+            continue
+        years = DECLASS_YEARS_BY_KEYWORD.get((match.keyword or "").strip().upper())
+        if not years:
+            continue
+        match.issue_year = year
+        match.declass_years = years
+        if current_year - year >= years:
+            match.declass_due = True
+            detail = (
+                f"{DECLASS_NOTE_LABEL} "
+                f"(văn bản {year}, {match.keyword} {years} năm)"
+            )
+            match.note = f"{match.note}; {detail}" if match.note else detail
 
 
 # File "mới" hơn nảy giây → có thể đang được copy/ghi dở trên share:
@@ -1357,17 +1544,22 @@ def scan_one_file_for_secret_artifact(
 
     Routing:
       - Word (.doc/.docx): always treated as digital — native text only, no OCR.
-      - PDF: each page is classified (digital/scan/mixed) via ``classify_pdf_page``
-        (same classifier as PDF-to-Word). Digital pages use native text; scan/mixed
-        pages are OCR'd at ``_SECRET_SCAN_DPI`` (200).
+      - PDF: per-file classify digital/scan first. Scan files are
+        rotation-corrected (classifier 4 hướng của Số hóa lưu trữ) BEFORE
+        OCR — digital files skip this (never rotated). Each page is then
+        classified (digital/scan/mixed); digital pages use native text,
+        scan/mixed pages are OCR'd at ``_SECRET_SCAN_DPI`` (200). Detection
+        assumes upright pages: stamps live in the top-left corner, textual
+        "Số .../MẬT" markers are accepted anywhere.
 
     Modes:
-      - ``first_page_only=True``  ("Tìm nhanh"): process only page 0, detect the
-        secrecy mark on it, no LightGBM, no other pages.
-      - ``first_page_only=False`` ("Tìm kỹ"): process ALL pages, detect secrecy
-        on every page (cheap token match), then run LightGBM doc-start only on
-        the candidate pages to filter false positives. For non-classified files
-        (the common case) there are no candidates, so LightGBM is skipped.
+      - ``first_page_only=True``  ("Tìm nhanh"): preprocess hướng trang trang
+        đầu, OCR trang đầu, detect the secrecy mark on it, no LightGBM.
+      - ``first_page_only=False`` ("Tìm kỹ"): preprocess hướng trang toàn
+        file, process ALL pages, detect secrecy on every page (cheap token
+        match), then run LightGBM doc-start only on the candidate pages to
+        filter false positives. For non-classified files (the common case)
+        there are no candidates, so LightGBM is skipped.
     """
     os.makedirs(file_work_dir, exist_ok=True)
     _precheck_source_readable(source_path)
@@ -1400,6 +1592,9 @@ def scan_one_file_for_secret_artifact(
             artifact_path=canonical_json_path,
             note=note,
             cancel_event=cancel_event,
+        )
+        _apply_declassification_notes(
+            matches, native_canonical, canonical_json_path
         )
         return SecretScanArtifact(
             matches=matches,
@@ -1437,6 +1632,31 @@ def scan_one_file_for_secret_artifact(
         scan_pdf = _extract_pdf_pages(source_pdf, first_pdf, [0])
         page_indices = [0]
 
+    # Xoay đúng chiều TRƯỚC khi OCR/dò (cùng cơ chế classifier 4 hướng của
+    # Số hóa lưu trữ): sau khi trang đã đứng thẳng, dấu mật thật chỉ tồn
+    # tại ở góc trên-trái — mọi hit ngoài vùng đó bị coi là mảnh mộc/dấu
+    # tròn khác. PDF digital bỏ qua (không bao giờ xoay sai, lại tránh copy
+    # thừa). Tắt bằng SECRET_SCAN_DISABLE_ROTATE=1 khi cần tốc độ tối đa.
+    rotations: list[int] | None = None
+    if os.environ.get("SECRET_SCAN_DISABLE_ROTATE", "").lower() not in {"1", "true"}:
+        try:
+            from scanindex.core.preprocessing import preprocessing as _pre
+            file_kind = _pre.classify_pdf(scan_pdf)
+        except Exception:
+            file_kind = "scan"
+        if file_kind != "digital":
+            log_cb("Xoay đúng chiều trang trước khi dò (như Số hóa lưu trữ)...")
+            pre_pdf = os.path.join(file_work_dir, "preprocessed.pdf")
+            pre_out, rotations = _preprocess_pdf_for_ocr(
+                scan_pdf,
+                pre_pdf,
+                log_cb,
+                max_workers=ocr_workers,
+            )
+            if os.path.abspath(pre_out) != os.path.abspath(scan_pdf):
+                scan_pdf = pre_out
+                source_note = f"{source_note}; đã xoay đúng chiều"
+
     canonical = _process_pdf_per_page(
         scan_pdf,
         source_path,
@@ -1446,31 +1666,6 @@ def scan_one_file_for_secret_artifact(
         dpi=_SECRET_SCAN_DPI,
         json_path=canonical_json_path,
     )
-
-    # If OCR produced no text at all on a scan page, try preprocess (deskew/rotate).
-    if not _canonical_has_text(canonical) and not first_page_only:
-        log_cb("OCR không ra chữ, thử preprocess xoay/nghiêng...")
-        pre_pdf = os.path.join(file_work_dir, "preprocessed.pdf")
-        ocr_input_pdf, rotations = _preprocess_pdf_for_ocr(
-            scan_pdf,
-            pre_pdf,
-            log_cb,
-            max_workers=ocr_workers,
-        )
-        if os.path.abspath(ocr_input_pdf) != os.path.abspath(scan_pdf):
-            canonical = _process_pdf_per_page(
-                ocr_input_pdf,
-                source_path,
-                page_indices,
-                cancel_event,
-                log_cb,
-                dpi=_SECRET_SCAN_DPI,
-                json_path=canonical_json_path,
-            )
-        else:
-            rotations = None
-    else:
-        rotations = None
 
     note = source_note
     if first_page_only:
@@ -1485,6 +1680,7 @@ def scan_one_file_for_secret_artifact(
             note=f"{note}; trang đầu",
             cancel_event=cancel_event,
         )
+        _apply_declassification_notes(matches, canonical, canonical_json_path)
         return SecretScanArtifact(
             matches=matches,
             source_pdf=scan_pdf,
@@ -1511,6 +1707,7 @@ def scan_one_file_for_secret_artifact(
         cancel_event=cancel_event,
     )
     matches = _filter_matches_by_doc_start(matches, canonical_json_path, log_cb)
+    _apply_declassification_notes(matches, canonical, canonical_json_path)
     return SecretScanArtifact(
         matches=matches,
         source_pdf=scan_pdf,
@@ -1586,7 +1783,9 @@ def export_matches_to_excel(matches: list[SecretScanMatch], output_path: str) ->
         ws.cell(row=row, column=5, value=match.source_path)
         ws.cell(row=row, column=6, value=int(match.page_number)).alignment = center
         ws.cell(row=row, column=7, value=match.mode)
-        ws.cell(row=row, column=8, value=match.note)
+        note_cell = ws.cell(row=row, column=8, value=match.note)
+        if _match_meets_declassification(match):
+            note_cell.font = Font(color="1D7A34", bold=True)
 
     for col, width in enumerate(_EXCEL_COL_WIDTHS, start=1):
         ws.column_dimensions[get_column_letter(col)].width = width
@@ -1802,6 +2001,34 @@ class _BusySpinner(QWidget):
         painter.end()
 
 
+class _ResultsTable(QTableWidget):
+    """Bảng kết quả phát thêm tín hiệu điều hướng bàn phím.
+
+    Click chuột đã có itemClicked xử lý (bấm cột checkbox không đổi preview);
+    phím mũi tên / PageUp / PageDown / Home / End đổi dòng chọn mà KHÔNG phát
+    itemClicked — phát signal riêng để màn hình đồng bộ panel xem trước với
+    dòng đang chọn.
+    """
+
+    keyboard_row_activated = Signal(int)
+
+    _NAV_KEYS = frozenset({
+        Qt.Key.Key_Up,
+        Qt.Key.Key_Down,
+        Qt.Key.Key_PageUp,
+        Qt.Key.Key_PageDown,
+        Qt.Key.Key_Home,
+        Qt.Key.Key_End,
+    })
+
+    def keyPressEvent(self, event) -> None:
+        super().keyPressEvent(event)
+        if event.key() in self._NAV_KEYS:
+            row = self.currentRow()
+            if 0 <= row < self.rowCount():
+                self.keyboard_row_activated.emit(row)
+
+
 class SecretFileScanScreen(ScreenContent):
     """Find classified-document stamps in supported files inside a folder."""
 
@@ -2015,7 +2242,7 @@ class SecretFileScanScreen(ScreenContent):
         picker_layout.addLayout(status_row)
         layout.addWidget(picker)
 
-        self.table = QTableWidget(0, 6)
+        self.table = _ResultsTable(0, 6)
         self.table.setHorizontalHeaderLabels(
             ["", "Độ mật", "File", "Trang", "Chế độ", "Ghi chú"]
         )
@@ -2028,13 +2255,17 @@ class SecretFileScanScreen(ScreenContent):
         # double-click vẫn mở file bằng app ngoài như trước.
         self.table.itemClicked.connect(self._on_row_clicked)
         self.table.itemChanged.connect(self._on_item_changed)
+        # Phím mũi tên / PageUp / Home… đổi dòng chọn → preview theo file đó.
+        self.table.keyboard_row_activated.connect(self._show_preview)
         header = self.table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        # Cột Interactive: kéo rộng/hẹp từng cột bằng chuột (để thấy được tên
+        # file dài); cột cuối (Ghi chú) tự chiếm phần bề ngang còn lại.
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        header.setStretchLastSection(True)
+        header.setMinimumSectionSize(28)
+        self.table.setWordWrap(False)
+        for col, width in ((0, 30), (1, 90), (2, 330), (3, 64), (4, 100)):
+            self.table.setColumnWidth(col, width)
         self.table.setStyleSheet(
             f"QTableWidget {{ background-color: {COLOR_SURFACE}; color: {COLOR_TEXT};"
             f" border: 1px solid {COLOR_BORDER}; border-radius: {RADIUS_MD}px;"
@@ -2097,6 +2328,13 @@ class SecretFileScanScreen(ScreenContent):
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
         splitter.setSizes([760, 440])
+        # Tay nắm 8px + đổi màu khi rê chuột: kéo tự do đổi tỷ lệ
+        # bảng danh sách / khung xem trước bằng chuột.
+        splitter.setHandleWidth(8)
+        splitter.setStyleSheet(
+            f"QSplitter::handle {{ background: {COLOR_BORDER}; border-radius: 2px; }}"
+            f"QSplitter::handle:hover {{ background: {COLOR_ACCENT}; }}"
+        )
         layout.addWidget(splitter, 1)
 
     def _build_preview_panel(self) -> QWidget:
@@ -2108,35 +2346,6 @@ class SecretFileScanScreen(ScreenContent):
         vbox = QVBoxLayout(panel)
         vbox.setContentsMargins(SP[3], SP[3], SP[3], SP[3])
         vbox.setSpacing(SP[2])
-
-        head = QHBoxLayout()
-        self.lbl_preview_title = QLabel("Xem trước")
-        self.lbl_preview_title.setStyleSheet(
-            f"color: {COLOR_TEXT}; font: 600 13px '{FONT_UI}';"
-        )
-        head.addWidget(self.lbl_preview_title, 1)
-        self.btn_preview_not_secret = QPushButton("Không phải mật")
-        self.btn_preview_not_secret.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_preview_not_secret.setStyleSheet(self._success_btn_qss())
-        self.btn_preview_not_secret.setEnabled(False)
-        self.btn_preview_not_secret.setToolTip(
-            "Xác nhận file đang xem là KHÔNG phải văn bản mật:\n"
-            "loại khỏi danh sách, KHÔNG xóa file trên đĩa, lượt quét sau\n"
-            "tự bỏ qua (đến khi file thay đổi nội dung)."
-        )
-        self.btn_preview_not_secret.clicked.connect(self._preview_not_secret_clicked)
-        head.addWidget(self.btn_preview_not_secret)
-        self.btn_preview_delete = QPushButton("🗑  Xóa file")
-        self.btn_preview_delete.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_preview_delete.setStyleSheet(self._danger_btn_qss())
-        self.btn_preview_delete.setEnabled(False)
-        self.btn_preview_delete.setToolTip(
-            "Xóa vĩnh viễn file đang xem khỏi đĩa — KHÔNG qua thùng rác,\n"
-            "không thể hoàn tác. Tự chuyển sang dòng kế sau khi xóa."
-        )
-        self.btn_preview_delete.clicked.connect(self._preview_delete_clicked)
-        head.addWidget(self.btn_preview_delete)
-        vbox.addLayout(head)
 
         self.lbl_preview_path = QLabel("")
         self.lbl_preview_path.setStyleSheet(
@@ -2162,6 +2371,34 @@ class SecretFileScanScreen(ScreenContent):
         self.preview_stack.addWidget(self.lbl_preview_empty)  # trang 0
         self.pdf_viewer = PdfViewerWidget()
         self.preview_stack.addWidget(self.pdf_viewer)  # trang 1
+
+        # Nút thao tác trên file đang xem đặt NGAY CẠNH thanh điều hướng trang
+        # của khung xem trước (thay vì chiếm một hàng header riêng).
+        self.btn_preview_not_secret = QPushButton("Không phải mật")
+        self.btn_preview_not_secret.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_preview_not_secret.setStyleSheet(
+            self._preview_action_btn_qss(COLOR_GREEN, COLOR_GREEN_HOVER)
+        )
+        self.btn_preview_not_secret.setEnabled(False)
+        self.btn_preview_not_secret.setToolTip(
+            "Xác nhận file đang xem là KHÔNG phải văn bản mật:\n"
+            "loại khỏi danh sách, KHÔNG xóa file trên đĩa, lượt quét sau\n"
+            "tự bỏ qua (đến khi file thay đổi nội dung)."
+        )
+        self.btn_preview_not_secret.clicked.connect(self._preview_not_secret_clicked)
+        self.pdf_viewer.add_toolbar_widget(self.btn_preview_not_secret)
+        self.btn_preview_delete = QPushButton("🗑  Xóa file")
+        self.btn_preview_delete.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_preview_delete.setStyleSheet(
+            self._preview_action_btn_qss(COLOR_RED, "#bd2130")
+        )
+        self.btn_preview_delete.setEnabled(False)
+        self.btn_preview_delete.setToolTip(
+            "Xóa vĩnh viễn file đang xem khỏi đĩa — KHÔNG qua thùng rác,\n"
+            "không thể hoàn tác. Tự chuyển sang dòng kế sau khi xóa."
+        )
+        self.btn_preview_delete.clicked.connect(self._preview_delete_clicked)
+        self.pdf_viewer.add_toolbar_widget(self.btn_preview_delete)
 
         # Lớp phủ "đang chuyển đổi" đè lên đúng vùng xem PDF: nền tối mờ +
         # icon xoay + dòng chữ. Màu tự thân (không theo theme sáng/tối) để
@@ -2233,6 +2470,16 @@ class SecretFileScanScreen(ScreenContent):
             f" border: none; padding: 8px 16px; border-radius: {RADIUS_MD}px;"
             f" font: 600 13px '{FONT_UI}'; }}"
             f"QPushButton:hover {{ background: {COLOR_GREEN_HOVER}; }}"
+            f"QPushButton:disabled {{ background: #555; color: #aaa; }}"
+        )
+
+    def _preview_action_btn_qss(self, bg: str, hover: str) -> str:
+        """Nút gọn trong thanh công cụ 32px của khung xem trước PDF."""
+        return (
+            f"QPushButton {{ background: {bg}; color: white; border: none;"
+            f" padding: 0 10px; border-radius: 4px;"
+            f" font: 600 12px '{FONT_UI}'; min-height: 22px; max-height: 22px; }}"
+            f"QPushButton:hover {{ background: {hover}; }}"
             f"QPushButton:disabled {{ background: #555; color: #aaa; }}"
         )
 
@@ -2637,7 +2884,6 @@ class SecretFileScanScreen(ScreenContent):
         if not isinstance(match, SecretScanMatch):
             return
         self._preview_current = match
-        self.lbl_preview_title.setText("Xem trước")
         self.lbl_preview_path.setText(match.source_path)
         self.lbl_preview_path.setToolTip(match.source_path)
         self._refresh_action_buttons()
@@ -2804,7 +3050,9 @@ class SecretFileScanScreen(ScreenContent):
         self._delete_files([path])
         # Tự chuyển sang dòng kế (hoặc dòng cuối) như đã hứa trong tooltip.
         if row is not None and self.table.rowCount() > 0:
-            self._show_preview(min(row, self.table.rowCount() - 1))
+            target = min(row, self.table.rowCount() - 1)
+            self._select_result_row(target)
+            self._show_preview(target)
 
     def _preview_not_secret_clicked(self) -> None:
         if self._busy or self._preview_current is None:
@@ -2813,7 +3061,21 @@ class SecretFileScanScreen(ScreenContent):
         row = self._first_row_of(path)
         self._mark_not_secret([path])
         if row is not None and self.table.rowCount() > 0:
-            self._show_preview(min(row, self.table.rowCount() - 1))
+            target = min(row, self.table.rowCount() - 1)
+            self._select_result_row(target)
+            self._show_preview(target)
+
+    def _select_result_row(self, row: int) -> None:
+        """Chọn dòng (cột File) và cuộn vào giữa bảng để phím mũi tên
+        tiếp tục điều hướng từ đúng vị trí mới."""
+        if not 0 <= row < self.table.rowCount():
+            return
+        self.table.setCurrentCell(row, 2)
+        item = self.table.item(row, 2)
+        if item is not None:
+            self.table.scrollToItem(
+                item, QAbstractItemView.ScrollHint.PositionAtCenter
+            )
 
     def _first_row_of(self, path: str) -> int | None:
         key = _norm(path)
@@ -3084,6 +3346,10 @@ class SecretFileScanScreen(ScreenContent):
             if missing:
                 item.setForeground(QColor(COLOR_TEXT_SECONDARY))
             self.table.setItem(row, col, item)
+        if not missing and _match_meets_declassification(match):
+            note_item = self.table.item(row, 5)
+            if note_item is not None:
+                note_item.setForeground(QColor(COLOR_GREEN))
         if missing:
             file_item = self.table.item(row, 2)
             if file_item is not None:
@@ -3202,7 +3468,6 @@ class SecretFileScanScreen(ScreenContent):
         )
         self.lbl_preview_path.setText("")
         self.lbl_preview_path.setToolTip("")
-        self.lbl_preview_title.setText("Xem trước")
         self._set_preview_banner("", None)
         self._set_preview_busy(False)
         self.btn_export.setEnabled(False)

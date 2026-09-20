@@ -609,7 +609,9 @@ QProgressBar {{
     background: {p["border"]};
     border: none;
     border-radius: 4px;
-    color: {p["text"]};
+    /* Chữ trắng: phần trăm nằm giữa bar, đè lên chunk màu accent
+       (xanh đậm ở cả 2 theme) — màu text của theme sẽ mờ trên nền đó. */
+    color: #ffffff;
     font-size: 11px;
     text-align: center;
     min-height: 18px;
