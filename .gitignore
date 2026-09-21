@@ -124,6 +124,7 @@ tests/*
 !tests/test_secret_scan_precheck.py
 !tests/test_secret_scan_list_actions.py
 !tests/test_secret_scan_declass_and_nav.py
+!tests/test_secret_scan_versioned_resume.py
 !tests/test_secrecy_detection.py
 /scan_progress/
 !tests/test_portable_config_bootstrap.py

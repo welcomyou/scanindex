@@ -1,0 +1,6 @@
+# Isolated research environment; do not add these to the desktop application's dependencies.
+ai-edge-litert==2.2.0
+numpy==2.5.3
+Pillow==12.3.0
+tflite==2.18.0
+rapidfuzz==3.14.6

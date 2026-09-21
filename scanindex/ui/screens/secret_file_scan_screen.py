@@ -14,7 +14,7 @@ import textwrap
 import threading
 import time
 import unicodedata
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -122,6 +122,34 @@ class SecretScanMatch:
     issue_year: int = 0
     declass_years: int = 0
     declass_due: bool = False
+    # Version app đã SINH RA dòng này. Journal/cache bản cũ không có field
+    # ("" = kế thừa) — dùng phân biệt "chưa cập nhật" với "đã quét bằng
+    # bản mới nhưng không tìm được năm" (R8 review).
+    source_version: str = ""
+
+
+@dataclass
+class ResumeDecision:
+    """Kết quả hộp thoại resume — quyết định chính sách cache & hàng đợi.
+
+    mode:
+      - ``restart``       : quét lại từ đầu — BỎ QUA cache lookup toàn lượt
+                           (R5) nhưng vẫn ghi lịch sử mới.
+      - ``resume``        : quét tiếp; kế thừa + đóng dấu version mới cho
+                           nhóm đã quét (lựa chọn 2).
+      - ``resume_rescan`` : như ``resume`` + quét lại đúng các file mật cũ
+                           (lựa chọn 3), thay thế hàng từng file.
+    ``rescan_abs``: danh sách đường dẫn tuyệt đối ĐÃ CHUẨN HÓA của các file
+    mật cũ (định danh theo source_path — R6, không theo rel kế thừa).
+    """
+
+    RESTART = "restart"
+    RESUME = "resume"
+    RESUME_RESCAN = "resume_rescan"
+
+    mode: str
+    prog: object | None = None
+    rescan_abs: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -1740,14 +1768,83 @@ EXCEL_HEADERS = [
     "STT",
     "Độ mật",
     "Tên tệp",
+    "Mã cơ quan",
+    "Tên cơ quan",
     "File (trong thư mục quét)",
     "Đường dẫn đầy đủ",
     "Trang",
     "Chế độ",
+    "Đáp ứng giải mật",
     "Ghi chú",
 ]
 
-_EXCEL_COL_WIDTHS = [6, 12, 30, 42, 62, 8, 12, 42]
+_EXCEL_COL_WIDTHS = [6, 12, 30, 14, 34, 42, 62, 8, 12, 26, 42]
+
+# Giá trị cột "Đáp ứng giải mật": CHỈ 2 trạng thái — "Đáp ứng (năm, N năm)"
+# khi đã đủ thời hạn giải mật, và TRỐNG khi chưa đạt / chưa xác định được.
+_DECLASS_CELL_DUE_RE = re.compile(r"^Đáp ứng \((\d{4}), (\d{1,2}) năm\)$")
+_DECLASS_NOTE_FIELDS_RE = re.compile(r"văn bản (\d{4}), \S+ (\d{1,2}) năm")
+
+
+def _declass_cell_text(match: SecretScanMatch, current_version: str) -> str:
+    if match.declass_due and match.issue_year and match.declass_years:
+        return f"Đáp ứng ({match.issue_year}, {match.declass_years} năm)"
+    return ""
+
+
+def _match_is_inherited(match: SecretScanMatch, current_version: str) -> bool:
+    """Dòng kế thừa chưa cập nhật: không có dữ liệu giải mật VÀ không do
+    version hiện tại sinh ra (R8 — không tính 0/False mặc định là kết luận;
+    chỉ dùng cho thống kê trạng thái, không ghi ra Excel)."""
+    return not match.issue_year and (match.source_version or "") != current_version
+
+
+# ---------------------------------------------------------------------------
+# Mã định danh cơ quan từ tên file "<uuid>_<mã>-<text>.<ext>"
+# ---------------------------------------------------------------------------
+
+_UUID_FILENAME_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
+    r"-[0-9a-fA-F]{12}_(.+)$"
+)
+
+_ORG_LOOKUP_CACHE: dict[str, str] | None = None
+
+
+def _org_name_lookup() -> dict[str, str]:
+    """Bảng mã định danh → tên cơ quan, nạp 1 lần từ madinhdanh_lookup.json
+    ở thư mục gốc của app. File thiếu/hỏng → bảng rỗng (cột Tên cơ quan để
+    trống), không bao giờ làm fail lượt quét."""
+    global _ORG_LOOKUP_CACHE
+    if _ORG_LOOKUP_CACHE is None:
+        cache: dict[str, str] = {}
+        try:
+            path = os.path.join(get_base_dir(), "madinhdanh_lookup.json")
+            with open(path, encoding="utf-8") as fh:
+                records = json.load(fh)
+            for record in records or []:
+                code = str(record.get("ma_dinh_danh") or "").strip()
+                name = str(record.get("ten_co_quan") or "").strip()
+                if code:
+                    cache[code] = name
+        except Exception:
+            cache = {}
+        _ORG_LOOKUP_CACHE = cache
+    return _ORG_LOOKUP_CACHE
+
+
+def _org_code_from_filename(source_path: str) -> str:
+    """Mã cơ quan trong tên file dạng "<uuid>_<mã>-<text>.<ext>": đoạn giữa
+    uuid và dấu "-" đầu tiên (bỏ phần mở rộng).
+
+    Ví dụ: 39cfea63-...-340ab5e3c6af_A29.183-A29.37.28.001-04-0010-082.pdf
+    → "A29.183". Tên không theo dạng uuid → trả "" (cả hai cột để trống)."""
+    name = os.path.basename(str(source_path or ""))
+    found = _UUID_FILENAME_RE.match(name)
+    if not found:
+        return ""
+    rest = os.path.splitext(found.group(1))[0]
+    return rest.split("-", 1)[0].strip()
 
 
 def export_matches_to_excel(matches: list[SecretScanMatch], output_path: str) -> str:
@@ -1755,12 +1852,18 @@ def export_matches_to_excel(matches: list[SecretScanMatch], output_path: str) ->
 
     One row per detected stamp — the same rows shown in the results table —
     plus the absolute path and bare file name so the list stays usable when
-    shared outside the app.
+    shared outside the app. "Mã cơ quan"/"Tên cơ quan" suy từ tên file
+    "<uuid>_<mã>-…"; "Đáp ứng giải mật" chỉ 2 trạng thái: giá trị khi đến
+    hạn, trống khi chưa đạt; chuỗi trong "Ghi chú" giữ nguyên để file nạp
+    lại không mâu thuẫn.
     """
     import openpyxl
     from openpyxl.styles import Alignment, Font, PatternFill
     from openpyxl.utils import get_column_letter
 
+    from scanindex.infra.version import get_version
+
+    current_version = get_version()
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Van ban mat"
@@ -1774,23 +1877,37 @@ def export_matches_to_excel(matches: list[SecretScanMatch], output_path: str) ->
         cell.fill = header_fill
         cell.alignment = center
 
+    green_font = Font(color="1D7A34", bold=True)
     for idx, match in enumerate(matches, start=1):
         row = idx + 1
+        org_code = _org_code_from_filename(match.source_path)
         ws.cell(row=row, column=1, value=idx).alignment = center
         ws.cell(row=row, column=2, value=match.keyword)
         ws.cell(row=row, column=3, value=os.path.basename(match.source_path))
-        ws.cell(row=row, column=4, value=match.relative_path)
-        ws.cell(row=row, column=5, value=match.source_path)
-        ws.cell(row=row, column=6, value=int(match.page_number)).alignment = center
-        ws.cell(row=row, column=7, value=match.mode)
-        note_cell = ws.cell(row=row, column=8, value=match.note)
+        ws.cell(row=row, column=4, value=org_code)
+        ws.cell(
+            row=row,
+            column=5,
+            value=_org_name_lookup().get(org_code, "") if org_code else "",
+        )
+        ws.cell(row=row, column=6, value=match.relative_path)
+        ws.cell(row=row, column=7, value=match.source_path)
+        ws.cell(row=row, column=8, value=int(match.page_number)).alignment = center
+        ws.cell(row=row, column=9, value=match.mode)
+        declass_cell = ws.cell(
+            row=row, column=10, value=_declass_cell_text(match, current_version)
+        )
+        if declass_cell.value:
+            declass_cell.font = green_font
+        note_cell = ws.cell(row=row, column=11, value=match.note)
         if _match_meets_declassification(match):
-            note_cell.font = Font(color="1D7A34", bold=True)
+            note_cell.font = green_font
 
     for col, width in enumerate(_EXCEL_COL_WIDTHS, start=1):
         ws.column_dimensions[get_column_letter(col)].width = width
     ws.freeze_panes = "A2"
-    ws.auto_filter.ref = f"A1:H{max(1, len(matches) + 1)}"
+    last_col = get_column_letter(len(EXCEL_HEADERS))
+    ws.auto_filter.ref = f"A1:{last_col}{max(1, len(matches) + 1)}"
 
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     wb.save(output_path)
@@ -1798,8 +1915,9 @@ def export_matches_to_excel(matches: list[SecretScanMatch], output_path: str) ->
 
 
 def _norm(path: str) -> str:
-    """Chuẩn hóa key so sánh đường dẫn (cột checkbox / xóa theo file)."""
-    return os.path.normpath(os.path.abspath(path))
+    """Chuẩn hóa key so sánh đường dẫn (cột checkbox / xóa theo file).
+    Phải giữ ĐỒNG NHẤT công thức với ``secret_scan_progress._norm_path``."""
+    return os.path.normcase(os.path.normpath(os.path.abspath(path)))
 
 
 def _permanent_delete(path: str) -> None:
@@ -1905,6 +2023,7 @@ def load_secret_matches_from_excel(xlsx_path: str) -> list[SecretScanMatch]:
         c_rel = col("File (trong thư mục quét)")
         c_page = col("Trang", 5)
         c_mode = col("Chế độ", 6)
+        c_dec = col("Đáp ứng giải mật")
         c_note = col("Ghi chú", 7)
 
         def cell(row_values, idx):
@@ -1925,6 +2044,27 @@ def load_secret_matches_from_excel(xlsx_path: str) -> list[SecretScanMatch]:
             except (TypeError, ValueError):
                 page = 1
             rel = str(cell(r, c_rel) or source).strip() or source
+            note = str(cell(r, c_note) or "").strip()
+            # Cột "Đáp ứng giải mật" (file mới): CHỈ nhận "Đáp ứng (năm, N
+            # năm)", trống = chưa đạt; file cũ (không cột) fallback bóc từ
+            # chuỗi Ghi chú để round-trip không mâu thuẫn.
+            issue_year = declass_years = 0
+            declass_due = False
+            source_version = "loaded"  # có dữ liệu giải mật → không phải kế thừa
+            declass_text = str(cell(r, c_dec) or "").strip()
+            found_cell = _DECLASS_CELL_DUE_RE.match(declass_text)
+            if found_cell:
+                issue_year = int(found_cell.group(1))
+                declass_years = int(found_cell.group(2))
+                declass_due = True
+            elif DECLASS_NOTE_LABEL in note:
+                found_note = _DECLASS_NOTE_FIELDS_RE.search(note)
+                if found_note:
+                    issue_year = int(found_note.group(1))
+                    declass_years = int(found_note.group(2))
+                    declass_due = True
+            if not issue_year:
+                source_version = ""
             matches.append(
                 SecretScanMatch(
                     source_path=source,
@@ -1933,7 +2073,11 @@ def load_secret_matches_from_excel(xlsx_path: str) -> list[SecretScanMatch]:
                     page_number=max(1, page),
                     mode=str(cell(r, c_mode) or "load").strip() or "load",
                     ocr_pdf_path="",
-                    note=str(cell(r, c_note) or "").strip(),
+                    note=note,
+                    issue_year=issue_year,
+                    declass_years=declass_years,
+                    declass_due=declass_due,
+                    source_version=source_version,
                 )
             )
         return matches
@@ -2036,6 +2180,9 @@ class SecretFileScanScreen(ScreenContent):
     _status_changed = Signal(str)
     _progress_changed = Signal(int, int)
     _result_found = Signal(object)
+    # Thay thế TOÀN BỘ hàng của một file (nhánh quét lại file mật cũ):
+    # payload = {"path": abs_norm, "matches": [match_dict...]}.
+    _results_replace = Signal(object)
     _scan_finished = Signal(object)
     # Emitted from the background warm-up thread once the OCR pool is ready
     # (or failed); handled on the main thread by _on_pool_ready.
@@ -2066,6 +2213,7 @@ class SecretFileScanScreen(ScreenContent):
         self._status_changed.connect(self._set_status)
         self._progress_changed.connect(self._set_progress)
         self._result_found.connect(self._add_result)
+        self._results_replace.connect(self._on_results_replace)
         self._scan_finished.connect(self._on_finished)
         self._pool_ready.connect(self._on_pool_ready)
         self._preview_ready.connect(self._on_preview_ready)
@@ -2499,10 +2647,14 @@ class SecretFileScanScreen(ScreenContent):
             return
 
         first_page_only = self.fast_checkbox.isChecked()
-        resume_prog = self._offer_resume(folder, first_page_only)
+        decision = self._resume_decision(folder, first_page_only)
+        if decision is None:
+            # Hủy / Esc / đóng hộp thoại: thao tác thoát, KHÔNG chạy worker,
+            # KHÔNG reset bảng, KHÔNG tạo journal (review mục 1).
+            return
 
         if (
-            resume_prog is None
+            decision.mode == ResumeDecision.RESTART
             and self._loaded_from
             and self.table.rowCount() > 0
         ):
@@ -2523,11 +2675,20 @@ class SecretFileScanScreen(ScreenContent):
         self._busy = True
         self._cancel_event.clear()
         self._reset_results()
-        if resume_prog is not None:
+        if decision.prog is not None:
             # Khôi phục các dòng mật đã phát hiện ở lượt trước lên bảng.
-            for match_dict in resume_prog.matches:
+            # Rel hiển thị tính lại theo thư mục ĐANG quét (R6): match kế
+            # thừa từ cache thư mục con mang rel theo thư mục cũ.
+            for match_dict in decision.prog.matches:
+                restored = dict(match_dict)
+                source = str(restored.get("source_path") or "")
+                if source:
+                    try:
+                        restored["relative_path"] = os.path.relpath(source, folder)
+                    except ValueError:
+                        pass
                 try:
-                    self._add_result(SecretScanMatch(**match_dict))
+                    self._add_result(SecretScanMatch(**restored))
                 except (TypeError, ValueError):
                     continue
         self._set_running_ui(True)
@@ -2537,19 +2698,53 @@ class SecretFileScanScreen(ScreenContent):
 
         thread = threading.Thread(
             target=self._run_worker,
-            args=(folder, first_page_only, resume_prog),
+            args=(folder, first_page_only, decision),
             daemon=True,
             name="secret-file-scan",
         )
         thread.start()
 
-    def _offer_resume(
-        self, folder: str, first_page_only: bool
-    ) -> "ssp.SecretScanProgress | None":
-        """Detect an unfinished scan for this folder+mode and ask the user.
+    @staticmethod
+    def _rescan_targets(prog, folder: str) -> list[str]:
+        """Các file mật của journal, định danh bằng source_path tuyệt đối đã
+        chuẩn hóa, lọc cho nằm trong thư mục gốc của phiên (R6)."""
+        root = _norm(folder)
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for d in prog.matches or []:
+            source = str(d.get("source_path") or "")
+            if not source:
+                continue
+            key = ssp._norm_path(source)
+            if key != root and not key.startswith(root + os.sep):
+                continue
+            if key in seen:
+                continue
+            seen.add(key)
+            ordered.append(key)
+        return ordered
 
-        Returns the progress object to resume from, or None for a fresh
-        scan. Also prunes abandoned journals older than 30 days.
+    @staticmethod
+    def _resume_dialog_kind(
+        journal_version: str, current_version: str, needs_continue: bool
+    ) -> str:
+        """Phân loại hộp thoại resume (hàm thuần để test):
+        - "continue" : còn migration/quét lại dở — đề nghị tiếp tục hoàn tất.
+        - "legacy3"  : journal khác version — 3 lựa chọn nâng cấp.
+        - "normal"   : cùng version — hỏi tiếp tục/quét lại như cũ.
+        """
+        if needs_continue:
+            return "continue"
+        if journal_version != current_version:
+            return "legacy3"
+        return "normal"
+
+    def _resume_decision(
+        self, folder: str, first_page_only: bool
+    ) -> ResumeDecision | None:
+        """Hỏi người dùng cách xử lý phiên quét dở của (folder, mode).
+
+        Trả ``None`` khi người dùng hủy. Không có journal → RESTART ngay.
         """
         try:
             ssp.prune_stale()
@@ -2559,28 +2754,116 @@ class SecretFileScanScreen(ScreenContent):
         try:
             prog = ssp.SecretScanProgress.load(folder, mode_key)
         except Exception:
-            return None
+            prog = None
         if prog is None:
-            return None
+            return ResumeDecision(ResumeDecision.RESTART)
         done_count, error_count, skip_count, found = prog.stats()
         if done_count == 0 and error_count == 0 and skip_count == 0 and found == 0:
-            return None
-        answer = QMessageBox.question(
-            self,
-            "Tiếp tục quét?",
-            (
-                "Thư mục này có lượt quét chưa hoàn tất:\n"
-                f"• Đã quét xong: {done_count} file\n"
-                f"• Lỗi lần trước (sẽ thử lại): {error_count} file\n"
-                f"• File hỏng (sẽ bỏ qua): {skip_count} file\n"
-                f"• Dòng mật đã phát hiện: {found}\n\n"
-                "Tiếp tục từ nơi dừng không?\n"
-                "Chọn \"No\" để quét lại toàn bộ từ đầu."
-            ),
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.Yes,
+            return ResumeDecision(ResumeDecision.RESTART)
+
+        from scanindex.infra.version import get_version
+
+        current_version = get_version()
+        kind = self._resume_dialog_kind(
+            prog.app_version, current_version, prog.needs_continue()
         )
-        return prog if answer == QMessageBox.StandardButton.Yes else None
+        stats_text = (
+            "Thư mục này có lượt quét chưa hoàn tất:\n"
+            f"• Đã quét xong: {done_count} file\n"
+            f"• Lỗi lần trước (sẽ thử lại): {error_count} file\n"
+            f"• File hỏng (sẽ bỏ qua): {skip_count} file\n"
+            f"• Dòng mật đã phát hiện: {found}"
+        )
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        if kind == "continue":
+            box.setWindowTitle("Tiếp tục phiên nâng cấp dở?")
+            pending = len(prog.rescan_pending)
+            pending_line = (
+                f"\n• File mật còn chờ quét lại: {pending}" if pending else ""
+            )
+            box.setText(
+                stats_text
+                + pending_line
+                + "\n\nLượt trước dừng giữa chừng khi nâng cấp lịch sử quét.\n"
+                "Tiếp tục hoàn tất phần việc còn dở?"
+            )
+            btn_continue = box.addButton(
+                "Tiếp tục hoàn tất", QMessageBox.ButtonRole.AcceptRole
+            )
+            btn_restart = box.addButton(
+                "Quét lại từ đầu", QMessageBox.ButtonRole.DestructiveRole
+            )
+            box.addButton("Hủy", QMessageBox.ButtonRole.RejectRole)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked is btn_continue:
+                mode = (
+                    ResumeDecision.RESUME_RESCAN
+                    if prog.rescan_pending
+                    else ResumeDecision.RESUME
+                )
+                return ResumeDecision(mode, prog=prog)
+            if clicked is btn_restart:
+                return ResumeDecision(ResumeDecision.RESTART)
+            return None
+
+        if kind == "legacy3":
+            targets = self._rescan_targets(prog, folder)
+            box.setWindowTitle("Tiếp tục quét? (phiên bản cũ)")
+            box.setText(
+                stats_text
+                + "\n\nPhiên quét dở này được tạo bởi PHIÊN BẢN CŨ của ứng dụng:\n"
+                "• Quét tiếp: giữ nguyên kết luận của nhóm đã quét và đóng dấu\n"
+                "  phiên bản mới vào lịch sử (không quét lại nhóm đã quét).\n"
+                "• Quét tiếp + quét lại file mật cũ: như trên, kèm quét lại đúng\n"
+                f"  {len(targets)} file mật đã phát hiện để có đầy đủ dữ liệu giải mật\n"
+                "  và loại các dòng nhận nhầm của bản cũ.\n"
+                "• Quét lại từ đầu: bỏ mọi kết luận cũ, quét toàn bộ bằng bản mới."
+            )
+            btn_restart = box.addButton(
+                "Quét lại từ đầu", QMessageBox.ButtonRole.DestructiveRole
+            )
+            btn_resume = box.addButton(
+                "Quét tiếp (giữ kết quả cũ)", QMessageBox.ButtonRole.AcceptRole
+            )
+            btn_rescan = box.addButton(
+                f"Quét tiếp + quét lại {len(targets)} file mật cũ",
+                QMessageBox.ButtonRole.AcceptRole,
+            )
+            box.addButton("Hủy", QMessageBox.ButtonRole.RejectRole)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked is btn_restart:
+                return ResumeDecision(ResumeDecision.RESTART)
+            if clicked is btn_resume:
+                return ResumeDecision(ResumeDecision.RESUME, prog=prog)
+            if clicked is btn_rescan:
+                return ResumeDecision(
+                    ResumeDecision.RESUME_RESCAN, prog=prog, rescan_abs=targets
+                )
+            return None
+
+        box.setWindowTitle("Tiếp tục quét?")
+        box.setText(
+            stats_text
+            + "\n\nTiếp tục từ nơi dừng không?\n"
+            "Chọn \"Quét lại từ đầu\" để quét lại toàn bộ."
+        )
+        btn_continue = box.addButton(
+            "Tiếp tục", QMessageBox.ButtonRole.AcceptRole
+        )
+        btn_restart = box.addButton(
+            "Quét lại từ đầu", QMessageBox.ButtonRole.DestructiveRole
+        )
+        box.addButton("Hủy", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is btn_continue:
+            return ResumeDecision(ResumeDecision.RESUME, prog=prog)
+        if clicked is btn_restart:
+            return ResumeDecision(ResumeDecision.RESTART)
+        return None
 
     def _stop_clicked(self) -> None:
         self._cancel_event.set()
@@ -2597,15 +2880,15 @@ class SecretFileScanScreen(ScreenContent):
         self.btn_export.setEnabled(not running and self.table.rowCount() > 0)
         self.btn_run.setVisible(not running)
         self.btn_stop.setVisible(running)
-        # Xóa file / "không phải mật" cấm chạy trong lúc quét (file đang bị
-        # engine đọc); xem trước thì vẫn cho phép.
+        # Xóa file / "Không phải mật" vẫn dùng được trong lúc quét — xem
+        # _refresh_action_buttons; xem trước cũng cho phép.
         self._refresh_action_buttons()
 
     def _run_worker(
         self,
         folder: str,
         first_page_only: bool,
-        resume_prog: "ssp.SecretScanProgress | None" = None,
+        decision: "ResumeDecision | None" = None,
     ) -> None:
         from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 
@@ -2613,39 +2896,191 @@ class SecretFileScanScreen(ScreenContent):
         work_root = os.path.join(get_base_dir(), "temp", f"secret_scan_{started}")
         os.makedirs(work_root, exist_ok=True)
         mode_key = "fast" if first_page_only else "thorough"
-        # resume_prog tới từ _offer_resume (đã hỏi người dùng); None = quét mới.
-        # Journal ghi tiếp theo từng file nên chi phí không đổi dù 1 triệu file.
-        prog = resume_prog if resume_prog is not None else ssp.SecretScanProgress.create(
-            folder, mode_key
+        from scanindex.infra.version import get_version
+
+        app_version = get_version()
+        restart = decision is None or decision.mode == ResumeDecision.RESTART
+        resume_like = not restart
+        prog = (
+            decision.prog
+            if decision is not None and decision.prog is not None
+            else ssp.SecretScanProgress.create(folder, mode_key, app_version)
         )
 
         files = list(_iter_supported_files(folder))
         total = len(files)
         pending, skipped = _split_pending(files, folder, prog.done_files())
 
-        # Sổ file toàn cục: file đã quét thành công mà không đổi (size +
-        # mtime + version + cùng chế độ) được bỏ qua ở MỌI lượt quét sau,
-        # kể cả khi quét thư mục cha chứa nó.
+        # Registry — tách ĐỌC cache khỏi GHI lịch sử (R4/R5 review):
+        # - ĐỌC cache: chỉ khi checkbox "Tận dụng" bật VÀ không phải quét
+        #   lại từ đầu (RESTART bỏ qua cache toàn lượt dù vẫn ghi mới).
+        # - GHI lịch sử: bật khi checkbox bật, HOẶC khi resume nâng cấp
+        #   (lựa chọn 2/3) vì người dùng đã yêu cầu lưu bền vững.
         use_history = self.history_checkbox.isChecked()
-        registry = ssp.FileRegistry.load() if use_history else None
-        from scanindex.infra.version import get_version
-
-        app_version = get_version()
+        needs_upgrade = resume_like and (
+            prog.app_version != app_version or bool(prog.migration)
+        )
+        registry = (
+            ssp.FileRegistry.load() if (use_history or needs_upgrade) else None
+        )
+        use_cache = use_history and not restart
         if registry is None:
-            self.log_message.emit("Lịch sử quét: TẮT — quét lại toàn bộ", "info")
+            self.log_message.emit("Lịch sử quét: TẮT — không tái dùng kết quả cũ", "info")
         cache_skipped = [0]
 
-        if skipped:
-            self._progress_changed.emit(skipped, max(1, total))
-            self._status_changed.emit(f"Tiếp tục: còn {len(pending)} file cần quét")
+        # ── Migration journal bản cũ → version mới (lựa chọn 2/3) ─────────
+        # Trình tự bền vững (review mục 4): lưu ý định → nâng registry (chạy
+        # lại được) → xác nhận trong journal. Crash giữa chừng: lần sau thấy
+        # migration còn dở → tiếp tục, không phụ thuộc av đã khớp.
+        rescan_rels: list[str] = []
+        upgraded_ok = True
+        inherited_created = 0
+        if resume_like:
+            if prog.rescan_pending:
+                rescan_rels = sorted(prog.rescan_pending)
+            elif (
+                decision is not None
+                and decision.mode == ResumeDecision.RESUME_RESCAN
+            ):
+                for abs_norm in decision.rescan_abs:
+                    try:
+                        rescan_rels.append(os.path.relpath(abs_norm, folder))
+                    except ValueError:
+                        continue
+            if needs_upgrade:
+                self._status_changed.emit(
+                    "Nâng cấp lịch sử quét của phiên bản cũ..."
+                )
+                if not prog.migration:
+                    prog.begin_migration(
+                        app_version,
+                        3
+                        if decision is not None
+                        and decision.mode == ResumeDecision.RESUME_RESCAN
+                        else 2,
+                    )
+                if (
+                    decision is not None
+                    and decision.mode == ResumeDecision.RESUME_RESCAN
+                    and rescan_rels
+                    and not prog.rescan_pending
+                ):
+                    prog.set_rescan_pending(rescan_rels)
+                prog.save()
+                matches_by_abs: dict[str, list[dict]] = {}
+                for match_dict in prog.matches:
+                    source = str(match_dict.get("source_path") or "")
+                    if source:
+                        matches_by_abs.setdefault(
+                            ssp._norm_path(source), []
+                        ).append(match_dict)
+                stat_failed: list[str] = []
+                bump_paths: list[str] = []
+                for rel in sorted(prog.ok_files()):
+                    path = os.path.join(folder, rel)
+                    bump_paths.append(path)
+                    if registry is not None and not registry.has_entry(
+                        path, mode_key
+                    ):
+                        # Entry thiếu (lượt cũ chạy với lịch sử TẮT, registry
+                        # hỏng/mất): kế thừa với fingerprint HIỆN TẠI — mốc
+                        # người dùng chấp nhận kế thừa, không phải bằng chứng
+                        # file chưa đổi (R4). File skip không được kế thừa.
+                        try:
+                            st = os.stat(path)
+                        except OSError:
+                            stat_failed.append(rel)
+                            continue
+                        registry.record(
+                            path,
+                            st.st_size,
+                            st.st_mtime,
+                            mode_key,
+                            app_version,
+                            matches_by_abs.get(ssp._norm_path(path), []),
+                            inherited=True,
+                        )
+                        inherited_created += 1
+                if registry is not None:
+                    registry.bump_versions_exact(
+                        bump_paths, mode_key, app_version
+                    )
+                    registry.snapshot()
+                if stat_failed:
+                    upgraded_ok = False
+                    self.log_message.emit(
+                        f"Nâng cấp lịch sử: {len(stat_failed)} file không đọc "
+                        "được trạng thái đĩa — giữ việc nâng cấp còn dở để "
+                        "lần sau chạy lại.",
+                        "err",
+                    )
+                else:
+                    prog.accept_version(app_version)
+                    prog.finish_migration()
+                    prog.save()
+                    self.log_message.emit(
+                        f"Đã nâng cấp lịch sử quét lên bản mới: kế thừa kết luận "
+                        f"của {skipped} file đã quét"
+                        + (
+                            f", tạo {inherited_created} entry kế thừa"
+                            if inherited_created
+                            else ""
+                        )
+                        + ".",
+                        "info",
+                    )
+
+        # ── Hàng đợi: pha quét lại file mật (nếu có) rồi pha pending ──────
+        # Một file chỉ có MỘT task (R6): file nằm cả trong rescan lẫn pending
+        # (trạng thái err) thì chỉ giữ nhiệm vụ quét lại.
+        enum_rel: dict[str, tuple[int, str]] = {
+            os.path.relpath(path, folder): (idx, path)
+            for idx, path in enumerate(files, start=1)
+        }
+        rescan_tasks: list[tuple[int, str]] = []
+        rescan_missing = 0
+        for rel in rescan_rels:
+            hit = enum_rel.get(rel)
+            if hit is None:
+                rescan_missing += 1
+            else:
+                rescan_tasks.append(hit)
+        rescan_relset = {rel for rel in rescan_rels if rel in enum_rel}
+        pending = [
+            task
+            for task in pending
+            if os.path.relpath(task[1], folder) not in rescan_relset
+        ]
+        if rescan_missing:
             self.log_message.emit(
-                f"Tiếp tục quét: bỏ qua {skipped} file đã quét lần trước, "
-                f"còn {len(pending)} file cần quét (tổng {total} file)",
+                f"{rescan_missing} file mật cũ không còn trong thư mục — giữ "
+                "kết quả cũ.",
+                "info",
+            )
+        # Tiến độ lượt này bắt đầu từ 0, tổng là số file lượt NÀY phải xử lý;
+        # nhóm kế thừa hiển thị riêng (review: không đếm một file hai lần).
+        progress_total = len(rescan_tasks) + len(pending)
+        self._progress_changed.emit(0, max(1, progress_total))
+        if resume_like:
+            self.log_message.emit(
+                f"Tiếp tục quét: kế thừa {skipped} file đã quét, còn "
+                f"{len(pending)} file cần quét"
+                + (
+                    f", quét lại {len(rescan_tasks)} file mật cũ"
+                    if rescan_tasks
+                    else ""
+                )
+                + f" (tổng thư mục {total} file)",
                 "info",
             )
         else:
-            self._progress_changed.emit(0, max(1, total))
-            self.log_message.emit(f"Quét file mật: tìm thấy {total} file hỗ trợ", "info")
+            self.log_message.emit(
+                f"Quét file mật: tìm thấy {total} file hỗ trợ", "info"
+            )
+            if restart and use_history:
+                self.log_message.emit(
+                    "Quét lại từ đầu: bỏ qua cache cho toàn lượt", "info"
+                )
 
         # File-level parallelism: each worker thread processes one file. The
         # OCR pool (when used inside _process_pdf_per_page) is a shared global,
@@ -2658,27 +3093,40 @@ class SecretFileScanScreen(ScreenContent):
         # state_lock: record_*/save trên prog dùng chung phải nguyên tố —
         # hai worker ghi xen kẽ vào cùng file handle sẽ làm hỏng dòng journal.
         state_lock = threading.Lock()
-        done = [skipped]
+        done = [0]
         scanned = [0]
         failures = [0]
         junk = [0]
+        updated = [0]
+        kept_old = [0]
         cancelled = [False]
 
-        def process_one(idx: int, path: str) -> None:
+        def process_one(idx: int, path: str, replace: bool = False) -> None:
             if self._cancel_event.is_set():
                 return
             rel = os.path.relpath(path, folder)
-            self._status_changed.emit(f"Đang quét {idx}/{total}: {rel}")
+            self._status_changed.emit(
+                f"Đang quét lại {idx}/{total}: {rel}"
+                if replace
+                else f"Đang quét {idx}/{total}: {rel}"
+            )
             file_work = os.path.join(work_root, f"{idx:05d}_{_safe_name(Path(path).stem)}")
 
             def file_log(message: str, rel_path=rel) -> None:
                 self.log_message.emit(f"[{rel_path}] {message}", "info")
 
             try:
+                # File bị xóa giữa chừng (xóa ngay trong lúc quét): ghi
+                # "skip" thay vì để OCR báo lỗi rồi mỗi lượt resume lại
+                # thử lại một file đã không còn tồn tại.
+                if not os.path.exists(path):
+                    raise _ScanSkip("file đã bị xóa trong lúc quét")
                 # Lookup lịch sử TRƯỚC khi quét: file không đổi → dùng lại
-                # kết quả cũ, không tốn OCR.
+                # kết quả cũ, không tốn OCR. Không áp dụng cho quét lại từ
+                # đầu (R5) và nhánh thay thế file mật (entry vừa được đóng
+                # dấu version mới sẽ trúng cache — bắt buộc quét thật).
                 cached_dicts: list[dict] | None = None
-                if registry is not None:
+                if use_cache and not replace and registry is not None:
                     try:
                         st = os.stat(path)
                         cached_dicts = registry.lookup(
@@ -2691,16 +3139,21 @@ class SecretFileScanScreen(ScreenContent):
                     except OSError:
                         cached_dicts = None
                 if cached_dicts is not None:
+                    # Rel tính lại theo thư mục ĐANG quét (R6): match trong
+                    # cache của thư mục con mang rel theo thư mục cũ.
+                    fixed_dicts = []
                     for match_dict in cached_dicts:
+                        fixed = dict(match_dict)
+                        fixed["relative_path"] = rel
+                        fixed_dicts.append(fixed)
+                    for fixed in fixed_dicts:
                         try:
-                            self._result_found.emit(
-                                SecretScanMatch(**match_dict)
-                            )
+                            self._result_found.emit(SecretScanMatch(**fixed))
                         except (TypeError, ValueError):
                             continue
                     with state_lock:
                         prog.record_file(rel, "ok")
-                        prog.record_matches(cached_dicts)
+                        prog.record_matches(fixed_dicts)
                         cache_skipped[0] += 1
                     self._status_changed.emit(
                         f"Đã quét trước đây, bỏ qua: {rel}"
@@ -2715,41 +3168,92 @@ class SecretFileScanScreen(ScreenContent):
                     self._cancel_event,
                     file_log,
                 )
-                match_dicts = [asdict(m) for m in matches]
                 for match in matches:
-                    self._result_found.emit(match)
-                with state_lock:
-                    prog.record_file(rel, "ok")
-                    prog.record_matches(match_dicts)
-                    if registry is not None:
-                        try:
-                            st = os.stat(path)
-                            registry.record(
-                                path,
-                                st.st_size,
-                                st.st_mtime,
-                                mode_key,
-                                app_version,
-                                match_dicts,
-                            )
-                        except OSError:
-                            pass
-                with progress_lock:
-                    scanned[0] += 1
+                    match.source_version = app_version
+                match_dicts = [asdict(m) for m in matches]
+                if replace:
+                    # Thay thế hàng THEO FILE: bỏ mọi hàng cũ của path rồi
+                    # thêm hàng mới (FP bản cũ rớt khỏi danh sách khi kết quả
+                    # rỗng). Chỉ phát ở nhánh này — không phát _result_found
+                    # song song gây trùng.
+                    abs_norm = ssp._norm_path(path)
+                    self._results_replace.emit(
+                        {"path": abs_norm, "matches": match_dicts}
+                    )
+                    with state_lock:
+                        # Một dòng journal = một transaction nguyên vẹn (R2):
+                        # file ok + thay matches + bỏ khỏi tập quét lại.
+                        prog.commit_replace_file(rel, abs_norm, match_dicts)
+                        if registry is not None:
+                            try:
+                                st = os.stat(path)
+                                registry.record(
+                                    path,
+                                    st.st_size,
+                                    st.st_mtime,
+                                    mode_key,
+                                    app_version,
+                                    match_dicts,
+                                )
+                            except OSError:
+                                pass
+                    with progress_lock:
+                        updated[0] += 1
+                else:
+                    for match in matches:
+                        self._result_found.emit(match)
+                    with state_lock:
+                        prog.record_file(rel, "ok")
+                        prog.record_matches(match_dicts)
+                        if registry is not None:
+                            try:
+                                st = os.stat(path)
+                                registry.record(
+                                    path,
+                                    st.st_size,
+                                    st.st_mtime,
+                                    mode_key,
+                                    app_version,
+                                    match_dicts,
+                                )
+                            except OSError:
+                                pass
+                    with progress_lock:
+                        scanned[0] += 1
             except _ScanCancelled:
                 cancelled[0] = True
             except _ScanSkip as exc:
                 with state_lock:
                     prog.record_file(rel, "skip", str(exc))
+                    if replace:
+                        # File giờ là rác (0 byte/hỏng): giữ hàng cũ, bỏ khỏi
+                        # tập quét lại để không retry vô hạn qua các lượt.
+                        prog.set_rescan_pending(
+                            sorted(prog.rescan_pending - {rel})
+                        )
                 with progress_lock:
                     junk[0] += 1
+                    if replace:
+                        kept_old[0] += 1
                 self.log_message.emit(f"[{rel}] Bỏ qua: {exc}", "info")
             except Exception as exc:
-                with state_lock:
-                    prog.record_file(rel, "err", str(exc))
-                with progress_lock:
-                    failures[0] += 1
-                self.log_message.emit(f"[{rel}] Lỗi: {exc}", "err")
+                # Nhánh thay thế gặp lỗi: KHÔNG ghi "err" (file vẫn ok với
+                # kết luận cũ) và vẫn nằm trong tập quét lại để lượt sau
+                # thử lại — tránh pending trùng phát hàng cũ + hàng mới.
+                if replace:
+                    with progress_lock:
+                        failures[0] += 1
+                        kept_old[0] += 1
+                    self.log_message.emit(
+                        f"[{rel}] Quét lại thất bại, giữ kết quả cũ: {exc}",
+                        "err",
+                    )
+                else:
+                    with state_lock:
+                        prog.record_file(rel, "err", str(exc))
+                    with progress_lock:
+                        failures[0] += 1
+                    self.log_message.emit(f"[{rel}] Lỗi: {exc}", "err")
             finally:
                 if os.path.isdir(file_work):
                     shutil.rmtree(file_work, ignore_errors=True)
@@ -2759,7 +3263,7 @@ class SecretFileScanScreen(ScreenContent):
                         registry.save()
                 with progress_lock:
                     done[0] += 1
-                    self._progress_changed.emit(done[0], max(1, total))
+                    self._progress_changed.emit(done[0], max(1, progress_total))
                     periodic_mem = done[0] % 500 == 0
                 if periodic_mem:
                     # Đo RAM định kỳ: bằng chứng cho các lần crash native
@@ -2776,26 +3280,32 @@ class SecretFileScanScreen(ScreenContent):
                 max_workers=max_file_workers, thread_name_prefix="secret-scan-file"
             ) as executor:
                 # Cửa sổ trượt: chỉ giữ tối đa _SCAN_MAX_INFLIGHT_FILES future
-                # thay vì submit toàn bộ `pending` (có thể là 300k+ file) —
+                # thay vì submit toàn bộ hàng đợi (có thể là 300k+ file) —
                 # chặn việc process chính phình RAM chỉ vì hàng đợi.
-                futures: set = set()
-                next_task = 0
+                def run_phase(tasks: list[tuple[int, str]], replace: bool) -> None:
+                    futures: set = set()
+                    next_task = 0
 
-                def submit_window() -> None:
-                    nonlocal next_task
-                    while (
-                        next_task < len(pending)
-                        and len(futures) < _SCAN_MAX_INFLIGHT_FILES
-                    ):
-                        futures.add(
-                            executor.submit(process_one, *pending[next_task])
-                        )
-                        next_task += 1
+                    def submit_window() -> None:
+                        nonlocal next_task
+                        while (
+                            next_task < len(tasks)
+                            and len(futures) < _SCAN_MAX_INFLIGHT_FILES
+                            and not self._cancel_event.is_set()
+                        ):
+                            task_idx, task_path = tasks[next_task]
+                            futures.add(
+                                executor.submit(
+                                    process_one, task_idx, task_path, replace
+                                )
+                            )
+                            next_task += 1
 
-                submit_window()
-                try:
+                    submit_window()
                     while futures and not self._cancel_event.is_set():
-                        done_set, futures = wait(futures, timeout=0.2, return_when=FIRST_COMPLETED)
+                        done_set, futures = wait(
+                            futures, timeout=0.2, return_when=FIRST_COMPLETED
+                        )
                         for fut in done_set:
                             # Re-raise any exception from the worker (except
                             # _ScanCancelled, which only flags cancellation).
@@ -2804,25 +3314,35 @@ class SecretFileScanScreen(ScreenContent):
                             except _ScanCancelled:
                                 cancelled[0] = True
                         submit_window()
-                except _ScanCancelled:
-                    cancelled[0] = True
-                if self._cancel_event.is_set():
-                    cancelled[0] = True
-                    for fut in futures:
-                        fut.cancel()
+                    if self._cancel_event.is_set():
+                        cancelled[0] = True
+                        for fut in futures:
+                            fut.cancel()
+
+                # HAI PHA CÓ RÀO (R6): nhóm quét lại file mật kết thúc HOÀN
+                # TOÀN trước khi nhóm pending bắt đầu — chỉ "đặt trước" trong
+                # cửa sổ 32 future không bảo đảm thứ tự đó.
+                if rescan_tasks:
+                    run_phase(rescan_tasks, True)
+                if not self._cancel_event.is_set():
+                    run_phase(pending, False)
         finally:
             with state_lock:
                 done_n, err_n, skip_n, found_n = prog.stats()
-                if (
-                    (done_n or err_n or skip_n or found_n)
-                    and (cancelled[0] or failures[0])
-                ):
-                    # Chưa xong hẳn (dừng tay hoặc còn file lỗi) → giữ journal
-                    # để lần sau chọn lại thư mục này được hỏi tiếp tục;
-                    # file lỗi sẽ được thử lại, file hỏng thì không.
+                # Chưa xong hẳn → giữ journal: dừng tay, còn file lỗi, còn
+                # file mật chờ quét lại, hoặc migration nâng cấp chưa xác
+                # nhận xong (R1 — không chỉ đếm lỗi/hủy của lượt hiện tại).
+                incomplete = (
+                    cancelled[0]
+                    or failures[0] > 0
+                    or prog.needs_continue()
+                    or not upgraded_ok
+                )
+                if (done_n or err_n or skip_n or found_n) and incomplete:
                     prog.save()
                 else:
-                    # Hoàn tất sạch (hoặc không có gì đáng tiếp) → xóa journal.
+                    # Hoàn tất sạch — mọi việc phục hồi đã xong và kết quả
+                    # cần giữ đã nằm trong registry.
                     prog.discard()
                 # Đóng handle ngay — file mở để lâu sẽ chặn "Xóa lịch sử
                 # quét" và backup trên Windows.
@@ -2842,6 +3362,9 @@ class SecretFileScanScreen(ScreenContent):
                     "failures": failures[0],
                     "cancelled": cancelled[0],
                     "work_root": work_root,
+                    "app_version": app_version,
+                    "updated": updated[0],
+                    "kept_old": kept_old[0],
                 }
             )
 
@@ -3043,7 +3566,7 @@ class SecretFileScanScreen(ScreenContent):
         self._mark_not_secret(sorted(self._checked_paths))
 
     def _preview_delete_clicked(self) -> None:
-        if self._busy or self._preview_current is None:
+        if self._preview_current is None:
             return
         path = self._preview_current.source_path
         row = self._first_row_of(path)
@@ -3055,7 +3578,7 @@ class SecretFileScanScreen(ScreenContent):
             self._show_preview(target)
 
     def _preview_not_secret_clicked(self) -> None:
-        if self._busy or self._preview_current is None:
+        if self._preview_current is None:
             return
         path = self._preview_current.source_path
         row = self._first_row_of(path)
@@ -3085,8 +3608,6 @@ class SecretFileScanScreen(ScreenContent):
         return None
 
     def _delete_files(self, paths: list[str]) -> None:
-        if self._busy:
-            return
         targets = list(dict.fromkeys(p for p in paths if p))
         if not targets:
             return
@@ -3138,8 +3659,6 @@ class SecretFileScanScreen(ScreenContent):
         self._refresh_totals()
 
     def _mark_not_secret(self, paths: list[str]) -> None:
-        if self._busy:
-            return
         targets = list(dict.fromkeys(p for p in paths if p))
         if not targets:
             return
@@ -3361,6 +3880,23 @@ class SecretFileScanScreen(ScreenContent):
         self.btn_export.setEnabled(True)
         self._refresh_totals()
 
+    def _on_results_replace(self, payload: dict) -> None:
+        """Slot cho signal thay thế hàng theo file (nhánh quét lại).
+
+        Bỏ mọi hàng cũ của path (giữ nhất quán preview/checkbox qua
+        _remove_file_rows) rồi thêm hàng mới — kết quả rỗng đồng nghĩa file
+        không còn được xem là mật (FP bản cũ rớt khỏi danh sách).
+        """
+        path = str(payload.get("path") or "")
+        if not path:
+            return
+        self._remove_file_rows(path)
+        for match_dict in payload.get("matches") or []:
+            try:
+                self._add_result(SecretScanMatch(**match_dict))
+            except (TypeError, ValueError):
+                continue
+
     def _row_path(self, row: int) -> str:
         item = self.table.item(row, 0)
         if item is None:
@@ -3406,13 +3942,16 @@ class SecretFileScanScreen(ScreenContent):
         self._refresh_action_buttons()
 
     def _refresh_action_buttons(self) -> None:
-        busy = self._busy
+        # Xóa file / "Không phải mật" dùng được NGAY CẢ KHI ĐANG QUÉT:
+        # dòng đã hiện trên bảng nghĩa là đã có thể xử lý luôn, không phải
+        # đợi hết lượt. File đang bị engine đọc mà xóa hỏng → báo lỗi từng
+        # file, giữ dòng, thử lại sau (worker thấy file mất sẽ tự "skip").
         has_check = bool(self._checked_paths)
-        self.btn_batch_delete.setEnabled(not busy and has_check)
-        self.btn_batch_not_secret.setEnabled(not busy and has_check)
+        self.btn_batch_delete.setEnabled(has_check)
+        self.btn_batch_not_secret.setEnabled(has_check)
         has_preview = self._preview_current is not None
-        self.btn_preview_delete.setEnabled(not busy and has_preview)
-        self.btn_preview_not_secret.setEnabled(not busy and has_preview)
+        self.btn_preview_delete.setEnabled(has_preview)
+        self.btn_preview_not_secret.setEnabled(has_preview)
 
     def _on_item_changed(self, item: QTableWidgetItem) -> None:
         if item.column() != 0:
@@ -3483,18 +4022,35 @@ class SecretFileScanScreen(ScreenContent):
         junk = int(payload.get("junk") or 0)
         failures = int(payload.get("failures") or 0)
         cancelled = bool(payload.get("cancelled"))
+        updated = int(payload.get("updated") or 0)
+        kept_old = int(payload.get("kept_old") or 0)
+        app_version = str(payload.get("app_version") or "")
         found = self.table.rowCount()
         prefix = "Đã dừng" if cancelled else "Hoàn tất"
         detail = f"quét {scanned + skipped + cache_skipped}/{total} file"
         notes = []
         if skipped:
-            notes.append(f"bỏ qua {skipped} file đã quét lần trước")
+            notes.append(f"kế thừa {skipped} file đã quét")
         if cache_skipped:
             notes.append(f"tận dụng {cache_skipped} file không đổi")
         if junk:
             notes.append(f"bỏ qua {junk} file hỏng")
         if notes:
             detail += " (" + "; ".join(notes) + ")"
+        # R8: phân biệt rõ "đã cập nhật" / "giữ kết quả cũ" / "dòng kế thừa
+        # chưa cập nhật" — không báo cập nhật đầy đủ khi còn file lỗi.
+        if updated or kept_old:
+            detail += (
+                f"; cập nhật {updated} file mật, {kept_old} file giữ kết quả cũ"
+            )
+        if app_version:
+            inherited_rows = sum(
+                1
+                for m in self._current_matches()
+                if (m.source_version or "") != app_version
+            )
+            if inherited_rows:
+                detail += f"; {inherited_rows} dòng kế thừa chưa cập nhật"
         self._set_status(
             f"{prefix}: {detail}, phát hiện {found} dòng mật, lỗi {failures}"
         )

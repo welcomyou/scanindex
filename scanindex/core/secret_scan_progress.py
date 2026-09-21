@@ -36,7 +36,9 @@ import json
 import os
 import time
 
-STATE_VERSION = 1
+STATE_VERSION = 2
+# Journal v1 (do bản phát hành trước ghi) vẫn phải đọc được để nâng cấp.
+_LEGACY_STATE_VERSION = 1
 STATE_DIR_NAME = "scan_progress"
 DEFAULT_MAX_AGE_DAYS = 30
 # Compaction floor: never compact a journal smaller than this many lines —
@@ -48,17 +50,40 @@ def _now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S")
 
 
+def _norm_path(path: str) -> str:
+    """Định danh file chuẩn hóa — nhóm theo đường dẫn tuyệt đối, không theo
+    chuỗi relative_path kế thừa (cache thư mục con dùng lại ở thư mục cha
+    ghi rel theo thư mục cũ). Phải giữ ĐỒNG NHẤT công thức với
+    ``secret_file_scan_screen._norm``."""
+    return os.path.normcase(os.path.normpath(os.path.abspath(path)))
+
+
 def progress_dir() -> str:
     from scanindex.infra.paths import get_base_dir
 
     return os.path.join(get_base_dir(), STATE_DIR_NAME)
 
 
-def journal_path(folder: str, mode: str) -> str:
-    key = hashlib.sha1(
+def _journal_key(folder: str, mode: str) -> str:
+    return hashlib.sha1(
         f"{os.path.normcase(os.path.abspath(folder))}|{mode}".encode("utf-8")
     ).hexdigest()[:16]
-    return os.path.join(progress_dir(), f"secret_scan_{key}.jsonl")
+
+
+def journal_path(folder: str, mode: str) -> str:
+    """Đường dẫn journal v2. Tách tên file khỏi bản v1 để bảo vệ downgrade:
+    bản cũ load journal lạ trả None rồi TẠO MỚI ghi đè cùng đường dẫn — nếu
+    dùng chung tên, journal v2 sẽ bị bản cũ phá khi hạ cấp."""
+    return os.path.join(
+        progress_dir(), f"secret_scan_{_journal_key(folder, mode)}_v2.jsonl"
+    )
+
+
+def legacy_journal_path(folder: str, mode: str) -> str:
+    """Journal v1 của bản phát hành trước (header v==1)."""
+    return os.path.join(
+        progress_dir(), f"secret_scan_{_journal_key(folder, mode)}.jsonl"
+    )
 
 
 def registry_path() -> str:
@@ -105,6 +130,16 @@ class SecretScanProgress:
         self._errors: dict[str, str] = {}
         self._skipped: dict[str, str] = {}
         self.matches: list[dict] = []
+        # Version app đã "chấp nhận" kết quả của journal này. Journal bản cũ
+        # không có field này → "" → khác version hiện tại.
+        self.app_version: str = ""
+        # Migration còn dở: {"target": version, "choice": 2|3} — None khi
+        # không có hoặc đã xong. Tồn tại bền vững để crash giữa chừng chạy lại
+        # được (ý định → nâng registry → xác nhận).
+        self.migration: dict | None = None
+        # Tập rel path (theo thư mục của journal) các file mật cũ còn chờ
+        # quét lại. Chỉ bỏ khỏi tập này khi commit thay thế THÀNH CÔNG.
+        self.rescan_pending: set[str] = set()
         self._fh = None
         # Lines the journal contained as of the last compaction/load (the
         # fresh header counts as 1) and lines appended since — the compact
@@ -115,7 +150,9 @@ class SecretScanProgress:
 
     # ── lifecycle ─────────────────────────────────────────────────────────
     @classmethod
-    def create(cls, folder: str, mode: str) -> "SecretScanProgress":
+    def create(
+        cls, folder: str, mode: str, app_version: str = ""
+    ) -> "SecretScanProgress":
         """Fresh progress: drop any previous journal for this key, then
         write the header line.
 
@@ -123,39 +160,54 @@ class SecretScanProgress:
         than append: if a stale progress object from an earlier run in
         this process still holds the old file open, os.remove() fails on
         Windows — truncation guarantees the new run starts from a clean
-        header regardless.
+        state regardless. The legacy v1 file (if any) is also removed so a
+        fresh scan does not keep resurrecting the old journal.
         """
         prog = cls(folder, mode)
+        prog.app_version = str(app_version or "")
         prog.discard()
+        try:
+            os.remove(legacy_journal_path(folder, mode))
+        except OSError:
+            pass
         os.makedirs(progress_dir(), exist_ok=True)
+        header: dict = {
+            "t": "h",
+            "v": STATE_VERSION,
+            "folder": folder,
+            "mode": mode,
+            "started_at": prog.started_at,
+        }
+        if prog.app_version:
+            header["av"] = prog.app_version
         with open(
             journal_path(folder, mode), "w", encoding="utf-8", newline="\n"
         ) as f:
-            f.write(
-                json.dumps(
-                    {
-                        "t": "h",
-                        "v": STATE_VERSION,
-                        "folder": folder,
-                        "mode": mode,
-                        "started_at": prog.started_at,
-                    },
-                    ensure_ascii=False,
-                )
-                + "\n"
-            )
+            f.write(json.dumps(header, ensure_ascii=False) + "\n")
         return prog
 
     @classmethod
     def load(cls, folder: str, mode: str) -> "SecretScanProgress | None":
         """Replay the journal for (folder, mode) into memory.
 
-        Missing/corrupt/foreign journals read as None — the caller just
-        does a fresh scan. A torn trailing line (power cut mid-append)
-        ends the replay at the last good line, losing at most the one
-        event being written.
+        Prefers the v2 journal; falls back to the legacy v1 file (written
+        by the previous release) which replays with the same event grammar
+        minus the new state events. Missing/corrupt/foreign journals read
+        as None — the caller just does a fresh scan. A torn trailing line
+        (power cut mid-append) ends the replay at the last good line,
+        losing at most the one event being written; per-file replacements
+        are single atomic ``rpf`` lines, so a torn tail keeps either the
+        old result or the complete new one — never half of each.
         """
-        path = journal_path(folder, mode)
+        prog = cls._replay(journal_path(folder, mode), folder, mode)
+        if prog is None:
+            prog = cls._replay(legacy_journal_path(folder, mode), folder, mode)
+        return prog
+
+    @classmethod
+    def _replay(
+        cls, path: str, folder: str, mode: str
+    ) -> "SecretScanProgress | None":
         try:
             with open(path, encoding="utf-8") as f:
                 raw_lines = f.readlines()
@@ -182,12 +234,13 @@ class SecretScanProgress:
             if header is None:
                 if (
                     event.get("t") != "h"
-                    or event.get("v") != STATE_VERSION
+                    or event.get("v") not in (STATE_VERSION, _LEGACY_STATE_VERSION)
                     or event.get("folder") != folder
                     or event.get("mode") != mode
                 ):
                     return None
                 header = event
+                prog.app_version = str(header.get("av") or "")
                 continue
             kind = event.get("t")
             if kind == "f":
@@ -206,6 +259,45 @@ class SecretScanProgress:
                     prog._skipped.pop(rel, None)
             elif kind == "m" and isinstance(event.get("d"), dict):
                 prog.matches.append(event["d"])
+            elif kind == "av":
+                prog.app_version = str(event.get("av") or "")
+            elif kind == "mig":
+                prog.migration = {
+                    "target": str(event.get("target") or ""),
+                    "choice": int(event.get("choice") or 0),
+                }
+            elif kind == "migdone":
+                prog.migration = None
+            elif kind == "rs" and isinstance(event.get("p"), list):
+                prog.rescan_pending = {
+                    str(rel) for rel in event["p"] if str(rel or "").strip()
+                }
+            elif kind == "rpf":
+                # Commit thay thế THEO FILE, một dòng nguyên vẹn: file ok +
+                # thay toàn bộ matches của file + bỏ khỏi tập quét lại.
+                rel = str(event.get("p") or "")
+                abs_norm = str(event.get("a") or "")
+                new_dicts = [
+                    d for d in event.get("m") or [] if isinstance(d, dict)
+                ]
+                if rel:
+                    prog._done.add(rel)
+                    prog._errors.pop(rel, None)
+                    prog._skipped.pop(rel, None)
+                    prog.rescan_pending.discard(rel)
+                if abs_norm:
+                    prog.matches = [
+                        d
+                        for d in prog.matches
+                        if _norm_path(str(d.get("source_path") or "")) != abs_norm
+                    ]
+                elif rel:
+                    prog.matches = [
+                        d
+                        for d in prog.matches
+                        if str(d.get("relative_path") or "") != rel
+                    ]
+                prog.matches.extend(new_dicts)
         if header is None:
             return None
         prog.started_at = str(header.get("started_at") or prog.started_at)
@@ -232,7 +324,11 @@ class SecretScanProgress:
         """Delete the journal — scan no longer resumable."""
         self.close()
         path = journal_path(self.folder, self.mode)
-        for candidate in (path, path + ".tmp"):
+        for candidate in (
+            path,
+            path + ".tmp",
+            legacy_journal_path(self.folder, self.mode),
+        ):
             try:
                 os.remove(candidate)
             except OSError:
@@ -262,6 +358,62 @@ class SecretScanProgress:
         for match_dict in match_dicts:
             self._append_line({"t": "m", "d": match_dict})
 
+    # ── versioned-resume state (R1/R2 review) ─────────────────────────────
+    def needs_continue(self) -> bool:
+        """Còn việc dở phải tiếp tục: migration chưa xác nhận xong hoặc còn
+        file mật chờ quét lại. Resume cùng version vẫn phải tiếp tục các
+        việc này — không phụ thuộc hộp thoại chọn 3 lựa chọn."""
+        return bool(self.migration) or bool(self.rescan_pending)
+
+    def begin_migration(self, target: str, choice: int) -> None:
+        """Lưu bền vững ý định nâng cấp: target = version mới, choice = 2|3.
+        Ghi TRƯỚC khi đụng registry — crash sau bước này vẫn chạy lại được."""
+        self.migration = {"target": str(target), "choice": int(choice)}
+        self._append_line(
+            {"t": "mig", "target": self.migration["target"],
+             "choice": self.migration["choice"]}
+        )
+
+    def finish_migration(self) -> None:
+        """Xác nhận migration hoàn tất (registry đã lưu bền vững)."""
+        self.migration = None
+        self._append_line({"t": "migdone"})
+
+    def accept_version(self, version: str) -> None:
+        self.app_version = str(version or "")
+        self._append_line({"t": "av", "av": self.app_version})
+
+    def set_rescan_pending(self, rels: list[str] | set[str]) -> None:
+        """Ghi đè toàn bộ tập file mật còn chờ quét lại (rel theo thư mục
+        journal). Replace-whole-set giữ idempotent khi replay/compact."""
+        self.rescan_pending = {str(r) for r in rels if str(r or "").strip()}
+        self._append_line({"t": "rs", "p": sorted(self.rescan_pending)})
+
+    def commit_replace_file(
+        self, rel: str, abs_norm: str, match_dicts: list[dict]
+    ) -> None:
+        """Commit thay thế kết quả THEO FILE bằng đúng MỘT dòng journal.
+
+        Một dòng = một transaction: replay thấy hoặc toàn bộ kết quả mới
+        (file ok + matches thay + bỏ khỏi tập quét lại) hoặc — nếu dòng bị
+        cắt dở vì mất điện — giữ nguyên kết quả cũ và file vẫn còn trong
+        tập quét lại. KHÔNG dùng cho kết quả lỗi/hủy/skip: những trường
+        hợp đó giữ nguyên hàng cũ và trạng thái chưa cập nhật.
+        """
+        self._done.add(rel)
+        self._errors.pop(rel, None)
+        self._skipped.pop(rel, None)
+        self.rescan_pending.discard(rel)
+        self.matches = [
+            d
+            for d in self.matches
+            if _norm_path(str(d.get("source_path") or "")) != abs_norm
+        ]
+        self.matches.extend(match_dicts)
+        self._append_line(
+            {"t": "rpf", "p": rel, "a": abs_norm, "m": list(match_dicts)}
+        )
+
     def save(self) -> None:
         """Flush + fsync the journal (power-cut durable up to the last
         event), compacting it when appends have outgrown the snapshot."""
@@ -278,6 +430,11 @@ class SecretScanProgress:
         as permanently unscannable (0 byte / not a PDF / no pages) — the
         latter are NOT retried, unlike errored files."""
         return set(self._done) | set(self._skipped)
+
+    def ok_files(self) -> set[str]:
+        """Riêng các file xử lý THÀNH CÔNG (không gồm skip) — tập được phép
+        kế thừa/đóng dấu version khi nâng cấp lịch sử quét (R4)."""
+        return set(self._done)
 
     def stats(self) -> tuple[int, int, int, int]:
         """(done, error, skipped, found) counts for the resume prompt."""
@@ -304,26 +461,42 @@ class SecretScanProgress:
         self._appended_lines += 1
 
     def _compact(self) -> None:
-        """Rewrite the journal as header + one line per record, then keep
-        appending. Closes the handle first — os.replace() on a file that
-        is open for writing fails on Windows."""
+        """Rewrite the journal as header + state + one line per record, then
+        keep appending. Closes the handle first — os.replace() on a file that
+        is open for writing fails on Windows. Flush + fsync tạm TRƯỚC khi
+        replace: snapshot phải xuống đĩa thật rồi mới công bố."""
         self.close()
         path = journal_path(self.folder, self.mode)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8", newline="\n") as f:
-            f.write(
-                json.dumps(
-                    {
-                        "t": "h",
-                        "v": STATE_VERSION,
-                        "folder": self.folder,
-                        "mode": self.mode,
-                        "started_at": self.started_at,
-                    },
-                    ensure_ascii=False,
+            header: dict = {
+                "t": "h",
+                "v": STATE_VERSION,
+                "folder": self.folder,
+                "mode": self.mode,
+                "started_at": self.started_at,
+            }
+            if self.app_version:
+                header["av"] = self.app_version
+            f.write(json.dumps(header, ensure_ascii=False) + "\n")
+            # State phiên bản/migration/quét lại PHẢI sống sót qua compact —
+            # các event rpf đã được gập vào trạng thái final nên không ghi lại.
+            if self.migration:
+                f.write(
+                    json.dumps(
+                        {"t": "mig", **self.migration}, ensure_ascii=False
+                    )
+                    + "\n"
                 )
-                + "\n"
-            )
+            if self.rescan_pending:
+                f.write(
+                    json.dumps(
+                        {"t": "rs", "p": sorted(self.rescan_pending)},
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
             for rel in sorted(self._done):
                 f.write(
                     json.dumps({"t": "f", "p": rel, "s": "ok"}, ensure_ascii=False)
@@ -344,9 +517,13 @@ class SecretScanProgress:
                     json.dumps({"t": "m", "d": match_dict}, ensure_ascii=False)
                     + "\n"
                 )
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, path)
         self._lines_at_compact = (
             1
+            + int(bool(self.migration))
+            + int(bool(self.rescan_pending))
             + len(self._done)
             + len(self._errors)
             + len(self._skipped)
@@ -376,6 +553,10 @@ class FileRegistry:
     def __init__(self):
         # key -> (size, mtime, version, matches list)
         self._entries: dict[str, tuple[int, float, str, list[dict]]] = {}
+        # Các key được "kế thừa" từ journal bản cũ khi nâng cấp (không phải
+        # kết quả quét thật của version này) — chỉ dùng làm nguồn gốc thống
+        # kê, không ảnh hưởng lookup.
+        self._inherited: set[str] = set()
         self._fh = None
         self._lines_at_compact = 1
         self._appended_lines = 0
@@ -420,6 +601,10 @@ class FileRegistry:
                     str(event.get("v") or ""),
                     payload,
                 )
+                if event.get("i"):
+                    reg._inherited.add(key)
+                else:
+                    reg._inherited.discard(key)
         reg._lines_at_compact = lines_seen
         if bad_tail:
             # Tự chữa như SecretScanProgress.load — cắt bỏ đuôi hỏng để các
@@ -452,19 +637,65 @@ class FileRegistry:
         mode: str,
         version: str,
         matches: list[dict],
+        *,
+        inherited: bool = False,
     ) -> None:
+        """Append one registry record. ``inherited=True`` đánh dấu entry kế
+        thừa từ journal bản cũ (lựa chọn 2/3 của resume nâng cấp) — nguồn
+        gốc thống kê, không đổi hành vi lookup."""
         key = self._key(path, mode)
         self._entries[key] = (size, mtime, version, list(matches))
-        self._append_line(
-            {
-                "t": "r",
-                "k": key,
-                "s": size,
-                "m": mtime,
-                "v": version,
-                "x": list(matches),
-            }
-        )
+        if inherited:
+            self._inherited.add(key)
+        else:
+            self._inherited.discard(key)
+        event: dict = {
+            "t": "r",
+            "k": key,
+            "s": size,
+            "m": mtime,
+            "v": version,
+            "x": list(matches),
+        }
+        if inherited:
+            event["i"] = 1
+        self._append_line(event)
+
+    def bump_versions_exact(
+        self, paths, mode: str, version: str
+    ) -> int:
+        """Đóng dấu version mới cho ĐÚNG các (path, mode) chỉ định.
+
+        Nhận tập key chính xác từ phiên (không duyệt prefix thư mục) để
+        không đụng file chưa quét, mode khác hay thư mục anh em. Chỉ đổi
+        trường version, giữ nguyên size/mtime/matches — file đã đổi nội
+        dung từ lần quét cũ sẽ miss lookup ở lần sau (đúng hành vi). Trả
+        số entry thực sự đổi. LƯU Ý: sửa này nằm trong RAM — caller phải
+        gọi ``snapshot()`` để lưu bền vững (R3: save() chỉ flush append).
+        """
+        changed = 0
+        for path in paths:
+            key = self._key(str(path), mode)
+            entry = self._entries.get(key)
+            if entry is None:
+                continue
+            size, mtime, old_version, matches = entry
+            if old_version == version:
+                continue
+            self._entries[key] = (size, mtime, version, matches)
+            changed += 1
+        return changed
+
+    def inherited_count(self) -> int:
+        return len(self._inherited)
+
+    def has_entry(self, path: str, mode: str) -> bool:
+        return self._key(path, mode) in self._entries
+
+    def snapshot(self) -> None:
+        """Ép ghi toàn bộ registry xuống đĩa: tmp → flush → fsync → replace.
+        Bắt buộc sau khi đổi ``_entries`` trực tiếp (bump_versions_exact)."""
+        self._compact()
 
     def save(self) -> None:
         self._open_fh()
@@ -512,20 +743,19 @@ class FileRegistry:
             f.write(json.dumps({"t": "h", "v": STATE_VERSION}) + "\n")
             for key in sorted(self._entries):
                 size, mtime, version, matches = self._entries[key]
-                f.write(
-                    json.dumps(
-                        {
-                            "t": "r",
-                            "k": key,
-                            "s": size,
-                            "m": mtime,
-                            "v": version,
-                            "x": matches,
-                        },
-                        ensure_ascii=False,
-                    )
-                    + "\n"
-                )
+                event: dict = {
+                    "t": "r",
+                    "k": key,
+                    "s": size,
+                    "m": mtime,
+                    "v": version,
+                    "x": matches,
+                }
+                if key in self._inherited:
+                    event["i"] = 1
+                f.write(json.dumps(event, ensure_ascii=False) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, path)
         self._lines_at_compact = 1 + len(self._entries)
         self._appended_lines = 0

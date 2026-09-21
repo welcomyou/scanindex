@@ -311,14 +311,19 @@ def test_declass_excel_note_cell_is_green(tmp_path) -> None:
 
     match = _match()
     match.declass_due = True
+    match.issue_year = 2016
+    match.declass_years = 10
     match.note = f"{DECLASS_NOTE_LABEL} (văn bản 2016, MẬT 10 năm)"
     dest = str(tmp_path / "danh_sach.xlsx")
     export_matches_to_excel([match], dest)
 
     wb = openpyxl.load_workbook(dest)
-    cell = wb.active.cell(row=2, column=8)
-    assert str(cell.value).startswith(DECLASS_NOTE_LABEL)
-    assert str(cell.font.color.rgb).endswith("1D7A34")
+    declass_cell = wb.active.cell(row=2, column=10)
+    assert declass_cell.value == "Đáp ứng (2016, 10 năm)"
+    assert str(declass_cell.font.color.rgb).endswith("1D7A34")
+    note_cell = wb.active.cell(row=2, column=11)
+    assert str(note_cell.value).startswith(DECLASS_NOTE_LABEL)
+    assert str(note_cell.font.color.rgb).endswith("1D7A34")
 
 
 # ---------------------------------------------------------------------------

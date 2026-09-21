@@ -42,6 +42,9 @@ add_data("assets", "assets")
 add_data("scanindex/core/repository/schema.sql", "scanindex/core/repository")
 add_data("settings.ini.example", ".")
 add_data("ignored_words.txt.example", ".")
+# Bảng mã định danh cơ quan cho cột "Mã cơ quan"/"Tên cơ quan" trong danh
+# sách văn bản mật xuất ra Excel.
+add_data("madinhdanh_lookup.json", ".")
 add_data("config/sign_settings.json.example", "config")
 add_data("config/sign_templates.json.example", "config")
 add_data("dictionaries", "dictionaries")

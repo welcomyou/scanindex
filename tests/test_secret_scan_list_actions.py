@@ -20,6 +20,7 @@ from scanindex.core import secret_scan_progress as ssp  # noqa: E402
 from scanindex.ui.screens.secret_file_scan_screen import (  # noqa: E402
     SecretFileScanScreen,
     SecretScanMatch,
+    _norm,
     _permanent_delete,
     export_matches_to_excel,
     load_secret_matches_from_excel,
@@ -238,7 +239,7 @@ def test_checkbox_updates_checked_paths_and_buttons(qapp, tmp_path) -> None:
     assert not screen.btn_batch_delete.isEnabled()
     item = screen.table.item(0, 0)
     item.setCheckState(__import__("PySide6").QtCore.Qt.CheckState.Checked)
-    assert screen._checked_paths == {os.path.normpath(os.path.abspath(path))}
+    assert screen._checked_paths == {_norm(path)}
     assert screen.btn_batch_delete.isEnabled()
     assert screen.btn_batch_not_secret.isEnabled()
 
@@ -247,20 +248,31 @@ def test_checkbox_updates_checked_paths_and_buttons(qapp, tmp_path) -> None:
     assert not screen.btn_batch_delete.isEnabled()
 
 
-def test_busy_disables_action_buttons(qapp, tmp_path) -> None:
+def test_action_buttons_stay_enabled_while_scanning(qapp, tmp_path) -> None:
+    """Xóa file / Không phải mật dùng được ngay trong lúc quét — dòng đã
+    hiện trên bảng là có thể xử lý, không phải đợi hết lượt."""
     screen = _screen(qapp)
     path = _mkfile(tmp_path)
     screen._add_result(_match(path))
     screen._checked_paths.add(os.path.normpath(os.path.abspath(path)))
 
-    screen._busy = True
-    screen._refresh_action_buttons()
-    assert not screen.btn_batch_delete.isEnabled()
-    assert not screen.btn_batch_not_secret.isEnabled()
-
-    screen._busy = False
+    screen._busy = True  # đang quét
     screen._refresh_action_buttons()
     assert screen.btn_batch_delete.isEnabled()
+    assert screen.btn_batch_not_secret.isEnabled()
+
+    screen._preview_current = _match(path)
+    screen._refresh_action_buttons()
+    assert screen.btn_preview_delete.isEnabled()
+    assert screen.btn_preview_not_secret.isEnabled()
+
+    # Hết check / hết preview thì mờ lại như thường.
+    screen._busy = False
+    screen._checked_paths.clear()
+    screen._preview_current = None
+    screen._refresh_action_buttons()
+    assert not screen.btn_batch_delete.isEnabled()
+    assert not screen.btn_preview_delete.isEnabled()
 
 
 def test_delete_files_removes_rows_and_disk_file(qapp, tmp_path, monkeypatch) -> None:
