@@ -236,6 +236,7 @@ UI_BACKEND_LOG_TEXT_PAIRS: tuple[tuple[str, str], ...] = (
     ("Processing {} pages...", "Đang xử lý {} trang..."),
     ("OCR completed: {}", "OCR đã hoàn tất: {}"),
     ("Assembled (cached OCR): {}", "Đã ghép (OCR cache): {}"),
+    ("Assembled canonical JSON only (cached OCR): {}", "Đã dựng dữ liệu OCR (JSON) từ cache: {}"),
     ("OCR page {}/{}...", "Đang OCR trang {}/{}..."),
     ("  Page {}: {} lines detected", "  Trang {}: nhận diện {} dòng"),
     ("Parallel OCR completed: {} selected page(s) in {}s ({} workers, max {} queued, {}s/page avg)", "OCR song song hoàn tất: {} trang đã chọn sau {} giây ({} worker, tối đa {} trong hàng đợi, trung bình {} giây/trang)"),

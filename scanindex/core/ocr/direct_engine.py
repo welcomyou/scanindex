@@ -109,6 +109,10 @@ _NUM_DLL_PER_PROCESS = 1
 
 _mp_pool = None  # multiprocessing.Pool with NUM_PAGE_WORKERS processes
 _mp_pool_lock = threading.Lock()
+# Recycle a worker after this many tasks (guards against native DLL leaks).
+# Default unchanged; env override exists for long-run leak/RSS measurement
+# only — see REVIEW_ocr_assembly_speedup.md §7.2 before changing the default.
+_MP_MAXTASKSPERCHILD = _env_int("DIRECT_OCR_MAXTASKSPERCHILD", 100)
 
 OCR_DPI = 240
 OCR_TEXT_NORMALIZATION = "latin_vi_canonical_v2"
@@ -308,7 +312,7 @@ def _get_pool():
                 processes=_NUM_PAGE_WORKERS,
                 initializer=_worker_init,
                 initargs=(dll_path, model_dir),
-                maxtasksperchild=100,
+                maxtasksperchild=max(1, _MP_MAXTASKSPERCHILD),
             )
 
         _mp_pool = pool
@@ -711,11 +715,158 @@ def _build_text_page_words(page, words_data, font_path, *, fallback_lines=None):
     with a horizontal morph keeps the PDF text layer aligned with word bboxes.
     ActualText preserves inter-word spacing even when adjacent bboxes are too
     close for a PDF viewer to infer the space geometrically.
+
+    Fast path: every word is committed through ONE Shape (one content stream)
+    and the /ActualText spans are wrapped in a single pass over that stream.
+    The legacy strategy (one `insert_text` + stream read/rewrite per word)
+    costs superlinearly on dense scan pages (1.7-2.6s/page at ~500-700 words).
+    On any structural surprise the batch is rolled back (its stream emptied)
+    and the legacy per-word path rebuilds the overlay, so output parity holds
+    on every code path — see `_build_text_page_words_batch`.
     """
     if not words_data:
         _build_text_page_lines(page, fallback_lines or [], font_path)
         return
+    if _build_text_page_words_batch(page, words_data, font_path):
+        return
+    _build_text_page_words_legacy(page, words_data, font_path)
 
+
+def _build_text_page_words_batch(page, words_data, font_path) -> bool:
+    """Batched word overlay. Returns True on success; False means the caller
+    must run `_build_text_page_words_legacy`.
+
+    Guarantees on False: either the page was never touched, or the single
+    committed batch stream has been emptied — so the legacy rebuild can never
+    double the overlay or damage the background content.
+    """
+    import fitz  # PyMuPDF - lazy import (not needed by screenshot tool)
+    font = fitz.Font(fontfile=font_path)
+
+    # Phase 1 — pure computation, no page mutation. Filters mirror the
+    # legacy path exactly (blank text, non-positive bbox) so parity holds.
+    ops = []  # (baseline, text, fontsize, morph matrix, ActualText hex)
+    for wd in words_data:
+        text = str(wd.get("text") or "")
+        if not text.strip():
+            continue
+        x, y, w, h = _line_xywh(wd)
+        if w <= 0 or h <= 0:
+            continue
+        font_size = max(h * 0.90, 4.0)
+        baseline = fitz.Point(x, y + h * 0.81)
+        natural_w = max(font.text_length(text, fontsize=font_size), 0.01)
+        hscale = max(0.05, min(20.0, w / natural_w))
+        actual_text = text + (" " if wd.get("has_space_after", True) else "")
+        actual_hex = ("FEFF" + actual_text.encode("utf-16-be").hex()).upper()
+        ops.append((baseline, text, font_size, fitz.Matrix(hscale, 1.0), actual_hex))
+    if not ops:
+        # Nothing survived filtering — same as legacy inserting nothing.
+        # Do NOT touch the page's content streams.
+        return True
+
+    def fill(shape):
+        for baseline, text, font_size, morph, _hex in ops:
+            shape.insert_text(
+                baseline,
+                text,
+                fontname="F0",
+                fontfile=font_path,
+                fontsize=font_size,
+                render_mode=3,
+                morph=(baseline, morph),
+            )
+
+    # Phase 2 — stage the exact same inserts on a scratch page first, so the
+    # committed stream bytes are obtained and validated before the real page
+    # is modified at all.
+    raw = _stage_word_overlay_stream(page.rect.width, page.rect.height, fill)
+    if raw is None:
+        return False
+    wrapped = _wrap_actual_text_spans(raw, [op[4] for op in ops])
+    if wrapped is None:
+        return False
+
+    # Phase 3 — replay the identical inserts on the real page. The committed
+    # bytes must equal the staged bytes; any deviation empties the batch
+    # stream and defers to the legacy path.
+    xref = None
+    try:
+        shape = page.new_shape()
+        fill(shape)
+        shape.commit()
+        xref = page.get_contents()[-1]
+        if page.parent.xref_stream(xref) != raw:
+            raise ValueError("committed stream differs from staged stream")
+        page.parent.update_stream(xref, wrapped)
+    except Exception:
+        if xref is not None:
+            try:
+                # Emptying the just-committed stream removes the overlay
+                # completely (renders/extracts nothing) without touching the
+                # page's background content or /Contents structure.
+                page.parent.update_stream(xref, b"")
+            except Exception:
+                pass
+        return False
+    return True
+
+
+def _stage_word_overlay_stream(page_w, page_h, fill):
+    """Run `fill(shape)` against a scratch page and return the committed
+    stream bytes, or None if anything unexpected happens (caller falls back
+    to the legacy overlay)."""
+    import fitz  # PyMuPDF - lazy import
+    try:
+        scratch_doc = fitz.open()
+        try:
+            scratch_page = scratch_doc.new_page(width=page_w, height=page_h)
+            shape = scratch_page.new_shape()
+            fill(shape)
+            shape.commit()
+            xrefs = scratch_page.get_contents()
+            if not xrefs:
+                return None
+            return bytes(scratch_doc.xref_stream(xrefs[-1]))
+        finally:
+            scratch_doc.close()
+    except Exception:
+        return None
+
+
+def _wrap_actual_text_spans(raw: bytes, actual_hexes) -> bytes | None:
+    """Wrap each staged text block (BT ... ET) with a /Span /ActualText
+    BDC..EMC pair, in insertion order — byte-equivalent to the wrapper the
+    legacy per-word path produced around its one-word streams.
+
+    Safe without a general PDF parser because every text payload in a staged
+    overlay stream is a hex glyph string `<...>`: 'T' is not a hex digit, so
+    the byte pairs b"BT"/b"ET" can only be the text-object operators. Any
+    count/structure deviation returns None and the caller falls back.
+    """
+    expected = len(actual_hexes)
+    if expected == 0:
+        return None
+    if raw.count(b"BT") != expected or raw.count(b"ET") != expected:
+        return None
+    parts = raw.split(b"BT")
+    if len(parts) != expected + 1:
+        return None
+    out = [parts[0]]
+    for actual_hex, seg in zip(actual_hexes, parts[1:]):
+        if b"ET" not in seg:
+            return None
+        out.append(f"/Span << /ActualText <{actual_hex}> >> BDC\nBT".encode("ascii"))
+        out.append(seg)
+        out.append(b"\nEMC\n")
+    return b"".join(out)
+
+
+def _build_text_page_words_legacy(page, words_data, font_path):
+    """Original per-word overlay: one `insert_text` + one stream read/rewrite
+    per word. Kept verbatim as the correctness fallback for
+    `_build_text_page_words_batch` and as the behavioural reference for
+    parity tests."""
     import fitz  # PyMuPDF - lazy import (not needed by screenshot tool)
     font = fitz.Font(fontfile=font_path)
     font_name = "F0"
@@ -1654,18 +1805,59 @@ def process_pdf(input_path, output_path, num_pages=None, update_callback=None,
         return False, str(e)
 
 
+def find_failed_page_results(page_results, total_pages) -> list[tuple[int, str]]:
+    """Detect pages whose OCR result is missing or carries an error payload.
+
+    Distinguishes a legitimately blank page (result present with render
+    dimensions and zero lines — a valid outcome) from a failed one:
+    result missing/None (submit or worker crash) or carrying
+    ``worker_init_failed``/``error`` (DLL/engine failure payloads that
+    `_worker_ocr_single` returns instead of raising).
+
+    Returns a list of ``(page_index, reason)`` with 0-based ``page_index``;
+    ``reason`` is ``"missing"`` or ``"engine-error"``. Callers (Archive
+    Step 1) use this to refuse assembling/predicting on incomplete OCR
+    instead of silently emitting empty canonical pages.
+    """
+    failures: list[tuple[int, str]] = []
+    for page_idx in range(int(total_pages or 0)):
+        try:
+            pr = page_results.get(page_idx)
+        except Exception:
+            pr = None
+        if pr is None:
+            failures.append((page_idx, "missing"))
+            continue
+        try:
+            if pr.get("worker_init_failed") or pr.get("error"):
+                failures.append((page_idx, "engine-error"))
+        except AttributeError:
+            failures.append((page_idx, "engine-error"))
+    return failures
+
+
 def assemble_pdf_from_page_results(input_path, output_path, all_page_results,
                                    source_document_path=None,
                                    source_page_indices=None,
                                    preprocess_rotations=None,
                                    update_callback=None,
                                    canonical_profile=None,
-                                   include_layout_analysis=True):
+                                   include_layout_analysis=True,
+                                   pdf_output=True):
     """Assemble `_ocr.pdf` + canonical JSON from already-OCRed page_results.
 
     Skips the OCR phase entirely — used when Step 1 of the archive screen has
     already pre-OCR'd every page and the cache hits. Mirrors the assembly
-    half of `process_pdf` (lines 727-850)."""
+    half of `process_pdf` (lines 727-850).
+
+    ``pdf_output=False`` builds ONLY the canonical JSON sidecar
+    (``<output_path>.json.zst``): no font lookup, no background copy, no
+    text overlay, no PDF write. Used by Archive Step 1, where the
+    full-source OCR PDF is never consumed downstream (Step 2 reassembles
+    per-segment PDFs from the page cache) and only the canonical JSON feeds
+    doc-start prediction + secrecy detection. Page geometry/index mapping,
+    coordinate normalization and the canonical profile stay identical to
+    the full build."""
     def log(msg, level="info"):
         if update_callback:
             try:
@@ -1680,9 +1872,11 @@ def assemble_pdf_from_page_results(input_path, output_path, all_page_results,
     try:
         import fitz
 
-        font_path = _find_unicode_font()
-        if not font_path:
-            return False, "No Unicode font found (need arial.ttf or similar)"
+        font_path = None
+        if pdf_output:
+            font_path = _find_unicode_font()
+            if not font_path:
+                return False, "No Unicode font found (need arial.ttf or similar)"
 
         source_for_pages = (source_document_path or input_path) if source_page_indices else input_path
         doc_in = fitz.open(source_for_pages)
@@ -1718,7 +1912,7 @@ def assemble_pdf_from_page_results(input_path, output_path, all_page_results,
             source_mode="scan",
         )
 
-        doc_out = fitz.open()
+        doc_out = fitz.open() if pdf_output else None
         pending_text_overlays = []
         background_specs = []
         for page_idx in range(total_pages):
@@ -1771,34 +1965,39 @@ def assemble_pdf_from_page_results(input_path, output_path, all_page_results,
             ocr_data["pages"].append(page_data)
 
             bake_angle = 180 if coord_flipped else 0
-            pending_text_overlays.append((words_data, lines_data))
-            background_specs.append({
-                "page_idx": source_page_idx,
-                "page_w": page_w,
-                "page_h": page_h,
-                "bake_angle": bake_angle,
-            })
+            if pdf_output:
+                pending_text_overlays.append((words_data, lines_data))
+                background_specs.append({
+                    "page_idx": source_page_idx,
+                    "page_w": page_w,
+                    "page_h": page_h,
+                    "bake_angle": bake_angle,
+                })
 
-        _append_backgrounds_preserving_inline_images(doc_out, doc_in, background_specs)
+        if pdf_output:
+            _append_backgrounds_preserving_inline_images(doc_out, doc_in, background_specs)
 
-        for page_idx, (words_data, lines_data) in enumerate(pending_text_overlays):
-            if page_idx >= len(doc_out):
-                break
-            _build_text_page_words(
-                doc_out[page_idx],
-                words_data,
-                font_path,
-                fallback_lines=lines_data,
-            )
+            for page_idx, (words_data, lines_data) in enumerate(pending_text_overlays):
+                if page_idx >= len(doc_out):
+                    break
+                _build_text_page_words(
+                    doc_out[page_idx],
+                    words_data,
+                    font_path,
+                    fallback_lines=lines_data,
+                )
 
-        doc_out.save(output_path, deflate=True, garbage=4)
-        doc_out.close()
+            doc_out.save(output_path, deflate=True, garbage=4)
+            doc_out.close()
         doc_in.close()
 
         json_path = output_path + ".json.zst"
         save_canonical(json_path, ocr_data, profile=canonical_profile)
 
-        log(f"Assembled (cached OCR): {output_path}", "success")
+        if pdf_output:
+            log(f"Assembled (cached OCR): {output_path}", "success")
+        else:
+            log(f"Assembled canonical JSON only (cached OCR): {json_path}", "success")
         return True, None
 
     except Exception as e:
@@ -1831,6 +2030,7 @@ def assemble_pdf_from_page_results_payload(payload_path: str):
             update_callback=None,
             canonical_profile=payload.get("canonical_profile"),
             include_layout_analysis=bool(payload.get("include_layout_analysis", True)),
+            pdf_output=bool(payload.get("pdf_output", True)),
         )
         return {
             "ok": bool(ok),

@@ -73,7 +73,8 @@ class ArchiveStep1Split(QWidget):
     zip_dropped = Signal(str)
     _ocr_page_done = Signal(int, int, int)  # run_id, page_idx, done_count
     _ocr_stage = Signal(int, str, str, int)  # run_id, status, title, total progress
-    _ocr_finished = Signal(int, str, object, str)  # run_id, ocr_pdf_path, split_result, error
+    # run_id, ocr_pdf_path ("" when JSON-only), canonical_json_path, split_result, error
+    _ocr_finished = Signal(int, str, str, object, str)
     _ocr_cancelled = Signal(int)  # run_id
 
     def __init__(self, session: ArchiveSession, parent=None):
@@ -739,7 +740,8 @@ class ArchiveStep1Split(QWidget):
             self._ocr_progress.setValue(max(0, min(100, int(progress_value))))
         self._set_overlay_status(status, title=title or None)
 
-    def _on_ocr_finished(self, run_id: int, ocr_pdf_path: str, split_result: object, error: str):
+    def _on_ocr_finished(self, run_id: int, ocr_pdf_path: str,
+                         canonical_json_path: str, split_result: object, error: str):
         if run_id != self._ocr_run_id:
             return
         self._ocr_timer.stop()
@@ -759,15 +761,12 @@ class ArchiveStep1Split(QWidget):
             title="Đang cập nhật giao diện",
         )
 
-        json_path = ""
-        resolved_json = None
-        if ocr_pdf_path:
-            from scanindex.core.canonical_io import companion_for_pdf, resolve_companion
-
-            resolved_json = resolve_companion(ocr_pdf_path)
-            json_path = str(resolved_json or companion_for_pdf(ocr_pdf_path))
-        self.session.step1_ocr_pdf_path = ocr_pdf_path
-        self.session.step1_ocr_json_path = str(resolved_json) if resolved_json is not None else None
+        # The completion payload carries both paths explicitly: with the
+        # default JSON-only assembly the OCR PDF is never written, so the
+        # canonical JSON must NOT be derived from a PDF path here.
+        json_path = canonical_json_path or ""
+        self.session.step1_ocr_pdf_path = ocr_pdf_path or ""
+        self.session.step1_ocr_json_path = json_path or None
 
         result = split_result if isinstance(split_result, dict) else {}
         starts = [int(p) for p in result.get("start_pages", [0]) if isinstance(p, int)]
@@ -777,9 +776,32 @@ class ArchiveStep1Split(QWidget):
 
         ui_t0 = time.monotonic()
         if self._viewer.page_count() != self.session.source_page_count:
-            if ocr_pdf_path and os.path.exists(ocr_pdf_path):
-                self.log_message.emit("[step1-ui] source viewer missing; loading OCR PDF for review")
-                self._viewer.load_pdf(ocr_pdf_path)
+            # Recover the viewer: prefer reloading the actual source PDF
+            # (always present), then the assembled OCR PDF when one was
+            # built. Never continue silently with a short viewer.
+            recovered = False
+            if self.session.source_pdf:
+                try:
+                    recovered = (
+                        self._viewer.load_pdf(self.session.source_pdf)
+                        == self.session.source_page_count
+                    )
+                except Exception as exc:
+                    self.log_message.emit(f"[step1-ui] source viewer reload failed: {exc}")
+            if not recovered and ocr_pdf_path and os.path.exists(ocr_pdf_path):
+                try:
+                    recovered = (
+                        self._viewer.load_pdf(ocr_pdf_path)
+                        == self.session.source_page_count
+                    )
+                except Exception as exc:
+                    self.log_message.emit(f"[step1-ui] OCR PDF reload failed: {exc}")
+            if recovered:
+                self.log_message.emit("[step1-ui] viewer reloaded after page-count mismatch")
+            else:
+                self.log_message.emit(
+                    "[step1-ui] viewer page-count mismatch could not be recovered"
+                )
         else:
             self.log_message.emit("[step1-ui] kept source PDF viewer; skipped full OCR PDF re-render")
         self._viewer.set_interaction_enabled(False)
@@ -883,7 +905,7 @@ class ArchiveStep1Split(QWidget):
                 try:
                     submit_until_full()
                 except Exception as e:
-                    self._ocr_finished.emit(run_id, "", {}, str(e))
+                    self._ocr_finished.emit(run_id, "", "", {}, str(e))
                     return
 
                 while pending:
@@ -917,7 +939,7 @@ class ArchiveStep1Split(QWidget):
                     try:
                         submit_until_full()
                     except Exception as e:
-                        self._ocr_finished.emit(run_id, "", {}, str(e))
+                        self._ocr_finished.emit(run_id, "", "", {}, str(e))
                         return
 
                 if cancel.is_set() or run_id != self._ocr_run_id:
@@ -926,16 +948,39 @@ class ArchiveStep1Split(QWidget):
 
                 self._ocr_stage.emit(
                     run_id,
-                    "OCR xong. Đang dựng PDF OCR và phát hiện trang đầu...",
+                    "OCR xong. Đang dựng dữ liệu OCR và phát hiện trang đầu...",
                     "Đang hoàn tất",
                     _PROGRESS_ASSEMBLE_START,
                 )
                 if cancel.is_set() or run_id != self._ocr_run_id:
                     self._ocr_cancelled.emit(run_id)
                     return
+                page_results = session.cache_slice(range(page_count))
+                # Correctness guard: refuse to assemble/predict on pages whose
+                # OCR failed (missing result or engine-error payload). A blank
+                # page with render dimensions is valid and passes; a dropped
+                # page would otherwise become a silent empty canonical page
+                # and skew doc-start prediction.
+                failures = direct_ocr_engine.find_failed_page_results(
+                    page_results, page_count)
+                if failures:
+                    preview = "; ".join(
+                        f"trang {pi + 1} ({reason})" for pi, reason in failures[:5])
+                    if len(failures) > 5:
+                        preview += ", ..."
+                    self._ocr_finished.emit(
+                        run_id, "", "", {},
+                        f"OCR thất bại trên {len(failures)}/{page_count} trang — "
+                        f"không thể tách văn bản tự động: {preview}",
+                    )
+                    return
                 os.makedirs(run_temp_dir, exist_ok=True)
                 ocr_pdf_path = os.path.join(run_temp_dir, "_step1_source_ocr.pdf")
-                page_results = session.cache_slice(range(page_count))
+                # Escape hatch read once per run and used consistently for the
+                # assemble call, the completion payload and the viewer fallback.
+                build_step1_pdf = os.environ.get(
+                    "OCRTOOL_STEP1_BUILD_OCR_PDF", ""
+                ).strip().lower() in {"1", "true", "yes", "on"}
                 assemble_t0 = time.monotonic()
                 ok, msg = direct_ocr_engine.assemble_pdf_from_page_results(
                     path,
@@ -945,12 +990,22 @@ class ArchiveStep1Split(QWidget):
                     update_callback=lambda m, lvl="info": self.log_message.emit(str(m)),
                     canonical_profile="layoutlmv3_runtime",
                     include_layout_analysis=False,
+                    pdf_output=build_step1_pdf,
                 )
                 if not ok:
-                    self._ocr_finished.emit(run_id, "", {}, msg or "assemble failed")
+                    self._ocr_finished.emit(run_id, "", "", {}, msg or "assemble failed")
+                    return
+                canonical_json_path = ocr_pdf_path + ".json.zst"
+                if not os.path.exists(canonical_json_path):
+                    self._ocr_finished.emit(
+                        run_id, "", "", {},
+                        f"canonical JSON missing after assemble: {canonical_json_path}",
+                    )
                     return
                 self.log_message.emit(
-                    f"[step1] assembled cached OCR PDF/JSON in {time.monotonic() - assemble_t0:.1f}s"
+                    f"[step1] assembled cached OCR JSON"
+                    f"{' + PDF' if build_step1_pdf else ''} "
+                    f"in {time.monotonic() - assemble_t0:.1f}s"
                 )
                 if cancel.is_set() or run_id != self._ocr_run_id:
                     self._ocr_cancelled.emit(run_id)
@@ -973,9 +1028,7 @@ class ArchiveStep1Split(QWidget):
                             warm_thread.join(timeout=0.2)
                     from scanindex.core.digitization import page_splitter as archive_page_splitter
                     split_t0 = time.monotonic()
-                    from scanindex.core.canonical_io import companion_for_pdf, resolve_companion
-
-                    canonical_path = resolve_companion(ocr_pdf_path) or companion_for_pdf(ocr_pdf_path)
+                    canonical_path = canonical_json_path
                     last_split_progress = _PROGRESS_ASSEMBLE_END
 
                     def on_split_progress(done_pages: int, total_pages: int):
@@ -1016,10 +1069,16 @@ class ArchiveStep1Split(QWidget):
                 except Exception as e:
                     self.log_message.emit(f"[step1-splitter] failed: {e}")
                     split_result = {"start_pages": [0], "pages": []}
-                self._ocr_finished.emit(run_id, ocr_pdf_path, split_result, "")
+                self._ocr_finished.emit(
+                    run_id,
+                    ocr_pdf_path if build_step1_pdf else "",
+                    canonical_json_path,
+                    split_result,
+                    "",
+                )
             except Exception as e:
                 self.log_message.emit(f"[step1-ocr] crashed: {e}\n{traceback.format_exc()}")
-                self._ocr_finished.emit(run_id, "", {}, str(e))
+                self._ocr_finished.emit(run_id, "", "", {}, str(e))
 
         self._ocr_thread = threading.Thread(target=worker, name="archive-step1-ocr",
                                             daemon=True)
@@ -1048,7 +1107,7 @@ class ArchiveStep1Split(QWidget):
                 and self.session.all_pages_cached()
                 and self._ocr_progress.value() <= _PROGRESS_OCR_END):
             self._set_overlay_status(
-                "OCR xong. Đang dựng PDF OCR và phát hiện trang đầu...",
+                "OCR xong. Đang dựng dữ liệu OCR và phát hiện trang đầu...",
                 title="Đang hoàn tất",
             )
 
