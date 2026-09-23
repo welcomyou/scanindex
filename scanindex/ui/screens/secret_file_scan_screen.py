@@ -1542,19 +1542,54 @@ def _precheck_source_readable(source_path: str) -> None:
                 verdict("PDF không có trang")
 
 
+def _settings_file_worker_count() -> int:
+    """Đọc [SecretScan] MaxFileWorkers từ settings.ini (0 = không cấu hình).
+
+    Tầng song song KHÁC MaxConcurrentOCR (số trang OCR song song trong pool
+    dùng chung toàn app): đây là số TÀI LIỆU quét mật xử lý đồng thời.
+    """
+    try:
+        import configparser
+
+        from scanindex.infra.data_versioning import get_active_settings_path
+
+        path = get_active_settings_path()
+        if not path or not os.path.exists(path):
+            return 0
+        parser = configparser.ConfigParser()
+        parser.read(path, encoding="utf-8")
+        if not parser.has_option("SecretScan", "MaxFileWorkers"):
+            return 0
+        return max(1, int(parser.get("SecretScan", "MaxFileWorkers")))
+    except Exception:
+        return 0
+
+
 def _file_worker_count(total: int) -> int:
-    """Số thread xử lý file song song (mặc định 2, clamp 1..total).
+    """Số thread xử lý file song song (clamp 1..total).
+
+    Thứ tự ưu tiên: biến môi trường SECRET_SCAN_MAX_FILE_WORKERS (debug,
+    override mọi thứ) → settings.ini [SecretScan] MaxFileWorkers → mặc
+    định 2. Ở "Tìm nhanh" mỗi file chỉ cần 1 trang OCR, nên để dùng hết
+    pool N worker OCR thì số file-worker cần cùng cỡ N (2 file-worker chỉ
+    bận 2/4 worker của pool MaxConcurrentOCR=4).
 
     Mỗi thread tự mở PDF riêng bằng PyMuPDF trong cùng process (Document
     không chia sẻ chéo thread). Stress-test trên wheel 1.26.7 ổn định,
     nhưng nếu cần loại trừ nghi vấn xung đột PyMuPDF đa luồng (vd máy
-    đang crash 0xc0000409), đặt biến môi trường
-    SECRET_SCAN_MAX_FILE_WORKERS=1 — scan chạy tuần hoàn toàn, chậm hơn
-    nhưng không còn fitz đa luồng nào.
+    đang crash 0xc0000409), đặt MaxFileWorkers=1 — scan chạy tuần hoàn
+    toàn phần, chậm hơn nhưng không còn fitz đa luồng nào.
     """
-    try:
-        want = int(os.environ.get("SECRET_SCAN_MAX_FILE_WORKERS", "2"))
-    except ValueError:
+    want = 0
+    raw_env = os.environ.get("SECRET_SCAN_MAX_FILE_WORKERS")
+    if raw_env:
+        try:
+            want = int(raw_env)
+        except ValueError:
+            want = 0
+    if not want:
+        want = _settings_file_worker_count()
+    if not want:
         want = 2
     return max(1, min(want, total if total > 0 else 1))
 
@@ -2739,6 +2774,22 @@ class SecretFileScanScreen(ScreenContent):
             return "legacy3"
         return "normal"
 
+    @staticmethod
+    def _continue_mode(prog, targets: list[str]) -> str:
+        """Chế độ cho nút "Tiếp tục hoàn tất" (hàm thuần để test): RESUME_RESCAN
+        khi còn tập quét lại chờ xử lý, HOẶC migration choice-3 dở mà tập rs
+        chưa kịp ghi (crash ngay sau begin_migration) — lúc đó dựng lại tập
+        quét lại từ matches theo choice đã lưu. Ngoài ra RESUME."""
+        if prog.rescan_pending:
+            return ResumeDecision.RESUME_RESCAN
+        if (
+            prog.migration
+            and int(prog.migration.get("choice") or 0) == 3
+            and targets
+        ):
+            return ResumeDecision.RESUME_RESCAN
+        return ResumeDecision.RESUME
+
     def _resume_decision(
         self, folder: str, first_page_only: bool
     ) -> ResumeDecision | None:
@@ -2798,12 +2849,17 @@ class SecretFileScanScreen(ScreenContent):
             box.exec()
             clicked = box.clickedButton()
             if clicked is btn_continue:
-                mode = (
-                    ResumeDecision.RESUME_RESCAN
-                    if prog.rescan_pending
-                    else ResumeDecision.RESUME
-                )
-                return ResumeDecision(mode, prog=prog)
+                targets = self._rescan_targets(prog, folder)
+                if (
+                    self._continue_mode(prog, targets)
+                    == ResumeDecision.RESUME_RESCAN
+                ):
+                    return ResumeDecision(
+                        ResumeDecision.RESUME_RESCAN,
+                        prog=prog,
+                        rescan_abs=targets,
+                    )
+                return ResumeDecision(ResumeDecision.RESUME, prog=prog)
             if clicked is btn_restart:
                 return ResumeDecision(ResumeDecision.RESTART)
             return None
@@ -2909,6 +2965,20 @@ class SecretFileScanScreen(ScreenContent):
 
         files = list(_iter_supported_files(folder))
         total = len(files)
+        # Ghép nhiệm vụ quét lại theo đường dẫn tuyệt đối ĐÃ CHUẨN HÓA
+        # (normcase): rel suy từ rescan_targets/rescan_pending có thể là chữ
+        # thường trong khi tên file trên đĩa có chữ HOA — so khớp chuỗi rel
+        # trực tiếp sẽ trượt toàn bộ trên Windows (vd "A06.35.25-CongVan.PDF"
+        # → rel "a06.35.25-congvan.pdf" không bao giờ tra cứu trúng).
+        enum_by_norm: dict[str, tuple[int, str]] = {}
+        for _enum_idx, _enum_path in enumerate(files, start=1):
+            enum_by_norm.setdefault(_norm(_enum_path), (_enum_idx, _enum_path))
+
+        def _canonical_rel(abs_norm: str) -> str | None:
+            """Rel đúng theo tên file trên đĩa cho abs đã chuẩn hóa."""
+            hit = enum_by_norm.get(abs_norm)
+            return os.path.relpath(hit[1], folder) if hit else None
+
         pending, skipped = _split_pending(files, folder, prog.done_files())
 
         # Registry — tách ĐỌC cache khỏi GHI lịch sử (R4/R5 review):
@@ -2932,21 +3002,30 @@ class SecretFileScanScreen(ScreenContent):
         # Trình tự bền vững (review mục 4): lưu ý định → nâng registry (chạy
         # lại được) → xác nhận trong journal. Crash giữa chừng: lần sau thấy
         # migration còn dở → tiếp tục, không phụ thuộc av đã khớp.
-        rescan_rels: list[str] = []
+        rescan_norms: list[str] = []
         upgraded_ok = True
         inherited_created = 0
         if resume_like:
             if prog.rescan_pending:
-                rescan_rels = sorted(prog.rescan_pending)
+                # Rel trong rs có thể là chữ thường (journal do bản bị lỗi
+                # chuẩn hóa ghi) → đưa về abs chuẩn hóa để so khớp không
+                # phân biệt chữ HOA/thường với tên file thật bên dưới.
+                candidates = [
+                    ssp._norm_path(os.path.join(folder, rel))
+                    for rel in sorted(prog.rescan_pending)
+                ]
             elif (
                 decision is not None
                 and decision.mode == ResumeDecision.RESUME_RESCAN
             ):
-                for abs_norm in decision.rescan_abs:
-                    try:
-                        rescan_rels.append(os.path.relpath(abs_norm, folder))
-                    except ValueError:
-                        continue
+                candidates = list(decision.rescan_abs)
+            else:
+                candidates = []
+            _seen_norm: set[str] = set()
+            for _norm_key in candidates:
+                if _norm_key and _norm_key not in _seen_norm:
+                    _seen_norm.add(_norm_key)
+                    rescan_norms.append(_norm_key)
             if needs_upgrade:
                 self._status_changed.emit(
                     "Nâng cấp lịch sử quét của phiên bản cũ..."
@@ -2962,10 +3041,20 @@ class SecretFileScanScreen(ScreenContent):
                 if (
                     decision is not None
                     and decision.mode == ResumeDecision.RESUME_RESCAN
-                    and rescan_rels
+                    and rescan_norms
                     and not prog.rescan_pending
                 ):
-                    prog.set_rescan_pending(rescan_rels)
+                    prog.set_rescan_pending(
+                        sorted(
+                            {
+                                rel
+                                for rel in (
+                                    _canonical_rel(n) for n in rescan_norms
+                                )
+                                if rel is not None
+                            }
+                        )
+                    )
                 prog.save()
                 matches_by_abs: dict[str, list[dict]] = {}
                 for match_dict in prog.matches:
@@ -3033,24 +3122,28 @@ class SecretFileScanScreen(ScreenContent):
         # ── Hàng đợi: pha quét lại file mật (nếu có) rồi pha pending ──────
         # Một file chỉ có MỘT task (R6): file nằm cả trong rescan lẫn pending
         # (trạng thái err) thì chỉ giữ nhiệm vụ quét lại.
-        enum_rel: dict[str, tuple[int, str]] = {
-            os.path.relpath(path, folder): (idx, path)
-            for idx, path in enumerate(files, start=1)
-        }
         rescan_tasks: list[tuple[int, str]] = []
         rescan_missing = 0
-        for rel in rescan_rels:
-            hit = enum_rel.get(rel)
+        for norm_key in rescan_norms:
+            hit = enum_by_norm.get(norm_key)
             if hit is None:
                 rescan_missing += 1
             else:
                 rescan_tasks.append(hit)
-        rescan_relset = {rel for rel in rescan_rels if rel in enum_rel}
+        rescan_found = {n for n in rescan_norms if n in enum_by_norm}
         pending = [
-            task
-            for task in pending
-            if os.path.relpath(task[1], folder) not in rescan_relset
+            task for task in pending if _norm(task[1]) not in rescan_found
         ]
+        if rescan_norms:
+            # Ghi lại tập chờ quét lại dạng CHUẨN (rel đúng tên file thật,
+            # bỏ file không còn trên đĩa): tự chữa journal từng bị ghi rel
+            # chữ thường, và không để file đã xóa kẹt mãi trong tập này
+            # (needs_continue luôn đúng → hộp thoại "còn dở" lặp vô hạn).
+            canonical_pending = sorted(
+                {rel for rel in (_canonical_rel(n) for n in rescan_found) if rel}
+            )
+            if set(canonical_pending) != prog.rescan_pending:
+                prog.set_rescan_pending(canonical_pending)
         if rescan_missing:
             self.log_message.emit(
                 f"{rescan_missing} file mật cũ không còn trong thư mục — giữ "
@@ -3228,8 +3321,13 @@ class SecretFileScanScreen(ScreenContent):
                     if replace:
                         # File giờ là rác (0 byte/hỏng): giữ hàng cũ, bỏ khỏi
                         # tập quét lại để không retry vô hạn qua các lượt.
+                        # Trừ cả dạng normcase — journal cũ có thể đang giữ
+                        # rel chữ thường cho file này.
                         prog.set_rescan_pending(
-                            sorted(prog.rescan_pending - {rel})
+                            sorted(
+                                prog.rescan_pending
+                                - {rel, os.path.normcase(rel)}
+                            )
                         )
                 with progress_lock:
                     junk[0] += 1

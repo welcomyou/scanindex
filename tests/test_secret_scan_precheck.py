@@ -135,9 +135,12 @@ def test_fresh_corrupt_content_is_retryable_not_skip(tmp_path):
 # ── Van điều chỉnh số file-worker (nghi vấn PyMuPDF đa luồng) ─────────────
 
 def test_file_worker_count_default_and_clamp(monkeypatch):
+    from scanindex.ui.screens import secret_file_scan_screen as sfss_mod
     from scanindex.ui.screens.secret_file_scan_screen import _file_worker_count
 
     monkeypatch.delenv("SECRET_SCAN_MAX_FILE_WORKERS", raising=False)
+    # Cô lập khỏi settings.ini thật của máy chạy test.
+    monkeypatch.setattr(sfss_mod, "_settings_file_worker_count", lambda: 0)
     assert _file_worker_count(10) == 2
     assert _file_worker_count(1) == 1
     monkeypatch.setenv("SECRET_SCAN_MAX_FILE_WORKERS", "1")
@@ -146,5 +149,20 @@ def test_file_worker_count_default_and_clamp(monkeypatch):
     assert _file_worker_count(10) == 9
     monkeypatch.setenv("SECRET_SCAN_MAX_FILE_WORKERS", "abc")
     assert _file_worker_count(10) == 2
+    # "0" vô nghĩa — coi như chưa đặt, dùng default.
     monkeypatch.setenv("SECRET_SCAN_MAX_FILE_WORKERS", "0")
-    assert _file_worker_count(10) == 1
+    assert _file_worker_count(10) == 2
+
+
+def test_file_worker_count_settings_priority(monkeypatch):
+    """Ưu tiên: env SECRET_SCAN_MAX_FILE_WORKERS > [SecretScan]
+    MaxFileWorkers trong settings.ini > mặc định 2."""
+    from scanindex.ui.screens import secret_file_scan_screen as sfss_mod
+    from scanindex.ui.screens.secret_file_scan_screen import _file_worker_count
+
+    monkeypatch.delenv("SECRET_SCAN_MAX_FILE_WORKERS", raising=False)
+    monkeypatch.setattr(sfss_mod, "_settings_file_worker_count", lambda: 4)
+    assert _file_worker_count(10) == 4   # settings thắng default
+    assert _file_worker_count(2) == 2    # clamp theo tổng số file
+    monkeypatch.setenv("SECRET_SCAN_MAX_FILE_WORKERS", "3")
+    assert _file_worker_count(10) == 3   # env thắng settings

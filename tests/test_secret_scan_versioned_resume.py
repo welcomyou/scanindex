@@ -643,3 +643,173 @@ def test_registry_bump_benchmark_300k(tmp_path) -> None:
     # Giới hạn lỏng (máy CI chậm): bump+snapshot toàn cục dưới 60s.
     assert bump_secs < 60, f"bump+snapshot quá chậm: {bump_secs:.1f}s"
     assert load_secs < 30, f"reload quá chậm: {load_secs:.1f}s"
+
+
+# ---------------------------------------------------------------------------
+# 7. Bug thực tế: journal v1 resume mồ côi + rescan trượt chữ HOA/thường
+# ---------------------------------------------------------------------------
+
+def test_journal_legacy_v1_resume_appends_loadable(tmp_path) -> None:
+    """Repro lỗi người dùng (1.1.9 → 1.1.11, dừng, mở lại): resume từ
+    journal v1 của bản cũ rồi append tiến độ mới — lần load SAU phải thấy
+    tiến độ MỚI, không rơi về state cũ của file v1."""
+    folder = str(tmp_path / "kho")
+    os.makedirs(folder, exist_ok=True)
+    legacy = ssp.legacy_journal_path(folder, "fast")
+    os.makedirs(os.path.dirname(legacy), exist_ok=True)
+    with open(legacy, "w", encoding="utf-8", newline="\n") as f:
+        f.write(json.dumps({"t": "h", "v": 1, "folder": folder, "mode": "fast"}) + "\n")
+        for i in range(100):
+            f.write(json.dumps({"t": "f", "p": f"f{i:03d}.pdf", "s": "ok"}) + "\n")
+        f.write(
+            json.dumps({"t": "m", "d": _old_match(os.path.join(folder, "f000.pdf"))})
+            + "\n"
+        )
+
+    # Lượt 2 (bản mới): load journal cũ → nâng cấp + thay file mật + quét thêm.
+    prog = ssp.SecretScanProgress.load(folder, "fast")
+    assert prog is not None
+    prog.begin_migration(NEW_VERSION, 3)
+    prog.accept_version(NEW_VERSION)
+    prog.finish_migration()
+    prog.commit_replace_file(
+        "f000.pdf", ssp._norm_path(os.path.join(folder, "f000.pdf")), []
+    )
+    for i in range(100, 150):
+        prog.record_file(f"f{i:03d}.pdf", "ok")
+    prog.save()
+    prog.close()
+
+    # Lượt 3: KHÔNG được rơi về journal v1 cũ (100 file, av rỗng).
+    prog3 = ssp.SecretScanProgress.load(folder, "fast")
+    assert prog3 is not None
+    assert len(prog3.done_files()) == 150
+    assert prog3.app_version == NEW_VERSION
+    assert prog3.matches == []            # f000 đã thay bằng kết quả rỗng
+    assert not os.path.exists(legacy)     # file v1 đã được gộp/xóa
+
+
+def test_worker_rescan_mixed_case_filename(qapp, tmp_path, monkeypatch) -> None:
+    """Repro: file tên có CHỮ HOA — rescan phải chạy THẬT (không bị coi là
+    'không còn trong thư mục'), tập chờ sạch, journal hoàn tất bị xóa."""
+    monkeypatch.setattr(sfss, "_SCAN_MAX_INFLIGHT_FILES", 1)
+    monkeypatch.setenv("SECRET_SCAN_MAX_FILE_WORKERS", "1")
+    folder = tmp_path / "Kho"
+    folder.mkdir()
+    fa = folder / "A06.35.25-CongVan.PDF"   # mật cũ — CHỮ HOA
+    fb = folder / "B06.35.25-KeHoach.PDF"   # mật cũ — CHỮ HOA
+    fc = folder / "c06.35.25-thuong.pdf"    # chưa quét
+    for p in (fa, fb, fc):
+        p.write_bytes(b"%PDF-1.4 fake")
+    fa_s, fb_s, fc_s = str(fa), str(fb), str(fc)
+    paths = [fa_s, fb_s, fc_s]
+
+    old = {fa_s: [_old_match(fa_s)], fb_s: [_old_match(fb_s)]}
+    _seed_journal(str(folder), paths, old, pending=(fc_s,))
+
+    screen = _screen(qapp)
+    calls = []
+
+    def fake_scan(source_path, *args):
+        calls.append(source_path)
+        return []
+
+    monkeypatch.setattr(sfss, "scan_one_file_for_secret", fake_scan)
+    prog = ssp.SecretScanProgress.load(str(folder), "fast")
+    decision = ResumeDecision(
+        ResumeDecision.RESUME_RESCAN,
+        prog=prog,
+        rescan_abs=SecretFileScanScreen._rescan_targets(prog, str(folder)),
+    )
+    _run_sync(screen, str(folder), decision)
+
+    # 2 file mật cũ được quét lại thật + 1 file pending — không file nào bị
+    # đếm nhầm "không còn trong thư mục".
+    assert sorted(calls) == sorted([fa_s, fb_s, fc_s])
+    loaded = ssp.SecretScanProgress.load(str(folder), "fast")
+    assert loaded is None                 # hoàn tất sạch — journal bị xóa
+    assert screen.table.rowCount() == 0   # rescan trả rỗng → hàng cũ biến mất
+
+
+def test_worker_rescan_heals_poisoned_pending(qapp, tmp_path, monkeypatch) -> None:
+    """Journal từng bị ghi rs chữ THƯỜNG (bản lỗi normcase) kèm file mật cũ
+    đã bị xóa khỏi đĩa: resume 'continue' phải quét lại đúng file còn, bỏ
+    file mất khỏi tập chờ — không kẹt hộp thoại 'còn dở' vô hạn."""
+    monkeypatch.setattr(sfss, "_SCAN_MAX_INFLIGHT_FILES", 1)
+    monkeypatch.setenv("SECRET_SCAN_MAX_FILE_WORKERS", "1")
+    folder = tmp_path / "Kho"
+    folder.mkdir()
+    fa = folder / "A06.35.25-CongVan.PDF"
+    fb = folder / "DaXoa.PDF"
+    fa_s, fb_s = str(fa), str(fb)
+    for p in (fa, fb):
+        p.write_bytes(b"%PDF-1.4 fake")
+
+    folder_s = str(folder)
+    prog = ssp.SecretScanProgress.create(folder_s, "fast", NEW_VERSION)
+    prog.record_file("A06.35.25-CongVan.PDF", "ok")
+    prog.record_matches([_old_match(fa_s)])
+    prog.record_file("DaXoa.PDF", "ok")
+    prog.record_matches([_old_match(fb_s)])
+    # Giả lập journal do bản lỗi chuẩn hóa ghi: rel chữ thường.
+    prog.set_rescan_pending(["a06.35.25-congvan.pdf", "daxoa.pdf"])
+    prog.save()
+    prog.close()
+    os.remove(fb_s)  # file mật cũ bị xóa khỏi đĩa sau đó
+
+    screen = _screen(qapp)
+    calls = []
+
+    def fake_scan(source_path, *args):
+        calls.append(source_path)
+        return [_m(fa_s, source_version=NEW_VERSION)]
+
+    monkeypatch.setattr(sfss, "scan_one_file_for_secret", fake_scan)
+    loaded = ssp.SecretScanProgress.load(folder_s, "fast")
+    assert loaded is not None and loaded.rescan_pending
+    decision = ResumeDecision(
+        ResumeDecision.RESUME_RESCAN,
+        prog=loaded,
+        rescan_abs=SecretFileScanScreen._rescan_targets(loaded, folder_s),
+    )
+    _run_sync(screen, folder_s, decision)
+
+    assert calls == [fa_s]                # chỉ file còn trên đĩa được quét lại
+    assert screen.table.rowCount() == 1   # hàng cũ thay bằng hàng mới
+    after = ssp.SecretScanProgress.load(folder_s, "fast")
+    assert after is None                  # pending sạch → journal xóa hẳn
+
+
+def test_continue_mode_rebuilds_rescan_from_mig_choice() -> None:
+    """Crash giữa begin_migration và set_rescan_pending: nút 'Tiếp tục hoàn
+    tất' vẫn phải chọn RESUME_RESCAN theo choice=3 đã lưu (R1 — ý định nâng
+    cấp phải dựng lại được)."""
+
+    class _Prog:
+        def __init__(self, pending, migration):
+            self.rescan_pending = pending
+            self.migration = migration
+
+    targets = [ssp._norm_path(r"D:\kho\A.PDF")]
+    assert (
+        SecretFileScanScreen._continue_mode(
+            _Prog(set(), {"target": NEW_VERSION, "choice": 3}), targets
+        )
+        == ResumeDecision.RESUME_RESCAN
+    )
+    # choice 2 / migration đã xong / không còn targets → RESUME thường.
+    assert (
+        SecretFileScanScreen._continue_mode(
+            _Prog(set(), {"target": NEW_VERSION, "choice": 2}), targets
+        )
+        == ResumeDecision.RESUME
+    )
+    assert (
+        SecretFileScanScreen._continue_mode(_Prog(set(), None), targets)
+        == ResumeDecision.RESUME
+    )
+    # Còn tập quét lại → RESUME_RESCAN bất kể migration.
+    assert (
+        SecretFileScanScreen._continue_mode(_Prog({"a.pdf"}, None), [])
+        == ResumeDecision.RESUME_RESCAN
+    )

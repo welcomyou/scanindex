@@ -27,6 +27,17 @@ device = cpu
 ; maxexportworkers: 1 phù hợp máy <16GB RAM; tăng lên 2 nếu máy khỏe (mỗi worker ~1.2GB GMFT)
 maxexportworkers = 1
 
+[SecretScan]
+; MaxFileWorkers = số TÀI LIỆU xử lý đồng thời khi quét file mật (mặc định 2).
+; LƯU Ý khác MaxConcurrentOCR (số TRANG OCR song song trong pool dùng chung):
+; ở chế độ "Tìm nhanh" mỗi tài liệu chỉ OCR trang đầu, nên với pool
+; MaxConcurrentOCR=4 mà MaxFileWorkers=2 thì chỉ 2/4 worker OCR được dùng.
+; Muốn dùng hết pool thì đặt MaxFileWorkers ngang MaxConcurrentOCR.
+; Đặt 1 nếu nghi ngờ crash 0xc0000409 liên quan PyMuPDF đa luồng (quét chậm
+; hơn nhưng chạy tuần tự hoàn toàn). Biến môi trường SECRET_SCAN_MAX_FILE_WORKERS
+; (nếu đặt) override key này.
+maxfileworkers = 2
+
 [KIE]
 ; Supported mode: layoutlmv3
 ; Full-field LightGBM KIE is disabled; LightGBM is kept only for the archive splitter.

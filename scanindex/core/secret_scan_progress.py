@@ -198,10 +198,26 @@ class SecretScanProgress:
         losing at most the one event being written; per-file replacements
         are single atomic ``rpf`` lines, so a torn tail keeps either the
         old result or the complete new one — never half of each.
+
+        A legacy journal that loads successfully is migrated IN PLACE into
+        the v2 file right here: appends only ever go to the v2 path, and a
+        v2 file whose first line is not a header replays as None — without
+        this rewrite every event appended after a legacy resume would be
+        orphaned and the next load would fall back to the stale v1 file
+        again, losing the whole session.
         """
         prog = cls._replay(journal_path(folder, mode), folder, mode)
         if prog is None:
             prog = cls._replay(legacy_journal_path(folder, mode), folder, mode)
+            if prog is not None:
+                try:
+                    prog._compact()  # header + toàn bộ state sang file v2
+                except OSError:
+                    return prog  # ghi hỏng: giữ nguyên v1, lần sau thử lại
+                try:
+                    os.remove(legacy_journal_path(folder, mode))
+                except OSError:
+                    pass
         return prog
 
     @classmethod
@@ -285,6 +301,7 @@ class SecretScanProgress:
                     prog._errors.pop(rel, None)
                     prog._skipped.pop(rel, None)
                     prog.rescan_pending.discard(rel)
+                    prog.rescan_pending.discard(os.path.normcase(rel))
                 if abs_norm:
                     prog.matches = [
                         d
@@ -403,7 +420,10 @@ class SecretScanProgress:
         self._done.add(rel)
         self._errors.pop(rel, None)
         self._skipped.pop(rel, None)
+        # Bỏ cả dạng normcase: journal do bản bị lỗi chuẩn hóa có thể đang
+        # giữ rel chữ thường cho đúng file này (tên trên đĩa có chữ HOA).
         self.rescan_pending.discard(rel)
+        self.rescan_pending.discard(os.path.normcase(rel))
         self.matches = [
             d
             for d in self.matches
