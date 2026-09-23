@@ -1034,6 +1034,7 @@ class MainWindow(QMainWindow):
         self._saved = {
             "w_page": "1.0", "w_int": "1.0",
             "concurrency": "4",   # default 4 page workers
+            "secret_file_workers": "2",   # quét file mật: số tài liệu song song
             "export_workers": "1",
             "model": "", "gpu": "CPU", "verbose": True,
             "correct": False, "export": True,
@@ -1088,6 +1089,17 @@ class MainWindow(QMainWindow):
                     self._saved["skip_duplicate_docs"] = self.config["Repository"].getboolean(
                         "SkipDuplicateDocs", True
                     )
+
+                if "SecretScan" in self.config:
+                    # Số tài liệu quét song song ở màn "Phát hiện file mật"
+                    # (tầng file, tách khỏi MaxConcurrentOCR — tầng trang).
+                    try:
+                        sfw = int(
+                            self.config["SecretScan"].get("MaxFileWorkers", "2")
+                        )
+                    except ValueError:
+                        sfw = 2
+                    self._saved["secret_file_workers"] = str(max(1, sfw))
 
                 if "KIE" in self.config:
                     self._saved["kie_mode"] = self._normalize_kie_mode_setting(
@@ -1162,6 +1174,7 @@ class MainWindow(QMainWindow):
             theme=s.get("theme", ACTIVE_THEME),
             zip_include_canonical=s.get("zip_include_canonical", True),
             skip_duplicate_docs=s.get("skip_duplicate_docs", True),
+            secret_file_workers=s.get("secret_file_workers", "2"),
         )
 
         self.log_panel.set_verbose(s["verbose"])
@@ -1185,6 +1198,18 @@ class MainWindow(QMainWindow):
         # removed to avoid over-allocating memory-heavy table-export workers.
         val_exp = 1
         self.max_export_workers = val_exp
+
+        # Số tài liệu quét song song ở màn "Phát hiện file mật". Clamp 1..8 —
+        # mỗi file-worker mở PDF riêng bằng PyMuPDF trong process chính
+        # (stress-test ổn định ở mức thấp; xem docstring _file_worker_count).
+        try:
+            val_sfw = max(1, min(8, int(vals.get("secret_file_workers", "2"))))
+        except (TypeError, ValueError):
+            val_sfw = 2
+        if "SecretScan" not in self.config:
+            self.config["SecretScan"] = {}
+        self.config["SecretScan"]["MaxFileWorkers"] = str(val_sfw)
+        self._saved["secret_file_workers"] = str(val_sfw)
 
         new_theme = "light" if str(vals.get("theme", "dark")).lower() == "light" else "dark"
         self.config["General"] = {

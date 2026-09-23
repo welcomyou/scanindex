@@ -3150,10 +3150,21 @@ class SecretFileScanScreen(ScreenContent):
                 "kết quả cũ.",
                 "info",
             )
-        # Tiến độ lượt này bắt đầu từ 0, tổng là số file lượt NÀY phải xử lý;
-        # nhóm kế thừa hiển thị riêng (review: không đếm một file hai lần).
-        progress_total = len(rescan_tasks) + len(pending)
-        self._progress_changed.emit(0, max(1, progress_total))
+        # Tiến độ theo TOÀN thư mục: resume ở 150/200 phải thấy thanh chạy
+        # từ 75%, không phải 0% (trước đây thanh đếm theo phần việc còn lại
+        # của lượt nên luôn khởi động 0%, trong khi status lại ghi
+        # "Đang quét 151/200" — hai thang đo lệch nhau). Base = số file
+        # enumeration đã xong; task pending và task quét lại cho file CHƯA
+        # được tính ở base (file err cũ có match cũ) hoàn thành xong +1 —
+        # không đếm một file hai lần, không vượt total.
+        progress_total = total
+        folder_done = [skipped]
+        counted_norms = {_norm(task[1]) for task in pending}
+        _done_rels = prog.done_files()
+        for _task_idx, _task_path in rescan_tasks:
+            if os.path.relpath(_task_path, folder) not in _done_rels:
+                counted_norms.add(_norm(_task_path))
+        self._progress_changed.emit(folder_done[0], max(1, progress_total))
         if resume_like:
             self.log_message.emit(
                 f"Tiếp tục quét: kế thừa {skipped} file đã quét, còn "
@@ -3361,7 +3372,11 @@ class SecretFileScanScreen(ScreenContent):
                         registry.save()
                 with progress_lock:
                     done[0] += 1
-                    self._progress_changed.emit(done[0], max(1, progress_total))
+                    if _norm(path) in counted_norms:
+                        folder_done[0] += 1
+                    self._progress_changed.emit(
+                        folder_done[0], max(1, progress_total)
+                    )
                     periodic_mem = done[0] % 500 == 0
                 if periodic_mem:
                     # Đo RAM định kỳ: bằng chứng cho các lần crash native

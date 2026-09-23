@@ -128,6 +128,22 @@ class SettingsTab(QWidget):
         self.lbl_concurrency = self._row_label("Số trang OCR song song")
         form.addRow(self.lbl_concurrency, self.entry_concurrency)
 
+        # Tầng song song KHÁC của dòng trên: số TÀI LIỆU xử lý đồng thời ở
+        # màn "Phát hiện file mật trong thư mục" — mỗi tài liệu bỏ trang vào
+        # pool OCR chung. "Tìm nhanh" chỉ cần 1 trang/tài liệu nên để dùng
+        # hết pool thì số này nên ngang số trang OCR song song.
+        self.entry_secret_file_workers = QLineEdit("2")
+        self.entry_secret_file_workers.setFixedWidth(100)
+        self.entry_secret_file_workers.setToolTip(
+            translations.get_text("tooltip_secret_file_workers")
+        )
+        self.lbl_secret_file_workers = self._row_label(
+            translations.get_text("lbl_secret_file_workers")
+        )
+        form.addRow(
+            self.lbl_secret_file_workers, self.entry_secret_file_workers
+        )
+
         # KIE inference mode (used by Số hóa lưu trữ).
         # Keep the control for compatibility with saved settings/exported config.
         self.combo_kie_mode = FuzzyComboBox(sort=False)
@@ -553,10 +569,12 @@ class SettingsTab(QWidget):
                    catalogs: dict | None = None,
                    theme: str = "dark",
                    zip_include_canonical: bool = True,
-                   skip_duplicate_docs: bool = True):
+                   skip_duplicate_docs: bool = True,
+                   secret_file_workers: str = "2"):
         self._wait_page_value = wait_page
         self._compare_value = compare_int
         self.entry_concurrency.setText(concurrency)
+        self.entry_secret_file_workers.setText(secret_file_workers)
         self.combo_model.blockSignals(True)
         if model and self.combo_model.findText(model) < 0:
             self.combo_model.addItem(model)
@@ -596,6 +614,7 @@ class SettingsTab(QWidget):
             "wait_page": self._wait_page_value,
             "compare_int": self._compare_value,
             "concurrency": self.entry_concurrency.text(),
+            "secret_file_workers": self.entry_secret_file_workers.text(),
             "export_workers": "1",
             "model": self.combo_model.currentText(),
             "correct": self.chk_correct_enabled.isChecked(),
@@ -637,6 +656,12 @@ class SettingsTab(QWidget):
         self.chk_verbose.setText(translations.get_text("chk_verbose_log"))
         self.lbl_desc.setText(translations.get_text("lbl_settings_desc"))
         self.lbl_concurrency.setText(translations.get_text("lbl_concurrency_ocr"))
+        self.lbl_secret_file_workers.setText(
+            translations.get_text("lbl_secret_file_workers")
+        )
+        self.entry_secret_file_workers.setToolTip(
+            translations.get_text("tooltip_secret_file_workers")
+        )
         if hasattr(self, "lbl_lang"):
             self.lbl_lang.setText(translations.get_text("lbl_language"))
         if hasattr(self, "lbl_theme"):

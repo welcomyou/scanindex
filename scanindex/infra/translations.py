@@ -304,6 +304,24 @@ The software prioritizes local processing when models and dependencies are insta
         "en": "OCR Files In Parallel:",
         "vi": "Số file OCR cùng lúc:"
     },
+    "lbl_secret_file_workers": {
+        "en": "Secret-scan Files In Parallel:",
+        "vi": "Số tài liệu quét song song (quét file mật):"
+    },
+    "tooltip_secret_file_workers": {
+        "en": (
+            "Number of documents scanned concurrently by the secret-file "
+            "scan (default 2).\nMatch the OCR pages setting so Fast mode "
+            "keeps the OCR pool busy.\nSet 1 if you suspect PyMuPDF "
+            "multithreading crashes (fully sequential, slower)."
+        ),
+        "vi": (
+            "Số tài liệu quét đồng thời ở màn Phát hiện file mật (mặc định 2).\n"
+            "Đặt ngang \"Số trang OCR song song\" để chế độ Tìm nhanh dùng hết "
+            "pool OCR.\nĐặt 1 nếu nghi crash 0xc0000409 liên quan PyMuPDF đa "
+            "luồng (chạy tuần tự, chậm hơn)."
+        ),
+    },
     "lbl_concurrency_export": {
         "en": "Word Export Processes:",
         "vi": "Số tiến trình xuất Word:"

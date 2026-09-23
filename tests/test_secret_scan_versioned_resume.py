@@ -813,3 +813,34 @@ def test_continue_mode_rebuilds_rescan_from_mig_choice() -> None:
         SecretFileScanScreen._continue_mode(_Prog({"a.pdf"}, None), [])
         == ResumeDecision.RESUME_RESCAN
     )
+
+
+def test_worker_resume_progress_counts_whole_folder(
+    qapp, tmp_path, monkeypatch
+) -> None:
+    """Resume khi 2/3 file đã quét: thanh tiến độ phải chạy theo TOÀN thư
+    mục (2/3 → 3/3), không reset 0% theo phần việc còn lại của lượt."""
+    monkeypatch.setenv("SECRET_SCAN_MAX_FILE_WORKERS", "1")
+    folder, paths = _mk_tree(tmp_path, 3)
+    f0, f1, f2 = paths
+    _seed_journal(folder, paths, {}, pending=(f2,))  # f0, f1 đã quét
+
+    screen = _screen(qapp)
+    seen = []
+    screen._progress_changed.connect(
+        lambda cur, tot: seen.append((cur, tot))
+    )
+
+    def fake_scan(source_path, *args):
+        return []
+
+    monkeypatch.setattr(sfss, "scan_one_file_for_secret", fake_scan)
+    decision = ResumeDecision(
+        ResumeDecision.RESUME,
+        prog=ssp.SecretScanProgress.load(folder, "fast"),
+    )
+    _run_sync(screen, folder, decision)
+
+    assert seen and seen[0] == (2, 3)   # khởi động ở 2/3, không phải 0/1
+    assert seen[-1] == (3, 3)           # kết thúc đúng 100% toàn thư mục
+    assert max(c for c, _ in seen) == 3  # không vượt total
