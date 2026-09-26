@@ -62,6 +62,7 @@ lock Windows mirror theo ``scanindex.core.repository.admin``.
 """
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import time
@@ -189,7 +190,18 @@ def _move_path_with_retry(src: Path, dst: Path, *,
     """Move một path, chịu đựng lock tạm thời của Windows (winerror 5/32/33)."""
     for attempt in range(max(1, int(attempts))):
         try:
-            shutil.move(str(src), str(dst))
+            # Check every move, including inverse/rollback moves after a parent
+            # has moved: those collisions are invisible during preflight.
+            if os.path.lexists(dst) and not (
+                    src == dst and os.path.samefile(src, dst)):
+                raise FileExistsError(f'Đã có sẵn "{dst}" — không ghi đè.')
+            if os.name == "nt":
+                # Windows rename refuses an occupied destination atomically.
+                # shutil.move would fall back to copy+delete on failure and
+                # could overwrite data or leave a copy after a sharing error.
+                os.rename(src, dst)
+            else:
+                shutil.move(str(src), str(dst))
             return
         except OSError as exc:
             is_transient_lock = (
@@ -1233,6 +1245,21 @@ def execute_plan(plan: RenamePlan, *,
     được gọi giữa các op — an toàn vì mỗi op là một rename nguyên tử.
     """
     total = len(plan.ops)
+    # Chốt cửa sổ hở giữa lúc lập kế hoạch và lúc chạy: _validate_ops chỉ
+    # nhìn thấy đĩa tại thời điểm lập kế hoạch; nếu sau đó ai đó tạo file/
+    # thư mục trùng tên đích, shutil.move trên Windows sẽ COPY ĐÈ lên file
+    # có sẵn thay vì báo lỗi (os.rename hỏng thì rơi nhánh copy+delete).
+    # Đích trùng với một src khác của chính kế hoạch là hợp lệ — two-phase
+    # dời nó vào staging trước; needs_stage (chỉ khác hoa/thường) cũng vậy.
+    sources = {op.src for op in plan.ops}
+    for op in plan.ops:
+        if op.dst == op.src or op.needs_stage or op.dst in sources:
+            continue
+        if op.dst.exists():
+            return ExecuteResult(
+                error=f'Đã có sẵn "{op.dst.name}" trong '
+                      f'"{op.dst.parent.name or op.dst.parent}" — không thực '
+                      "thi để tránh ghi đè. Hãy làm mới cây rồi thử lại.")
     if plan.staging_dir is not None and total:
         try:
             plan.staging_dir.mkdir(parents=True, exist_ok=True)

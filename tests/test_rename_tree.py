@@ -1,4 +1,5 @@
 """Tests cho scanindex.core.rename_tree (đổi tên theo cây CSDL_SOHOA)."""
+import json
 import os
 import sys
 import time
@@ -1621,4 +1622,281 @@ def test_screen_renumber_pdf_from_menu_follows_visual_order(tree, monkeypatch,
         f"{prefix}-001.pdf".encode()  # cũ 001 xếp sau → 003
     assert not (d / f"{prefix}-001.pdf").exists()
     assert hs_rel not in screen._manual_order  # đã ghi vào tên → dọn thứ tự
+    screen.deleteLater()
+
+
+# ------------------------------------- hoàn tác thứ tự hiển thị + pre-flight
+
+def test_execute_aborts_when_pdf_dst_appears_after_plan(tree):
+    """Đích bị chiếm SAU lúc dựng kế hoạch → chặn cả kế hoạch.
+
+    shutil.move trên Windows sẽ copy đè im lặng lên file có sẵn nếu os.rename
+    hỏng — pre-flight của execute_plan phải chặn trước khi đụng đĩa."""
+    hs_a = Path(MDD) / PHONG / "01" / f"{MDD}-{PHONG}-01-0001"
+    hs_b = Path(MDD) / PHONG / "01" / f"{MDD}-{PHONG}-01-0002"
+    n2 = f"{MDD}-{PHONG}-01-0001-002.pdf"
+    plan = rt.plan_pdf_move(tree, [hs_a / n2], hs_b)
+    assert plan.ops
+
+    clash = tree / hs_b / f"{MDD}-{PHONG}-01-0002-002.pdf"
+    clash.write_bytes(b"du-lieu-quan-trong")
+
+    res = rt.execute_plan(plan)
+    assert "ghi đè" in res.error and not res.rolled_back
+    assert (tree / hs_a / n2).is_file()  # nguồn không bị xóa/đổi
+    assert clash.read_bytes() == b"du-lieu-quan-trong"  # không bị đè
+
+
+def test_execute_aborts_when_folder_dst_appears_after_plan(tree):
+    """Thư mục trùng tên đích xuất hiện sau lúc dựng kế hoạch → chặn."""
+    ml = Path(MDD) / PHONG / "01"
+    plan = rt.plan_folder_rename(tree, ml, "03")
+    assert plan.ops
+    blocker = tree / MDD / PHONG / "03"
+    blocker.mkdir()
+    res = rt.execute_plan(plan)
+    assert "ghi đè" in res.error
+    assert (tree / ml / f"{MDD}-{PHONG}-01-0001").is_dir()  # cây nguyên vẹn
+    assert blocker.is_dir()
+
+
+def test_execute_preflight_allows_two_phase_swap(tree):
+    """Hoán đổi tên 001↔002 (two-phase) không bị pre-flight chặn nhầm."""
+    hs = Path(MDD) / PHONG / "01" / f"{MDD}-{PHONG}-01-0001"
+    d, names = _pdf_names(tree)
+    plan = rt.plan_pdf_reorder(tree, hs, list(reversed(names)))
+    res = rt.execute_plan(plan)
+    assert not res.error and res.done_ops == len(plan.ops)
+    assert (d / f"{MDD}-{PHONG}-01-0001-001.pdf").read_bytes() == \
+        f"{MDD}-{PHONG}-01-0001-002.pdf".encode()
+
+
+def test_screen_undo_visual_reorder_keeps_prior_disk_op(tree, monkeypatch,
+                                                        tmp_path):
+    """Ctrl+Z sau khi xếp lại thứ tự trong cùng cha: trả thứ tự hiển thị,
+    KHÔNG được lùi thao tác đĩa đứng trước nó."""
+    from PySide6.QtWidgets import QApplication
+
+    screen = _make_screen(tree, monkeypatch, tmp_path)
+    ml01 = f"{MDD}/{PHONG}/01"
+    # 1) Thao tác đĩa thật: đổi số hồ sơ 0002 → 0007.
+    plan = rt.plan_folder_rename(
+        tree, Path(ml01) / f"{MDD}-{PHONG}-01-0002", "0007")
+    screen._execute_plan(plan)
+    _wait_not_busy(screen)
+    hs7 = f"{ml01}/{MDD}-{PHONG}-01-0007"
+    assert (tree / Path(hs7)).is_dir()
+
+    # 2) Kéo 0007 lên đầu (thuần hiển thị).
+    screen._handle_ho_so_drop(hs7, ml01, 0)
+    QApplication.processEvents()
+    assert screen._dir_child_order(ml01)[0] == f"{MDD}-{PHONG}-01-0007"
+
+    # 3) Ctrl+Z: thứ tự hiển thị trở lại, đĩa nguyên vẹn.
+    screen._undo_last()
+    QApplication.processEvents()
+    order = screen._dir_child_order(ml01)
+    assert order.index(f"{MDD}-{PHONG}-01-0007") > \
+        order.index(f"{MDD}-{PHONG}-01-0001")
+    assert (tree / Path(hs7)).is_dir()
+    assert len(screen._undo_stack) == 1  # entry đổi tên chưa bị tiêu
+
+    # 4) Ctrl+Z lần nữa mới lùi đúng thao tác đĩa (0007 → 0002).
+    screen._undo_last()
+    _wait_not_busy(screen)
+    assert (tree / Path(ml01) / f"{MDD}-{PHONG}-01-0002").is_dir()
+    assert not (tree / Path(hs7)).exists()
+    screen.deleteLater()
+
+
+def test_screen_undo_pdf_visual_reorder(tree, monkeypatch, tmp_path):
+    """Ctrl+Z sau khi xếp lại thứ tự PDF trong cùng hồ sơ: trả lại thứ tự."""
+    from PySide6.QtWidgets import QApplication
+
+    screen = _make_screen(tree, monkeypatch, tmp_path)
+    hs_rel = f"{MDD}/{PHONG}/01/{MDD}-{PHONG}-01-0001"
+    n1 = f"{MDD}-{PHONG}-01-0001-001.pdf"
+    n2 = f"{MDD}-{PHONG}-01-0001-002.pdf"
+
+    screen._handle_pdf_move([f"{hs_rel}/{n2}"], hs_rel, 0)  # 002 lên đầu
+    QApplication.processEvents()
+    assert screen._child_order(hs_rel, dirs=False) == [n2, n1]
+
+    screen._undo_last()
+    QApplication.processEvents()
+    assert screen._child_order(hs_rel, dirs=False) == [n1, n2]
+    assert sorted(p.name for p in (tree / Path(hs_rel)).glob("*.pdf")) == \
+        [n1, n2]  # đĩa nguyên vẹn
+    screen.deleteLater()
+
+
+def test_screen_undo_move_restores_manual_orders(tree, monkeypatch, tmp_path):
+    """Hoàn tác chuyển hồ sơ: thứ tự thủ công của đích cũng phải về như trước
+    (tên hồ sơ không còn nằm treo trong danh sách thứ tự của mục lục đích)."""
+    screen = _make_screen(tree, monkeypatch, tmp_path)
+    ml01, ml02 = f"{MDD}/{PHONG}/01", f"{MDD}/{PHONG}/02"
+    hs2 = f"{ml01}/{MDD}-{PHONG}-01-0002"
+
+    screen._handle_ho_so_drop(hs2, ml02, 0)  # đầu mục lục đích
+    _wait_not_busy(screen)
+    assert screen._manual_order[ml02][0] == f"{MDD}-{PHONG}-02-0002"
+
+    screen._undo_last()
+    _wait_not_busy(screen)
+    assert ml02 not in screen._manual_order
+    assert (tree / Path(hs2)).is_dir()
+    screen.deleteLater()
+
+
+def test_settings_load_does_not_wipe_manual_orders(tree, monkeypatch,
+                                                   tmp_path):
+    """Mở lại app: thứ tự thủ công trong settings phải còn nguyên trên đĩa
+    sau khi nạp (trước đây bị ghi đè rỗng ngay lúc khởi động)."""
+    from PySide6.QtWidgets import QApplication
+
+    from scanindex.ui.screens import rename_tree_screen as rts
+
+    settings_path = tmp_path / "rename_tree_settings.json"
+    monkeypatch.setattr(rts, "_SETTINGS_FILE", str(settings_path))
+    ml01 = f"{MDD}/{PHONG}/01"
+    hs2 = f"{ml01}/{MDD}-{PHONG}-01-0002"
+
+    # Lần chạy đầu: đặt thứ tự thủ công.
+    screen = rts.RenameTreeScreen()
+    screen._set_root(tree)
+    screen._handle_ho_so_drop(hs2, ml01, 0)
+    QApplication.processEvents()
+    saved = json.loads(settings_path.read_text(encoding="utf-8"))
+    assert saved["order"][ml01][0] == f"{MDD}-{PHONG}-01-0002"
+    screen.deleteLater()
+
+    # Lần chạy thứ hai (mở lại app): order phải được giữ cả trên đĩa lẫn cây.
+    screen2 = rts.RenameTreeScreen()
+    QApplication.processEvents()
+    again = json.loads(settings_path.read_text(encoding="utf-8"))
+    assert again["order"].get(ml01, [])[0] == f"{MDD}-{PHONG}-01-0002"
+    assert screen2._manual_order[ml01][0] == f"{MDD}-{PHONG}-01-0002"
+    screen2.deleteLater()
+
+
+def test_screen_failed_undo_preserves_history_and_orders_for_retry(
+        tree, monkeypatch, tmp_path):
+    screen = _make_screen(tree, monkeypatch, tmp_path)
+    ml01, ml02 = f"{MDD}/{PHONG}/01", f"{MDD}/{PHONG}/02"
+    hs = f"{ml01}/{MDD}-{PHONG}-01-0002"
+    screen._handle_ho_so_drop(hs, ml02, 0)
+    _wait_not_busy(screen)
+    orders = screen._snapshot_orders()
+    entry = screen._undo_stack[-1]
+    # An external folder now occupies the original name.
+    blocker = tree / hs
+    blocker.mkdir()
+    screen._undo_last()
+    _wait_not_busy(screen)
+    assert screen._undo_stack == [entry]
+    assert screen._manual_order == orders
+    assert json.loads((tmp_path / "rename_tree_settings.json").read_text(
+        encoding="utf-8"))["order"] == orders
+    blocker.rmdir()
+    screen._undo_last()
+    _wait_not_busy(screen)
+    assert (tree / hs).is_dir()
+    assert not screen._undo_stack
+    assert not screen._manual_order
+    screen.deleteLater()
+
+
+def test_screen_undo_build_failure_keeps_entry(tree, monkeypatch, tmp_path):
+    from scanindex.ui.screens import rename_tree_screen as rts
+
+    screen = _make_screen(tree, monkeypatch, tmp_path)
+    def unavailable():
+        raise OSError("temporarily unavailable")
+    entry = rts._UndoEntry(title="unavailable", build=unavailable)
+    screen._push_undo(entry)
+    monkeypatch.setattr(rts.QMessageBox, "warning", lambda *a: None)
+    screen._undo_last()
+    assert screen._undo_stack == [entry]
+    screen.deleteLater()
+
+
+def test_screen_failed_move_restores_manual_order(tree, monkeypatch, tmp_path):
+    screen = _make_screen(tree, monkeypatch, tmp_path)
+    hs = f"{MDD}/{PHONG}/01/{MDD}-{PHONG}-01-0001"
+    target = f"{MDD}/{PHONG}/01/{MDD}-{PHONG}-01-0002"
+    n2 = f"{MDD}-{PHONG}-01-0001-002.pdf"
+    screen._handle_pdf_move([f"{hs}/{n2}"], hs, 0)
+    orders = screen._snapshot_orders()
+    history = list(screen._undo_stack)
+    def locked(*args, **kwargs):
+        raise PermissionError("simulated lock")
+    monkeypatch.setattr(rt, "_move_path_with_retry", locked)
+    screen._handle_pdf_move([f"{hs}/{n2}"], target, 0)
+    _wait_not_busy(screen)
+    assert screen._manual_order == orders
+    assert screen._undo_stack == history
+    assert screen._child_order(hs, dirs=False)[0] == n2
+    screen.deleteLater()
+
+
+def test_inverse_folder_rename_preserves_external_pdf_collision(tree):
+    hs = Path(MDD) / PHONG / "01" / f"{MDD}-{PHONG}-01-0001"
+    plan = rt.plan_folder_rename(tree, hs, "0007")
+    assert not rt.execute_plan(plan).error
+    new_hs = tree / hs.parent / plan.new_name
+    old_name = f"{MDD}-{PHONG}-01-0001-001.pdf"
+    new_name = f"{MDD}-{PHONG}-01-0007-001.pdf"
+    content = (new_hs / new_name).read_bytes()
+    # This clash is hidden under the renamed parent during preflight.
+    (new_hs / old_name).write_bytes(b"external document")
+    result = rt.execute_plan(rt.plan_invert(plan, "undo"))
+    assert result.error
+    assert result.rolled_back
+    assert (new_hs / old_name).read_bytes() == b"external document"
+    assert (new_hs / new_name).read_bytes() == content
+
+
+def test_execute_preserves_destination_created_during_execution(tree):
+    hs = Path(MDD) / PHONG / "01" / f"{MDD}-{PHONG}-01-0001"
+    plan = rt.plan_folder_rename(tree, hs, "0007")
+    blocker = plan.ops[1].dst
+    def create_collision(done, total):
+        if done == 1:
+            blocker.write_bytes(b"external document")
+    result = rt.execute_plan(plan, progress_cb=create_collision)
+    assert result.error
+    assert blocker.read_bytes() == b"external document"
+    for op in plan.ops:
+        assert op.src.exists()
+
+
+@pytest.mark.parametrize("busy", [False, True])
+def test_screen_delayed_preview_does_not_interrupt_next_action(
+        tree, monkeypatch, tmp_path, busy):
+    from scanindex.ui.screens import rename_tree_screen as rts
+
+    screen = _make_screen(tree, monkeypatch, tmp_path)
+    hs = f"{MDD}/{PHONG}/01/{MDD}-{PHONG}-01-0001"
+    n1 = f"{MDD}-{PHONG}-01-0001-001.pdf"
+    n2 = f"{MDD}-{PHONG}-01-0001-002.pdf"
+    opened, callbacks = [], []
+    monkeypatch.setattr(screen.pdf_viewer, "show_pdf", opened.append)
+    monkeypatch.setattr(rts.QTimer, "singleShot",
+                        lambda delay, context, callback: callbacks.append(callback))
+    screen._show_pdf(f"{hs}/{n1}")
+    screen._execute_plan(rt.plan_pdf_rename_stt(tree, Path(hs) / n1, "003"))
+    _wait_not_busy(screen)
+    assert callbacks
+    if busy:
+        # Another undo has started and must retain exclusive disk access.
+        screen._executing = True
+    else:
+        screen._show_pdf(f"{hs}/{n2}")
+    expected = screen._current_pdf_rel
+    opened.clear()
+    for callback in callbacks:
+        callback()
+    assert not opened
+    assert screen._current_pdf_rel == expected
+    screen._executing = False
     screen.deleteLater()

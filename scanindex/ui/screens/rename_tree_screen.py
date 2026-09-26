@@ -40,7 +40,7 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from PySide6.QtCore import QPoint, QPointF, QSize, Qt, QThread, QTimer, Signal
@@ -708,9 +708,18 @@ class _UndoEntry:
     ``build`` chạy lúc hoàn tác (Ctrl+Z): dựng kế hoạch đảo ngược op của
     kế hoạch gốc — chạy ngược từ trạng thái cuối về trạng thái đầu. Nếu
     cây đã đổi khác khiến op hỏng thì thực thi tự rollback và báo lỗi.
+
+    ``orders`` là ảnh WHOLE của thứ tự thủ công TRƯỚC thao tác — hoàn tác
+    khôi phục lại cùng lúc với op trên đĩa (kéo thả đổi cả hai).
+
+    ``apply`` (nếu có) là hoàn tác thuần hiển thị cho kéo-thả chỉ xếp lại
+    thứ tự trong cùng cha (không đụng đĩa) — khôi phục ``orders`` và vẽ
+    lại cây, không chạy kế hoạch nào.
     """
     title: str
-    build: Callable[[], rt.RenamePlan]
+    build: Callable[[], rt.RenamePlan] | None = None
+    apply: Callable[[], None] | None = None
+    orders: dict[str, list[str]] = field(default_factory=dict)
 
 
 # --------------------------------------------------------------------------- #
@@ -1246,6 +1255,7 @@ class RenameTreeScreen(ScreenContent):
             return
         order = None
         container = None
+        orders_before = None
         level = item.data(0, _ROLE_LEVEL)
         if not item.data(0, _ROLE_ISDIR):  # tài liệu PDF
             container = Path(rel).parent.as_posix()
@@ -1267,9 +1277,10 @@ class RenameTreeScreen(ScreenContent):
             return
         if container is not None:
             # Tên đã mang đúng thứ tự hiển thị → bỏ thứ tự thủ công của cha.
+            orders_before = self._snapshot_orders()
             self._manual_order.pop(container, None)
             self._save_settings()
-        self._execute_plan(plan)
+        self._execute_plan(plan, orders_before=orders_before)
 
     def _open_in_explorer(self, path: Path):
         try:
@@ -1303,6 +1314,8 @@ class RenameTreeScreen(ScreenContent):
     # ------------------------------------------------------------- viewer
 
     def _show_pdf(self, rel: str):
+        if self.is_busy() or self._root is None:
+            return
         path = self._root / Path(rel)
         if not path.is_file():
             return
@@ -1310,6 +1323,11 @@ class RenameTreeScreen(ScreenContent):
         self.lbl_preview_path.setText(rel)
         self.preview_stack.setCurrentIndex(1)
         self.pdf_viewer.show_pdf(str(path))
+
+    def _restore_pdf_preview(self, rel: str):
+        # A delayed callback can outlive the selection or the next Ctrl+Z.
+        if self._current_pdf_rel == rel:
+            self._show_pdf(rel)
 
     # ------------------------------------------------------------- đổi tên
 
@@ -1375,11 +1393,17 @@ class RenameTreeScreen(ScreenContent):
             return
         self._execute_plan(dlg.plan)
 
-    def _execute_plan(self, plan: rt.RenamePlan, *, undoable: bool = True):
+    def _execute_plan(self, plan: rt.RenamePlan, *, undoable: bool = True,
+                      orders_before: dict[str, list[str]] | None = None,
+                      undo_entry: _UndoEntry | None = None):
         # Windows chặn rename file đang mở và MuPDF không thích bị đóng lúc
         # render thread đang chạy → nhả viewer + xả hết slot treo trước khi
         # thực thi (cùng pattern với Kho lưu trữ trước khi relabel hồ sơ).
-        self._pending_undo = self._undo_entry_for(plan) if undoable else None
+        self._pending_undo = (
+            self._undo_entry_for(plan, orders_before) if undoable else None)
+        orders_before = self._snapshot_orders() if orders_before is None else {
+            k: list(v) for k, v in orders_before.items()
+        }
         self._executing = True
         had_pdf = self._current_pdf_rel is not None
         self.pdf_viewer.clear()
@@ -1398,7 +1422,8 @@ class RenameTreeScreen(ScreenContent):
         self._worker.progress.connect(self._on_rename_progress)
         self._worker.done.connect(
             lambda p, r: self._on_rename_done(
-                p, r, old_expanded, old_selected, old_pdf
+                p, r, old_expanded, old_selected, old_pdf,
+                orders_before=orders_before, undo_entry=undo_entry,
             )
         )
         self._worker.start()
@@ -1410,9 +1435,9 @@ class RenameTreeScreen(ScreenContent):
 
     def _on_rename_done(self, plan: rt.RenamePlan, result: rt.ExecuteResult,
                         old_expanded: set[str], old_selected: str | None,
-                        old_pdf: str | None):
-        self._executing = False
-        self._set_busy(False)
+                        old_pdf: str | None, *,
+                        orders_before: dict[str, list[str]] | None = None,
+                        undo_entry: _UndoEntry | None = None):
         # KHÔNG set self._worker = None tại đây: slot này chạy ngay khi thread
         # vừa emit done xong — hủy wrapper QThread lúc C++ còn dọn dẹp sẽ
         # abort tiến trình. Giữ reference cho đến khi bị thay thế ở lần
@@ -1453,10 +1478,20 @@ class RenameTreeScreen(ScreenContent):
         # Map trạng thái cây / viewer sang path mới CHỈ khi thao tác thành
         # công; nếu đã hoàn tác thì mọi path giữ nguyên như trước thao tác.
         success = not result.error
+        if success and undo_entry is not None:
+            # Consume history and restore display state only after disk undo
+            # succeeds. A failed/cancelled undo stays available for retry.
+            if self._undo_stack and self._undo_stack[-1] is undo_entry:
+                self._undo_stack.pop()
+            self._manual_order = {
+                k: list(v) for k, v in undo_entry.orders.items()
+            }
+            self._save_settings()
+        elif not success and orders_before is not None:
+            self._manual_order = {k: list(v) for k, v in orders_before.items()}
+            self._save_settings()
         if success and self._pending_undo is not None:
-            self._undo_stack.append(self._pending_undo)
-            if len(self._undo_stack) > self._UNDO_LIMIT:
-                self._undo_stack.pop(0)
+            self._push_undo(self._pending_undo)
         self._pending_undo = None
         if success:
             expanded = {rt.map_path(plan, r) for r in old_expanded}
@@ -1476,12 +1511,14 @@ class RenameTreeScreen(ScreenContent):
                 self.lbl_preview_path.setText(target_rel)
                 self.preview_stack.setCurrentIndex(1)
                 QTimer.singleShot(
-                    30, self, lambda rel=target_rel: self._show_pdf(rel)
+                    30, self, lambda rel=target_rel: self._restore_pdf_preview(rel)
                 )
             else:
                 self._current_pdf_rel = None
                 self.lbl_preview_path.setText("")
                 self.preview_stack.setCurrentIndex(0)
+        self._executing = False
+        self._set_busy(False)
 
     # ------------------------------------------------------ di chuyển (DnD)
 
@@ -1532,8 +1569,18 @@ class RenameTreeScreen(ScreenContent):
             if insert_at < 0:
                 insert_at = len(names)
             names.insert(min(insert_at, len(names)), name)
+            # Xếp lại thứ tự trong cùng cha là thuần hiển thị — vẫn phải
+            # hoàn tác được (Ctrl+Z), nếu không Ctrl+Z sẽ lùi thao tác ĐĨA
+            # trước đó thay vì thao tác người dùng vừa làm.
+            snapshot = self._snapshot_orders()
             self._set_manual_order(target_ml_rel, names)
             self._repopulate_item(target_ml_rel)
+            self._push_undo(_UndoEntry(
+                title=(f'đặt hồ sơ "{name}" vào vị trí {insert_at + 1} '
+                       f'của "{target_ml_rel}"'),
+                apply=lambda s=snapshot, c=[target_ml_rel]:
+                    self._apply_orders_undo(s, c),
+            ))
             self.log_message.emit(
                 translations.localize_text(
                     f'Đã đặt hồ sơ "{name}" vào vị trí {insert_at + 1} của '
@@ -1541,6 +1588,7 @@ class RenameTreeScreen(ScreenContent):
                 ),
                 "info")
             return
+        orders_before = self._snapshot_orders()
         try:
             plan = rt.plan_folder_move(
                 self._root, Path(rel), Path(target_ml_rel))
@@ -1558,7 +1606,7 @@ class RenameTreeScreen(ScreenContent):
         if old_order and Path(rel).name in old_order:
             old_order.remove(Path(rel).name)
             self._set_manual_order(src_ml, old_order)
-        self._execute_plan(plan)
+        self._execute_plan(plan, orders_before=orders_before)
 
     def _on_pdf_move_requested(self, rels: list, target_rel: str,
                                insert_at: int = -1):
@@ -1587,9 +1635,18 @@ class RenameTreeScreen(ScreenContent):
                 insert_at = len(names)
             for k, n in enumerate(group_names):
                 names.insert(min(insert_at + k, len(names)), n)
+            # Như hồ sơ cùng mục lục: thuần hiển thị nhưng phải hoàn tác được.
+            snapshot = self._snapshot_orders()
             self._set_manual_order(target_rel, names)
             self._repopulate_item(target_rel)
+            self._push_undo(_UndoEntry(
+                title=(f"đặt {len(group_names)} tài liệu vào vị trí "
+                       f'{insert_at + 1} của "{Path(target_rel).name}"'),
+                apply=lambda s=snapshot, c=[target_rel]:
+                    self._apply_orders_undo(s, c),
+            ))
             return
+        orders_before = self._snapshot_orders()
         try:
             plan = rt.plan_pdf_move(
                 self._root, [Path(r) for r in rels], Path(target_rel))
@@ -1619,17 +1676,22 @@ class RenameTreeScreen(ScreenContent):
                     old_list.remove(Path(r).name)
                     self._set_manual_order(src_hs, old_list)
         if plan.ops:
-            self._execute_plan(plan)
+            self._execute_plan(plan, orders_before=orders_before)
         else:
             self._repopulate_item(target_rel)
 
     # ------------------------------------------------------------- hoàn tác
 
-    def _undo_entry_for(self, plan: rt.RenamePlan) -> _UndoEntry | None:
+    def _undo_entry_for(self, plan: rt.RenamePlan,
+                        orders_before: dict[str, list[str]] | None = None
+                        ) -> _UndoEntry | None:
         """Mục hoàn tác cho plan sắp thực thi: đảo ngược toàn bộ op (xem
-        ``rt.plan_invert`` — chạy ngược từ trạng thái cuối về đầu)."""
+        ``rt.plan_invert`` — chạy ngược từ trạng thái cuối về đầu) kèm ảnh
+        thứ tự thủ công TRƯỚC thao tác để khôi phục cùng lúc."""
         if not plan.ops:
             return None
+        orders = self._snapshot_orders() if orders_before is None \
+            else {k: list(v) for k, v in orders_before.items()}
 
         def build() -> rt.RenamePlan:
             return rt.plan_invert(
@@ -1639,13 +1701,46 @@ class RenameTreeScreen(ScreenContent):
                 ),
             )
 
-        return _UndoEntry(title=plan.title, build=build)
+        return _UndoEntry(title=plan.title, build=build, orders=orders)
+
+    def _snapshot_orders(self) -> dict[str, list[str]]:
+        """Ảnh WHOLE của thứ tự thủ công hiện tại (deep-copy từng danh sách)."""
+        return {k: list(v) for k, v in self._manual_order.items()}
+
+    def _push_undo(self, entry: _UndoEntry) -> None:
+        self._undo_stack.append(entry)
+        if len(self._undo_stack) > self._UNDO_LIMIT:
+            self._undo_stack.pop(0)
+
+    def _apply_orders_undo(self, orders: dict[str, list[str]],
+                           containers: list[str]) -> None:
+        """Hoàn tác thuần hiển thị (xếp lại thứ tự trong cùng cha): trả thứ
+        tự thủ công về ảnh trước thao tác và vẽ lại các mục bị đụng đến."""
+        self._manual_order = {k: list(v) for k, v in orders.items()}
+        self._save_settings()
+        for rel in containers:
+            self._repopulate_item(rel)
 
     def _undo_last(self):
-        """Ctrl+Z — hoàn tác thao tác đổi tên / di chuyển / sắp xếp gần nhất."""
+        """Ctrl+Z — hoàn tác thao tác đổi tên / di chuyển / sắp xếp gần nhất.
+
+        Hoàn tác thuần hiển thị (``apply``) chạy ngay tại chỗ; hoàn tác đĩa
+        chạy ngược toàn bộ op của kế hoạch gốc và chỉ khôi phục thứ tự thủ
+        công / xóa lịch sử sau khi thành công.
+        """
         if self.is_busy() or self._root is None or not self._undo_stack:
             return
-        entry = self._undo_stack.pop()
+        entry = self._undo_stack[-1]
+        if entry.apply is not None:
+            entry.apply()
+            self._undo_stack.pop()
+            self.log_message.emit(
+                translations.localize_text(
+                    f"Hoàn tác: {translations.localize_text(entry.title)}"
+                ),
+                "info",
+            )
+            return
         try:
             plan = entry.build()
         except (ValueError, OSError) as exc:
@@ -1658,6 +1753,7 @@ class RenameTreeScreen(ScreenContent):
             )
             return
         if not plan.ops:
+            self._undo_stack.pop()
             return  # cây đã về đúng trạng thái cũ
         self.log_message.emit(
             translations.localize_text(
@@ -1665,7 +1761,7 @@ class RenameTreeScreen(ScreenContent):
             ),
             "info",
         )
-        self._execute_plan(plan, undoable=False)
+        self._execute_plan(plan, undoable=False, undo_entry=entry)
 
     def _collect_expanded(self) -> set[str]:
         rels: set[str] = set()
@@ -1735,6 +1831,10 @@ class RenameTreeScreen(ScreenContent):
                         str(k): [str(n) for n in v]
                         for k, v in order.items() if isinstance(v, list)
                     }
+                    # _set_root đã xả file settings với thứ tự rỗng (nó phải
+                    # clear trước khi đọc được root) — ghi lại ngay, kẻo app
+                    # đóng trước một lần _save_settings kế tiếp thì mất.
+                    self._save_settings()
         except Exception:
             pass
 
