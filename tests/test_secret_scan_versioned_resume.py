@@ -604,10 +604,10 @@ def test_excel_old_8col_file_roundtrip_consistent(tmp_path) -> None:
     dest = str(tmp_path / "moi.xlsx")
     export_matches_to_excel(loaded, dest)
     ws2 = openpyxl.load_workbook(dest).active
-    assert ws2.cell(row=1, column=10).value == "Đáp ứng giải mật"
-    assert ws2.cell(row=2, column=10).value == "Đáp ứng (2016, 10 năm)"
+    assert ws2.cell(row=1, column=11).value == "Đáp ứng giải mật"
+    assert ws2.cell(row=2, column=11).value == "Đáp ứng (2016, 10 năm)"
     # Chưa đạt (không dữ liệu) → ô trống.
-    assert ws2.cell(row=3, column=10).value in ("", None)
+    assert ws2.cell(row=3, column=11).value in ("", None)
 
     # Nạp lại file mới: field dựng đúng từ cột; dòng không dữ liệu → kế thừa.
     reloaded = load_secret_matches_from_excel(dest)

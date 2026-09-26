@@ -43,7 +43,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from scanindex.infra.paths import get_base_dir
+from scanindex.infra.paths import get_base_dir, get_resource_path
 from scanindex.infra.app_log import write as app_log_write
 from scanindex.infra.mem_stats import memory_snapshot_text
 from scanindex.core import secret_scan_progress as ssp
@@ -126,6 +126,16 @@ class SecretScanMatch:
     # ("" = kế thừa) — dùng phân biệt "chưa cập nhật" với "đã quét bằng
     # bản mới nhưng không tìm được năm" (R8 review).
     source_version: str = ""
+    # Tên cơ quan dự phòng "<cơ quan ban hành> <cơ quan cấp trên>*" do KIE
+    # (nhãn ISSUE_ORG_NAME / ISSUE_ORG_SUPERIOR) bóc từ chính văn bản mật.
+    # CHỈ dùng khi mã định danh trong tên file KHÔNG tra được tên ở
+    # madinhdanh_lookup.json; dấu "*" ở cuối đánh dấu đây là cơ quan theo
+    # văn bản, không phải cơ quan xác định rõ qua danh mục.
+    kie_org_name: str = ""
+    # Ngày cập nhật file (epoch giây) — chụp lúc quét để hiển thị lại cho
+    # dòng có file đã bị xóa khỏi đĩa; file còn tồn tại thì hiển thị luôn
+    # mtime hiện thời (xem _file_mtime_for_display).
+    file_mtime: float = 0.0
 
 
 @dataclass
@@ -1234,6 +1244,11 @@ def _collect_secret_matches(
     cancel_event: threading.Event,
 ) -> list[SecretScanMatch]:
     matches: list[SecretScanMatch] = []
+    # Chụp mtime một lần cho cả file — hiển thị "Ngày cập nhật" ở bảng/Excel.
+    try:
+        file_mtime = float(os.stat(source_path).st_mtime)
+    except OSError:
+        file_mtime = 0.0
     for page_index in page_indices:
         if cancel_event.is_set():
             raise _ScanCancelled()
@@ -1248,6 +1263,7 @@ def _collect_secret_matches(
                     mode=mode,
                     ocr_pdf_path=artifact_path,
                     note=note,
+                    file_mtime=file_mtime,
                 )
             )
     return matches
@@ -1369,31 +1385,88 @@ def _extract_issue_year(canonical: dict, page_index: int = 0) -> int:
 # NHIỀU hơn 2 dòng ngày ứng viên (nhiễu kiểu "BIÊN BẢN HỌP NGÀY 15 THÁNG 10
 # NĂM 2004") mới gọi LayoutLM — model có nhãn PLACE_DATE, gán đúng dòng
 # ngày ban hành — chi phí model chỉ phát sinh trên các trang nhiễu.
+# Ngoài ra, khi KIE ĐÃ chạy cho trang (pass tên cơ quan dự phòng chạy
+# TRƯỚC) thì tận dụng luôn năm trong kết quả đó — một lần infer lấy đủ
+# năm + cơ quan ban hành + cơ quan cấp trên.
 # KIE KHÔNG dùng để xác định độ mật (model không có nhãn dấu mật).
-# Tắt bằng SECRET_SCAN_DISABLE_KIE_YEAR=1.
+# Tắt năm-KIE bằng SECRET_SCAN_DISABLE_KIE_YEAR=1.
 _DECLASS_KIE_MIN_CANDIDATES = 3
-_KIE_YEAR_LOCK = threading.RLock()
+# 2 file-worker không cùng warmup/infer model song song — cả pass năm ban
+# hành lẫn pass tên cơ quan dự phòng đều phải chạy qua lock này.
+_KIE_INFER_LOCK = threading.RLock()
+# Field instances infer theo (file canonical, trang): pass năm và pass tên
+# cơ quan thường cùng chạy trên một trang → cache để không infer 2 lần.
+# Working set mỗi file chỉ vài trang; vượt ngưỡng thì xóa sạch (hi hữu lắm
+# mới mất cache, tệ nhất trả thêm 1 lần infer).
+_KIE_FIELDS_CACHE_MAX = 256
+_KIE_FIELDS_CACHE: dict[tuple[str, int], list[dict] | None] = {}
+# Sentinel "chưa infer cho trang này" — phân biệt với None ("đã infer nhưng
+# lỗi/không có field"), để pass năm biết có thể tận dụng kết quả sẵn.
+_KIE_CACHE_MISS = object()
+
+
+def _kie_cache_key(canonical_json_path: str, page_index: int) -> tuple[str, int]:
+    return (os.path.normcase(os.path.abspath(str(canonical_json_path))), int(page_index))
+
+
+def _kie_cached_fields(canonical_json_path: str, page_index: int):
+    """Peek cache KHÔNG infer: trả list field, None (infer lỗi) hoặc
+    ``_KIE_CACHE_MISS`` khi trang chưa từng được infer."""
+    if not canonical_json_path:
+        return _KIE_CACHE_MISS
+    return _KIE_FIELDS_CACHE.get(
+        _kie_cache_key(canonical_json_path, page_index), _KIE_CACHE_MISS
+    )
+
+
+def _kie_fields_for_page(
+    canonical_json_path: str, page_index: int
+) -> list[dict] | None:
+    """Field instances của LayoutLM trên đúng trang, infer 1 lần/(file, trang).
+
+    Trả None khi model không có sẵn / lỗi / payload lệch dạng — caller
+    fallback về kết quả regex (năm ban hành) hoặc bỏ qua (tên cơ quan dự
+    phòng). Mọi lỗi model đều bị nuốt ở đây: một file mật không được phép
+    fail lượt quét chỉ vì KIE lỗi.
+    """
+    if not canonical_json_path or not os.path.exists(canonical_json_path):
+        return None
+    key = _kie_cache_key(canonical_json_path, page_index)
+    if key in _KIE_FIELDS_CACHE:
+        return _KIE_FIELDS_CACHE[key]
+    result: list[dict] | None = None
+    try:
+        from scanindex.core.kie.engine import _run_layoutlmv3
+
+        with _KIE_INFER_LOCK:
+            payload = _run_layoutlmv3(
+                canonical_json_path, selected_pages=[int(page_index)]
+            )
+        if isinstance(payload, dict):
+            # Bọc try riêng: payload dạng lạ (field_instances là chuỗi/số...)
+            # phải đọc thành rỗng chứ không raise ra khỏi hàm này.
+            try:
+                raw_fields = payload.get("field_instances") or []
+                result = [f for f in raw_fields if isinstance(f, dict)]
+            except Exception:
+                result = None
+    except Exception:
+        result = None
+    if len(_KIE_FIELDS_CACHE) >= _KIE_FIELDS_CACHE_MAX:
+        _KIE_FIELDS_CACHE.clear()
+    _KIE_FIELDS_CACHE[key] = result
+    return result
 
 
 def _kie_issue_year(canonical_json_path: str, page_index: int) -> int | None:
     """Năm ban hành theo field PLACE_DATE của LayoutLM trên đúng trang.
 
     Trả None khi model không có sẵn / lỗi / không gán nhãn được — caller
-    fallback về kết quả regex. Chạy dưới lock để 2 file-worker không cùng
-    warmup/infer model song song.
+    fallback về kết quả regex.
     """
-    if not canonical_json_path or not os.path.exists(canonical_json_path):
-        return None
-    try:
-        from scanindex.core.kie.engine import _run_layoutlmv3
-
-        with _KIE_YEAR_LOCK:
-            payload = _run_layoutlmv3(
-                canonical_json_path, selected_pages=[int(page_index)]
-            )
-    except Exception:
-        return None
-    for field in payload.get("field_instances") or []:
+    for field in _kie_fields_for_page(canonical_json_path, page_index) or []:
+        if not isinstance(field, dict):
+            continue
         if str(field.get("label") or "") != "PLACE_DATE":
             continue
         try:
@@ -1416,6 +1489,19 @@ def _match_meets_declassification(match: SecretScanMatch) -> bool:
     return bool(match.declass_due) or DECLASS_NOTE_LABEL in (match.note or "")
 
 
+def _safe_page_index(page_number) -> int:
+    """Trang 0-based từ page_number của match; kiểu rác (None/str hỏng…) → 0.
+
+    page_number do code mình sinh luôn là int, nhưng dòng nạp lại từ
+    Excel/journal không đáng tin tuyệt đối — một dòng rác không được phép
+    làm sập nguyên file-worker.
+    """
+    try:
+        return max(0, int(page_number or 1) - 1)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _apply_declassification_notes(
     matches: list[SecretScanMatch],
     canonical: dict,
@@ -1428,9 +1514,10 @@ def _apply_declassification_notes(
     Tuyệt mật 30 năm). Không suy được năm ban hành thì bỏ qua.
 
     Lấy năm theo cascade: regex chọn dòng ngắn gần đầu trang (miễn phí);
-    nếu trang có nhiều hơn 2 dòng ngày ứng viên (nhiễu) thì gọi KIE
-    (LayoutLM, nhãn PLACE_DATE) chọn đúng dòng — chỉ trên các file đã
-    xác định là mật.
+    gọi KIE (LayoutLM, nhãn PLACE_DATE) khi (a) trang có nhiều hơn 2 dòng
+    ngày ứng viên (nhiễu), hoặc (b) KIE ĐÃ chạy cho trang này vì pass tên
+    cơ quan dự phòng — khi đó đọc lại từ cache, không infer thêm. Chỉ chạy
+    trên các file đã xác định là mật.
     """
     if not matches:
         return
@@ -1440,21 +1527,27 @@ def _apply_declassification_notes(
     ).lower() not in {"1", "true"}
     year_by_page: dict[int, int] = {}
     for match in matches:
-        page_idx = max(0, int(match.page_number or 1) - 1)
+        page_idx = _safe_page_index(match.page_number)
         if page_idx not in year_by_page:
-            page = _page_for_index(canonical, page_idx)
+            page = (
+                _page_for_index(canonical, page_idx)
+                if isinstance(canonical, dict)
+                else None
+            )
             candidates = _issue_date_candidates(page) if page else []
             year = candidates[0][1] if candidates else 0
-            if (
-                kie_enabled
-                and canonical_json_path
-                and len(candidates) >= _DECLASS_KIE_MIN_CANDIDATES
-            ):
-                # Nhiều hơn 2 dòng ngày ứng viên → regex không đủ tin cậy,
-                # nhờ KIE gán nhãn PLACE_DATE chọn đúng dòng ngày ban hành.
-                kie_year = _kie_issue_year(canonical_json_path, page_idx)
-                if kie_year is not None:
-                    year = kie_year
+            if kie_enabled and canonical_json_path:
+                already_inferred = (
+                    _kie_cached_fields(canonical_json_path, page_idx)
+                    is not _KIE_CACHE_MISS
+                )
+                if already_inferred or len(candidates) >= _DECLASS_KIE_MIN_CANDIDATES:
+                    # (b) tận dụng lần infer đã chạy của pass cơ quan —
+                    # _kie_issue_year đọc cache, không tốn model; (a) trang
+                    # nhiễu → infer rồi lấy năm theo nhãn PLACE_DATE.
+                    kie_year = _kie_issue_year(canonical_json_path, page_idx)
+                    if kie_year is not None:
+                        year = kie_year
             year_by_page[page_idx] = year
         year = year_by_page[page_idx]
         if not 1900 <= year <= current_year:
@@ -1656,6 +1749,10 @@ def scan_one_file_for_secret_artifact(
             note=note,
             cancel_event=cancel_event,
         )
+        # Cơ quan dự phòng TRƯỚC, giải mật SAU: pass cơ quan là bên quyết định
+        # có infer KIE cho trang hay không — pass năm đọc lại cache, một lần
+        # infer lấy đủ năm + cơ quan ban hành + cơ quan cấp trên.
+        _apply_kie_org_fallback(matches, canonical_json_path)
         _apply_declassification_notes(
             matches, native_canonical, canonical_json_path
         )
@@ -1743,6 +1840,8 @@ def scan_one_file_for_secret_artifact(
             note=f"{note}; trang đầu",
             cancel_event=cancel_event,
         )
+        # Cơ quan dự phòng trước, giải mật sau — xem chú thích nhánh Word.
+        _apply_kie_org_fallback(matches, canonical_json_path)
         _apply_declassification_notes(matches, canonical, canonical_json_path)
         return SecretScanArtifact(
             matches=matches,
@@ -1770,6 +1869,8 @@ def scan_one_file_for_secret_artifact(
         cancel_event=cancel_event,
     )
     matches = _filter_matches_by_doc_start(matches, canonical_json_path, log_cb)
+    # Cơ quan dự phòng trước, giải mật sau — xem chú thích nhánh Word.
+    _apply_kie_org_fallback(matches, canonical_json_path)
     _apply_declassification_notes(matches, canonical, canonical_json_path)
     return SecretScanArtifact(
         matches=matches,
@@ -1807,13 +1908,14 @@ EXCEL_HEADERS = [
     "Tên cơ quan",
     "File (trong thư mục quét)",
     "Đường dẫn đầy đủ",
+    "Ngày cập nhật",
     "Trang",
     "Chế độ",
     "Đáp ứng giải mật",
     "Ghi chú",
 ]
 
-_EXCEL_COL_WIDTHS = [6, 12, 30, 14, 34, 42, 62, 8, 12, 26, 42]
+_EXCEL_COL_WIDTHS = [6, 12, 30, 14, 34, 42, 62, 17, 8, 12, 26, 42]
 
 # Giá trị cột "Đáp ứng giải mật": CHỈ 2 trạng thái — "Đáp ứng (năm, N năm)"
 # khi đã đủ thời hạn giải mật, và TRỐNG khi chưa đạt / chưa xác định được.
@@ -1847,14 +1949,18 @@ _ORG_LOOKUP_CACHE: dict[str, str] | None = None
 
 
 def _org_name_lookup() -> dict[str, str]:
-    """Bảng mã định danh → tên cơ quan, nạp 1 lần từ madinhdanh_lookup.json
-    ở thư mục gốc của app. File thiếu/hỏng → bảng rỗng (cột Tên cơ quan để
-    trống), không bao giờ làm fail lượt quét."""
+    """Bảng mã định danh → tên cơ quan, nạp 1 lần từ madinhdanh_lookup.json.
+
+    Tìm qua ``get_resource_path``: ưu tiên file đặt CẠNH EXE (người dùng có
+    thể thay danh mục mới hơn mà không cần build lại), fallback về bản đóng
+    gói trong thư mục bundle ``_internal`` của PyInstaller. File thiếu/hỏng
+    → bảng rỗng (cột Tên cơ quan để trống), không bao giờ làm fail lượt quét.
+    """
     global _ORG_LOOKUP_CACHE
     if _ORG_LOOKUP_CACHE is None:
         cache: dict[str, str] = {}
         try:
-            path = os.path.join(get_base_dir(), "madinhdanh_lookup.json")
+            path = get_resource_path("madinhdanh_lookup.json")
             with open(path, encoding="utf-8") as fh:
                 records = json.load(fh)
             for record in records or []:
@@ -1882,17 +1988,124 @@ def _org_code_from_filename(source_path: str) -> str:
     return rest.split("-", 1)[0].strip()
 
 
+def _kie_org_fallback_name(canonical_json_path: str, page_index: int) -> str:
+    """Tên cơ quan dự phòng "<cơ quan ban hành> <cơ quan cấp trên>*" theo KIE.
+
+    Bóc 2 nhãn ISSUE_ORG_NAME (cơ quan ban hành) và ISSUE_ORG_SUPERIOR (cơ
+    quan cấp trên) trên đúng trang chứa dấu mật — cũng là trang đầu văn bản
+    mang letterhead. Thiếu cơ quan nào thì bỏ bớt phần đó; không có gì thì
+    trả "". Dấu "*" ở cuối đánh dấu đây là cơ quan theo văn bản, không phải
+    cơ quan xác định rõ qua danh mục madinhdanh.
+    """
+    issuing = ""
+    superior = ""
+    for field in _kie_fields_for_page(canonical_json_path, page_index) or []:
+        if not isinstance(field, dict):
+            continue
+        label = str(field.get("label") or "")
+        if label not in ("ISSUE_ORG_NAME", "ISSUE_ORG_SUPERIOR"):
+            continue
+        try:
+            if int(field.get("page_index", -1)) != int(page_index):
+                continue
+        except (TypeError, ValueError):
+            continue
+        # Field multi_line nối các dòng bằng "\n" — gộp về 1 dòng trắng phân cách.
+        text = re.sub(r"\s+", " ", str(field.get("text") or "")).strip()
+        if not text:
+            continue
+        if label == "ISSUE_ORG_NAME" and not issuing:
+            issuing = text
+        elif label == "ISSUE_ORG_SUPERIOR" and not superior:
+            superior = text
+    parts = [part for part in (issuing, superior) if part]
+    return " ".join(parts) + "*" if parts else ""
+
+
+def _org_display_name(source_path: str, kie_org_name: str) -> str:
+    """Tên cơ quan cho bảng/Excel: ưu tiên tên tra theo mã định danh trong
+    tên file qua madinhdanh_lookup; không tra được thì dùng tên dự phòng KIE
+    bóc từ văn bản (kết thúc bằng "*", cơ quan theo văn bản)."""
+    org_code = _org_code_from_filename(source_path)
+    name = _org_name_lookup().get(org_code, "") if org_code else ""
+    return name or (kie_org_name or "").strip()
+
+
+def _file_mtime_for_display(match: SecretScanMatch) -> float:
+    """Mtime hiện thời của file ("Ngày cập nhật"); file đã bị xóa khỏi đĩa
+    thì dùng mtime chụp lúc quét. Không có gì → 0 (hiển thị trống)."""
+    try:
+        return os.stat(match.source_path).st_mtime
+    except OSError:
+        return float(match.file_mtime or 0.0)
+
+
+def _format_file_mtime(ts: float) -> str:
+    """Epoch → "dd/MM/yyyy HH:mm" giờ địa phương; 0 → chuỗi rỗng."""
+    return time.strftime("%d/%m/%Y %H:%M", time.localtime(ts)) if ts > 0 else ""
+
+
+def _apply_kie_org_fallback(
+    matches: list[SecretScanMatch],
+    canonical_json_path: str | None,
+) -> None:
+    """Điền tên cơ quan dự phòng (KIE) cho file mật không tra được tên.
+
+    Pass này chạy TRƯỚC pass giải mật ở ``scan_one_file_for_secret_artifact``:
+    khi nó phải infer cho một trang (mã định danh không tra được tên), kết
+    quả được cache lại để pass năm tận dụng luôn PLACE_DATE — một lần infer
+    lấy đủ năm + cơ quan ban hành + cơ quan cấp trên.
+
+    Mã định danh trong tên file KHÔNG có trong madinhdanh_lookup (hoặc tên
+    file không theo dạng uuid có mã) → nhờ KIE bóc "<cơ quan ban hành>
+    <cơ quan cấp trên>*" từ chính văn bản. Chỉ chạy trên các dòng đã là mật
+    (sau khi lọc); mỗi trang chứa dấu chỉ infer 1 lần (cache dùng chung với
+    pass năm ban hành). Tắt bằng SECRET_SCAN_DISABLE_KIE_ORG=1.
+    """
+    if not matches:
+        return
+    if os.environ.get("SECRET_SCAN_DISABLE_KIE_ORG", "").lower() in {"1", "true"}:
+        return
+    canonical_json_path = str(canonical_json_path or "")
+    if not canonical_json_path or not os.path.exists(canonical_json_path):
+        return
+    try:
+        lookup = _org_name_lookup()
+    except Exception:
+        return  # đã có try bên trong, giữ cho chắc: không fail lượt quét
+    name_by_page: dict[int, str] = {}
+    for match in matches:
+        try:
+            if match.kie_org_name:
+                continue
+            org_code = _org_code_from_filename(match.source_path)
+            if org_code and lookup.get(org_code):
+                continue  # tra được tên theo danh mục → không cần dự phòng
+            page_idx = _safe_page_index(match.page_number)
+            if page_idx not in name_by_page:
+                name_by_page[page_idx] = _kie_org_fallback_name(
+                    canonical_json_path, page_idx
+                )
+            match.kie_org_name = name_by_page[page_idx]
+        except Exception:
+            # Một dòng rác không được kéo sập cả file: bỏ qua dự phòng của
+            # dòng đó, giữ nguyên các dòng đã điền.
+            continue
+
+
 def export_matches_to_excel(matches: list[SecretScanMatch], output_path: str) -> str:
     """Write the scan results to a one-sheet .xlsx workbook.
 
     One row per detected stamp — the same rows shown in the results table —
     plus the absolute path and bare file name so the list stays usable when
     shared outside the app. "Mã cơ quan"/"Tên cơ quan" suy từ tên file
-    "<uuid>_<mã>-…"; "Đáp ứng giải mật" chỉ 2 trạng thái: giá trị khi đến
-    hạn, trống khi chưa đạt; chuỗi trong "Ghi chú" giữ nguyên để file nạp
-    lại không mâu thuẫn.
+    "<uuid>_<mã>-…"; tên không tra được trong madinhdanh_lookup thì dùng
+    tên dự phòng KIE bóc từ văn bản (kết thúc "*"). "Đáp ứng giải mật" chỉ
+    2 trạng thái: giá trị khi đến hạn, trống khi chưa đạt; chuỗi trong
+    "Ghi chú" giữ nguyên để file nạp lại không mâu thuẫn.
     """
     import openpyxl
+    from datetime import datetime
     from openpyxl.styles import Alignment, Font, PatternFill
     from openpyxl.utils import get_column_letter
 
@@ -1923,18 +2136,27 @@ def export_matches_to_excel(matches: list[SecretScanMatch], output_path: str) ->
         ws.cell(
             row=row,
             column=5,
-            value=_org_name_lookup().get(org_code, "") if org_code else "",
+            value=_org_display_name(match.source_path, match.kie_org_name),
         )
         ws.cell(row=row, column=6, value=match.relative_path)
         ws.cell(row=row, column=7, value=match.source_path)
-        ws.cell(row=row, column=8, value=int(match.page_number)).alignment = center
-        ws.cell(row=row, column=9, value=match.mode)
+        # "Ngày cập nhật": ô datetime thật (sắp xếp/lọc được trong Excel),
+        # định dạng dd/MM/yyyy HH:mm; không biết ngày → để trống.
+        mtime = _file_mtime_for_display(match)
+        if mtime > 0:
+            date_cell = ws.cell(
+                row=row, column=8, value=datetime.fromtimestamp(mtime)
+            )
+            date_cell.number_format = "DD/MM/YYYY HH:MM"
+            date_cell.alignment = center
+        ws.cell(row=row, column=9, value=int(match.page_number)).alignment = center
+        ws.cell(row=row, column=10, value=match.mode)
         declass_cell = ws.cell(
-            row=row, column=10, value=_declass_cell_text(match, current_version)
+            row=row, column=11, value=_declass_cell_text(match, current_version)
         )
         if declass_cell.value:
             declass_cell.font = green_font
-        note_cell = ws.cell(row=row, column=11, value=match.note)
+        note_cell = ws.cell(row=row, column=12, value=match.note)
         if _match_meets_declassification(match):
             note_cell.font = green_font
 
@@ -2035,6 +2257,7 @@ def load_secret_matches_from_excel(xlsx_path: str) -> list[SecretScanMatch]:
     khác. Trả về danh sách match theo đúng thứ tự trong file.
     """
     import openpyxl
+    from datetime import datetime
 
     wb = openpyxl.load_workbook(xlsx_path, read_only=True, data_only=True)
     try:
@@ -2060,6 +2283,8 @@ def load_secret_matches_from_excel(xlsx_path: str) -> list[SecretScanMatch]:
         c_mode = col("Chế độ", 6)
         c_dec = col("Đáp ứng giải mật")
         c_note = col("Ghi chú", 7)
+        c_org = col("Tên cơ quan")
+        c_date = col("Ngày cập nhật")
 
         def cell(row_values, idx):
             if idx is None or idx >= len(row_values):
@@ -2100,6 +2325,28 @@ def load_secret_matches_from_excel(xlsx_path: str) -> list[SecretScanMatch]:
                     declass_due = True
             if not issue_year:
                 source_version = ""
+            # Chỉ round-trip tên cơ quan dự phòng KIE (kết thúc "*"): tên
+            # tra được từ danh mục thì để tra lại lúc hiển thị, không giữ
+            # bản sao cũ lỡ danh mục đã đổi.
+            org_cell = str(cell(r, c_org) or "").strip()
+            # "Ngày cập nhật": ưu tiên ô datetime thật của openpyxl; chuỗi
+            # tay ("dd/mm/yyyy hh:mm" hoặc "dd/mm/yyyy") parse lại; lỗi → 0.
+            file_mtime = 0.0
+            raw_date = cell(r, c_date)
+            if isinstance(raw_date, datetime):
+                try:
+                    file_mtime = float(raw_date.timestamp())
+                except (OSError, OverflowError, ValueError):
+                    file_mtime = 0.0
+            elif raw_date:
+                for fmt in ("%d/%m/%Y %H:%M", "%d/%m/%Y"):
+                    try:
+                        file_mtime = float(
+                            datetime.strptime(str(raw_date).strip(), fmt).timestamp()
+                        )
+                        break
+                    except ValueError:
+                        continue
             matches.append(
                 SecretScanMatch(
                     source_path=source,
@@ -2113,6 +2360,8 @@ def load_secret_matches_from_excel(xlsx_path: str) -> list[SecretScanMatch]:
                     declass_years=declass_years,
                     declass_due=declass_due,
                     source_version=source_version,
+                    kie_org_name=org_cell if org_cell.endswith("*") else "",
+                    file_mtime=file_mtime,
                 )
             )
         return matches
@@ -2425,9 +2674,12 @@ class SecretFileScanScreen(ScreenContent):
         picker_layout.addLayout(status_row)
         layout.addWidget(picker)
 
-        self.table = _ResultsTable(0, 6)
+        self.table = _ResultsTable(0, 9)
         self.table.setHorizontalHeaderLabels(
-            ["", "Độ mật", "File", "Trang", "Chế độ", "Ghi chú"]
+            [
+                "", "Độ mật", "File", "Mã CQ", "Cơ quan", "Ngày cập nhật",
+                "Trang", "Chế độ", "Ghi chú",
+            ]
         )
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -2447,7 +2699,10 @@ class SecretFileScanScreen(ScreenContent):
         header.setStretchLastSection(True)
         header.setMinimumSectionSize(28)
         self.table.setWordWrap(False)
-        for col, width in ((0, 30), (1, 90), (2, 330), (3, 64), (4, 100)):
+        for col, width in (
+            (0, 30), (1, 90), (2, 260), (3, 80), (4, 200), (5, 120),
+            (6, 56), (7, 90)
+        ):
             self.table.setColumnWidth(col, width)
         self.table.setStyleSheet(
             f"QTableWidget {{ background-color: {COLOR_SURFACE}; color: {COLOR_TEXT};"
@@ -3952,34 +4207,45 @@ class SecretFileScanScreen(ScreenContent):
         check_item.setData(Qt.ItemDataRole.UserRole, match.source_path)
         check_item.setData(Qt.ItemDataRole.UserRole + 1, match)
         self.table.setItem(row, 0, check_item)
+        org_code = _org_code_from_filename(match.source_path)
+        org_name = _org_display_name(match.source_path, match.kie_org_name)
         values = [
             match.keyword,
             match.relative_path,
+            org_code,
+            org_name,
+            _format_file_mtime(_file_mtime_for_display(match)),
             str(match.page_number),
             match.mode,
             match.note,
         ]
         for col, value in enumerate(values, start=1):
             item = QTableWidgetItem(value)
-            if col == 4:
+            if col == 7:
                 translations.set_translatable_item_text(
                     item, value, sync_tooltip=True
                 )
-            elif col == 5:
+            elif col == 8:
                 translations.set_translatable_item_text(
                     item, value, context="secret_note", sync_tooltip=True
                 )
             item.setData(Qt.ItemDataRole.UserRole, match.source_path)
             item.setData(Qt.ItemDataRole.UserRole + 1, match)
-            if col not in (4, 5):
+            if col not in (7, 8):
                 item.setToolTip(match.source_path if col == 2 else value)
             if col == 1:
                 item.setForeground(QColor(COLOR_RED))
             if missing:
                 item.setForeground(QColor(COLOR_TEXT_SECONDARY))
             self.table.setItem(row, col, item)
+        org_item = self.table.item(row, 4)
+        if org_item is not None and org_item.text().endswith("*"):
+            org_item.setToolTip(
+                "Cơ quan theo văn bản (bóc bằng KIE) — không tra được tên "
+                'xác định qua danh mục mã định danh (dấu "*")'
+            )
         if not missing and _match_meets_declassification(match):
-            note_item = self.table.item(row, 5)
+            note_item = self.table.item(row, 8)
             if note_item is not None:
                 note_item.setForeground(QColor(COLOR_GREEN))
         if missing:

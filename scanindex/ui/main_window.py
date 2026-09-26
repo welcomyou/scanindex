@@ -3086,8 +3086,19 @@ class MainWindow(QMainWindow):
         `canonical_json_path`), so this serves both Step 3's "Chuyển vào Kho"
         and the ZIP re-import paths (pre-extracted PDFs + bundled `.json.zst`
         companions — no OCR/KIE re-run)."""
-        from scanindex.ui.repository.screen import _read_archive_path_setting
-        archive_path = _read_archive_path_setting()
+        # Use the Kho screen's *validated* location: at startup it may have
+        # prompted the user after the configured path disappeared, so a fresh
+        # settings read could still point at a stale folder that would then
+        # be silently recreated empty by the worker's ArchiveStore.
+        repo_screen = self.repository_screen
+        archive_path = getattr(repo_screen, "_archive_path", None)
+        if getattr(repo_screen, "_store", None) is None or archive_path is None:
+            QMessageBox.warning(
+                self, "Kho lưu trữ",
+                "Kho lưu trữ chưa được mở (vị trí kho không còn hợp lệ).\n"
+                "Hãy mở màn hình Kho lưu trữ, chọn lại vị trí kho, rồi thử lại.",
+            )
+            return
 
         progress = QProgressDialog(
             "Đang chuyển vào Kho lưu trữ…", "Hủy",

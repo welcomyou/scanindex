@@ -257,6 +257,15 @@ def _is_auto_seeded_ini(path: Path) -> bool:
         return False
 
 
+def is_settings_auto_seeded() -> bool:
+    """True when the active settings ini is still machine-seeded (first run
+    of this version in this folder, never user-saved). UIs use this to gate
+    one-time first-run suggestions without nagging returning users."""
+    from scanindex.infra.paths import get_base_dir
+    own = find_versioned_file(Path(get_base_dir()), "settings", ".ini")
+    return own is not None and _is_auto_seeded_ini(own)
+
+
 def _is_empty_or_default(path: Path, example_path: Optional[Path]) -> bool:
     """Heuristic for non-INI files (json/txt): empty, or byte-identical to the
     bundled example. Used to decide whether the own file should yield to a

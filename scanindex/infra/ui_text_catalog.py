@@ -25,6 +25,8 @@ UI_TEXT_PAIRS: tuple[tuple[str, str], ...] = (
     ("Continue and finish", "Tiếp tục hoàn tất"),
     ("Continue scan (keep previous results)", "Quét tiếp (giữ kết quả cũ)"),
     ("Continue scan + re-scan {} old classified files", "Quét tiếp + quét lại {} file mật cũ"),
+    ("Org code", "Mã CQ"),
+    ("Agency", "Cơ quan"),
     ("This folder has an unfinished scan:\n• Completed: {} files\n• Previous errors (will retry): {} files\n• Broken files (will be skipped): {} files\n• Classified matches found: {}\n\nResume where it stopped?\nChoose \"No\" to scan everything from scratch.", "Thư mục này có lượt quét chưa hoàn tất:\n• Đã quét xong: {} file\n• Lỗi lần trước (sẽ thử lại): {} file\n• File hỏng (sẽ bỏ qua): {} file\n• Dòng mật đã phát hiện: {}\n\nTiếp tục từ nơi dừng không?\nChọn \"No\" để quét lại toàn bộ từ đầu."),
     ("Clear scan history?", "Xóa lịch sử quét?"),
     ("This will delete all:\n• Unfinished scan progress (cannot be resumed)\n• Scan history — the next scan will process every file from scratch\n\nExported Excel results, logs in logs/ and \"not classified\"\nconfirmations are unaffected.\nDelete now?", "Sẽ xóa toàn bộ:\n• Tiến độ các lượt quét chưa hoàn tất (không tiếp tục được nữa)\n• Lịch sử \"đã quét\" — lượt quét sau sẽ quét lại mọi file từ đầu\n\nKết quả đã xuất Excel, log trong logs/ và các xác nhận\n\"không phải mật\" không bị ảnh hưởng.\nXóa ngay?"),
@@ -1224,3 +1226,365 @@ UI_VALIDATION_AND_REPORT_TEXT_PAIRS: tuple[tuple[str, str], ...] = (
 
 
 UI_TEXT_PAIRS += UI_VALIDATION_AND_REPORT_TEXT_PAIRS
+
+
+# ── Công cụ "Đổi tên theo cây thư mục" (Rename by folder tree) ────────────
+# Bao gồm cả thông báo nghiệp vụ của scanindex.core.rename_tree hiện trong
+# hộp thoại xem trước / hộp thông báo / nhật ký của màn hình này.
+UI_RENAME_TREE_TEXT_PAIRS: tuple[tuple[str, str], ...] = (
+    # Ô công cụ trong menu Công cụ
+    ("Rename by folder tree", "Đổi tên theo cây thư mục"),
+    (
+        "Rename Identity code / Fonds / Catalog / Dossier in CSDL_SOHOA — "
+        "subfolders and PDF files are renamed automatically, with a PDF "
+        "preview right beside the tree.",
+        "Đổi tên Mã định danh / Phông / Mục lục / Hồ sơ trong CSDL_SOHOA — "
+        "thư mục con và file PDF tự đổi theo, xem được PDF ngay bên phải.",
+    ),
+    # Thanh công cụ chính
+    ("📂  Select CSDL_SOHOA folder…", "📂  Chọn thư mục CSDL_SOHOA…"),
+    ("No root folder selected", "Chưa chọn thư mục gốc"),
+    ("🔄  Refresh", "🔄  Làm mới"),
+    ("Select CSDL_SOHOA root folder", "Chọn thư mục gốc CSDL_SOHOA"),
+    (
+        "Select a PDF file in the tree to preview.",
+        "Chọn một file PDF trong cây để xem trước.",
+    ),
+    # Cột cây và nhãn cấp (cột Loại)
+    ("Name", "Tên"),
+    ("Type", "Loại"),
+    ("Catalog", "Mục lục"),
+    ("Subfolder", "Thư mục con"),
+    ("PDF (name mismatch)", "PDF (lệch tên)"),
+    ("Other file", "File khác"),
+    (
+        "Name does not match the convention — this item is skipped when "
+        "renaming its parent.",
+        "Tên không khớp quy ước — mục này sẽ bị bỏ qua khi đổi tên cấp cha.",
+    ),
+    (
+        "PDF name does not match the 5-segment convention — it will not be "
+        "renamed with the dossier.",
+        "Tên PDF không khớp quy ước 5 đoạn — sẽ không được đổi tên theo hồ sơ.",
+    ),
+    # Trạng thái / tiến trình
+    ("{} identity codes · {} fonds · {} dossiers · {} PDF",
+     "{} mã định danh · {} phông · {} hồ sơ · {} PDF"),
+    ("Renaming… {}/{}", "Đang đổi tên… {}/{}"),
+    # Hộp thoại đổi tên / đổi số thứ tự
+    ("Rename", "Đổi tên"),
+    ("Rename {}", "Đổi tên {}"),
+    ("Rename identity code", "Đổi tên mã định danh"),
+    ("Rename fonds", "Đổi tên phông"),
+    ("Rename catalog", "Đổi tên mục lục"),
+    ("Rename dossier", "Đổi tên hồ sơ"),
+    ("Rename identity code (F2)", "Đổi tên mã định danh (F2)"),
+    ("Rename fonds (F2)", "Đổi tên phông (F2)"),
+    ("Rename catalog (F2)", "Đổi tên mục lục (F2)"),
+    ("Rename dossier (F2)", "Đổi tên hồ sơ (F2)"),
+    ("Change document order number", "Đổi số thứ tự tài liệu"),
+    ("Change document order number (F2)", "Đổi số thứ tự tài liệu (F2)"),
+    ("Rename {} (F2)", "Đổi tên {} (F2)"),
+    ("Auto-number from this {} to the end of the {}",
+     "Đánh số từ {} này tự động đến hết {}"),
+    ("Auto-number from this dossier to the end of the catalog",
+     "Đánh số từ hồ sơ này tự động đến hết mục lục"),
+    ("Auto-number from this catalog to the end of the fonds",
+     "Đánh số từ mục lục này tự động đến hết phông"),
+    ("Auto-number from this document to the end of the dossier",
+     "Đánh số từ tài liệu này tự động đến hết hồ sơ"),
+    ("Open in Explorer", "Mở trong Explorer"),
+    ("Belongs to: {}", "Thuộc: {}"),
+    ("Current name:  <span style='font-family:\"{}\";'>{}</span>",
+     "Tên hiện tại:  <span style='font-family:\"{}\";'>{}</span>"),
+    ("New identity code (fonds, catalogs, dossiers, and PDF files follow):",
+     "Mã định danh mới (phông, mục lục, hồ sơ, PDF đổi theo):"),
+    ("New fonds code (catalogs, dossiers, and PDF files follow):",
+     "Mã phông mới (mục lục, hồ sơ, PDF đổi theo):"),
+    ("New catalog number (exactly 2 digits; dossiers and PDF files follow):",
+     "Số mục lục mới (bắt buộc đúng 2 chữ số; hồ sơ, PDF đổi theo):"),
+    ("New dossier number (exactly 4 digits; or paste the full 4-segment name):",
+     "Số hồ sơ mới (bắt buộc đúng 4 chữ số; hoặc dán cả tên 4 đoạn):"),
+    ("New order number (exactly 3 digits, e.g. 001):",
+     "Số thứ tự mới (bắt buộc đúng 3 chữ số, ví dụ 001):"),
+    ("<span style='color:#f87171;'>✖ {}</span>",
+     "<span style='color:#f87171;'>✖ {}</span>"),
+    ("Name unchanged.", "Tên không thay đổi."),
+    ("New name: <span style='font-family:\"{}\";'>{}</span>",
+     "Tên mới: <span style='font-family:\"{}\";'>{}</span>"),
+    ("✔ New name: <span style='font-family:\"{}\";'>{}</span>",
+     "✔ Tên mới: <span style='font-family:\"{}\";'>{}</span>"),
+    ("{} item(s) skipped (do not match the convention)",
+     "{} mục bỏ qua (không khớp quy ước)"),
+    ("Will rename {} folders and {} PDF files inside{}.",
+     "Sẽ đổi tên {} thư mục và {} file PDF bên trong{}."),
+    # Hộp thông báo
+    ("Cannot read folder", "Không đọc được thư mục"),
+    ("Auto-numbering", "Đánh số tự động"),
+    ("The items after it are already in order — nothing to rename.",
+     "Các mục phía sau đã đúng thứ tự — không cần đổi tên gì."),
+    ("Open folder", "Mở thư mục"),
+    ("Cannot open:\n{}", "Không mở được:\n{}"),
+    ("Move folder", "Di chuyển thư mục"),
+    ("Move dossier", "Di chuyển hồ sơ"),
+    ("Move document", "Chuyển tài liệu"),
+    ("Operation failed", "Thao tác thất bại"),
+    ("Cannot undo", "Không hoàn tác được"),
+    ("Operation \"{}\" cannot be undone:\n\n{}",
+     "Thao tác \"{}\" không hoàn tác được:\n\n{}"),
+    # Kết quả thao tác + hoàn tác (nhật ký và hộp thoại)
+    ("{} PDF file(s) renamed", "{} file PDF đổi tên"),
+    ("{} folders, {} PDF(s)", "{} thư mục, {} PDF"),
+    ("{} item(s) skipped", "{} mục bỏ qua"),
+    ("Done — {}: {}{}.", "Đã hoàn tất — {}: {}{}."),
+    ("Placed dossier \"{}\" at position {} of \"{}\"",
+     "Đã đặt hồ sơ \"{}\" vào vị trí {} của \"{}\""),
+    ("Rename folder tree: opened {}", "Đổi tên cây thư mục: đã mở {}"),
+    ("Rename folder tree: {}", "Đổi tên cây thư mục: {}"),
+    ("Undo: {}", "Hoàn tác: {}"),
+    ("renamed \"{}\" → \"{}\"", "đổi tên \"{}\" → \"{}\""),
+    ("moved \"{}\" from \"{}\" to \"{}\"",
+     "chuyển \"{}\" từ \"{}\" sang \"{}\""),
+    ("moved \"{}\" into \"{}\"", "chuyển \"{}\" vào \"{}\""),
+    ("moved {} PDF file(s) into \"{}\"", "chuyển {} file PDF vào \"{}\""),
+    ("auto-numbered documents from \"{}\" to the end of the dossier "
+     "({} file(s) renamed)",
+     "đánh số từ tài liệu \"{}\" tự động đến hết hồ sơ ({} file đổi tên)"),
+    ("renumbered from \"{}\" onward ({} item(s) renamed)",
+     "đánh số lại từ \"{}\" về sau ({} mục đổi tên)"),
+    ("reordered {} PDF(s) in \"{}\"", "xếp lại thứ tự {} PDF trong \"{}\""),
+    ("changed order number of document \"{}\" → \"{}\"",
+     "đổi số thứ tự tài liệu \"{}\" → \"{}\""),
+    ("undo {}", "hoàn tác {}"),
+    # Lỗi nghiệp vụ — scanindex.core.rename_tree (validate_component)
+    ("Missing identity code.", "Thiếu Mã định danh."),
+    ("Missing fonds code.", "Thiếu Phông."),
+    ("Missing catalog number.", "Thiếu Mục lục."),
+    ("Missing dossier number.", "Thiếu Hồ sơ."),
+    ("Invalid identity code: {}", "Mã định danh không hợp lệ: {}"),
+    ("Invalid fonds code: {}", "Phông không hợp lệ: {}"),
+    ("Invalid catalog number: {}", "Mục lục không hợp lệ: {}"),
+    ("Invalid dossier number: {}", "Hồ sơ không hợp lệ: {}"),
+    ("Identity code contains invalid characters "
+     "(do not use \\ / : * ? \" < > |): {}",
+     "Mã định danh chứa ký tự không hợp lệ "
+     "(không dùng \\ / : * ? \" < > |): {}"),
+    ("Fonds code contains invalid characters "
+     "(do not use \\ / : * ? \" < > |): {}",
+     "Phông chứa ký tự không hợp lệ (không dùng \\ / : * ? \" < > |): {}"),
+    ("Catalog number contains invalid characters "
+     "(do not use \\ / : * ? \" < > |): {}",
+     "Mục lục chứa ký tự không hợp lệ "
+     "(không dùng \\ / : * ? \" < > |): {}"),
+    ("Dossier number contains invalid characters "
+     "(do not use \\ / : * ? \" < > |): {}",
+     "Hồ sơ chứa ký tự không hợp lệ (không dùng \\ / : * ? \" < > |): {}"),
+    ("Identity code must not contain \"-\" because it separates segments "
+     "in dossier/PDF names: {}",
+     "Mã định danh không được chứa dấu \"-\" vì đây là dấu phân cách đoạn "
+     "trong tên hồ sơ/file: {}"),
+    ("Fonds code must not contain \"-\" because it separates segments "
+     "in dossier/PDF names: {}",
+     "Phông không được chứa dấu \"-\" vì đây là dấu phân cách đoạn "
+     "trong tên hồ sơ/file: {}"),
+    ("Catalog number must not contain \"-\" because it separates segments "
+     "in dossier/PDF names: {}",
+     "Mục lục không được chứa dấu \"-\" vì đây là dấu phân cách đoạn "
+     "trong tên hồ sơ/file: {}"),
+    ("Dossier number must not contain \"-\" because it separates segments "
+     "in dossier/PDF names: {}",
+     "Hồ sơ không được chứa dấu \"-\" vì đây là dấu phân cách đoạn "
+     "trong tên hồ sơ/file: {}"),
+    ("Catalog number must be exactly 2 digits (e.g. 01) — received: {}",
+     "Mục lục bắt buộc phải là đúng 2 chữ số (ví dụ: 01) — nhận được: {}"),
+    ("Dossier number must be exactly 4 digits (e.g. 0001) — received: {}",
+     "Hồ sơ bắt buộc phải là đúng 4 chữ số (ví dụ: 0001) — nhận được: {}"),
+    # Lỗi nghiệp vụ — plan_folder_rename
+    ("Invalid folder path.", "Đường dẫn thư mục không hợp lệ."),
+    ("Only folders on the 4 levels can be renamed: Identity code, Fonds, "
+     "Catalog, Dossier.",
+     "Chỉ đổi tên được thư mục ở 4 cấp: Mã định danh, Phông, Mục lục, Hồ sơ."),
+    ("Folder does not exist: {}", "Thư mục không tồn tại: {}"),
+    ("The dossier name must have 4 segments separated by \"-\": {}",
+     "Tên hồ sơ phải có 4 đoạn ngăn cách bởi \"-\": {}"),
+    ("The first 3 segments of the new name ({}) must match the parent "
+     "folder: {}",
+     "3 đoạn đầu của tên mới ({}) phải trùng với thư mục cha: {}"),
+    ("The current dossier folder name does not match the 4-segment "
+     "convention \"<Identity>-<Fonds>-<Catalog>-<Dossier>\": {}",
+     "Tên thư mục hồ sơ hiện tại không khớp quy ước 4 đoạn "
+     "\"<MãĐD>-<MãPhông>-<MụcLục>-<HồSơ>\": {}"),
+    # Lỗi nghiệp vụ — plan_folder_move
+    ("Folder to move: invalid path.",
+     "Thư mục cần chuyển: đường dẫn không hợp lệ."),
+    ("Target folder: invalid path.",
+     "Thư mục đích: đường dẫn không hợp lệ."),
+    ("Only Fonds, Catalog and Dossier can be moved — Identity code is the "
+     "top level of the tree.",
+     "Chỉ di chuyển được Phông, Mục lục và Hồ sơ — Mã định danh là cấp cao "
+     "nhất của cây."),
+    ("Folder to move does not exist: {}",
+     "Thư mục cần chuyển không tồn tại: {}"),
+    ("Target folder does not exist: {}",
+     "Thư mục đích không tồn tại: {}"),
+    ("Cannot move a folder into itself or into its own subfolder.",
+     "Không thể chuyển thư mục vào chính nó hoặc vào thư mục con của nó."),
+    ("Fonds can only be moved into an identity code, not \"{}\".",
+     "Phông chỉ chuyển được vào mã định danh, không phải \"{}\"."),
+    ("Catalog can only be moved into a fonds, not \"{}\".",
+     "Mục lục chỉ chuyển được vào phông, không phải \"{}\"."),
+    ("Dossier can only be moved into a catalog, not \"{}\".",
+     "Hồ sơ chỉ chuyển được vào mục lục, không phải \"{}\"."),
+    ("This fonds is already in identity code \"{}\".",
+     "Phông này đã nằm sẵn trong mã định danh \"{}\"."),
+    ("This catalog is already in fonds \"{}\".",
+     "Mục lục này đã nằm sẵn trong phông \"{}\"."),
+    ("This dossier is already in catalog \"{}\".",
+     "Hồ sơ này đã nằm sẵn trong mục lục \"{}\"."),
+    ("Target name \"{}\" does not match the target catalog code \"{}\".",
+     "Tên đích \"{}\" không khớp mã của mục lục đích \"{}\"."),
+    # Lỗi nghiệp vụ — đánh số lại
+    ("Invalid path.", "Đường dẫn không hợp lệ."),
+    ("The selected document must already have a valid order number — "
+     "rename it first: \"{}\"",
+     "Tài liệu được chọn phải có sẵn số trang hợp lệ — hãy đổi tên nó "
+     "trước: \"{}\""),
+    ("Renumbering can only start from a Dossier, a Catalog or a PDF "
+     "document.",
+     "Chỉ đánh số lại được từ một Hồ sơ, một Mục lục hoặc một tài liệu PDF."),
+    ("The selected dossier must already have a valid number — name it "
+     "first: \"{}\"",
+     "Hồ sơ được chọn phải có sẵn số hợp lệ — hãy đặt tên cho nó trước: "
+     "\"{}\""),
+    ("The selected catalog must already have a valid number — name it "
+     "first: \"{}\"",
+     "Mục lục được chọn phải có sẵn số hợp lệ — hãy đặt tên cho nó trước: "
+     "\"{}\""),
+    # Lỗi nghiệp vụ — plan_pdf_reorder
+    ("PDFs can only be reordered inside a dossier.",
+     "Chỉ xếp lại thứ tự PDF bên trong một hồ sơ."),
+    ("Dossier folder does not exist: {}",
+     "Thư mục hồ sơ không tồn tại: {}"),
+    ("Dossier folder name does not match the 4-segment convention: {}",
+     "Tên thư mục hồ sơ không khớp quy ước 4 đoạn: {}"),
+    ("The new order list is empty.", "Danh sách thứ tự mới trống."),
+    ("File does not belong to the dossier or is invalid: {}",
+     "File không thuộc hồ sơ hoặc không hợp lệ: {}"),
+    ("The new order list has {} files but the dossier has {} valid PDFs — "
+     "all must be listed.",
+     "Danh sách thứ tự mới có {} file nhưng hồ sơ có {} PDF hợp lệ — "
+     "phải liệt kê đủ."),
+    ("The new order list contains duplicate file names.",
+     "Danh sách thứ tự mới có tên file trùng nhau."),
+    ("File {} has a code different from the dossier name {}.",
+     "File {} có mã khác với tên hồ sơ {}."),
+    # Lỗi nghiệp vụ — plan_pdf_move
+    ("Target dossier: invalid path.",
+     "Hồ sơ đích: đường dẫn không hợp lệ."),
+    ("PDFs can only be moved into a dossier (level 4 of the tree).",
+     "PDF chỉ chuyển được vào một hồ sơ (cấp 4 của cây)."),
+    ("Target dossier folder does not exist: {}",
+     "Thư mục hồ sơ đích không tồn tại: {}"),
+    ("Target dossier name does not match the 4-segment convention: {}",
+     "Tên hồ sơ đích không khớp quy ước 4 đoạn: {}"),
+    ("File to move: invalid path.",
+     "File cần chuyển: đường dẫn không hợp lệ."),
+    ("File is not inside a level-4 dossier: {}",
+     "File không nằm trong một hồ sơ ở cấp 4: {}"),
+    ("File does not exist: {}", "File không tồn tại: {}"),
+    ("Only PDF files (.pdf) can be moved: {}",
+     "Chỉ chuyển được file PDF (.pdf): {}"),
+    ("No files to move.", "Không có file nào để chuyển."),
+    ("\"{}\" already exists in the target dossier.",
+     "Đã có sẵn \"{}\" trong hồ sơ đích."),
+    # Lỗi nghiệp vụ — plan_pdf_rename_stt
+    ("The document must be inside a level-4 dossier.",
+     "Tài liệu phải nằm trong một hồ sơ ở cấp 4 của cây."),
+    ("Not a PDF document: {}", "Không phải tài liệu PDF: {}"),
+    ("The document name does not match the 5-segment convention and cannot "
+     "be renamed: {}",
+     "Tên tài liệu không khớp quy ước 5 đoạn nên không đổi được: {}"),
+    ("Document order number must be exactly 3 digits (e.g. 001) — "
+     "received: {}",
+     "Số thứ tự tài liệu bắt buộc phải là đúng 3 chữ số (ví dụ: 001) — "
+     "nhận được: {}"),
+    ("\"{}\" already exists in this dossier.",
+     "Đã có sẵn \"{}\" trong hồ sơ này."),
+    # Lỗi nghiệp vụ — kiểm tra xung đột trước khi thực thi
+    ("Two items resolve to the same name: {} and {}",
+     "Hai mục cùng đổi về một tên: {} và {}"),
+    ("\"{}\" already exists in the target folder — renaming would create "
+     "a duplicate. Rename that item first or choose a different code.",
+     "Đã có sẵn \"{}\" trong thư mục đích — đổi tên sẽ gây trùng. Hãy đổi "
+     "tên mục kia trước hoặc chọn mã khác."),
+    ("\"{}\" already exists — this operation would create a duplicate name.",
+     "Đã có sẵn \"{}\" — thao tác sẽ gây trùng tên."),
+    # Lỗi nghiệp vụ — thực thi / rollback
+    ("File is in use by another program: {}. Close the window or Explorer "
+     "preview pane that has it open and try again.",
+     "File đang được chương trình khác sử dụng: {}. Hãy đóng cửa sổ đang "
+     "mở hoặc khung xem trước Explorer rồi thử lại."),
+    ("Cannot create temp folder: {}", "Không tạo được thư mục tạm: {}"),
+    ("Cancelled. The completed renames have been reverted.{}",
+     "Đã hủy. Các đổi tên đã thực hiện được lùi về như cũ.{}"),
+    ("Partially reverted ({}/{} operations done)",
+     "Đã lùi về như cũ một phần ({}/{} op đã làm)"),
+    ("Reverted to the original state ({}/{} operations done)",
+     "Đã lùi về như cũ ({}/{} op đã làm)"),
+    ("Error renaming {}: {}\n{}.", "Lỗi khi đổi tên {}: {}\n{}."),
+    ("\nWARNING: could not restore {} item(s): {}{}. These files keep "
+     "their NEW names — close the program using them (Viewer/Explorer) "
+     "and try the operation again.",
+     "\nCẢNH BÁO: không khôi phục được {} mục: {}{}. Các file này còn giữ "
+     "tên MỚI — hãy đóng chương trình đang mở chúng (Viewer/Explorer) "
+     "rồi thực hiện lại thao tác."),
+)
+
+UI_TEXT_PAIRS += UI_RENAME_TREE_TEXT_PAIRS
+
+
+# ── Kho lưu trữ: chọn/tạo vị trí kho (repository location prompts) ───────
+UI_REPOSITORY_STORE_TEXT_PAIRS: tuple[tuple[str, str], ...] = (
+    ("Repository is not open (the repository location is no longer "
+     "valid).\nOpen the Repository screen, choose the repository location "
+     "again, then retry.",
+     "Kho lưu trữ chưa được mở (vị trí kho không còn hợp lệ).\n"
+     "Hãy mở màn hình Kho lưu trữ, chọn lại vị trí kho, rồi thử lại."),
+    ("Repository not found", "Không tìm thấy kho lưu trữ"),
+    ("The repository is configured at:\n{}\n\nwhich does not exist or has "
+     "no data (the folder may have been moved or renamed). What would you "
+     "like to do?",
+     "Kho lưu trữ được cấu hình tại:\n{}\n\nkhông tồn tại hoặc chưa có dữ "
+     "liệu (thư mục có thể đã bị di chuyển hoặc đổi tên). Bạn muốn xử lý "
+     "thế nào?"),
+    ("Choose a different repository location", "Chọn vị trí kho khác"),
+    ("Create a new repository here", "Tạo kho mới tại vị trí này"),
+    ("New repository", "Kho mới"),
+    ("The selected folder has no repository data:\n{}\n\nCreate a new "
+     "(empty) repository here?",
+     "Thư mục được chọn chưa có dữ liệu kho:\n{}\n\nTạo kho mới (rỗng) "
+     "tại đây?"),
+    ("Create new repository", "Tạo kho mới"),
+    ("Pick again", "Chọn lại"),
+    ("Repository data from a previous installation detected",
+     "Phát hiện kho dữ liệu của bản cũ"),
+    ("A repository with data was detected at:\n{}\n\nReuse this repository "
+     "for the current app?",
+     "Phát hiện kho lưu trữ có dữ liệu tại:\n{}\n\nDùng lại kho này cho "
+     "ứng dụng hiện tại?"),
+    ("The repository is empty at {}. If you just moved the app or upgraded "
+     "to a new version, {} to reuse the old repository.",
+     "Kho hiện trống tại {}. Nếu bạn vừa di chuyển ứng dụng hoặc nâng cấp "
+     "sang bản mới, {} để dùng lại kho cũ."),
+    ("Repository is not open — the configured location no longer "
+     "exists:\n{} — {}",
+     "Kho lưu trữ chưa được mở — vị trí cấu hình không còn tồn tại:\n"
+     "{} — {}"),
+    ("Date updated", "Ngày cập nhật"),
+    ("Agency per the document (extracted by KIE) — the exact name cannot "
+     "be looked up via the identity-code catalog (the \"*\" mark)",
+     "Cơ quan theo văn bản (bóc bằng KIE) — không tra được tên xác định "
+     "qua danh mục mã định danh (dấu \"*\")"),
+)
+
+UI_TEXT_PAIRS += UI_REPOSITORY_STORE_TEXT_PAIRS

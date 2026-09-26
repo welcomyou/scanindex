@@ -306,6 +306,72 @@ def test_declass_kie_disabled_by_env(monkeypatch, tmp_path) -> None:
     assert match.issue_year == 2016
 
 
+# ---------------------------------------------------------------------------
+# Một lần infer lấy đủ: pass cơ quan chạy TRƯỚC, pass năm tận dụng cache
+# ---------------------------------------------------------------------------
+
+def test_kie_org_pass_enables_year_reuse(tmp_path, monkeypatch) -> None:
+    """Trang SẠCH (1 dòng ngày): một mình pass năm không gọi KIE — nhưng pass
+    cơ quan đã infer cho trang đó → pass năm đọc cache lấy năm theo nhãn
+    PLACE_DATE, KHÔNG infer lần 2. Một lần infer, đủ cả năm + cơ quan."""
+    _freeze_year(monkeypatch, 2026)
+    from scanindex.core.kie import engine as kie_engine
+
+    canon = {"pages": [_page_with_dates([(95, 2016)])]}  # regex → 2016
+    json_path = str(tmp_path / "ocr.json.zst")
+    open(json_path, "wb").close()
+    calls = []
+
+    def fake_run(path, selected_pages=None):
+        calls.append(selected_pages)
+        return {
+            "field_instances": [
+                {
+                    "label": "PLACE_DATE",
+                    "page_index": 0,
+                    "text": "Hà Nội, ngày 10 tháng 10 năm 2004",
+                },
+                {"label": "ISSUE_ORG_NAME", "page_index": 0, "text": "SỞ TƯ PHÁP"},
+            ]
+        }
+
+    monkeypatch.setattr(kie_engine, "_run_layoutlmv3", fake_run)
+    sfss._KIE_FIELDS_CACHE.clear()
+    match = _match(keyword="MẬT")  # D:/kho/a.pdf — không có mã định danh
+    try:
+        # Đúng thứ tự scan_one_file_for_secret_artifact: cơ quan trước,
+        # giải mật sau.
+        sfss._apply_kie_org_fallback([match], json_path)
+        sfss._apply_declassification_notes(
+            [match], canon, canonical_json_path=json_path
+        )
+    finally:
+        sfss._KIE_FIELDS_CACHE.clear()
+
+    assert calls == [[0]]  # đúng 1 lần infer cho cả hai pass
+    assert match.kie_org_name == "SỞ TƯ PHÁP*"
+    assert match.issue_year == 2004  # năm theo KIE, ưu tiên hơn regex 2016
+    assert match.declass_due is True  # 2026 - 2004 ≥ 10 năm của MẬT
+    assert DECLASS_NOTE_LABEL in match.note
+
+
+def test_year_pass_alone_still_skips_kie_on_clean_page(monkeypatch, tmp_path) -> None:
+    """Không có pass cơ quan (đơn giản chỉ gọi pass năm): trang sạch vẫn
+    KHÔNG gọi KIE — cascade regex-first giữ nguyên."""
+    _freeze_year(monkeypatch, 2026)
+    canon = {"pages": [_page_with_dates([(95, 2016)])]}
+    json_path = str(tmp_path / "ocr.json.zst")
+    open(json_path, "wb").close()
+
+    def fake_kie(path, page_index):
+        raise AssertionError("Trang sạch, cache trống → không được gọi KIE")
+
+    monkeypatch.setattr(sfss, "_kie_issue_year", fake_kie)
+    match = _match(keyword="MẬT")
+    _apply_declassification_notes([match], canon, canonical_json_path=json_path)
+    assert match.issue_year == 2016
+
+
 def test_declass_excel_note_cell_is_green(tmp_path) -> None:
     import openpyxl
 
@@ -318,10 +384,10 @@ def test_declass_excel_note_cell_is_green(tmp_path) -> None:
     export_matches_to_excel([match], dest)
 
     wb = openpyxl.load_workbook(dest)
-    declass_cell = wb.active.cell(row=2, column=10)
+    declass_cell = wb.active.cell(row=2, column=11)
     assert declass_cell.value == "Đáp ứng (2016, 10 năm)"
     assert str(declass_cell.font.color.rgb).endswith("1D7A34")
-    note_cell = wb.active.cell(row=2, column=11)
+    note_cell = wb.active.cell(row=2, column=12)
     assert str(note_cell.value).startswith(DECLASS_NOTE_LABEL)
     assert str(note_cell.font.color.rgb).endswith("1D7A34")
 
@@ -377,7 +443,7 @@ def test_add_result_colors_declass_note_green(qapp, screen) -> None:
     match.note = f"{DECLASS_NOTE_LABEL} (văn bản 2016, MẬT 10 năm)"
     screen._add_result(match)
 
-    note_item = screen.table.item(0, 5)
+    note_item = screen.table.item(0, 8)
     assert note_item is not None
     assert note_item.foreground().color() == QColor(COLOR_GREEN)
     # Cột khác giữ màu bình thường.
@@ -394,4 +460,32 @@ def test_add_result_loaded_note_without_flag_still_green(qapp, screen) -> None:
     match = _match()
     match.note = f"x; {DECLASS_NOTE_LABEL} (văn bản 2015, MẬT 10 năm)"
     screen._add_result(match)
-    assert screen.table.item(0, 5).foreground().color() == QColor(COLOR_GREEN)
+    assert screen.table.item(0, 8).foreground().color() == QColor(COLOR_GREEN)
+
+
+def test_add_result_shows_org_columns(qapp, screen) -> None:
+    """Bảng giao diện hiển thị Mã CQ / Cơ quan suy từ tên file uuid_mã."""
+    m = SecretScanMatch(
+        source_path=(
+            r"D:\kho\39cfea63-af46-460f-8c1c-340ab5e3c6af_"
+            r"A29.183-A29.37.28.001-04-0010-082.pdf"
+        ),
+        relative_path=(
+            "39cfea63-af46-460f-8c1c-340ab5e3c6af_"
+            "A29.183-A29.37.28.001-04-0010-082.pdf"
+        ),
+        keyword="MẬT",
+        page_number=1,
+        mode="Trang đầu",
+        ocr_pdf_path="",
+        note="",
+    )
+    screen._add_result(m)
+    assert screen.table.item(0, 3).text() == "A29.183"
+    assert screen.table.item(0, 4).text() == "Đảng ủy Xã Hưng Long"
+
+    # Tên file không dạng uuid → 2 cột trống, các cột khác vẫn đủ.
+    screen._add_result(_match(r"D:\kho\congvan_thuong.pdf"))
+    assert screen.table.item(1, 3).text() == ""
+    assert screen.table.item(1, 4).text() == ""
+    assert screen.table.item(1, 1).text() == "MẬT"

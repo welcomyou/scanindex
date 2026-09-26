@@ -144,6 +144,8 @@ tests/*
 VERSION
 reproduce_issue.py
 xxxxxx/
+/sodochongoi/
+/$null
 .hf_cache/
 .pytest_cache/
 .cache/
@@ -169,5 +171,6 @@ config/sign_stamp_images/*.jpg
 config/sign_stamp_images/*.jpeg
 # Bulk-signing tool per-machine settings (input/output dirs of the last run).
 config/batch_sign_settings.json
+config/rename_tree_settings.json
 # Standalone dev benchmarks (not part of the app).
 benchmark_oneocr_vs_screenai.py

@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
 
 from scanindex.ui.screens.accuracy_screen import AccuracyScreen
 from scanindex.ui.screens.batch_signing_screen import BatchSigningScreen
+from scanindex.ui.screens.rename_tree_screen import RenameTreeScreen
 from scanindex.ui.screens.screen_base import ScreenContent
 from scanindex.ui.screens.secret_file_scan_screen import SecretFileScanScreen
 from scanindex.ui.theme import (
@@ -120,6 +121,7 @@ class SupportToolsScreen(ScreenContent):
         "accuracy": "Đo độ chính xác OCR",
         "secret_scan": "Phát hiện file mật trong thư mục",
         "batch_sign": "Ký số hàng loạt",
+        "rename_tree": "Đổi tên theo cây thư mục",
     }
 
     def __init__(self, parent: QWidget | None = None):
@@ -128,10 +130,12 @@ class SupportToolsScreen(ScreenContent):
         self._accuracy = AccuracyScreen()
         self._secret_scan = SecretFileScanScreen()
         self._batch_sign = BatchSigningScreen()
+        self._rename_tree = RenameTreeScreen()
         self._tools: dict[str, ScreenContent] = {
             "accuracy": self._accuracy,
             "secret_scan": self._secret_scan,
             "batch_sign": self._batch_sign,
+            "rename_tree": self._rename_tree,
         }
         self._sub_pages: dict[str, QWidget] = {}
         self._build_ui()
@@ -243,6 +247,15 @@ class SupportToolsScreen(ScreenContent):
         batch_sign.clicked.connect(lambda: self._open_tool("batch_sign"))
         grid.addWidget(batch_sign, 1, 0)
 
+        rename_tree = _ToolTile(
+            "🌳",
+            "Đổi tên theo cây thư mục",
+            "Đổi tên Mã định danh / Phông / Mục lục / Hồ sơ trong CSDL_SOHOA — "
+            "thư mục con và file PDF tự đổi theo, xem được PDF ngay bên phải.",
+        )
+        rename_tree.clicked.connect(lambda: self._open_tool("rename_tree"))
+        grid.addWidget(rename_tree, 1, 1)
+
         grid.setColumnStretch(0, 1)
         grid.setColumnStretch(1, 1)
         menu_layout.addStretch(1)
@@ -251,9 +264,11 @@ class SupportToolsScreen(ScreenContent):
         self._sub_pages["accuracy"] = self._accuracy
         self._sub_pages["secret_scan"] = self._secret_scan
         self._sub_pages["batch_sign"] = self._batch_sign
+        self._sub_pages["rename_tree"] = self._rename_tree
         self._stack.addWidget(self._sub_pages["accuracy"])
         self._stack.addWidget(self._sub_pages["secret_scan"])
         self._stack.addWidget(self._sub_pages["batch_sign"])
+        self._stack.addWidget(self._sub_pages["rename_tree"])
         self._stack.setCurrentWidget(self._menu)
 
     def _open_tool(self, key: str) -> None:

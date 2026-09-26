@@ -803,6 +803,124 @@ def _write_archive_path_setting(path: Path) -> None:
     _write_repository_path_setting(path)
 
 
+def _read_repository_path_setting_raw() -> str:
+    """Raw (unresolved) [Repository]/[Archive] path string; '' when unset."""
+    from scanindex.infra.data_versioning import get_active_settings_path
+    cfg_path = Path(get_active_settings_path())
+    if cfg_path.exists():
+        cfg = configparser.ConfigParser()
+        try:
+            cfg.read(cfg_path, encoding="utf-8")
+            for section, option in (("Repository", "path"), ("Archive", "path")):
+                if cfg.has_section(section) and cfg.has_option(section, option):
+                    p = cfg.get(section, option).strip()
+                    if p:
+                        return p
+        except Exception:
+            pass
+    return ""
+
+
+def _is_default_repository_setting(raw: str) -> bool:
+    """True when the configured path equals the bundled default ('repository'
+    relative to the app folder) — i.e. the user never chose a Kho location.
+    Only non-default locations deserve a "kho không còn ở đây" prompt: the
+    default one always moves together with the app folder."""
+    return raw.strip().lower().rstrip("\\/") == C.DEFAULT_ARCHIVE_DIRNAME.lower()
+
+
+def _repository_has_db(archive_path: Path) -> bool:
+    """True when the folder holds a repository SQLite DB (current versioned
+    name or any older one). An empty/missing folder must not be mistaken for
+    a Kho — otherwise a stale configured path looks like "data loss" after a
+    silent recreate."""
+    if not archive_path.is_dir():
+        return False
+    try:
+        for entry in archive_path.iterdir():
+            if not entry.is_file():
+                continue
+            name = entry.name.lower()
+            if name == C.SQLITE_FILE.lower() or (
+                name.startswith("repository-") and name.endswith(".db")
+            ):
+                return True
+    except OSError:
+        return False
+    return False
+
+
+def _find_sibling_repository(base_dir: Path) -> Optional[Path]:
+    """Look for a data-bearing Kho in folders next to the app (e.g. a newer
+    version was extracted to a fresh folder while the old install, with its
+    repository/, still sits beside it). Returns the most recently written
+    candidate, or None. Used only to *suggest* adoption — never auto-applied."""
+    parent = base_dir.parent
+    try:
+        entries = list(parent.iterdir())
+    except OSError:
+        return None
+    myself = base_dir.resolve()
+    candidates: list[tuple[float, Path]] = []
+    for entry in entries:
+        try:
+            if not entry.is_dir() or entry.resolve() == myself:
+                continue
+        except OSError:
+            continue
+        repo = entry / C.DEFAULT_ARCHIVE_DIRNAME
+        if not _repository_has_db(repo):
+            continue
+        try:
+            stamp = max(p.stat().st_mtime for p in repo.glob("repository*.db"))
+        except (OSError, ValueError):
+            stamp = 0.0
+        candidates.append((stamp, repo))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
+
+
+_DECLINED_SIBLING_KEY = "declinedsibling"
+
+
+def _read_repository_declined_sibling() -> str:
+    from scanindex.infra.data_versioning import get_active_settings_path
+    cfg_path = Path(get_active_settings_path())
+    if cfg_path.exists():
+        cfg = configparser.ConfigParser()
+        try:
+            cfg.read(cfg_path, encoding="utf-8")
+            if cfg.has_option("Repository", _DECLINED_SIBLING_KEY):
+                return cfg.get("Repository", _DECLINED_SIBLING_KEY).strip()
+        except Exception:
+            pass
+    return ""
+
+
+def _write_repository_declined_sibling(path: Path) -> None:
+    """Remember that the user declined adopting this sibling Kho so the
+    suggestion is not repeated on every launch. Best-effort: a failure just
+    means the question may be asked again."""
+    from scanindex.infra.data_versioning import get_active_settings_path
+    cfg_path = Path(get_active_settings_path())
+    cfg = configparser.ConfigParser()
+    if cfg_path.exists():
+        try:
+            cfg.read(cfg_path, encoding="utf-8")
+        except Exception:
+            pass
+    if not cfg.has_section("Repository"):
+        cfg.add_section("Repository")
+    cfg.set("Repository", _DECLINED_SIBLING_KEY, str(path))
+    try:
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            cfg.write(f)
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------- Domain
 # Lightweight in-screen view types — kept separate from search_engine's
 # SearchResult so the UI can compose its own dossier / file / hit groupings
@@ -3450,6 +3568,9 @@ class RepositoryScreen(ScreenContent):
         self.setStyleSheet(f"background: {COLOR_BG};")
 
         self._archive_path: Path = _read_repository_path_setting()
+        # Set when the startup "kho không còn ở đây" prompt was declined: no
+        # store is opened and nothing is created until the user picks a Kho.
+        self._repo_open_declined = False
         self._store: Optional[ArchiveStore] = None
         self._index: Optional[HybridIndex] = None
         self._engine: Optional[SearchEngine] = None
@@ -3522,7 +3643,7 @@ class RepositoryScreen(ScreenContent):
         self._active_dossier_view_id = 0
 
         self._build_ui()
-        self._open_store()
+        self._open_store(interactive=True)
         # Land on dossier list after store opens.
         self._show_dossier_list()
 
@@ -3552,6 +3673,20 @@ class RepositoryScreen(ScreenContent):
         outer.setSpacing(SP[2])
 
         self._header_info_widget = self._build_status_bar()
+        # One-line warning strip (missing Kho / suspiciously empty Kho) shown
+        # above everything else; see _refresh_status for the show/hide logic.
+        self._repo_banner = QLabel()
+        self._repo_banner.setObjectName("repositoryBanner")
+        self._repo_banner.setWordWrap(True)
+        self._repo_banner.setVisible(False)
+        self._repo_banner.setStyleSheet(
+            f"QLabel#repositoryBanner {{ background: {COLOR_ELEVATED};"
+            f" border: 1px solid {COLOR_RED}; border-radius: {RADIUS_MD}px;"
+            f" padding: {SP[2]}px {SP[3]}px; color: {COLOR_TEXT};"
+            f" font: 12px '{FONT_UI}'; }}"
+        )
+        self._repo_banner.linkActivated.connect(self._on_banner_link_activated)
+        outer.addWidget(self._repo_banner)
         # Tab row (Hồ sơ / Tài liệu) sits ABOVE the search box because the
         # search box's meaning (tên hồ sơ vs nội dung OCR) follows the
         # active tab. Criteria panels sit under the search bar, next to the
@@ -4415,7 +4550,133 @@ class RepositoryScreen(ScreenContent):
 
     # ------ Store/Index lifecycle ------
 
-    def _open_store(self):
+    def _startup_resolve_repository(self) -> None:
+        """Interactive guard before the first Kho open of the session.
+
+        A Kho the user explicitly configured (non-default ``[Repository]
+        path``) that is missing or holds no DB used to be silently recreated
+        empty — which looks exactly like total data loss after the app folder
+        (or the Kho) was moved. Ask what to do instead. Default-path installs
+        keep the silent-create behaviour; fresh installs additionally get a
+        one-time offer to adopt a data-bearing Kho found beside this app.
+        """
+        raw = _read_repository_path_setting_raw()
+        if _is_default_repository_setting(raw):
+            self._offer_sibling_repository()
+            return
+        if _repository_has_db(self._archive_path):
+            return
+        box = QMessageBox(self)
+        box.setWindowTitle("Không tìm thấy kho lưu trữ")
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setText(
+            "Kho lưu trữ được cấu hình tại:\n"
+            f"{self._archive_path}\n\n"
+            "không tồn tại hoặc chưa có dữ liệu (thư mục có thể đã bị di "
+            "chuyển hoặc đổi tên). Bạn muốn xử lý thế nào?"
+        )
+        btn_pick = box.addButton("Chọn vị trí kho khác",
+                                 QMessageBox.ButtonRole.YesRole)
+        box.addButton("Tạo kho mới tại vị trí này",
+                      QMessageBox.ButtonRole.NoRole)
+        btn_cancel = box.addButton("Hủy",
+                                   QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is btn_pick:
+            start = (self._archive_path.parent
+                     if self._archive_path.parent.is_dir()
+                     else Path.home())
+            picked = QFileDialog.getExistingDirectory(
+                self, translations.localize_text("Chọn vị trí kho lưu trữ"),
+                str(start),
+            )
+            if picked:
+                candidate = Path(picked)
+                if _repository_has_db(candidate) or self._confirm_new_store(candidate):
+                    self._archive_path = candidate
+                    try:
+                        _write_repository_path_setting(candidate)
+                    except Exception as e:
+                        self.log_message.emit(
+                            f"Không lưu được settings.ini: {e}", "err"
+                        )
+                    return
+            self._repo_open_declined = True
+        elif clicked is btn_cancel:
+            self._repo_open_declined = True
+        else:
+            # "Tạo kho mới tại vị trí này": keep the historic silent-create
+            # behaviour, but leave a trail in the log panel.
+            self.log_message.emit(
+                f"Kho lưu trữ: tạo kho mới (trống) tại {self._archive_path}",
+                "info",
+            )
+
+    def _confirm_new_store(self, candidate: Path) -> bool:
+        """Ask before silently turning a freshly picked folder without any
+        repository DB into a new empty Kho (guards against wrong picks)."""
+        box = QMessageBox(self)
+        box.setWindowTitle("Kho mới")
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setText(
+            f"Thư mục được chọn chưa có dữ liệu kho:\n{candidate}\n\n"
+            "Tạo kho mới (rỗng) tại đây?"
+        )
+        box.addButton("Tạo kho mới", QMessageBox.ButtonRole.YesRole)
+        box.addButton("Chọn lại", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        return box.clickedButton() is not None and \
+            box.clickedButton().text() == "Tạo kho mới"
+
+    def _offer_sibling_repository(self) -> None:
+        """First-run helper: this app folder has no Kho yet, but an older
+        installation's data-bearing Kho sits next to it (e.g. a new release
+        was extracted to a fresh folder). Offer to adopt it instead of
+        starting from scratch. Never shown to returning users (settings no
+        longer auto-seeded) or after a decline (remembered in settings)."""
+        from scanindex.infra.data_versioning import is_settings_auto_seeded
+        base_dir = Path(get_base_dir())
+        if _repository_has_db(base_dir / C.DEFAULT_ARCHIVE_DIRNAME):
+            return
+        if not is_settings_auto_seeded():
+            return
+        sibling = _find_sibling_repository(base_dir)
+        if sibling is None:
+            return
+        declined = _read_repository_declined_sibling()
+        if declined:
+            try:
+                if Path(declined).resolve() == sibling.resolve():
+                    return
+            except OSError:
+                pass
+        choice = QMessageBox.question(
+            self,
+            "Phát hiện kho dữ liệu của bản cũ",
+            f"Phát hiện kho lưu trữ có dữ liệu tại:\n{sibling}\n\n"
+            "Dùng lại kho này cho ứng dụng hiện tại?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if choice == QMessageBox.StandardButton.Yes:
+            self._archive_path = sibling
+            try:
+                _write_repository_path_setting(sibling)
+            except Exception as e:
+                self.log_message.emit(f"Không lưu được settings.ini: {e}", "err")
+        else:
+            _write_repository_declined_sibling(sibling)
+
+    def _open_store(self, *, interactive: bool = False, force: bool = False):
+        if interactive:
+            self._startup_resolve_repository()
+        if self._repo_open_declined and not force:
+            # The startup prompt was declined (or a re-pick was abandoned):
+            # leave the Kho closed instead of silently recreating an empty
+            # store at the stale location.
+            self._refresh_status()
+            return
         try:
             # Migrate any legacy repository DB into this version's filename
             # BEFORE opening the store, so ArchiveStore opens the right file.
@@ -4454,6 +4715,7 @@ class RepositoryScreen(ScreenContent):
                 return
             self._finish_index_init()
         except Exception as e:
+            self._refresh_status()
             QMessageBox.critical(self, "Kho lưu trữ",
                                  f"Không mở được kho:\n{e}")
 
@@ -4484,6 +4746,7 @@ class RepositoryScreen(ScreenContent):
             self._refresh_status()
             self._populate_dossier_filter_combos()
         except Exception as e:
+            self._refresh_status()
             QMessageBox.critical(self, "Kho lưu trữ",
                                  f"Không mở được kho:\n{e}")
 
@@ -4553,12 +4816,48 @@ class RepositoryScreen(ScreenContent):
         progress.canceled.connect(worker.cancel)
         worker.start()
 
+    def _on_banner_link_activated(self, link: str) -> None:
+        if link == "pick":
+            self._pick_archive_path()
+
+    def _update_repo_banner(self, n_dossiers: int = 0) -> None:
+        """Show a warning strip when the Kho is not open, or is open but
+        suspiciously empty at a user-configured (non-default) location —
+        the two states that look like data loss after moving the app."""
+        banner = getattr(self, "_repo_banner", None)
+        if banner is None:
+            return
+        pick_link = "<a href='pick'>Chọn lại vị trí kho</a>"
+        if self._store is None:
+            if self._repo_open_declined:
+                banner.setText(
+                    "Kho lưu trữ chưa được mở — vị trí cấu hình không còn "
+                    f"tồn tại:\n{self._archive_path} — {pick_link}"
+                )
+            else:
+                banner.setText(
+                    "Không mở được kho lưu trữ. " + pick_link
+                )
+            banner.setVisible(True)
+            return
+        if n_dossiers == 0 and not _is_default_repository_setting(
+                _read_repository_path_setting_raw()):
+            banner.setText(
+                "Kho hiện trống tại "
+                f"{self._archive_path}. Nếu bạn vừa di chuyển ứng dụng hoặc "
+                f"nâng cấp sang bản mới, {pick_link} để dùng lại kho cũ."
+            )
+            banner.setVisible(True)
+            return
+        banner.setVisible(False)
+
     def _refresh_status(self):
         if self._store is None:
             self._path_label.setText("Chưa có kho")
             self._path_label.setToolTip("Chưa có kho")
             self._stats_label.setText("")
             self._stats_label.setToolTip("")
+            self._update_repo_banner()
             return
         try:
             row = self._store.connect().execute(
@@ -4585,6 +4884,7 @@ class RepositoryScreen(ScreenContent):
         )
         self._stats_label.setText(stats)
         self._stats_label.setToolTip(stats)
+        self._update_repo_banner(n_dossiers)
 
     def update_texts(self) -> None:
         """Refresh dynamic repository labels after an EN/VI switch."""
@@ -4604,16 +4904,20 @@ class RepositoryScreen(ScreenContent):
         )
         if not new_path:
             return
-        self._archive_path = Path(new_path)
+        candidate = Path(new_path)
+        if not _repository_has_db(candidate) and not self._confirm_new_store(candidate):
+            return
+        self._archive_path = candidate
+        self._repo_open_declined = False
         try:
-            _write_repository_path_setting(self._archive_path)
+            _write_repository_path_setting(candidate)
         except Exception as e:
             self.log_message.emit(f"Không lưu được settings.ini: {e}", "err")
         if self._store is not None:
             if self._index is not None:
                 self._index.close()
             self._store.close()
-        self._open_store()
+        self._open_store(force=True)
         self._show_dossier_list()
 
     # ------ List rendering helpers ------
@@ -7507,6 +7811,12 @@ class RepositoryScreen(ScreenContent):
 
     def reset_archive_data(self) -> Path:
         """Destructive reset requested from Settings after typed confirm."""
+        if self._store is None or self._repo_open_declined:
+            raise RuntimeError(
+                "Kho lưu trữ chưa được mở (vị trí kho không còn hợp lệ). "
+                "Hãy mở màn hình Kho lưu trữ và chọn lại vị trí kho trước "
+                "khi reset dữ liệu."
+            )
         if getattr(self, "_prepare_add_worker", None) is not None:
             worker = self._prepare_add_worker
             if worker is not None and worker.isRunning():
