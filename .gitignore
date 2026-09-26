@@ -127,6 +127,10 @@ tests/*
 !tests/test_secret_scan_versioned_resume.py
 !tests/test_ocr_text_layer.py
 !tests/test_archive_step1_json_only.py
+!tests/test_rename_tree.py
+!tests/test_repository_missing_path_guard.py
+!tests/test_repository_open_guard_interactive.py
+!tests/test_settings_tab_secret_workers.py
 !tests/test_secrecy_detection.py
 /scan_progress/
 !tests/test_portable_config_bootstrap.py
