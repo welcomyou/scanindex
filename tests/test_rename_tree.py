@@ -65,6 +65,30 @@ def test_parse_dossier_and_pdf_names():
     assert rt.parse_pdf_name(f"{MDD}-{PHONG}-01-0001-001.docx") is None
 
 
+def test_parse_pdf_name_optional_extra_info():
+    """Quy ước: <MãĐD>-<MãPhông>-<ML>-<HS>-<STT>[-<thông tin khác>].pdf."""
+    # Ví dụ đầy đủ: thông tin khác = loại BC, số 0004, năm 2026.
+    name = "A29.01-A29.01-03-0005-120-BC-0004-2026.pdf"
+    p = rt.parse_pdf_name(name)
+    assert p == rt.PdfName("A29.01", "A29.01", "03", "0005", "120",
+                           ".pdf", "BC-0004-2026")
+    assert p.compose() == name
+    # Không có phần tùy chọn → extra rỗng, parse như cũ.
+    plain = f"{MDD}-{PHONG}-01-0001-012.PDF"
+    q = rt.parse_pdf_name(plain)
+    assert q.extra == "" and q.compose() == plain
+    # Phần tùy chọn chấp nhận nhiều đoạn bất kỳ (không có đoạn rỗng).
+    assert rt.parse_pdf_name(
+        f"{MDD}-{PHONG}-01-0001-012-TL.chinhsua.pdf").extra == "TL.chinhsua"
+    # Đoạn rỗng trong phần tùy chọn → lệch quy ước.
+    assert rt.parse_pdf_name(f"{MDD}-{PHONG}-01-0001-012-.pdf") is None
+    assert rt.parse_pdf_name(f"{MDD}-{PHONG}-01-0001-012-BC--2026.pdf") is None
+    # Vẫn phải đủ 5 đoạn đầu và là file PDF.
+    assert rt.parse_pdf_name(f"{MDD}-{PHONG}-01-0001.pdf") is None
+    assert rt.parse_pdf_name(
+        f"{MDD}-{PHONG}-01-0001-012-BC-0004-2026.docx") is None
+
+
 def test_validate_component_rejects_bad_values():
     with pytest.raises(ValueError):
         rt.validate_component("Mã định danh", "  ")
@@ -378,6 +402,95 @@ def test_path_map_and_map_path(tree):
 def test_scan_stats(tree):
     stats = rt.scan_stats(tree)
     assert stats == {"mdd": 1, "phong": 2, "ho_so": 5, "pdf": 6}
+
+
+# -------------------------------------- thông tin tùy chọn PDF (sau số STT)
+
+def test_rename_ho_so_preserves_pdf_extra_info(tree):
+    """Đổi tên hồ sơ: PDF dựng lại theo mã mới, GIỮ STT + thông tin tùy chọn."""
+    hs = Path(MDD) / PHONG / "01" / f"{MDD}-{PHONG}-01-0001"
+    src = f"{MDD}-{PHONG}-01-0001-120-BC-0004-2026.pdf"
+    (tree / hs / src).write_bytes(b"x")
+
+    plan = rt.plan_folder_rename(tree, hs, "0005")
+    rt.execute_plan(plan)
+
+    new_hs = Path(MDD) / PHONG / "01" / f"{MDD}-{PHONG}-01-0005"
+    assert (tree / new_hs /
+            f"{MDD}-{PHONG}-01-0005-120-BC-0004-2026.pdf").is_file()
+    assert plan.affected_pdfs == 3  # 001 + 002 + file có thông tin tùy chọn
+
+
+def test_rename_muc_luc_preserves_pdf_extra_info(tree):
+    """Đổi mục lục cascade xuống hồ sơ/PDF: thông tin tùy chọn giữ nguyên."""
+    ml = Path(MDD) / PHONG / "01"
+    src = f"{MDD}-{PHONG}-01-0002-007-BC-0004-2026.pdf"
+    (tree / ml / f"{MDD}-{PHONG}-01-0002" / src).write_bytes(b"x")
+
+    plan = rt.plan_folder_rename(tree, ml, "03")
+    rt.execute_plan(plan)
+
+    new_hs = Path(MDD) / PHONG / "03" / f"{MDD}-{PHONG}-03-0002"
+    assert (tree / new_hs /
+            f"{MDD}-{PHONG}-03-0002-007-BC-0004-2026.pdf").is_file()
+
+
+def test_pdf_rename_stt_preserves_extra_info(tree):
+    hs = Path(MDD) / PHONG / "01" / f"{MDD}-{PHONG}-01-0001"
+    src = f"{MDD}-{PHONG}-01-0001-120-BC-0004-2026.pdf"
+    (tree / hs / src).write_bytes(b"x")
+
+    plan = rt.plan_pdf_rename_stt(tree, hs / src, "121")
+    assert plan.new_name == f"{MDD}-{PHONG}-01-0001-121-BC-0004-2026.pdf"
+    rt.execute_plan(plan)
+    assert (tree / hs /
+            f"{MDD}-{PHONG}-01-0001-121-BC-0004-2026.pdf").is_file()
+
+
+def test_pdf_move_preserves_extra_info(tree):
+    """Chuyển PDF sang hồ sơ khác: giữ STT (còn tự do) và thông tin tùy chọn."""
+    src_hs = Path(MDD) / PHONG / "01" / f"{MDD}-{PHONG}-01-0001"
+    tgt = Path(MDD) / PHONG / "02" / f"{MDD}-{PHONG}-02-0001"  # có sẵn 001
+    src_name = f"{MDD}-{PHONG}-01-0001-120-BC-0004-2026.pdf"
+    (tree / src_hs / src_name).write_bytes(b"x")
+
+    plan = rt.plan_pdf_move(tree, [src_hs / src_name], tgt)
+    rt.execute_plan(plan)
+    assert (tree / tgt /
+            f"{MDD}-{PHONG}-02-0001-120-BC-0004-2026.pdf").is_file()
+
+
+def test_pdf_reorder_preserves_extra_info(tree):
+    hs_rel = Path(MDD) / PHONG / "01" / f"{MDD}-{PHONG}-01-0001"
+    d = tree / hs_rel
+    prefix = f"{MDD}-{PHONG}-01-0001"
+    ex = f"{prefix}-120-BC-0004-2026.pdf"
+    (d / ex).write_bytes(b"x")
+
+    plan = rt.plan_pdf_reorder(tree, hs_rel, [
+        f"{prefix}-001.pdf", ex, f"{prefix}-002.pdf",
+    ])
+    rt.execute_plan(plan)
+
+    # Vị trí 2 → STT 002, thông tin tùy chọn giữ nguyên.
+    assert (d / f"{prefix}-002-BC-0004-2026.pdf").is_file()
+    assert (d / f"{prefix}-001.pdf").is_file()
+    assert (d / f"{prefix}-003.pdf").is_file()
+
+
+def test_renumber_pdfs_preserves_extra_info(tree):
+    """Đánh số lại: file có thông tin tùy chọn nhận STT mới, giữ nguyên phần đó."""
+    hs = tree / MDD / PHONG / "01" / f"{MDD}-{PHONG}-01-0001"
+    (hs / f"{MDD}-{PHONG}-01-0001-005-BC-0004-2026.pdf").write_bytes(b"5")
+
+    rel = Path(MDD) / PHONG / "01" / f"{MDD}-{PHONG}-01-0001" / \
+        f"{MDD}-{PHONG}-01-0001-002.pdf"
+    plan = rt.plan_renumber_siblings_from(tree, rel)
+    rt.execute_plan(plan)
+
+    # Từ 002: file 005 (có extra) là phần tử kế → nhận 003, giữ extra.
+    assert (hs /
+            f"{MDD}-{PHONG}-01-0001-003-BC-0004-2026.pdf").is_file()
 
 
 # ---------------------------------------------------------------- UI screen

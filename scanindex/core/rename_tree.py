@@ -26,8 +26,14 @@ thì **tên hồ sơ / file PDF bên dưới được DỰNG LẠI từ bộ mã
 Hồ sơ / PDF đang LỆCH mã cha (tên cũ không khớp thư mục cha — dữ liệu cũ
 hoặc đã bị đổi tên thủ công bên ngoài) cũng được dựng lại luôn theo bộ mã
 mới của chuỗi cha, giữ nguyên số hồ sơ và số thứ tự PDF. Chỉ mục KHÔNG
-parse được quy ước 4/5 đoạn mới bị bỏ qua và báo trong
-``RenamePlan.skipped``.
+parse được quy ước (hồ sơ 4 đoạn; PDF 5 đoạn + phần thông tin tùy chọn)
+mới bị bỏ qua và báo trong ``RenamePlan.skipped``.
+
+Tên file PDF có thể kèm **thông tin tùy chọn** sau số thứ tự:
+``<MãĐD>-<MãPhông>-<ML>-<HS>-<STT>[-<thông tin khác>].pdf`` — ví dụ
+``...-0120-BC-0004-2026.pdf`` (loại văn bản BC, số 0004, năm 2026). Phần
+này KHÔNG thuộc định danh: đổi mã cha / di chuyển / đánh số lại giữ nguyên
+verbatim (``PdfName.extra``), kể cả khi số thứ tự được gán số mới.
 
 Độ rộng số BẮT BUỘC (``LEVEL_WIDTH`` / ``PDF_STT_WIDTH``): Mục lục đúng 2
 chữ số, Hồ sơ đúng 4 chữ số, số thứ tự PDF (NNN) đúng 3 chữ số — ép khi
@@ -111,21 +117,29 @@ class DossierName:
 
 @dataclass(frozen=True)
 class PdfName:
-    """Tên file `<MãĐD>-<MãPhông>-<ML>-<HS>-<NNN>.pdf` (giữ nguyên chuỗi STT)."""
+    """Tên file `<MãĐD>-<MãPhông>-<ML>-<HS>-<NNN>[-<thông tin khác>].pdf`.
+
+    ``stt`` giữ nguyên chuỗi gốc; ``extra`` là phần thông tin tùy chọn đứng
+    SAU số thứ tự (ví dụ ``BC-0004-2026`` — loại văn bản, số, năm ban hành),
+    có thể tự chứa dấu "-" và được giữ nguyên verbatim qua mọi thao tác đổi
+    tên / di chuyển / đánh số. ``extra = ""`` khi file không có phần này.
+    """
     ma_dinh_danh: str
     ma_phong: str
     muc_luc: str
     ho_so: str
     stt: str
     ext: str  # ".pdf" hoặc ".PDF" — giữ nguyên như file gốc
+    extra: str = ""  # thông tin tùy chọn sau STT (không bắt buộc)
 
     def compose(self) -> str:
-        return (
-            SEGMENT_SEP.join(
-                (self.ma_dinh_danh, self.ma_phong, self.muc_luc,
-                 self.ho_so, self.stt)
-            ) + self.ext
+        name = SEGMENT_SEP.join(
+            (self.ma_dinh_danh, self.ma_phong, self.muc_luc,
+             self.ho_so, self.stt)
         )
+        if self.extra:
+            name += SEGMENT_SEP + self.extra
+        return name + self.ext
 
 
 def parse_dossier_folder_name(name: str) -> DossierName | None:
@@ -137,14 +151,25 @@ def parse_dossier_folder_name(name: str) -> DossierName | None:
 
 
 def parse_pdf_name(name: str) -> PdfName | None:
-    """Parse tên file PDF; trả None nếu không khớp quy ước 5 đoạn + .pdf."""
+    """Parse tên file PDF; trả None nếu không khớp quy ước ≥5 đoạn + .pdf.
+
+    5 đoạn đầu bắt buộc: ``<MãĐD>-<MãPhông>-<ML>-<HS>-<STT>``. Các đoạn từ
+    thứ 6 trở đi (tùy chọn, không được có đoạn rỗng) được gộp lại bằng "-"
+    thành ``PdfName.extra`` — ví dụ ``...-120-BC-0004-2026.pdf`` cho
+    ``extra="BC-0004-2026"``. Vì mã định danh / phông / mục lục / hồ sơ /
+    STT không bao giờ chứa "-" (bị chặn ở ``validate_component``), mọi đoạn
+    thừa chắc chắn thuộc phần thông tin tùy chọn — không gây nhập nhằng.
+    """
     p = Path(name)
     if p.suffix.lower() != ".pdf":
         return None
     parts = p.stem.split(SEGMENT_SEP)
-    if len(parts) != 5 or not all(parts):
+    if len(parts) < 5 or not all(parts):
         return None
-    return PdfName(*parts, ext=p.suffix)
+    return PdfName(
+        *parts[:5], ext=p.suffix,
+        extra=SEGMENT_SEP.join(parts[5:]),
+    )
 
 
 def validate_component(label: str, value: str,
@@ -307,6 +332,7 @@ def _plan_ml_children(ml_dir: Path, *, new_mdd: str, new_phong: str,
             new_pdf = PdfName(
                 ma_dinh_danh=new_mdd, ma_phong=new_phong, muc_luc=new_ml,
                 ho_so=parsed.ho_so, stt=pdf.stt, ext=pdf.ext,
+                extra=pdf.extra,
             ).compose()
             if new_pdf != entry.name:
                 plan.ops.append(RenameOp(
@@ -418,6 +444,7 @@ def plan_folder_rename(root: Path, folder_rel: Path,
             new_pdf = PdfName(
                 ma_dinh_danh=parts[0], ma_phong=parts[1], muc_luc=parts[2],
                 ho_so=comp, stt=pdf.stt, ext=pdf.ext,
+                extra=pdf.extra,
             ).compose()
             if new_pdf != entry.name:
                 plan.ops.append(RenameOp(
@@ -479,6 +506,7 @@ def _plan_move_dossier_pdfs(ho_so_dir: Path,
         new_pdf = PdfName(
             ma_dinh_danh=mdd, ma_phong=phong, muc_luc=ml, ho_so=hs,
             stt=stt, ext=entry.suffix,
+            extra=parsed.extra if parsed is not None else "",
         ).compose()
         if new_pdf != entry.name:
             plan.ops.append(RenameOp(
@@ -700,7 +728,7 @@ def _plan_renumber_pdfs_from(root: Path, rel: Path, item: Path,
         final = PdfName(
             ma_dinh_danh=base.ma_dinh_danh, ma_phong=base.ma_phong,
             muc_luc=base.muc_luc, ho_so=base.ho_so, stt=stt,
-            ext=f.suffix,
+            ext=f.suffix, extra=p.extra,
         ).compose()
         if final != f.name:
             changed.append((f, ho_so_dir / final))
@@ -944,6 +972,7 @@ def plan_pdf_reorder(root: Path, ho_so_rel: Path,
             ma_dinh_danh=parsed.ma_dinh_danh, ma_phong=parsed.ma_phong,
             muc_luc=parsed.muc_luc, ho_so=parsed.ho_so,
             stt=str(k).zfill(width), ext=parsed.ext,
+            extra=parsed.extra,
         ).compose()
         if new_name != old_name:
             changed.append((old_name, new_name))
@@ -1045,6 +1074,7 @@ def plan_pdf_move(root: Path, pdf_rels, target_ho_so_rel: Path) -> RenamePlan:
             ma_dinh_danh=tgt_codes.ma_dinh_danh, ma_phong=tgt_codes.ma_phong,
             muc_luc=tgt_codes.muc_luc, ho_so=tgt_codes.ho_so,
             stt=stt, ext=src.suffix,
+            extra=parsed.extra if parsed is not None else "",
         ).compose()
         dst = target_dir / final
         if dst == src:
@@ -1080,8 +1110,8 @@ def plan_pdf_rename_stt(root: Path, pdf_rel: Path, new_stt: str) -> RenamePlan:
     parsed = parse_pdf_name(src.name)
     if parsed is None:
         raise ValueError(
-            f"Tên tài liệu không khớp quy ước 5 đoạn nên không đổi được: "
-            f"{src.name}"
+            f"Tên tài liệu không khớp quy ước (5 đoạn + thông tin tùy chọn) "
+            f"nên không đổi được: {src.name}"
         )
     stt = str(new_stt or "").strip()
     if not stt.isdigit() or len(stt) != PDF_STT_WIDTH:
@@ -1092,6 +1122,7 @@ def plan_pdf_rename_stt(root: Path, pdf_rel: Path, new_stt: str) -> RenamePlan:
     final = PdfName(
         ma_dinh_danh=parsed.ma_dinh_danh, ma_phong=parsed.ma_phong,
         muc_luc=parsed.muc_luc, ho_so=parsed.ho_so, stt=stt, ext=parsed.ext,
+        extra=parsed.extra,
     ).compose()
     plan = RenamePlan(root=root, folder_rel=rel.parent, level=Level.HO_SO,
                       old_name=src.name, new_name=final, kind="rename",

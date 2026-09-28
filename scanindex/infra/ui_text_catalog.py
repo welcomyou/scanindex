@@ -1263,9 +1263,10 @@ UI_RENAME_TREE_TEXT_PAIRS: tuple[tuple[str, str], ...] = (
         "Tên không khớp quy ước — mục này sẽ bị bỏ qua khi đổi tên cấp cha.",
     ),
     (
-        "PDF name does not match the 5-segment convention — it will not be "
-        "renamed with the dossier.",
-        "Tên PDF không khớp quy ước 5 đoạn — sẽ không được đổi tên theo hồ sơ.",
+        "PDF name does not match the convention (5 segments plus optional "
+        "extra info) — it will not be renamed with the dossier.",
+        "Tên PDF không khớp quy ước (5 đoạn + thông tin tùy chọn) — sẽ không "
+        "được đổi tên theo hồ sơ.",
     ),
     # Trạng thái / tiến trình
     ("{} identity codes · {} fonds · {} dossiers · {} PDF",
@@ -1501,9 +1502,10 @@ UI_RENAME_TREE_TEXT_PAIRS: tuple[tuple[str, str], ...] = (
     ("The document must be inside a level-4 dossier.",
      "Tài liệu phải nằm trong một hồ sơ ở cấp 4 của cây."),
     ("Not a PDF document: {}", "Không phải tài liệu PDF: {}"),
-    ("The document name does not match the 5-segment convention and cannot "
-     "be renamed: {}",
-     "Tên tài liệu không khớp quy ước 5 đoạn nên không đổi được: {}"),
+    ("The document name does not match the convention (5 segments plus "
+     "optional extra info) and cannot be renamed: {}",
+     "Tên tài liệu không khớp quy ước (5 đoạn + thông tin tùy chọn) nên "
+     "không đổi được: {}"),
     ("Document order number must be exactly 3 digits (e.g. 001) — "
      "received: {}",
      "Số thứ tự tài liệu bắt buộc phải là đúng 3 chữ số (ví dụ: 001) — "

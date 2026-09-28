@@ -1082,8 +1082,8 @@ class RenameTreeScreen(ScreenContent):
         item.setData(0, _ROLE_BADGE, badge)
         item.setIcon(0, _file_icon("#eef1f4" if is_pdf else "#cdd3da"))
         if bad:
-            tip = ("Tên PDF không khớp quy ước 5 đoạn — sẽ không "
-                   "được đổi tên theo hồ sơ.")
+            tip = ("Tên PDF không khớp quy ước (5 đoạn + thông tin tùy "
+                   "chọn) — sẽ không được đổi tên theo hồ sơ.")
             item.setData(0, _ROLE_TIP, tip)
             item.setToolTip(0, translations.localize_text(tip))
         item.setForeground(1, QColor(COLOR_TEXT_SECONDARY))
