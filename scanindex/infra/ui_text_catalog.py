@@ -188,7 +188,12 @@ UI_TEXT_PAIRS: tuple[tuple[str, str], ...] = (
         "Tra cứu metadata và toàn văn kho PDF đã số hóa, lọc theo metadata HSLTCQ.",
     ),
     ("Tools", "Công cụ"),
-    ("Measure OCR accuracy and detect classified files in a folder.", "Đo độ chính xác OCR, phát hiện file mật trong thư mục."),
+    (
+        "Measure OCR accuracy, detect classified files, bulk-sign PDFs, "
+        "rename by folder tree, and audit digitization.",
+        "Đo độ chính xác OCR, phát hiện file mật, ký số hàng loạt, "
+        "đổi tên theo cây thư mục, thẩm định số hóa.",
+    ),
     ("Settings", "Cấu hình"),
     ("Adjust processing speed, models, language, and advanced options.", "Tùy chỉnh tốc độ xử lý, model, ngôn ngữ và tùy chọn nâng cao."),
     ("About", "Giới thiệu"),

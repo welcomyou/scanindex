@@ -16,6 +16,9 @@ from PySide6.QtWidgets import (
 
 from scanindex.ui.screens.accuracy_screen import AccuracyScreen
 from scanindex.ui.screens.batch_signing_screen import BatchSigningScreen
+from scanindex.ui.screens.digitization_audit_screen import (
+    DigitizationAuditScreen,
+)
 from scanindex.ui.screens.rename_tree_screen import RenameTreeScreen
 from scanindex.ui.screens.screen_base import ScreenContent
 from scanindex.ui.screens.secret_file_scan_screen import SecretFileScanScreen
@@ -122,6 +125,7 @@ class SupportToolsScreen(ScreenContent):
         "secret_scan": "Phát hiện file mật trong thư mục",
         "batch_sign": "Ký số hàng loạt",
         "rename_tree": "Đổi tên theo cây thư mục",
+        "digitization_audit": "Thẩm định số hóa",
     }
 
     def __init__(self, parent: QWidget | None = None):
@@ -131,11 +135,13 @@ class SupportToolsScreen(ScreenContent):
         self._secret_scan = SecretFileScanScreen()
         self._batch_sign = BatchSigningScreen()
         self._rename_tree = RenameTreeScreen()
+        self._digit_audit = DigitizationAuditScreen()
         self._tools: dict[str, ScreenContent] = {
             "accuracy": self._accuracy,
             "secret_scan": self._secret_scan,
             "batch_sign": self._batch_sign,
             "rename_tree": self._rename_tree,
+            "digitization_audit": self._digit_audit,
         }
         self._sub_pages: dict[str, QWidget] = {}
         self._build_ui()
@@ -256,6 +262,15 @@ class SupportToolsScreen(ScreenContent):
         rename_tree.clicked.connect(lambda: self._open_tool("rename_tree"))
         grid.addWidget(rename_tree, 1, 1)
 
+        digit_audit = _ToolTile(
+            "✅",
+            "Thẩm định số hóa",
+            "Chỉ đọc: duyệt cây CSDL_SOHOA, đếm tài liệu/trang theo thư mục, "
+            "kiểm tra PDF scan màu, độ nén, DPI và đã OCR theo chuẩn số hóa.",
+        )
+        digit_audit.clicked.connect(lambda: self._open_tool("digitization_audit"))
+        grid.addWidget(digit_audit, 2, 0)
+
         grid.setColumnStretch(0, 1)
         grid.setColumnStretch(1, 1)
         menu_layout.addStretch(1)
@@ -265,10 +280,12 @@ class SupportToolsScreen(ScreenContent):
         self._sub_pages["secret_scan"] = self._secret_scan
         self._sub_pages["batch_sign"] = self._batch_sign
         self._sub_pages["rename_tree"] = self._rename_tree
+        self._sub_pages["digitization_audit"] = self._digit_audit
         self._stack.addWidget(self._sub_pages["accuracy"])
         self._stack.addWidget(self._sub_pages["secret_scan"])
         self._stack.addWidget(self._sub_pages["batch_sign"])
         self._stack.addWidget(self._sub_pages["rename_tree"])
+        self._stack.addWidget(self._sub_pages["digitization_audit"])
         self._stack.setCurrentWidget(self._menu)
 
     def _open_tool(self, key: str) -> None:

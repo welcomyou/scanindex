@@ -29,7 +29,7 @@ from scanindex.ui.theme import (
 from scanindex.infra import translations
 
 # ---------- Design tokens ----------
-_H = 26
+_H = 28
 _FONT = 12
 _FONT_SM = 11
 _PAGE_GAP = 6
@@ -40,7 +40,7 @@ _ICON_BTN = f"""
     QPushButton {{
         background: transparent;
         border: 1px solid transparent;
-        border-radius: 4px;
+        border-radius: 5px;
         color: {COLOR_TEXT_SECONDARY};
         font-size: {_FONT}px;
         font-family: {FONT_UI};
@@ -57,15 +57,54 @@ _ICON_BTN = f"""
     QPushButton:disabled {{ color: {COLOR_BORDER_DEFAULT}; }}
 """
 
+# Nút icon nằm TRONG hộp grouping (ZoomBox) — không viền riêng, chỉ đổi
+# nền khi hover để cả nhóm trông như một khối điều khiển liền mạch.
+_ICON_BTN_PLAIN = f"""
+    QPushButton {{
+        background: transparent;
+        border: none;
+        border-radius: 4px;
+        color: {COLOR_TEXT_SECONDARY};
+        font-size: 14px;
+        font-family: {FONT_UI};
+        min-width: {_H}px; max-width: {_H}px;
+        min-height: {_H - 4}px; max-height: {_H - 4}px;
+        padding: 0;
+    }}
+    QPushButton:hover {{
+        background: {COLOR_ELEVATED};
+        color: {COLOR_TEXT};
+    }}
+    QPushButton:pressed {{ background: {COLOR_HOVER}; }}
+    QPushButton:disabled {{ color: {COLOR_BORDER_DEFAULT}; }}
+"""
+
+# Nhãn % zoom là nút — bấm để đặt lại 100%.
+_ZOOM_LABEL_BTN = f"""
+    QPushButton {{
+        background: transparent;
+        border: none;
+        border-radius: 4px;
+        color: {COLOR_TEXT};
+        font-size: {_FONT}px;
+        font-weight: 600;
+        font-family: {FONT_UI};
+        min-width: 44px; max-width: 44px;
+        min-height: {_H - 4}px; max-height: {_H - 4}px;
+        padding: 0;
+    }}
+    QPushButton:hover {{ background: {COLOR_ELEVATED}; }}
+"""
+
 _TEXT_BTN = f"""
     QPushButton {{
         background: transparent;
         border: 1px solid transparent;
-        border-radius: 4px;
+        border-radius: 5px;
         color: {COLOR_TEXT_SECONDARY};
         font-size: {_FONT_SM}px;
         font-family: {FONT_UI};
-        padding: 0 8px;
+        padding: 0 10px;
         min-height: {_H}px; max-height: {_H}px;
     }}
     QPushButton:hover {{
@@ -646,7 +685,7 @@ class PdfViewerWidget(QWidget):
 
         # --- Toolbar ---
         tb_frame = QFrame()
-        tb_frame.setFixedHeight(32)
+        tb_frame.setFixedHeight(40)
         tb_frame.setStyleSheet(f"""
             QFrame {{
                 background: {_TOOLBAR_BG};
@@ -654,11 +693,12 @@ class PdfViewerWidget(QWidget):
             }}
         """)
         toolbar = QHBoxLayout(tb_frame)
-        toolbar.setContentsMargins(6, 0, 6, 0)
-        toolbar.setSpacing(2)
+        toolbar.setContentsMargins(8, 0, 8, 0)
+        toolbar.setSpacing(4)
         self._toolbar_layout = toolbar
 
-        # File navigation
+        # File navigation — ẩn mặc định: chỉ hiện khi màn hình chủ có danh
+        # sách file (gọi set_file_label / set_file_nav_enabled), tránh ô chết.
         self._btn_prev_file = QPushButton("\u25C0")
         self._btn_prev_file.setStyleSheet(_ICON_BTN)
         self._btn_prev_file.setToolTip("Previous file")
@@ -679,33 +719,44 @@ class PdfViewerWidget(QWidget):
         self._btn_next_file.clicked.connect(self.next_file_requested.emit)
         toolbar.addWidget(self._btn_next_file)
 
-        # Separator
         sep = QFrame()
         self._file_nav_sep = sep
-        sep.setFixedSize(1, 16)
+        sep.setFixedSize(1, 18)
         sep.setStyleSheet(f"background: {COLOR_BORDER_DEFAULT};")
-        toolbar.addSpacing(4)
         toolbar.addWidget(sep)
-        toolbar.addSpacing(4)
+        self._set_file_nav_visible(False)
 
-        # Zoom controls
+        # Zoom controls — một hộp liền khối [−] [100%] [+]; bấm % về 100%.
+        zoom_box = QFrame()
+        zoom_box.setObjectName("ZoomBox")
+        zoom_box.setStyleSheet(
+            f"QFrame#ZoomBox {{ background: {COLOR_BG};"
+            f" border: 1px solid {COLOR_BORDER}; border-radius: 6px; }}"
+        )
+        zoom_lay = QHBoxLayout(zoom_box)
+        zoom_lay.setContentsMargins(2, 0, 2, 0)
+        zoom_lay.setSpacing(0)
+
         self._btn_zoom_out = QPushButton("\u2212")
-        self._btn_zoom_out.setStyleSheet(_ICON_BTN)
+        self._btn_zoom_out.setStyleSheet(_ICON_BTN_PLAIN)
         self._btn_zoom_out.setCursor(Qt.CursorShape.PointingHandCursor)
         self._btn_zoom_out.clicked.connect(self._zoom_out)
-        toolbar.addWidget(self._btn_zoom_out)
+        zoom_lay.addWidget(self._btn_zoom_out)
 
-        self._lbl_zoom = QLabel("100%")
-        self._lbl_zoom.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._lbl_zoom.setFixedWidth(44)
-        self._lbl_zoom.setStyleSheet(_LABEL_STYLE)
-        toolbar.addWidget(self._lbl_zoom)
+        self._lbl_zoom = QPushButton("100%")
+        self._lbl_zoom.setStyleSheet(_ZOOM_LABEL_BTN)
+        self._lbl_zoom.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._lbl_zoom.setToolTip("Đặt lại mức phóng 100%")
+        self._lbl_zoom.clicked.connect(self._zoom_reset)
+        zoom_lay.addWidget(self._lbl_zoom)
 
         self._btn_zoom_in = QPushButton("+")
-        self._btn_zoom_in.setStyleSheet(_ICON_BTN)
+        self._btn_zoom_in.setStyleSheet(_ICON_BTN_PLAIN)
         self._btn_zoom_in.setCursor(Qt.CursorShape.PointingHandCursor)
         self._btn_zoom_in.clicked.connect(self._zoom_in)
-        toolbar.addWidget(self._btn_zoom_in)
+        zoom_lay.addWidget(self._btn_zoom_in)
+
+        toolbar.addWidget(zoom_box)
 
         self._btn_fit = QPushButton("Fit")
         self._btn_fit.setStyleSheet(_TEXT_BTN)
@@ -713,12 +764,17 @@ class PdfViewerWidget(QWidget):
         self._btn_fit.clicked.connect(self._zoom_fit)
         toolbar.addWidget(self._btn_fit)
 
-        # Page indicator ("Trang x / y")
+        # Page indicator ("Trang x / y") — chip nền nổi, ẩn khi không có tài liệu.
         toolbar.addSpacing(4)
         self._lbl_page = QLabel()
+        self._lbl_page.setObjectName("PageChip")
         self._lbl_page.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._lbl_page.setMinimumWidth(60)
-        self._lbl_page.setStyleSheet(_LABEL_STYLE)
+        self._lbl_page.setStyleSheet(
+            f"QLabel#PageChip {{ background: {COLOR_ELEVATED};"
+            f" color: {COLOR_TEXT_SECONDARY}; border-radius: 10px;"
+            f" padding: 3px 10px; font: 600 11px '{FONT_UI}'; }}"
+        )
+        self._lbl_page.setVisible(False)
         toolbar.addWidget(self._lbl_page)
 
         toolbar.addStretch()
@@ -845,11 +901,23 @@ class PdfViewerWidget(QWidget):
             self._hint_label.setText(str(e))
             self._hint_label.setVisible(True)
 
+    def _set_file_nav_visible(self, visible: bool):
+        """Bật/tắt cả nhóm chuyển file (2 nút + nhãn vị trí + vạch ngăn)."""
+        # Default True để lần gọi đầu (False lúc dựng toolbar) luôn áp dụng.
+        if getattr(self, "_file_nav_visible", True) == visible:
+            return
+        self._file_nav_visible = visible
+        for w in (self._btn_prev_file, self._lbl_file,
+                  self._btn_next_file, self._file_nav_sep):
+            w.setVisible(visible)
+
     def set_file_label(self, current_idx, total):
         self._file_label_text = f"{current_idx + 1} / {total}" if total > 0 else ""
         self._lbl_file.setText(self._file_label_text)
+        self._set_file_nav_visible(total > 0)
 
     def set_file_nav_enabled(self, can_prev, can_next):
+        self._set_file_nav_visible(True)
         self._btn_prev_file.setEnabled(can_prev)
         self._btn_next_file.setEnabled(can_next)
 
@@ -863,7 +931,7 @@ class PdfViewerWidget(QWidget):
         """
         if not hasattr(self, "_custom_toolbar_index"):
             separator = QFrame()
-            separator.setFixedSize(1, 16)
+            separator.setFixedSize(1, 18)
             separator.setStyleSheet(f"background: {COLOR_BORDER_DEFAULT};")
             after_page = self._toolbar_layout.indexOf(self._lbl_page) + 1
             self._toolbar_layout.insertWidget(after_page, separator)
@@ -1630,6 +1698,10 @@ class PdfViewerWidget(QWidget):
                 self._set_zoom(z)
                 return
 
+    def _zoom_reset(self):
+        self._fit_mode = False
+        self._set_zoom(1.0)
+
     def _zoom_fit(self):
         self._fit_mode = True
         self._rebuild_scaled_pages()
@@ -1842,6 +1914,7 @@ class PdfViewerWidget(QWidget):
         self._lbl_page.setText(
             f"Trang 1 / {self._page_count}" if has else ""
         )
+        self._lbl_page.setVisible(has)
         if hasattr(self, "_btn_print"):
             self._btn_print.setEnabled(has)
 

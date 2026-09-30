@@ -205,8 +205,8 @@ class HomeScreen(QWidget):
              "Tra cứu metadata và toàn văn kho PDF đã số hóa, "
              "lọc theo metadata HSLTCQ."),
             (FUNCTION_SUPPORT_TOOLS, "🛠", "Công cụ",
-             "Đo độ chính xác OCR, phát hiện file mật "
-             "trong thư mục."),
+             "Đo độ chính xác OCR, phát hiện file mật, ký số hàng loạt, "
+             "đổi tên theo cây thư mục, thẩm định số hóa."),
             (FUNCTION_SETTINGS, "⚙", "Cấu hình",
              "Tùy chỉnh tốc độ xử lý, model, "
              "ngôn ngữ và tùy chọn nâng cao."),
