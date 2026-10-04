@@ -812,11 +812,11 @@ The software prioritizes local processing when models and dependencies are insta
 }
 
 class Localization:
-    def __init__(self, lang="en"):
+    def __init__(self, lang="vi"):
         self.lang = lang
 
     def set_language(self, lang):
-        self.lang = lang if lang in {"en", "vi"} else "en"
+        self.lang = lang if lang in {"en", "vi"} else "vi"
 
     def get(self, key, *args):
         # Default to key if not found
@@ -834,7 +834,7 @@ class Localization:
         return text
 
 # Global instance
-current_locale = Localization("en")
+current_locale = Localization("vi")
 
 def get_text(key, *args):
     return current_locale.get(key, *args)

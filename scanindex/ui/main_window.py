@@ -410,7 +410,7 @@ class MainWindow(QMainWindow):
 
         # Config
         self.config = configparser.ConfigParser()
-        self.current_language = "en"
+        self.current_language = "vi"
 
         # Load settings before building UI
         self.load_settings()
@@ -1122,7 +1122,7 @@ class MainWindow(QMainWindow):
         if os.path.exists(settings_path):
             try:
                 if "General" in self.config:
-                    self.current_language = self.config["General"].get("Language", "en")
+                    self.current_language = self.config["General"].get("Language", "vi")
                     translations.set_lang(self.current_language)
                     theme_val = str(self.config["General"].get("Theme", ACTIVE_THEME)).strip().lower()
                     self._saved["theme"] = "light" if theme_val == "light" else "dark"

@@ -42,6 +42,14 @@ jobs:
       - name: Validate pinned model sources
         run: python scripts/download_offline_models.py --validate-config
 
+      - name: Verify Vietnamese first-run default
+        shell: pwsh
+        run: |
+          $config = Get-Content -LiteralPath settings.ini.example -Raw
+          if ($config -notmatch '(?m)^language\s*=\s*vi\s*$') {
+            throw 'settings.ini.example must default to Vietnamese for release builds.'
+          }
+
       - name: Download and verify offline models
         run: python scripts/download_offline_models.py
 

@@ -292,6 +292,58 @@ def test_accuracy_report_has_complete_english_and_vietnamese_versions():
     assert "Phần mềm này" in vietnamese
 
 
+def test_digitization_audit_text_is_bilingual():
+    from scanindex.ui.screens.digitization_audit_screen import _audit_text
+
+    assert translations.Localization().lang == "vi"
+    samples = {
+        "Thẩm định số hóa": "Digitization audit",
+        "Scan màu": "Colour scan",
+        "Đang quét… 2 tài liệu · 3 trang":
+            "Scanning… 2 documents · 3 pages",
+        "Không xác định được chế độ nén JPEG 2000":
+            "Cannot determine JPEG 2000 compression mode",
+    }
+    for vietnamese, english in samples.items():
+        assert translations.localize_text(vietnamese, "en") == english
+        assert translations.localize_text(english, "vi") == vietnamese
+
+    translations.set_lang("en")
+    assert _audit_text(
+        "Tên file: mục lục phải là đúng 2 chữ số; hồ sơ phải là đúng 4 chữ số."
+    ) == "Filename: catalog must be exactly two digits; dossier must be exactly four digits."
+    translations.set_lang("vi")
+
+
+def test_digitization_audit_screen_retranslates_result(tmp_path, monkeypatch):
+    from scanindex.core.digitization_audit import PdfAuditResult
+    from scanindex.ui.screens import digitization_audit_screen as audit_ui
+
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(audit_ui, "_SETTINGS_FILE", str(tmp_path / "missing.json"))
+    translations.set_lang("en")
+    screen = audit_ui.DigitizationAuditScreen()
+    translations.retranslate_widget_tree(screen)
+    screen._render_audit(PdfAuditResult(
+        path="sample.pdf", pages=1, signed=False, name_ok=False,
+        name_note="mục lục phải là đúng 2 chữ số",
+    ))
+    assert screen.btn_pick.text() == "📂  Pick root folder…"
+    assert screen.card_color.title.text() == "COLOUR SCAN"
+    assert screen.chip_verdict.text() == "Undetermined"
+    assert "Filename: catalog must be exactly two digits" in (
+        screen.lbl_audit_detail.text())
+
+    translations.set_lang("vi")
+    screen.update_texts()
+    translations.retranslate_widget_tree(screen)
+    assert screen.btn_pick.text() == "📂  Chọn thư mục gốc…"
+    assert screen.card_color.title.text() == "SCAN MÀU"
+    assert screen.chip_verdict.text() == "Chưa xác định"
+    screen.deleteLater()
+    app.processEvents()
+
+
 def test_backend_activity_log_literals_have_a_bilingual_catalog_entry():
     methods = {
         "showMessage",

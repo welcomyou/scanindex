@@ -53,7 +53,7 @@ _VN_DIACRITIC_RE = re.compile(
     r"[ăâđêôơưáàảãạấầẩẫậắằẳẵặéèẻẽẹếềểễệíìỉĩịóòỏõọốồổỗộớờởỡợ"
     r"úùủũụứừửữựýỳỷỹỵĐĂÂÊÔƠƯ]", re.IGNORECASE)
 
-FITZ_LOCK = threading.Lock()  # tuần tự hóa fitz giữa các worker + viewer
+FITZ_LOCK = threading.RLock()  # _compression_note may re-enter during audit_pdf
 
 
 # --------------------------------------------------------------------------- #
@@ -104,6 +104,7 @@ class PdfAuditResult:
     filters: list[str] = field(default_factory=list)
     pages_with_text: int = 0
     pages_with_image: int = 0
+    scanned_pages_with_text: int = 0
     blank_pages: int = 0
     text_chars: int = 0
     vn_letters: int = 0             # số chữ cái có dấu tiếng Việt
@@ -226,8 +227,8 @@ def _jpx_transform(data: bytes) -> int | None:
     return None
 
 
-def _compression_note(doc: "fitz.Document", im: ImageInfo) -> str:
-    """Mô tả vi phạm nén của một ảnh ('' = không vi phạm).
+def _compression_note(doc: "fitz.Document", im: ImageInfo) -> str | None:
+    """Mô tả vi phạm nén ('' = đạt, None = không xác định).
 
     Chuẩn cho phép: KHÔNG NÉN hoặc nén KHÔNG MẤT DỮ LIỆU — LZW, Flate
     (zlib), CCITT Fax G3/G4 (thang xám 1 bit), JPEG 2000 lossless (wavelet
@@ -244,10 +245,11 @@ def _compression_note(doc: "fitz.Document", im: ImageInfo) -> str:
             with FITZ_LOCK:
                 raw = doc.xref_stream_raw(im.xref)
         except Exception:
-            return ""
-        if _jpx_transform(raw[:2_000_000]) == 0:
+            return None
+        transform = _jpx_transform(raw[:2_000_000])
+        if transform == 0:
             return f"trang {im.page_no}: JPEG 2000 lossy (wavelet 9/7)"
-        return ""
+        return "" if transform == 1 else None
     return ""
 
 
@@ -356,6 +358,8 @@ def audit_pdf(path: str | os.PathLike, *, quick: bool = False,
                     chars = len("".join(text.split()))
                     if chars >= OCR_MIN_CHARS:
                         result.pages_with_text += 1
+                        if has_image:
+                            result.scanned_pages_with_text += 1
                         result.text_chars += chars
                         result.letters += sum(ch.isalpha() for ch in text)
                         result.vn_letters += len(
@@ -462,16 +466,23 @@ def _conclude(result: PdfAuditResult, doc: "fitz.Document"):
     if not result.quick:
         seen: list[str] = []
         notes: list[str] = []
+        compression_unknown = False
         for im in result.images:
             for f in im.filters:
                 if f not in seen:
                     seen.append(f)
             note = _compression_note(doc, im)
+            if note is None:
+                compression_unknown = True
             if note and note not in notes:
                 notes.append(note)
         result.filters = sorted(seen)
-        result.compression_ok = (not notes) if result.images else None
-        result.compression_note = notes[0] if notes else ""
+        result.compression_ok = (False if notes else
+                                 None if compression_unknown or not result.images
+                                 else True)
+        result.compression_note = (notes[0] if notes else
+                                   "Không xác định được chế độ nén JPEG 2000"
+                                   if compression_unknown else "")
     # --- DPI ----------------------------------------------------------------
     if result.images:
         result.min_dpi = min(im.dpi for im in result.images)
@@ -484,8 +495,9 @@ def _conclude(result: PdfAuditResult, doc: "fitz.Document"):
             # File sinh từ Word/Excel… không có ảnh scan: có text là đạt.
             result.ocr_ok = result.pages_with_text > 0 or result.pages == 0
         else:
-            result.ocr_ok = (result.pages_with_text
-                             >= result.pages - result.blank_pages)
+            # Text-only pages must not make up for scanned pages lacking OCR.
+            result.ocr_ok = (result.scanned_pages_with_text
+                             == result.pages_with_image)
 
 
 # --------------------------------------------------------------------------- #
@@ -735,7 +747,7 @@ def audit_tiff(path: str | os.PathLike, *, quick: bool = False,
             if result.ncomp and bpc_list:
                 result.color_ok = (
                     result.ncomp >= 3
-                    and photo not in (3, 4)       # palette / mask không tính
+                    and photo in (2, 5, 6)       # RGB / CMYK / YCbCr
                     and all(b == 8 for b in bpc_list))
     except Exception as exc:
         result.error = f"Không đọc được TIFF: {exc}"

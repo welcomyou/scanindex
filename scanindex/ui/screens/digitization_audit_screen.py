@@ -107,7 +107,7 @@ class _TreeAuditWorker(QThread):
     stats_step = Signal(int, int)        # (tài liệu, trang) đang đếm
     marked = Signal(str, object, bool)   # (rel, kết quả audit, không đạt?)
     stats_done = Signal(object)          # FolderStats
-    done = Signal(int)                   # tổng số file không đạt
+    done = Signal(int, int)              # không đạt, không xác định
 
     def __init__(self, root: Path, parent=None):
         super().__init__(parent)
@@ -154,6 +154,7 @@ class _TreeAuditWorker(QThread):
         total = len(pdfs)
 
         bad = 0
+        unknown = 0
         docs_done = 0
         pages_done = 0
         unreadable: list[str] = []
@@ -170,12 +171,18 @@ class _TreeAuditWorker(QThread):
             if result.error:
                 unreadable.append(rel)
                 pages_by_rel[rel] = 0
+                unknown += 1
             else:
                 pages_by_rel[rel] = max(0, result.pages)
                 pages_done += max(0, result.pages)
                 bad_flag = result.hard_fail()
                 if bad_flag:
                     bad += 1
+                elif (result.color_ok is None or result.dpi_ok is None
+                      or isinstance(result, da.TiffAuditResult)
+                      and (result.single_page_ok is None
+                           or result.compression_status == "unknown")):
+                    unknown += 1
                 self.marked.emit(rel, result, bad_flag)
             self.progress.emit(i, total)
             self.stats_step.emit(docs_done, pages_done)
@@ -227,7 +234,7 @@ class _TreeAuditWorker(QThread):
             elif level is rt.Level.HO_SO:
                 stats.level_counts["ho_so"] += 1
         self.stats_done.emit(stats)
-        self.done.emit(bad)
+        self.done.emit(bad, unknown)
 
 
 class _AuditWorker(QThread):
@@ -306,10 +313,26 @@ def _fmt_size(n: int) -> str:
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if v < 1024 or unit == "TB":
             if unit == "B":
-                return f"{int(v):,}".replace(",", ".") + " B"
-            return f"{v:.1f}".replace(".", ",") + f" {unit}"
+                value = f"{int(v):,}"
+                return (value.replace(",", ".") if
+                        translations.current_locale.lang == "vi" else value) + " B"
+            value = f"{v:.1f}"
+            return (value.replace(".", ",") if
+                    translations.current_locale.lang == "vi" else value) + f" {unit}"
         v /= 1024
     return f"{n} B"
+
+
+def _audit_text(value: str) -> str:
+    """Localize a result note while keeping filenames and codes unchanged."""
+    for prefix in ("Tên file: ", "Chuỗi trang: "):
+        if value.startswith(prefix) and value.endswith("."):
+            body = "; ".join(
+                translations.localize_text(part)
+                for part in value[len(prefix):-1].split("; ")
+            )
+            return f"{translations.localize_text(prefix[:-2])}: {body}."
+    return translations.localize_text(value)
 
 
 # --------------------------------------------------------------------------- #
@@ -326,6 +349,7 @@ class DigitizationAuditScreen(ScreenContent):
         self.setStyleSheet(f"background: {COLOR_BG};")
         self._root: Path | None = None
         self._stats = None                    # FolderStats | None
+        self._last_tree_counts: tuple[int, int] | None = None
         self._tree_worker: _TreeAuditWorker | None = None
         self._audit_worker: _AuditWorker | None = None
         self._audit_seq = 0                   # kết quả cũ đến sau thì bỏ
@@ -519,7 +543,7 @@ class DigitizationAuditScreen(ScreenContent):
         # Trang 0: chưa chọn gì / file không phải PDF.
         empty = QLabel(
             "Chọn một thư mục để xem Số tài liệu / Số trang,\n"
-            "hoặc chọn file PDF để thẩm định chất lượng số hóa.")
+            "hoặc chọn file PDF/TIFF để thẩm định chất lượng số hóa.")
         empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
         empty.setStyleSheet(
             f"color: {COLOR_TEXT_SECONDARY}; font: 13px '{FONT_UI}';"
@@ -666,6 +690,7 @@ class DigitizationAuditScreen(ScreenContent):
         self.edit_root.setText(str(self._root))
         self._stop_workers()
         self._stats = None
+        self._last_tree_counts = None
         self._current_pdf_abs = None
         self._last_audit = None
         self._clear_info_header()
@@ -689,6 +714,7 @@ class DigitizationAuditScreen(ScreenContent):
             return
         self._stop_workers()
         self._stats = None
+        self._last_tree_counts = None
         self.pdf_viewer.clear()
         self.img_viewer.clear()
         self._reload_root()
@@ -755,6 +781,7 @@ class DigitizationAuditScreen(ScreenContent):
         (thêm/sửa/xóa)."""
         if self._root is None:
             return
+        self._last_tree_counts = None
         # parent=self: Qt đợi thread chạy xong khi dọn dẹp (thoát app) thay
         # vì hủy QThread đang chạy → tránh crash lúc shutdown.
         self._tree_worker = _TreeAuditWorker(self._root, parent=self)
@@ -769,7 +796,8 @@ class DigitizationAuditScreen(ScreenContent):
             lambda rel, r, bad, s=seq: self._on_tree_marked(rel, r, bad, s))
         w.stats_done.connect(
             lambda stats, s=seq: self._on_tree_stats_done(stats, s))
-        w.done.connect(lambda bad, s=seq: self._on_tree_done(bad, s))
+        w.done.connect(
+            lambda bad, unknown, s=seq: self._on_tree_done(bad, unknown, s))
         w.start()
         self.progress_scan.setRange(0, 0)
         self.progress_scan.setValue(0)
@@ -813,7 +841,7 @@ class DigitizationAuditScreen(ScreenContent):
         self._stats = stats
         extra = ""
         if stats.unreadable:
-            extra = (f" · {len(stats.unreadable)} PDF không đọc được")
+            extra = (f" · {len(stats.unreadable)} PDF/TIFF không đọc được")
         self.lbl_stats.setText(translations.localize_text(
             f"{stats.total_docs} tài liệu · "
             f"{stats.total_pages} trang{extra}")
@@ -823,14 +851,25 @@ class DigitizationAuditScreen(ScreenContent):
         if item is not None and item.data(0, _ROLE_ISDIR):
             self._show_folder_info(item.data(0, _ROLE_REL))
 
-    def _on_tree_done(self, bad: int, seq: int):
+    def _on_tree_done(self, bad: int, unknown: int, seq: int):
         if seq != self._tree_mark_seq:
             return
         self.progress_scan.setVisible(False)
         self.btn_stop_scan.setVisible(False)
-        if bad:
+        self._last_tree_counts = (bad, unknown)
+        self._render_tree_summary(bad, unknown)
+
+    def _render_tree_summary(self, bad: int, unknown: int):
+        if bad or unknown:
+            parts = []
+            if bad:
+                parts.append(translations.localize_text(
+                    f"{bad} file không đạt"))
+            if unknown:
+                parts.append(translations.localize_text(
+                    f"{unknown} file chưa xác định"))
             self.lbl_audit_stats.setText(
-                translations.localize_text(f"⚠ {bad} file không đạt"))
+                "⚠ " + " · ".join(parts))
             self.lbl_audit_stats.setStyleSheet(
                 f"color: {_COLOR_FAIL_FG}; font: 600 12px '{FONT_UI}';"
             )
@@ -1006,9 +1045,9 @@ class DigitizationAuditScreen(ScreenContent):
             parts.append(f"{lc['ho_so']} hồ sơ")
         if self._stats.unreadable:
             parts.append(
-                f"{len(self._stats.unreadable)} PDF không đọc được")
+                f"{len(self._stats.unreadable)} PDF/TIFF không đọc được")
         self.lbl_folder_extra.setText(
-            translations.localize_text(" · ".join(parts)))
+            " · ".join(translations.localize_text(p) for p in parts))
 
     def _show_pdf(self, rel: str):
         if self._root is None:
@@ -1123,7 +1162,9 @@ class DigitizationAuditScreen(ScreenContent):
         trang/tệp), ẩn thẻ Ký số với TIFF; thẻ 6 "Đặt tên đúng" chỉ cảnh
         báo, không vào chip."""
         self._last_audit = result
-        is_tiff = isinstance(result, da.TiffAuditResult)
+        is_tiff = (isinstance(result, da.TiffAuditResult) or result is None
+                   and bool(self._current_pdf_abs)
+                   and self._current_pdf_abs.lower().endswith((".tif", ".tiff")))
         titles = (("Scan màu", "DPI", "Độ nén", "Số trang/tệp", "Ký số",
                    "Đặt tên đúng") if is_tiff else
                   ("Scan màu", "DPI", "Độ nén", "Đã OCR", "Ký số",
@@ -1138,7 +1179,7 @@ class DigitizationAuditScreen(ScreenContent):
             self._set_verdict([])
             return
         if result.error:
-            msg = html.escape(translations.localize_text(result.error))
+            msg = html.escape(_audit_text(result.error))
             for card in self._check_cards:
                 card.set_status("na", "—")
             self.lbl_audit_detail.setText(
@@ -1188,7 +1229,7 @@ class DigitizationAuditScreen(ScreenContent):
                 translations.localize_text(
                     "Đảm bảo" if ok else "Không đảm bảo"))
             if result.compression_note:
-                notes.append(translations.localize_text(
+                notes.append(_audit_text(
                     result.compression_note))
 
         # Đã OCR — chỉ cảnh báo vàng: chưa OCR KHÔNG làm trượt thẩm định
@@ -1206,7 +1247,7 @@ class DigitizationAuditScreen(ScreenContent):
         if result.signed is None:
             self.card_sign.set_status("na", "—")
         elif result.signed:
-            self.card_sign.set_status("pass", "Có")
+            self.card_sign.set_status("pass", translations.localize_text("Có"))
         else:
             self.card_sign.set_status(
                 "warn", translations.localize_text("Không"))
@@ -1240,10 +1281,10 @@ class DigitizationAuditScreen(ScreenContent):
         bits += notes
         warn_segs = [
             f"<span style='color:{_COLOR_WARN_FG};'>⚠ "
-            f"{html.escape(translations.localize_text(w))}</span>"
+            f"{html.escape(_audit_text(w))}</span>"
             for w in result.warnings()]
         html_bits = [
-            html.escape(translations.localize_text(b)) for b in bits]
+            html.escape(_audit_text(b)) for b in bits]
         self.lbl_audit_detail.setText(
             " · ".join(html_bits + warn_segs))
         self._set_verdict(statuses)
@@ -1272,7 +1313,8 @@ class DigitizationAuditScreen(ScreenContent):
             ok = bool(result.dpi_ok)
             self.card_dpi.set_status(
                 "pass" if ok else "fail",
-                result.dpi_detail() if result.dpi_x and result.dpi_y else "—")
+                _audit_text(result.dpi_detail())
+                if result.dpi_x and result.dpi_y else "—")
             statuses.append("pass" if ok else "fail")
             if not ok:
                 notes.append(translations.localize_text(
@@ -1287,17 +1329,18 @@ class DigitizationAuditScreen(ScreenContent):
             self.card_compression.set_status(
                 "warn", translations.localize_text("Nén lossless"))
             notes.append(translations.localize_text(
-                f"TIFF nén {result.compression_name.lower()} — văn bản quy "
+                f"TIFF nén {_audit_text(result.compression_name)} — văn bản quy "
                 "định TIFF không nén"))
         elif status == "lossy":
             self.card_compression.set_status(
                 "fail", translations.localize_text("Mất dữ liệu"))
             statuses.append("fail")
             notes.append(translations.localize_text(
-                f"TIFF nén {result.compression_name.lower()} — nén mất dữ "
+                f"TIFF nén {_audit_text(result.compression_name)} — nén mất dữ "
                 "liệu không đạt"))
         else:
             self.card_compression.set_status("na", "—")
+            statuses.append("na")
 
         # Số trang/tệp — TIFF hợp lệ đúng 1 trang (lỗi nặng).
         if result.single_page_ok is None:
@@ -1339,10 +1382,10 @@ class DigitizationAuditScreen(ScreenContent):
         bits += notes
         warn_segs = [
             f"<span style='color:{_COLOR_WARN_FG};'>⚠ "
-            f"{html.escape(translations.localize_text(w))}</span>"
+            f"{html.escape(_audit_text(w))}</span>"
             for w in result.warnings()]
         html_bits = [
-            html.escape(translations.localize_text(str(b))) for b in bits]
+            html.escape(_audit_text(str(b))) for b in bits]
         self.lbl_audit_detail.setText(
             " · ".join(html_bits + warn_segs))
         self._set_verdict(statuses)
@@ -1352,13 +1395,14 @@ class DigitizationAuditScreen(ScreenContent):
         — PDF: Scan màu + DPI; TIFF: Scan màu + DPI + Số trang/tệp + nén
         lossy → 'Đạt' / 'Không đạt' (OCR và các thẻ vàng chỉ tham khảo,
         không vào chip)."""
-        known = [s for s in statuses if s != "na"]
         if error:
             key, text = "fail", "Lỗi thẩm định"
-        elif not known:
+        elif not statuses:
             key, text = "na", "Đang phân tích…"
-        elif "fail" in known:
+        elif "fail" in statuses:
             key, text = "fail", "Không đạt"
+        elif "na" in statuses:
+            key, text = "na", "Chưa xác định"
         else:
             key, text = "pass", "Đạt"
         fg, accent = _STATUS_LOOK[key]
@@ -1419,6 +1463,18 @@ class DigitizationAuditScreen(ScreenContent):
                 walk(item.child(i))
         for i in range(self.tree.topLevelItemCount()):
             walk(self.tree.topLevelItem(i))
+        if self._stats is not None:
+            extra = (f" · {len(self._stats.unreadable)} PDF/TIFF không đọc được"
+                     if self._stats.unreadable else "")
+            self.lbl_stats.setText(translations.localize_text(
+                f"{self._stats.total_docs} tài liệu · "
+                f"{self._stats.total_pages} trang{extra}")
+                + f" · {_fmt_size(self._stats.total_size)}")
+            item = self.tree.currentItem()
+            if item is not None and item.data(0, _ROLE_ISDIR):
+                self._show_folder_info(item.data(0, _ROLE_REL))
+        if self._last_tree_counts is not None:
+            self._render_tree_summary(*self._last_tree_counts)
         if self._last_audit is not None:
             self._render_audit(self._last_audit)
 

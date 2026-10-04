@@ -116,6 +116,7 @@ drivers/
 tests/
 !tests/
 tests/*
+!tests/test_digitization_audit_logic.py
 !tests/test_archive_runner_ocr_reuse.py
 !tests/test_kie_doc_subject_postprocess.py
 !tests/test_data_versioning.py
