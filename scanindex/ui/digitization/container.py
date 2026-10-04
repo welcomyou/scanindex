@@ -5,9 +5,9 @@ selects between the 3 sub-screens, and forwards the same Qt signal API the
 old monolithic `ArchiveTab` exposed (so `main_window.py` integrations keep
 working with minimal change).
 
-Bước 1: Phân tách (Step 1 — split a long PDF into named segments)
-Bước 2: Trích xuất KIE (Step 2 — OCR + correction + KIE)
-Bước 3: Ký số (Step 3 — placeholder)
+Bước 1: Tách file scan (tùy chọn — split a long scanned PDF into named segments)
+Bước 2: Bóc tách dữ liệu văn bản (OCR + correction + KIE extraction)
+Bước 3: Ký số (digital signing)
 
 Cross-step rules:
 - If user goes back to Step 1 and resubmits to Step 2, the container cancels
@@ -35,6 +35,7 @@ from scanindex.infra import translations
 
 
 _STEP_BAR_H = 36
+_STEP_TITLE_KEYS = ["arc_step1_title", "arc_step2_title", "arc_step3_title"]
 
 
 class _StepBar(QFrame):
@@ -53,8 +54,7 @@ class _StepBar(QFrame):
         h.setSpacing(4)
 
         self._buttons = []
-        keys = ["arc_step1_title", "arc_step2_title", "arc_step3_title"]
-        for i, k in enumerate(keys):
+        for i, k in enumerate(_STEP_TITLE_KEYS):
             b = QPushButton(translations.get_text(k))
             b.setCheckable(True)
             b.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -62,11 +62,20 @@ class _StepBar(QFrame):
             b.setMinimumWidth(140)
             b.setFixedHeight(_STEP_BAR_H - 8)
             b.clicked.connect(lambda _checked=False, idx=i: self.step_clicked.emit(idx))
+            self._apply_tooltip(b, k)
             self._buttons.append(b)
             h.addWidget(b)
 
         h.addStretch()
         self._restyle()
+
+    @staticmethod
+    def _apply_tooltip(button: QPushButton, title_key: str):
+        """Show the step's description on hover when a `<title>_tooltip`
+        entry exists (steps without one get no tooltip)."""
+        tip_key = f"{title_key.split('_title')[0]}_tooltip"
+        if tip_key in translations.TRANSLATIONS:
+            button.setToolTip(translations.get_text(tip_key))
 
     def set_active(self, idx: int):
         for i, b in enumerate(self._buttons):
@@ -74,9 +83,9 @@ class _StepBar(QFrame):
         self._restyle()
 
     def update_texts(self):
-        keys = ["arc_step1_title", "arc_step2_title", "arc_step3_title"]
-        for b, k in zip(self._buttons, keys):
+        for b, k in zip(self._buttons, _STEP_TITLE_KEYS):
             b.setText(translations.get_text(k))
+            self._apply_tooltip(b, k)
 
     def _restyle(self):
         for b in self._buttons:
@@ -154,7 +163,8 @@ class ArchiveContainer(QWidget):
 
         self._stack = QStackedWidget()
         self._step1 = ArchiveStep1Split(self.session)
-        self._step2 = ArchiveStep2Kie(icons=self._icons)
+        self._step2 = ArchiveStep2Kie(
+            icons=self._icons, session=self.session)
         self._step3 = ArchiveStep3Sign(session=self.session)
         self._stack.addWidget(self._step1)
         self._stack.addWidget(self._step2)
@@ -345,7 +355,12 @@ class ArchiveContainer(QWidget):
             self._step3.set_documents([], default_output_dir="")
         except Exception:
             pass
-        # Per-session temp dir.
+        # Per-session temp dir + multi-dossier state (mục 6: reset về phiên
+        # đơn hồ sơ sạch).
+        try:
+            self.session.clear_dossiers()
+        except Exception:
+            pass
         try:
             self.session.cleanup_temp()
         except Exception:

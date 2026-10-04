@@ -266,7 +266,11 @@ def write_aggregated_excel(tasks_or_docs, excel_path: str,
 class FileSpec:
     """Caller-provided description of one input file. `pre_ocr_cache`, when
     set, is consulted by the pipeline to skip OCR for already-processed
-    pages (handed off from Step 1 of the archive screen)."""
+    pages (handed off from Step 1 of the archive screen).
+
+    `output_subdir` (multi-dossier folder import): outputs land under
+    `<output_dir>/<output_subdir>/` so same-named PDFs from different
+    dossiers never clobber each other (plan §6)."""
     input_path: str
     file_id: str = ""
     source_document_path: Optional[str] = None
@@ -274,6 +278,7 @@ class FileSpec:
     pre_ocr_cache: object = field(default_factory=dict)  # page_idx -> page_dict mapping
     selected_pages: Optional[list[int]] = None
     from_step1: bool = False
+    output_subdir: str = ""
 
 
 def _unique_output_pdf_path(output_dir: str, stem: str) -> str:
@@ -589,7 +594,11 @@ class ArchiveRunner:
             file_id = spec.file_id or os.path.basename(spec.input_path)
             from_step1 = step1_handoff_by_file.get(file_id, False)
             stem = os.path.splitext(file_id)[0]
-            out_pdf = _unique_output_pdf_path(self.output_dir, stem)
+            out_dir = self.output_dir
+            if getattr(spec, "output_subdir", ""):
+                out_dir = os.path.join(self.output_dir, spec.output_subdir)
+                os.makedirs(out_dir, exist_ok=True)
+            out_pdf = _unique_output_pdf_path(out_dir, stem)
             out_json = out_pdf + ".json.zst"
             original_input_path = spec.input_path
             task_input_path = original_input_path

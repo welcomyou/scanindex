@@ -1,20 +1,21 @@
-"""Thẩm định số hóa — công cụ CHỈ ĐỌC kiểm tra chất lượng file PDF số hóa.
+"""Thẩm định số hóa — công cụ CHỈ ĐỌC kiểm tra chất lượng file PDF/TIFF
+số hóa.
 
 Giao diện giống "Đổi tên theo cây thư mục": chọn thư mục gốc, cây 4 cấp
 CSDL_SOHOA với icon màu tương tự; KHÔNG đổi tên / kéo thả / sửa gì.
 
   * Bấm thư mục → bên phải hiện Số tài liệu / Số trang / Dung lượng
-    (chỉ tính file PDF; đếm nền, xem
-    ``scanindex.core.digitization_audit.scan_tree_stats``).
-  * Bấm PDF → viewer + 5 thẻ chỉ tiêu 2 dòng (Scan màu, DPI, Độ nén, Đã
-    OCR, Ký số) kèm chip tổng kết; màu thống nhất: ĐẠT = xanh, KHÔNG ĐẠT
-    quan trọng (DPI, Scan màu) = đỏ, ít quan trọng (Độ nén, Đã OCR, Ký số
-    chưa ký) = vàng, chưa xác định = xám. Ký số là tùy chọn — không tính
-    vào chip tổng kết / dấu ❗.
-  * Dưới thẻ: một hàng mô tả dài (chế độ màu, bộ nén, số trang, dung lượng,
-    PDF/A, ghi chú kết luận, cảnh báo ⚠) — chỉ mô tả file.
-  * Chạy nền: thẩm định tất cả PDF dưới thư mục gốc — file trượt tiêu chí
-    nặng (Scan màu HOẶC DPI) được gắn dấu " !" sau tên + tô đỏ trên cây.
+    (tính file PDF + TIFF — TIFF chuẩn 1 tệp = 1 trang; đếm nền).
+  * Bấm PDF/TIFF → preview (viewer PDF / ảnh TIFF) + thẻ chỉ tiêu 2 dòng
+    kèm chip tổng kết. PDF: Scan màu, DPI, Độ nén, Đã OCR, Ký số, Đặt tên
+    đúng. TIFF: Scan màu, DPI, Độ nén, Số trang/tệp, Đặt tên đúng. Màu
+    thống nhất: ĐẠT = xanh, KHÔNG ĐẠT quan trọng = đỏ, ít quan trọng =
+    vàng, chưa xác định = xám. Ký số là tùy chọn — không tính vào chip.
+  * Dưới thẻ: một hàng mô tả dài (chế độ màu, bộ nén, số trang, dung
+    lượng, PDF/A, ghi chú kết luận, cảnh báo ⚠) — chỉ mô tả file.
+  * Chạy nền: thẩm định tất cả PDF + TIFF (.tif) dưới thư mục gốc — file
+    trượt tiêu chí nặng (PDF: Scan màu/DPI; TIFF: Scan màu/DPI/1 trang/
+    nén lossy) được gắn dấu " !" sau tên + tô đỏ trên cây.
   * Không cache: mỗi lần quét / chọn file đều đọc lại để phản ánh hiện
     trạng (file thêm / sửa / xóa luôn được đánh giá lại).
 """
@@ -25,8 +26,8 @@ import json
 import os
 from pathlib import Path
 
-from PySide6.QtCore import QSize, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QFontMetrics
+from PySide6.QtCore import QEvent, QSize, Qt, QThread, QTimer, Signal
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QImage, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QFileDialog, QFrame, QGridLayout,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMenu, QProgressBar,
@@ -96,15 +97,15 @@ _COLOR_FAIL_FG = _STATUS_LOOK["fail"][0]
 # --------------------------------------------------------------------------- #
 
 class _TreeAuditWorker(QThread):
-    """Một lượt đi duy nhất trên cây: quét nhanh từng PDF (trang, ảnh,
-    DPI, màu, chữ ký — bỏ text/filter) để gắn dấu ❗, đồng thời tích lũy
-    Số tài liệu / Số trang / Dung lượng theo subtree (chỉ tính file PDF,
-    bỏ qua file khác). Mỗi lần quét đều đọc lại file (không cache) để
-    luôn phản ánh hiện trạng mới nhất."""
+    """Một lượt đi duy nhất trên cây: quét nhanh từng file PDF/TIFF (TIFF
+    đọc header rẻ nên luôn đầy đủ; PDF bỏ text/filter) để gắn dấu ❗, đồng
+    thời tích lũy Số tài liệu / Số trang / Dung lượng theo subtree (chỉ
+    tính PDF + .tif, bỏ qua file khác). Mỗi lần quét đều đọc lại file
+    (không cache) để luôn phản ánh hiện trạng mới nhất."""
 
-    progress = Signal(int, int)          # (đã xét, tổng PDF) → progress bar
+    progress = Signal(int, int)          # (đã xét, tổng file) → progress bar
     stats_step = Signal(int, int)        # (tài liệu, trang) đang đếm
-    marked = Signal(str, object, bool)   # (rel, PdfAuditResult, không đạt?)
+    marked = Signal(str, object, bool)   # (rel, kết quả audit, không đạt?)
     stats_done = Signal(object)          # FolderStats
     done = Signal(int)                   # tổng số file không đạt
 
@@ -137,8 +138,9 @@ class _TreeAuditWorker(QThread):
                     if e.is_dir(follow_symlinks=False):
                         child_rel = f"{rel}/{e.name}" if rel else e.name
                         walk(Path(e.path), child_rel)
-                    elif e.name.lower().endswith(".pdf"):
-                        # Chỉ thống kê file PDF — dung lượng cũng chỉ tính PDF.
+                    elif e.name.lower().endswith((".pdf", ".tif", ".tiff")):
+                        # Thống kê PDF + TIFF (.tif/.tiff cùng định dạng —
+                        # nhận ngang hàng); dung lượng cũng vậy.
                         pdfs.append(Path(e.path))
                         try:
                             size += e.stat().st_size
@@ -160,7 +162,7 @@ class _TreeAuditWorker(QThread):
             if self._cancel:
                 return
             rel = path.relative_to(self._root).as_posix()
-            result = da.audit_pdf(
+            result = da.audit_file(
                 str(path), quick=True, cancel_cb=lambda: self._cancel)
             if self._cancel:
                 return
@@ -171,11 +173,9 @@ class _TreeAuditWorker(QThread):
             else:
                 pages_by_rel[rel] = max(0, result.pages)
                 pages_done += max(0, result.pages)
-                if result.color_ok is False or result.dpi_ok is False:
+                bad_flag = result.hard_fail()
+                if bad_flag:
                     bad += 1
-                    bad_flag = True
-                else:
-                    bad_flag = False
                 self.marked.emit(rel, result, bad_flag)
             self.progress.emit(i, total)
             self.stats_step.emit(docs_done, pages_done)
@@ -231,17 +231,17 @@ class _TreeAuditWorker(QThread):
 
 
 class _AuditWorker(QThread):
-    """Thẩm định đầy đủ một file PDF khi được bấm chọn (đọc cấu trúc,
-    không sửa file). Mỗi lần chọn đều đọc lại — không cache."""
+    """Thẩm định đầy đủ một file PDF/TIFF khi được bấm chọn (đọc cấu
+    trúc, không sửa file). Mỗi lần chọn đều đọc lại — không cache."""
 
-    done = Signal(str, object)  # (path, PdfAuditResult)
+    done = Signal(str, object)  # (path, PdfAuditResult | TiffAuditResult)
 
     def __init__(self, path: str, parent=None):
         super().__init__(parent)
         self._path = path
 
     def run(self):
-        self.done.emit(self._path, da.audit_pdf(self._path))
+        self.done.emit(self._path, da.audit_file(self._path))
 
 
 class _CheckCard(QFrame):
@@ -333,7 +333,8 @@ class DigitizationAuditScreen(ScreenContent):
         self._bad_rels: set[str] = set()      # rel các file trượt nặng
         self._item_by_rel: dict = {}          # rel → item file trên cây
         self._current_pdf_abs: str | None = None
-        self._last_audit = None               # PdfAuditResult đang hiển thị
+        self._preview_pixmap = None           # QPixmap gốc của preview TIFF
+        self._last_audit = None               # kết quả thẩm định đang hiển thị
         self._build_ui()
         self._load_settings()
 
@@ -553,26 +554,35 @@ class DigitizationAuditScreen(ScreenContent):
         pv.setContentsMargins(0, 0, 0, 0)
         pv.setSpacing(SP[2])
 
-        cards_row = QHBoxLayout()
-        cards_row.setSpacing(SP[2])
+        # 6 thẻ chỉ tiêu xếp 2 hàng × 3 cột: nếu dồn vào MỘT hàng, chiều
+        # rộng tối thiểu của khung bên phải lên ~900px — splitter bị kẹt
+        # ở khổ lớn, phải fullscreen mới kéo nhỏ được; 3 cột giảm còn
+        # ~470px nên pane kéo hẹp thoải mái mà thẻ vẫn đủ chữ.
+        cards_grid = QGridLayout()
+        cards_grid.setContentsMargins(0, 0, 0, 0)
+        cards_grid.setHorizontalSpacing(SP[2])
+        cards_grid.setVerticalSpacing(SP[1])
         self.card_color = _CheckCard("Scan màu")
         self.card_dpi = _CheckCard("DPI")
         self.card_compression = _CheckCard("Độ nén")
         self.card_ocr = _CheckCard("Đã OCR")
         self.card_sign = _CheckCard("Ký số")
+        self.card_name = _CheckCard("Đặt tên đúng")
         self._check_cards = (self.card_color, self.card_dpi,
                              self.card_compression, self.card_ocr,
-                             self.card_sign)
-        # Cân đều 4 cột: min width theo giá trị dài nhất ("Không đảm bảo")
-        # để các thẻ không bị lệch kích thước khi chia chỗ trong layout.
+                             self.card_sign, self.card_name)
+        # Min width theo giá trị dài nhất ("Không đảm bảo") để thẻ không
+        # bị lệch kích thước khi chia chỗ trong layout.
         fm = QFontMetrics(self._card_value_font())
         min_w = max(fm.horizontalAdvance(txt) for txt in
                     ("Đúng", "300 dpi", "Không đảm bảo", "—")) \
             + SP[3] * 2 + 4
-        for card in self._check_cards:
+        for idx, card in enumerate(self._check_cards):
+            row, col = divmod(idx, 3)
             card.setMinimumWidth(min_w)
-            cards_row.addWidget(card, 1)
-        pv.addLayout(cards_row)
+            cards_grid.addWidget(card, row, col)
+            cards_grid.setColumnStretch(col, 1)
+        pv.addLayout(cards_grid)
 
         # Một hàng mô tả dài: thông tin file + ghi chú kết luận + cảnh báo
         # (chỉ mô tả, không góp phần quyết định kết quả thẩm định).
@@ -587,6 +597,27 @@ class DigitizationAuditScreen(ScreenContent):
 
         self.pdf_viewer = PdfViewerWidget()
         pv.addWidget(self.pdf_viewer, 1)
+        # Preview ảnh TIFF — cùng trang 2, thay thế viewer PDF khi chọn
+        # tệp .tif/.tiff. Min size 1×1 + scale theo khung (eventFilter) để
+        # pane co kéo tự do — pixmap cỡ lớn sẽ ép label phình to, không
+        # thu nhỏ được.
+        self.img_viewer = QLabel("")
+        self.img_viewer.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.img_viewer.setWordWrap(True)
+        self.img_viewer.setMinimumSize(1, 1)
+        self.img_viewer.setStyleSheet(
+            f"QLabel {{ background: {COLOR_SURFACE};"
+            f" color: {COLOR_TEXT_SECONDARY};"
+            f" border: 1px solid {COLOR_BORDER};"
+            f" border-radius: {RADIUS_MD}px; font: 12px '{FONT_UI}'; }}"
+        )
+        self.img_viewer.setVisible(False)
+        pv.addWidget(self.img_viewer, 1)
+        self.img_viewer.installEventFilter(self)
+        self._preview_fit_timer = QTimer(self)
+        self._preview_fit_timer.setSingleShot(True)
+        self._preview_fit_timer.setInterval(120)
+        self._preview_fit_timer.timeout.connect(self._fit_preview_pixmap)
         self.info_stack.addWidget(pdf_page)             # trang 2
 
         self.info_stack.setCurrentIndex(0)
@@ -642,6 +673,7 @@ class DigitizationAuditScreen(ScreenContent):
         self.lbl_audit_stats.setText("")
         self.info_stack.setCurrentIndex(0)
         self.pdf_viewer.clear()
+        self.img_viewer.clear()
         self._reload_root()
         if self.isVisible():
             QTimer.singleShot(0, self, self._expand_all_loaded)
@@ -658,6 +690,7 @@ class DigitizationAuditScreen(ScreenContent):
         self._stop_workers()
         self._stats = None
         self.pdf_viewer.clear()
+        self.img_viewer.clear()
         self._reload_root()
         self._expand_all_loaded()
         self._start_tree_audit()
@@ -716,10 +749,10 @@ class DigitizationAuditScreen(ScreenContent):
     # ------------------------------------------------- quét + thẩm định cây
 
     def _start_tree_audit(self):
-        """Một lượt đi duy nhất trên cây: quét nhanh từng PDF (trang, ảnh,
-        DPI, màu, chữ ký — bỏ text/filter nên nhanh) để gắn dấu ❗, đồng
-        thời đếm Số tài liệu / Số trang / Dung lượng. Luôn đọc lại file —
-        không cache — để phản ánh đúng hiện trạng (thêm/sửa/xóa)."""
+        """Một lượt đi duy nhất trên cây: quét nhanh từng file PDF/TIFF
+        để gắn dấu ❗, đồng thời đếm Số tài liệu / Số trang / Dung lượng.
+        Luôn đọc lại file — không cache — để phản ánh đúng hiện trạng
+        (thêm/sửa/xóa)."""
         if self._root is None:
             return
         # parent=self: Qt đợi thread chạy xong khi dọn dẹp (thoát app) thay
@@ -797,13 +830,13 @@ class DigitizationAuditScreen(ScreenContent):
         self.btn_stop_scan.setVisible(False)
         if bad:
             self.lbl_audit_stats.setText(
-                translations.localize_text(f"⚠ {bad} PDF không đạt"))
+                translations.localize_text(f"⚠ {bad} file không đạt"))
             self.lbl_audit_stats.setStyleSheet(
                 f"color: {_COLOR_FAIL_FG}; font: 600 12px '{FONT_UI}';"
             )
         else:
             self.lbl_audit_stats.setText(
-                translations.localize_text("Tất cả PDF đạt"))
+                translations.localize_text("Tất cả PDF/TIFF đạt"))
             self.lbl_audit_stats.setStyleSheet(
                 f"color: {_STATUS_LOOK['pass'][0]}; font: 12px '{FONT_UI}';"
             )
@@ -867,14 +900,16 @@ class DigitizationAuditScreen(ScreenContent):
     def _make_file_item(self, path: Path) -> QTreeWidgetItem:
         rel = path.relative_to(self._root).as_posix()
         is_pdf = path.suffix.lower() == ".pdf"
-        badge = "PDF" if is_pdf else "File khác"
+        is_tif = path.suffix.lower() in (".tif", ".tiff")
+        badge = "PDF" if is_pdf else ("TIFF" if is_tif else "File khác")
         item = QTreeWidgetItem([path.name, translations.localize_text(badge)])
         item.setData(0, _ROLE_REL, rel)
         item.setData(0, _ROLE_LEVEL, None)
         item.setData(0, _ROLE_ISDIR, False)
         item.setData(0, _ROLE_BADGE, badge)
         item.setData(0, _ROLE_BASENAME, path.name)
-        item.setIcon(0, _file_icon("#eef1f4" if is_pdf else "#cdd3da"))
+        item.setIcon(0, _file_icon(
+            "#eef1f4" if is_pdf else ("#d9e8d9" if is_tif else "#cdd3da")))
         item.setForeground(1, QColor(COLOR_TEXT_SECONDARY))
         item.setTextAlignment(1, Qt.AlignmentFlag.AlignRight
                               | Qt.AlignmentFlag.AlignVCenter)
@@ -920,6 +955,8 @@ class DigitizationAuditScreen(ScreenContent):
             self._show_folder(rel)
         elif rel and rel.lower().endswith(".pdf"):
             self._show_pdf(rel)
+        elif rel and rel.lower().endswith((".tif", ".tiff")):
+            self._show_tiff(rel)
         else:
             self._set_info_header(Path(rel).name if rel else "")
             self.info_stack.setCurrentIndex(0)
@@ -982,10 +1019,73 @@ class DigitizationAuditScreen(ScreenContent):
         self._current_pdf_abs = str(path)
         self._set_info_header(path.name)
         self.chip_verdict.setVisible(True)
+        self.pdf_viewer.setVisible(True)
+        self.img_viewer.setVisible(False)
         self.info_stack.setCurrentIndex(2)
         self._render_audit(None)  # trạng thái chờ
         self._start_audit(str(path))
         self.pdf_viewer.show_pdf(str(path))
+
+    def _show_tiff(self, rel: str):
+        """Chọn tệp TIFF: preview ảnh (Qt đọc TIFF sẵn) + thẻ chỉ tiêu."""
+        if self._root is None:
+            return
+        path = self._root / Path(rel)
+        if not path.is_file():
+            return
+        self._current_pdf_abs = str(path)
+        self._set_info_header(path.name)
+        self.chip_verdict.setVisible(True)
+        self.pdf_viewer.setVisible(False)
+        self.img_viewer.setVisible(True)
+        self.info_stack.setCurrentIndex(2)
+        self._render_audit(None)  # trạng thái chờ
+        self._set_image_preview(path)
+        self._start_audit(str(path))
+
+    def _set_image_preview(self, path: Path):
+        """Preview TIFF vừa khung: giữ pixmap gốc, scale theo kích thước
+        thực của label — pane co tới đâu preview theo tới đó."""
+        img = QImage(str(path))
+        if img.isNull():
+            self._preview_pixmap = None
+            self.img_viewer.setText(
+                translations.localize_text("Không xem trước được ảnh TIFF."))
+            return
+        pix = QPixmap.fromImage(img)
+        max_side = 2200   # chặn RAM: ảnh quét 300 dpi rất lớn
+        if max(pix.width(), pix.height()) > max_side:
+            pix = pix.scaled(
+                max_side, max_side, Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation)
+        self._preview_pixmap = pix
+        self._fit_preview_pixmap()
+
+    def _fit_preview_pixmap(self, fast: bool = False):
+        """Scale preview vừa khung hiện có (giữ tỉ lệ, không vượt khung)."""
+        pix = self._preview_pixmap
+        if pix is None:
+            return
+        label = self.img_viewer
+        avail = label.size()
+        if avail.width() < 40 or avail.height() < 40:
+            return          # chưa layout xong — đợi resize event gọi lại
+        scaled = pix.scaled(
+            avail, Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.FastTransformation if fast
+            else Qt.TransformationMode.SmoothTransformation)
+        current = label.pixmap()
+        if current is not None and current.size() == scaled.size():
+            return          # đúng cỡ rồi — tránh vòng lặp repaint
+        label.setPixmap(scaled)
+
+    def eventFilter(self, obj, event):
+        """Label preview đổi kích thước (kéo splitter / đổi cỡ cửa sổ) →
+        fit lại ảnh: Fast trong lúc kéo, Smooth sau khi ngưng 120ms."""
+        if obj is self.img_viewer and event.type() == QEvent.Type.Resize:
+            self._fit_preview_pixmap(fast=True)
+            self._preview_fit_timer.start()
+        return super().eventFilter(obj, event)
 
     # ------------------------------------------------------------ thẩm định
 
@@ -1018,12 +1118,18 @@ class DigitizationAuditScreen(ScreenContent):
         return f
 
     def _render_audit(self, result):
-        """Đổ 5 chỉ tiêu vào thẻ (Ký số là tùy chọn); ``result=None`` =
-        đang phân tích."""
+        """Đổ 6 thẻ chỉ tiêu; ``result=None`` = đang phân tích. PDF và
+        TIFF dùng chung khung thẻ — khác nhãn thẻ 4 (Đã OCR / Số
+        trang/tệp), ẩn thẻ Ký số với TIFF; thẻ 6 "Đặt tên đúng" chỉ cảnh
+        báo, không vào chip."""
         self._last_audit = result
-        for card, name in zip(self._check_cards,
-                              ("Scan màu", "DPI", "Độ nén", "Đã OCR",
-                               "Ký số")):
+        is_tiff = isinstance(result, da.TiffAuditResult)
+        titles = (("Scan màu", "DPI", "Độ nén", "Số trang/tệp", "Ký số",
+                   "Đặt tên đúng") if is_tiff else
+                  ("Scan màu", "DPI", "Độ nén", "Đã OCR", "Ký số",
+                   "Đặt tên đúng"))
+        self.card_sign.setVisible(not is_tiff)
+        for card, name in zip(self._check_cards, titles):
             card.set_title(translations.localize_text(name))
         if result is None:
             for card in self._check_cards:
@@ -1039,11 +1145,14 @@ class DigitizationAuditScreen(ScreenContent):
                 f"<span style='color:{_COLOR_FAIL_FG};'>{msg}</span>")
             self._set_verdict([], error=True)
             return
+        if is_tiff:
+            self._render_tiff(result)
+            return
 
         statuses: list[str] = []
         notes: list[str] = []      # ghi chú kết luận → hàng mô tả dài
 
-        # Scan màu — lỗi nặng.
+        # Scan màu — lỗi nặng (chính sách "phải là số hóa màu").
         if result.color_ok is None:
             self.card_color.set_status("na", "—")
             statuses.append("na")
@@ -1082,7 +1191,8 @@ class DigitizationAuditScreen(ScreenContent):
                 notes.append(translations.localize_text(
                     result.compression_note))
 
-        # Đã OCR — lỗi nhẹ.
+        # Đã OCR — chỉ cảnh báo vàng: chưa OCR KHÔNG làm trượt thẩm định
+        # (không vào chip tổng kết, không gắn dấu ❗ trên cây).
         if result.ocr_ok is None:
             self.card_ocr.set_status("na", "—")
         else:
@@ -1102,6 +1212,17 @@ class DigitizationAuditScreen(ScreenContent):
                 "warn", translations.localize_text("Không"))
             notes.append(translations.localize_text(
                 "chưa ký số (tùy chọn)"))
+
+        # Đặt tên đúng — quy ước hồ sơ + khớp thư mục cha (chỉ cảnh báo;
+        # chi tiết vi phạm chạy qua warnings() ⚠ ở hàng mô tả).
+        if result.name_ok is None:
+            self.card_name.set_status("na", "—")
+        elif result.name_ok:
+            self.card_name.set_status(
+                "pass", translations.localize_text("Đúng"))
+        else:
+            self.card_name.set_status(
+                "warn", translations.localize_text("Sai"))
 
         # Một hàng mô tả dài: thông tin file + ghi chú + cảnh báo ⚠.
         # Trạng thái PDF/A là mô tả trung tính (thiếu PDF/A không phải lỗi —
@@ -1127,10 +1248,110 @@ class DigitizationAuditScreen(ScreenContent):
             " · ".join(html_bits + warn_segs))
         self._set_verdict(statuses)
 
+    def _render_tiff(self, result):
+        """Đổ kết quả thẩm định TIFF vào 6 thẻ + hàng mô tả."""
+        statuses: list[str] = []
+        notes: list[str] = []
+
+        # Scan màu — lỗi nặng (chính sách "phải là số hóa màu" như PDF).
+        if result.color_ok is None:
+            self.card_color.set_status("na", "—")
+            statuses.append("na")
+        else:
+            ok = bool(result.color_ok)
+            self.card_color.set_status(
+                "pass" if ok else "fail",
+                translations.localize_text("Đúng" if ok else "Không"))
+            statuses.append("pass" if ok else "fail")
+
+        # DPI — lỗi nặng (đọc từ thẻ metadata X/YResolution).
+        if result.dpi_ok is None:
+            self.card_dpi.set_status("na", "—")
+            statuses.append("na")
+        else:
+            ok = bool(result.dpi_ok)
+            self.card_dpi.set_status(
+                "pass" if ok else "fail",
+                result.dpi_detail() if result.dpi_x and result.dpi_y else "—")
+            statuses.append("pass" if ok else "fail")
+            if not ok:
+                notes.append(translations.localize_text(
+                    f"DPI dưới ngưỡng {da.DPI_MIN} dpi"))
+
+        # Độ nén — không nén đạt; lossless chỉ cảnh báo vàng; lossy trượt.
+        status = result.compression_status
+        if status == "none":
+            self.card_compression.set_status(
+                "pass", translations.localize_text("Không nén"))
+        elif status == "lossless":
+            self.card_compression.set_status(
+                "warn", translations.localize_text("Nén lossless"))
+            notes.append(translations.localize_text(
+                f"TIFF nén {result.compression_name.lower()} — văn bản quy "
+                "định TIFF không nén"))
+        elif status == "lossy":
+            self.card_compression.set_status(
+                "fail", translations.localize_text("Mất dữ liệu"))
+            statuses.append("fail")
+            notes.append(translations.localize_text(
+                f"TIFF nén {result.compression_name.lower()} — nén mất dữ "
+                "liệu không đạt"))
+        else:
+            self.card_compression.set_status("na", "—")
+
+        # Số trang/tệp — TIFF hợp lệ đúng 1 trang (lỗi nặng).
+        if result.single_page_ok is None:
+            self.card_ocr.set_status("na", "—")
+            statuses.append("na")
+        elif result.single_page_ok:
+            self.card_ocr.set_status(
+                "pass", translations.localize_text("1 trang"))
+            statuses.append("pass")
+        else:
+            self.card_ocr.set_status(
+                "fail", translations.localize_text(f"{result.pages} trang"))
+            statuses.append("fail")
+            notes.append(translations.localize_text(
+                "TIFF phải 1 trang/tệp — tách trang trước khi thẩm định"))
+
+        # Đặt tên đúng — quy ước trang + khớp thư mục cha (chỉ cảnh báo).
+        if result.name_ok is None:
+            self.card_name.set_status("na", "—")
+        elif result.name_ok:
+            self.card_name.set_status(
+                "pass", translations.localize_text("Đúng"))
+        else:
+            self.card_name.set_status(
+                "warn", translations.localize_text("Sai"))
+
+        # Hàng mô tả dài + cảnh báo ⚠ (khổ nhỏ < 600 dpi, chuỗi trang,
+        # tên lệch quy ước — chạy qua TiffAuditResult.warnings()).
+        size_mb = result.file_size / (1024 * 1024)
+        bits = [
+            f"{result.width_px}×{result.height_px} px",
+            result.color_summary(),
+            result.dpi_detail(),
+            result.compression_name,
+            f"{size_mb:.1f} MB",
+        ]
+        if result.has_icc:
+            bits.append("có ICC profile")
+        bits += notes
+        warn_segs = [
+            f"<span style='color:{_COLOR_WARN_FG};'>⚠ "
+            f"{html.escape(translations.localize_text(w))}</span>"
+            for w in result.warnings()]
+        html_bits = [
+            html.escape(translations.localize_text(str(b))) for b in bits]
+        self.lbl_audit_detail.setText(
+            " · ".join(html_bits + warn_segs))
+        self._set_verdict(statuses)
+
     def _set_verdict(self, statuses: list[str], error: bool = False):
-        """Chip tổng kết cạnh tên file: CHỈ 2 tiêu chí quan trọng quyết
-        định — Scan màu + DPI → 'Đạt' / 'Không đạt' (không đếm x/4; các
-        tiêu chí vàng chỉ mang tính tham khảo, không vào chip)."""
+        """Chip tổng kết cạnh tên file: CHỈ tiêu chí quan trọng quyết định
+        — PDF: Scan màu + DPI; TIFF: Scan màu + DPI + Số trang/tệp + nén
+        lossy → 'Đạt' / 'Không đạt' (OCR và các thẻ vàng chỉ tham khảo,
+        không vào chip)."""
         known = [s for s in statuses if s != "na"]
         if error:
             key, text = "fail", "Lỗi thẩm định"

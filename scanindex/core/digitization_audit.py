@@ -1,13 +1,22 @@
-"""Thẩm định chất lượng số hóa PDF — chỉ đọc cấu trúc file, không sửa.
+"""Thẩm định chất lượng số hóa PDF/TIFF — chỉ đọc cấu trúc file, không sửa.
 
-Kiểm tra qua PyMuPDF: DPI ảnh (≥ 300), chế độ màu (chỉ cần CÓ ảnh màu —
-RGB/CMYK — là đạt; 100% ảnh đen-trắng/xám mới trượt), độ nén (không nén
-hoặc lossless — JPEG/DCT, JBIG2, JPEG 2000 lossy 9/7 là trượt), lớp text
-OCR (trang scan phải có text, cảnh báo khi text gần như không có dấu
-tiếng Việt) và metadata PDF/A.
+PDF (qua PyMuPDF): DPI ảnh (≥ 300; khổ ≤ ~70% A4 còn phải ≥ 600 dpi — chỉ
+cảnh báo), chế độ màu (chỉ cần CÓ ảnh màu — RGB/CMYK — là đạt; 100% ảnh
+đen-trắng/xám mới trượt), độ nén (không nén hoặc lossless — JPEG/DCT,
+JBIG2, JPEG 2000 lossy 9/7 là trượt), lớp text OCR (trang scan phải có
+text, cảnh báo khi text gần như không có dấu tiếng Việt) và metadata
+PDF/A. Tên file kiểm tra quy ước hồ sơ ``<MãĐĐ>-<Phông>-<ML 2 số>-<HS
+4 số>-<STT 3 số>.pdf`` khớp thư mục cha (chỉ cảnh báo — xem
+``_pdf_name_check``).
 
-``scan_tree_stats`` đếm tài liệu/trang theo từng thư mục trong cây
-CSDL_SOHOA (cấp thư mục xem ``scanindex.core.rename_tree.level_of``).
+TIFF (qua Pillow — ``audit_tiff``): bản bảo hiểm lưu trữ 1 tệp = 1 trang,
+không nén (nén lossless chỉ cảnh báo, lossy trượt), DPI/màu như PDF và
+quy ước tên trang ``…-<Trang 3 số>.tif`` khớp thư mục cha + chuỗi trang
+liên tục (chỉ cảnh báo). ``audit_file`` chọn hàm theo đuôi file.
+
+``scan_tree_stats`` đếm tài liệu/trang (PDF + TIFF) theo từng thư mục
+trong cây CSDL_SOHOA (cấp thư mục xem
+``scanindex.core.rename_tree.level_of``).
 """
 from __future__ import annotations
 
@@ -18,6 +27,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import fitz  # PyMuPDF
+from PIL import Image
 
 from scanindex.core import rename_tree as rt
 
@@ -26,6 +36,13 @@ from scanindex.core import rename_tree as rt
 # --------------------------------------------------------------------------- #
 
 DPI_MIN = 300
+# Quy định 600 dpi cho khổ nhỏ hơn A4: "khổ nhỏ" = tỉ lệ cạnh ≤ ~70% A4
+# (chọn 0,72 để bao trọn A5 — A5/A4 = 70,7% — mà vẫn bỏ qua khổ chỉ "bé
+# hơn A4 một xíu"). Chỉ CẢNH BÁO, không trượt: máy quét cắt lề làm khổ đo
+# được lệch, còn "cỡ chữ dưới 8" thì file không cho biết.
+DPI_SMALL_PAGE = 600
+A4_SMALL_SCALE = 0.72
+A4_MM = (210.0, 297.0)
 
 # Số ký tự text tối thiểu trên một trang có ảnh scan để tính là "có lớp text".
 OCR_MIN_CHARS = 10
@@ -93,6 +110,9 @@ class PdfAuditResult:
     letters: int = 0                # tổng chữ cái latin trong text
     pdfa: str = ""                  # "1B", "2B", "3U"… — rỗng nếu không có
     signed: bool | None = None      # có chữ ký số (None = không xác định)
+    name_ok: bool | None = None     # tên khớp quy ước hồ sơ + thư mục cha
+    name_note: str = ""             # mô tả vi phạm tên ('' = đạt)
+    small_page_note: str = ""       # khổ ≤ ~70% A4 mà < 600 dpi ('' = không)
     file_size: int = 0
     error: str = ""                 # không rỗng = không thẩm định được
     quick: bool = False             # True = quét nhanh (chưa có nén/OCR)
@@ -144,7 +164,16 @@ class PdfAuditResult:
         if self.letters >= 200 and self.vn_letters < 5:
             out.append("Text hầu như không có dấu tiếng Việt — "
                        "khả năng OCR chạy sai ngôn ngữ.")
+        if self.small_page_note:
+            out.append(self.small_page_note)
+        if self.name_ok is False and self.name_note:
+            out.append(f"Tên file: {self.name_note}.")
         return out
+
+    def hard_fail(self) -> bool:
+        """Trượt tiêu chí nặng mức quét nhanh (màu/DPI) — dùng gắn dấu ❗
+        trên cây; OCR chốt ở bản thẩm định đầy đủ khi bấm chọn file."""
+        return self.color_ok is False or self.dpi_ok is False
 
 
 # --------------------------------------------------------------------------- #
@@ -222,6 +251,39 @@ def _compression_note(doc: "fitz.Document", im: ImageInfo) -> str:
     return ""
 
 
+def _pdf_name_check(path: str | os.PathLike) -> tuple[bool | None, str]:
+    """Kiểm tra quy ước tên hồ sơ của một file PDF (chỉ CẢNH BÁO, không
+    vào tiêu chí nặng).
+
+    Tên file ≥ 5 đoạn ``<MãĐĐ>-<Phông>-<MụcLục>-<Hồ sơ>-<STT>[-gợi nhớ].
+    pdf`` — mã định danh/phông tùy ý (chỉ cấm dấu "-"), mục lục 2 chữ số,
+    hồ sơ 4 chữ số, số thứ tự 3 chữ số; phần sau STT giữ nguyên như
+    ``PdfName.extra``. 4 mã đầu phải trùng khớp tên thư mục hồ sơ chứa nó.
+    """
+    p = Path(path)
+    parsed = rt.parse_pdf_name(p.name)
+    if parsed is None:
+        return False, ("không khớp quy ước 5 đoạn <MãĐĐ>-<Phông>-<Mục lục>"
+                       "-<Hồ sơ>-<STT>.pdf")
+    bad: list[str] = []
+    if not (parsed.muc_luc.isdigit() and len(parsed.muc_luc) == 2):
+        bad.append("mục lục phải là đúng 2 chữ số")
+    if not (parsed.ho_so.isdigit() and len(parsed.ho_so) == 4):
+        bad.append("hồ sơ phải là đúng 4 chữ số")
+    if not (parsed.stt.isdigit() and len(parsed.stt) == 3):
+        bad.append("số thứ tự phải là đúng 3 chữ số")
+    parent = rt.parse_dossier_folder_name(p.parent.name)
+    if parent is None:
+        bad.append("thư mục chứa không đúng quy ước hồ sơ 4 đoạn")
+    elif (parent.ma_dinh_danh, parent.ma_phong, parent.muc_luc,
+          parent.ho_so) != (parsed.ma_dinh_danh, parsed.ma_phong,
+                            parsed.muc_luc, parsed.ho_so):
+        bad.append("4 mã đầu của tên file không khớp thư mục hồ sơ chứa")
+    if bad:
+        return False, "; ".join(bad)
+    return True, ""
+
+
 # --------------------------------------------------------------------------- #
 # Thẩm định 1 file
 # --------------------------------------------------------------------------- #
@@ -239,6 +301,7 @@ def audit_pdf(path: str | os.PathLike, *, quick: bool = False,
         result.file_size = os.path.getsize(path)
     except OSError:
         pass
+    result.name_ok, result.name_note = _pdf_name_check(path)
     try:
         with FITZ_LOCK:
             doc = fitz.open(str(path))
@@ -265,9 +328,26 @@ def audit_pdf(path: str | os.PathLike, *, quick: bool = False,
                 except Exception:
                     infos = []
                 has_image = bool(infos)
-                for im in infos:
-                    result.images.append(
-                        _image_entry(i + 1, im, doc, quick=quick))
+                page_entries = [_image_entry(i + 1, im, doc, quick=quick)
+                                for im in infos]
+                result.images.extend(page_entries)
+                if page_entries and not result.small_page_note:
+                    # Quy định 600 dpi cho khổ nhỏ: cả hai cạnh trang ≤
+                    # ~70% A4 (đã chuẩn hóa chiều) mà ảnh < 600 dpi → ghi
+                    # chú cảnh báo (không trượt nặng — máy quét cắt lề có
+                    # thể làm khổ đo được lệch).
+                    w_mm = page.rect.width * 25.4 / 72.0
+                    h_mm = page.rect.height * 25.4 / 72.0
+                    scale = min(min(w_mm, h_mm) / A4_MM[0],
+                                max(w_mm, h_mm) / A4_MM[1])
+                    if scale <= A4_SMALL_SCALE:
+                        worst = min(e.dpi for e in page_entries)
+                        if worst < DPI_SMALL_PAGE - 1.0:
+                            result.small_page_note = (
+                                f"Trang {i + 1} khổ nhỏ (≈{scale * 100:.0f}"
+                                f"% A4) quét {worst:.0f} dpi — quy định yêu "
+                                "cầu 600 dpi cho khổ nhỏ hơn A4, cân nhắc "
+                                "quét lại")
                 if not quick:
                     try:
                         text = page.get_text("text") or ""
@@ -409,6 +489,279 @@ def _conclude(result: PdfAuditResult, doc: "fitz.Document"):
 
 
 # --------------------------------------------------------------------------- #
+# Thẩm định 1 tệp TIFF (bản bảo hiểm lưu trữ — 1 tệp = 1 trang)
+# --------------------------------------------------------------------------- #
+
+# Compression tag 259: lossless (CCITT RLE/G3/G4, LZW, Deflate, PackBits,
+# zlib) chỉ CẢNH BÁO ("văn bản quy định TIFF không nén"); lossy (JPEG cũ/
+# mới, JPEG 2000) TRƯỢT nặng. Giá trị lạ → "unknown" (cảnh báo).
+_TIFF_LOSSLESS = {2, 3, 4, 5, 8, 32773, 32946}
+_TIFF_LOSSY = {6, 7, 34712}
+_TIFF_COMPRESSION_NAMES = {
+    1: "Không nén", 2: "CCITT RLE", 3: "CCITT G3", 4: "CCITT G4",
+    5: "LZW", 6: "JPEG (cũ)", 7: "JPEG", 8: "Deflate",
+    32773: "PackBits", 32946: "Deflate", 34712: "JPEG 2000",
+}
+
+# Tên trang ``<MãĐĐ>-<Phông>-<ML 2 số>-<ĐVBC 4 số>-<Trang 3 số>`` — thống
+# nhất quy ước hồ sơ với PDF (_pdf_name_check), phông tùy ý chỉ cấm "-".
+_TIFF_NAME_RE = re.compile(
+    r"^(?P<mdd>[^-]+)-(?P<phong>[^-]+)-(?P<ml>\d{2})-(?P<dvbc>\d{4})"
+    r"-(?P<trang>\d{3})$")
+
+
+@dataclass(frozen=True)
+class TiffName:
+    """Tên trang TIFF ``<MãĐĐ>-<Phông>-<ML>-<ĐVBC>-<Trang>`` (đã khớp mẫu)."""
+    ma_dinh_danh: str
+    ma_phong: str
+    muc_luc: str
+    don_vi_bao_quan: str
+    trang: str
+
+
+def parse_tiff_name(name: str) -> TiffName | None:
+    """Parse tên tệp trang TIFF; trả None nếu không khớp quy ước 5 đoạn.
+
+    Đuôi ``.tif``/``.tiff`` do caller kiểm tra riêng — hai đuôi là CÙNG
+    định dạng TIFF, nhận ngang hàng (không ép đuôi).
+    """
+    m = _TIFF_NAME_RE.match(Path(name).stem)
+    if m is None:
+        return None
+    return TiffName(m["mdd"], m["phong"], m["ml"], m["dvbc"], m["trang"])
+
+
+@dataclass
+class TiffAuditResult:
+    """Kết quả thẩm định một tệp TIFF trang quét (1 tệp = 1 trang)."""
+
+    path: str
+    pages: int = 1                    # n_frames — hợp lệ phải == 1
+    width_px: int = 0
+    height_px: int = 0
+    dpi_x: float = 0.0                # 0 = thiếu thẻ DPI trong metadata
+    dpi_y: float = 0.0
+    bpc: int = 0                      # bits per sample (0 = thiếu tag)
+    ncomp: int = 0                    # samples per pixel
+    photometric: str = "unknown"      # RGB | grey | palette | CMYK | other
+    compression_status: str = "unknown"  # none | lossless | lossy | unknown
+    compression_name: str = ""
+    has_icc: bool = False             # có ICC profile (tham khảo sRGB)
+    color_ok: bool | None = None
+    dpi_ok: bool | None = None
+    single_page_ok: bool | None = None
+    name_ok: bool | None = None
+    name_note: str = ""
+    sequence_warning: str = ""        # trang thiếu/trùng trong thư mục
+    lowres_page_warning: str = ""     # khổ ≤ ~70% A4 mà < 600 dpi
+    file_size: int = 0
+    error: str = ""                   # không rỗng = không thẩm định được
+
+    @property
+    def dpi(self) -> float:
+        return min(self.dpi_x, self.dpi_y)
+
+    def hard_fail(self) -> bool:
+        """Trượt tiêu chí nặng: màu, DPI, 1 trang/tệp, nén lossy."""
+        return (self.color_ok is False or self.dpi_ok is False
+                or self.single_page_ok is False
+                or self.compression_status == "lossy")
+
+    def color_summary(self) -> str:
+        if self.photometric == "RGB":
+            return f"Màu {self.bpc * 3} bit" if self.bpc else "Màu RGB"
+        names = {"grey": "Thang xám/đen trắng", "palette": "Bảng màu",
+                 "CMYK": "CMYK", "other": "Chế độ màu lạ",
+                 "unknown": "Chế độ màu không rõ"}
+        return names.get(self.photometric, self.photometric)
+
+    def dpi_detail(self) -> str:
+        if not self.dpi_x or not self.dpi_y:
+            return "không có thẻ DPI trong metadata"
+        return f"{self.dpi:.0f} dpi"
+
+    def warnings(self) -> list[str]:
+        """Cảnh báo phụ (không vào tiêu chí nặng): khổ nhỏ < 600 dpi,
+        chuỗi trang thiếu/trùng, tên lệch quy ước."""
+        out: list[str] = []
+        if self.lowres_page_warning:
+            out.append(self.lowres_page_warning)
+        if self.sequence_warning:
+            out.append(f"Chuỗi trang: {self.sequence_warning}.")
+        if self.name_ok is False and self.name_note:
+            out.append(f"Tên file: {self.name_note}.")
+        return out
+
+
+def _tiff_name_check(path: Path) -> tuple[bool | None, str, str]:
+    """Kiểm tra tên + vị trí tệp TIFF. Trả ``(name_ok, name_note,
+    sequence_warning)`` — vi phạm tên/chuỗi trang chỉ CẢNH BÁO."""
+    parsed = parse_tiff_name(path.name)
+    if parsed is None:
+        return False, ("không khớp quy ước <MãĐĐ>-<Phông>-<Mục lục 2 số>"
+                       "-<Đơn vị bảo quản 4 số>-<Trang 3 số>.tif"), ""
+    bad: list[str] = []
+    parent = rt.parse_dossier_folder_name(path.parent.name)
+    if parent is None:
+        bad.append("thư mục chứa không đúng quy ước hồ sơ 4 đoạn")
+    elif (parent.ma_dinh_danh, parent.ma_phong, parent.muc_luc,
+          parent.ho_so) != (parsed.ma_dinh_danh, parsed.ma_phong,
+                            parsed.muc_luc, parsed.don_vi_bao_quan):
+        bad.append("4 mã đầu của tên file không khớp thư mục hồ sơ chứa")
+    seq_warn = ""
+    try:
+        siblings = [e for e in path.parent.iterdir()
+                    if e.suffix.lower() in (".tif", ".tiff")]
+    except OSError:
+        siblings = []
+    if len(siblings) > 1:
+        nums: list[int] = []
+        dupes: list[str] = []
+        for s in siblings:
+            q = parse_tiff_name(s.name)
+            if q is None or not q.trang.isdigit():
+                continue
+            n = int(q.trang)
+            if n in nums:
+                dupes.append(q.trang)
+            nums.append(n)
+        if dupes:
+            seq_warn = "số trang bị trùng: " + ", ".join(sorted(set(dupes)))
+        else:
+            missing = sorted(set(range(1, max(nums, default=0) + 1))
+                             - set(nums))
+            if missing:
+                seq_warn = ("thiếu trang: " + ", ".join(
+                    str(t).zfill(3) for t in missing[:10]))
+    if bad:
+        return False, "; ".join(bad), seq_warn
+    return True, "", seq_warn
+
+
+def audit_tiff(path: str | os.PathLike, *, quick: bool = False,
+               progress_cb=None, cancel_cb=None) -> TiffAuditResult:
+    """Thẩm định một tệp TIFF trang quét. Chỉ đọc header qua Pillow nên
+    rẻ — mọi lượt quét cùng độ sâu; ``quick`` giữ để tương thích chữ ký
+    ``audit_file``. Không ghi/sửa file.
+
+    Tiêu chí nặng: DPI ≥ 300, màu (RGB ≥ 3 kênh, 8 bit/kênh — xám/1-bit
+    trượt như chính sách PDF), đúng 1 trang/tệp, nén không lossy. Cảnh
+    báo: nén lossless ("văn bản quy định TIFF không nén"), khổ ≤ ~70% A4
+    mà < 600 dpi, tên/chuỗi trang lệch quy ước.
+    """
+    result = TiffAuditResult(path=str(path))
+    p = Path(path)
+    try:
+        result.file_size = os.path.getsize(path)
+    except OSError:
+        pass
+    try:
+        with Image.open(str(path)) as im:
+            im.seek(0)
+            n_frames = getattr(im, "n_frames", 1) or 1
+            result.pages = n_frames
+            result.single_page_ok = n_frames == 1
+            result.width_px = int(im.width)
+            result.height_px = int(im.height)
+            tags = getattr(im, "tag_v2", {})
+
+            def _num(tag):
+                v = tags.get(tag)
+                if v is None:
+                    return None
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    return None
+
+            unit = _num(296)
+            factor = 2.54 if unit == 3 else 1.0   # 2 = inch (mặc định), 3 = cm
+            xres, yres = _num(282), _num(283)
+            if xres is not None:
+                result.dpi_x = xres * factor
+            if yres is not None:
+                result.dpi_y = yres * factor
+            bps = tags.get(258)
+            if isinstance(bps, (tuple, list)):
+                bpc_list = [int(b) for b in bps]
+            elif bps is not None:
+                bpc_list = [int(bps)]
+            else:
+                bpc_list = []
+            spp = _num(277)
+            if spp is None and not bpc_list and im.mode in ("1", "L"):
+                # Bilevel/thang xám không ghi tag 258/277 (giá trị ngầm
+                # định 1 bit / 8 bit, 1 kênh) — suy ra từ mode Pillow.
+                bpc_list = [1 if im.mode == "1" else 8]
+                spp = 1.0
+            result.bpc = bpc_list[0] if bpc_list else 0
+            result.ncomp = int(spp) if spp is not None else len(bpc_list)
+            photo = _num(262)
+            photo = int(photo) if photo is not None else None
+            result.photometric = {
+                0: "grey", 1: "grey", 2: "RGB", 3: "palette",
+                5: "CMYK", 6: "RGB",          # YCbCr = JPEG RGB
+            }.get(photo, "other")
+            result.has_icc = 34675 in tags
+            comp = _num(259)
+            comp = int(comp) if comp is not None else None
+            result.compression_name = _TIFF_COMPRESSION_NAMES.get(
+                comp, f"bộ nén lạ ({comp})" if comp is not None else "không rõ")
+            if comp == 1:
+                result.compression_status = "none"
+            elif comp in _TIFF_LOSSLESS:
+                result.compression_status = "lossless"
+            elif comp in _TIFF_LOSSY:
+                result.compression_status = "lossy"
+            else:
+                result.compression_status = "unknown"
+
+            if result.dpi_x > 0 and result.dpi_y > 0:
+                dpi_eff = min(result.dpi_x, result.dpi_y)
+                result.dpi_ok = dpi_eff >= DPI_MIN - 1.0
+                w_mm = result.width_px * 25.4 / result.dpi_x
+                h_mm = result.height_px * 25.4 / result.dpi_y
+                scale = min(min(w_mm, h_mm) / A4_MM[0],
+                            max(w_mm, h_mm) / A4_MM[1])
+                if result.dpi_ok and scale <= A4_SMALL_SCALE \
+                        and dpi_eff < DPI_SMALL_PAGE - 1.0:
+                    result.lowres_page_warning = (
+                        f"Khổ nhỏ (≈{scale * 100:.0f}% A4) quét "
+                        f"{dpi_eff:.0f} dpi — quy định yêu cầu 600 dpi cho "
+                        "khổ nhỏ hơn A4, cân nhắc quét lại")
+            # Màu bắt buộc (chính sách như PDF): RGB/YCbCr/CMYK ≥ 3 kênh,
+            # đủ 8 bit/kênh; xám, bảng màu, 1-bit, 16 bit đều trượt.
+            if result.ncomp and bpc_list:
+                result.color_ok = (
+                    result.ncomp >= 3
+                    and photo not in (3, 4)       # palette / mask không tính
+                    and all(b == 8 for b in bpc_list))
+    except Exception as exc:
+        result.error = f"Không đọc được TIFF: {exc}"
+        return result
+    result.name_ok, result.name_note, result.sequence_warning = \
+        _tiff_name_check(p)
+    return result
+
+
+def audit_file(path: str | os.PathLike, *, quick: bool = False,
+               progress_cb=None, cancel_cb=None):
+    """Thẩm định 1 file theo đuôi: ``.pdf`` → ``audit_pdf``, ``.tif``/
+    ``.tiff`` → ``audit_tiff`` (hai đuôi cùng định dạng, nhận ngang hàng).
+    Đuôi khác raise ValueError (UI không đưa vào cây)."""
+    suffix = Path(path).suffix.lower()
+    if suffix == ".pdf":
+        return audit_pdf(path, quick=quick, progress_cb=progress_cb,
+                         cancel_cb=cancel_cb)
+    if suffix in (".tif", ".tiff"):
+        return audit_tiff(path, progress_cb=progress_cb,
+                          cancel_cb=cancel_cb)
+    raise ValueError(
+        f"Không thẩm định được định dạng \"{suffix or '(không có)'}\": {path}")
+
+
+# --------------------------------------------------------------------------- #
 # Thống kê cây thư mục (số tài liệu / số trang theo từng thư mục)
 # --------------------------------------------------------------------------- #
 
@@ -505,6 +858,14 @@ def scan_tree_stats(root: Path, *, page_cache: dict | None = None,
                     n = 0
                 docs += 1
                 pages += n
+            elif entry.suffix.lower() in (".tif", ".tiff"):
+                # TIFF chuẩn là 1 tệp = 1 trang — không đọc file (.tif và
+                # .tiff cùng định dạng, đếm ngang hàng).
+                docs_seen += 1
+                if progress_cb is not None:
+                    progress_cb(docs_seen, entry)
+                docs += 1
+                pages += 1
         stats.dir_stats[rel] = (docs, pages)
         return docs, pages
 

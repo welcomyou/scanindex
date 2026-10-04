@@ -498,9 +498,26 @@ The software prioritizes local processing when models and dependencies are insta
     "arc_saved_notice": { "en": "Saved", "vi": "Đã lưu" },
 
     # ── Step bar ────────────────────────────────────────────────────
-    "arc_step1_title": { "en": "Step 1 - Split large file", "vi": "Bước 1 - Tách file lớn" },
-    "arc_step2_title": { "en": "Step 2 — Extract KIE", "vi": "Bước 2 — Trích xuất KIE" },
-    "arc_step3_title": { "en": "Step 3 — Sign", "vi": "Bước 3 — Ký số" },
+    "arc_step1_title": {
+        "en": "Step 1 — Split scanned file (optional)",
+        "vi": "Bước 1: Tách file scan (tùy chọn)",
+    },
+    "arc_step1_tooltip": {
+        "en": "If the whole dossier was scanned into one large PDF file, process it in this step to split it into small PDF files, one per document.",
+        "vi": "Nếu scan toàn bộ hồ sơ thành 1 file PDF lớn, thì xử lý tại bước 1 để tách thành các file PDF nhỏ theo từng văn bản",
+    },
+    "arc_step2_title": {
+        "en": "Step 2 — Extract document data",
+        "vi": "Bước 2: Bóc tách dữ liệu văn bản",
+    },
+    "arc_step2_tooltip": {
+        "en": "Recognize and extract document fields such as number, signing date, signer, subject, ... A folder containing PDF files can be provided as input to skip Step 1.",
+        "vi": "Nhận diện và bóc tách các trường thông tin văn bản như số, ngày ký, người ký, trích yếu ... Có thể đưa một thư mục chứa file PDF là đầu vào nếu bỏ qua Bước 1.",
+    },
+    "arc_step3_title": {
+        "en": "Step 3 — Digital signing",
+        "vi": "Bước 3: Ký số",
+    },
 
     # ── Dossier info dialog (Bước 1 / Kho edit) ─────────────────────
     "arc_session_dialog_title": {
@@ -617,6 +634,174 @@ The software prioritizes local processing when models and dependencies are insta
               "(đã bỏ một vị trí). Việc kéo thả sẽ đánh lại số thứ tự tuần tự "
               "(1, 2, 3…). Vui lòng kiểm tra chính xác thứ tự của từng văn bản "
               "trước khi xác nhận.",
+    },
+    "arc_step2_edit_dossier": {
+        "en": "Dossier info",
+        "vi": "Thông tin hồ sơ",
+    },
+    "arc_step2_dossier_updated": {
+        "en": "Updated dossier info: {label}",
+        "vi": "Đã cập nhật thông tin hồ sơ: {label}",
+    },
+    "arc_step3_col_sign": {
+        "en": "Sign",
+        "vi": "Ký",
+    },
+    "arc_step3_no_checked_files": {
+        "en": "No valid PDF is ticked for signing.",
+        "vi": "Chưa có file PDF hợp lệ nào được tích để ký.",
+    },
+    "arc_dossier_cache_clear": {
+        "en": "Clear suggestion cache",
+        "vi": "Xóa cache gợi ý",
+    },
+    "arc_dossier_cache_clear_tip": {
+        "en": "Forget remembered fonds/catalog names and the last term — "
+              "fields will no longer be auto-filled.",
+        "vi": "Quên tên phông/tên mục lục và nhiệm kỳ đã nhớ — các trường "
+              "sẽ không còn tự điền.",
+    },
+    "arc_dossier_cache_confirm": {
+        "en": "Clear the remembered fonds/catalog names and last term?",
+        "vi": "Xóa toàn bộ cache gợi ý tên phông, tên mục lục và nhiệm kỳ "
+              "đã nhớ?",
+    },
+    "arc_dossier_cache_cleared": {
+        "en": "Cleared ✓",
+        "vi": "Đã xóa ✓",
+    },
+    "arc_step2_missing_info": {
+        "en": "— missing info",
+        "vi": "— thiếu thông tin",
+    },
+    "arc_step2_missing_info_markup": {
+        "en": "<b>{}</b>&nbsp;&nbsp;<i style='color:#f59e0b;'>{}</i>",
+        "vi": "<b>{}</b>&nbsp;&nbsp;<i style='color:#f59e0b;'>{}</i>",
+    },
+    "arc_step2_edit_dossier_btn_tip": {
+        "en": "Edit this dossier's info",
+        "vi": "Sửa thông tin hồ sơ này",
+    },
+    "arc_step3_sep_row": {
+        "en": "🗂  {}  ·  {} document(s)",
+        "vi": "🗂  {}  ·  {} tài liệu",
+    },
+    "audit_pick_root_btn": {
+        "en": "📂  Pick root folder…",
+        "vi": "📂  Chọn thư mục gốc…",
+    },
+    "audit_stop_btn": {
+        "en": "⏹  Stop",
+        "vi": "⏹  Dừng",
+    },
+    "audit_empty_hint": {
+        "en": "Pick a folder to see document / page counts,\nor a PDF file "
+              "to review digitization quality.",
+        "vi": "Chọn một thư mục để xem Số tài liệu / Số trang,\n"
+              "hoặc chọn file PDF để thẩm định chất lượng số hóa.",
+    },
+    "audit_span_markup": {
+        "en": "<span style='color:{};'>{}</span>",
+        "vi": "<span style='color:{};'>{}</span>",
+    },
+    "pdf_viewer_zoom_reset_tip": {
+        "en": "Reset zoom to 100%",
+        "vi": "Đặt lại mức phóng 100%",
+    },
+    "arc_browse_no_pdf_title": {
+        "en": "No PDF found",
+        "vi": "Không có file PDF",
+    },
+    "arc_browse_no_pdf_body": {
+        "en": "No PDF file exists in the selected folder or its subfolders.",
+        "vi": "Thư mục đã chọn (kể cả thư mục con) không có file PDF nào.",
+    },
+    "arc_browse_scan_failed": {
+        "en": "Cannot read the selected folder:\n{error}",
+        "vi": "Không đọc được thư mục đã chọn:\n{error}",
+    },
+    "arc_browse_merge_title": {
+        "en": "Standard folder structure not found",
+        "vi": "Không tìm thấy cấu trúc thư mục chuẩn",
+    },
+    "arc_browse_merge_body": {
+        "en": "No Mã định danh / Phông / Mục lục / Hồ sơ folder structure "
+              "was found.\n\nDo you want to combine all PDF files in this "
+              "folder and its subfolders into ONE dossier?",
+        "vi": "Không tìm thấy cấu trúc thư mục Mã định danh / Phông / Mục "
+              "lục / Hồ sơ theo chuẩn.\n\nBạn có muốn gom toàn bộ PDF trong "
+              "thư mục này và các thư mục con vào MỘT hồ sơ không?",
+    },
+    "arc_browse_merge_cancelled": {
+        "en": "Folder import cancelled. The current session is unchanged.",
+        "vi": "Đã hủy nhập thư mục. Phiên hiện tại không thay đổi.",
+    },
+    "arc_multi_process_started": {
+        "en": "Processing {n} dossier(s), {m} PDF file(s)…",
+        "vi": "Bắt đầu xử lý {n} hồ sơ, {m} file PDF…",
+    },
+    "arc_multi_export_done_text": {
+        "en": "Archive ZIP files exported.",
+        "vi": "Đã xuất các hồ sơ nén.",
+    },
+    "arc_multi_export_ask_kho": {
+        "en": "Do you also want to load these dossiers into the internal "
+              "Repository?",
+        "vi": "Bạn có muốn chuyển các hồ sơ này vào Kho lưu trữ nội bộ không?",
+    },
+    "arc_multi_export_none_qualify": {
+        "en": "No dossier qualifies for export (signatures missing or "
+              "invalid everywhere).\nSign the documents in Step 3 first.",
+        "vi": "Không có hồ sơ nào đủ điều kiện xuất (tất cả còn thiếu bản "
+              "ký hoặc bản ký đã hết hiệu lực).\nHãy sang Bước 3 ký số rồi "
+              "quay lại đây.",
+    },
+    "arc_multi_unsigned_title": {
+        "en": "Some dossiers are not fully signed",
+        "vi": "Có hồ sơ chưa ký đủ",
+    },
+    "arc_multi_export_blocked_body": {
+        "en": "These dossiers CANNOT be exported (not fully signed, or a "
+              "signature went stale after the source was edited):\n\n{}\n\n"
+              "Export only the qualifying dossiers?",
+        "vi": "Các hồ sơ sau KHÔNG đủ điều kiện xuất (chưa ký đủ hoặc bản "
+              "ký đã hết hiệu lực):\n\n{}\n\nChỉ xuất các hồ sơ đủ điều "
+              "kiện?",
+    },
+    "arc_multi_kho_none_qualify": {
+        "en": "No dossier qualifies for the Repository (not fully signed, "
+              "or canonical JSON missing).\nSign the documents in Step 3 "
+              "and try again.",
+        "vi": "Không có hồ sơ nào đủ điều kiện chuyển (chưa ký đủ hoặc "
+              "thiếu canonical JSON).\nHãy sang Bước 3 ký số rồi thử lại.",
+    },
+    "arc_multi_kho_blocked_body": {
+        "en": "These dossiers CANNOT be loaded into the Repository:\n\n{}\n\n"
+              "Load only the qualifying dossiers?",
+        "vi": "Các hồ sơ sau KHÔNG đủ điều kiện chuyển vào Kho:\n\n{}\n\n"
+              "Chỉ chuyển các hồ sơ đủ điều kiện?",
+    },
+    "arc_multi_kho_missing_codes": {
+        "en": "Dossier {label} is missing complete identity codes. Edit the "
+              "dossier info before loading it into the Repository.",
+        "vi": "Hồ sơ {label} thiếu mã định danh đầy đủ. Hãy sửa thông tin "
+              "hồ sơ trước khi chuyển vào Kho.",
+    },
+    "arc_multi_kho_cleanup_ask": {
+        "en": "All dossiers were safely loaded into the Repository.\n"
+              "Do you want to delete this session's temp folder?",
+        "vi": "Các hồ sơ đã được chuyển vào Kho an toàn.\n"
+              "Bạn có muốn xóa thư mục tạm của phiên này không?",
+    },
+    "arc_multi_kho_resume_note": {
+        "en": "(Skipped {n} document(s) already imported in this session)",
+        "vi": "(Đã bỏ qua {n} tài liệu đã nhập trong phiên này)",
+    },
+    "arc_multi_kho_failed_dossiers": {
+        "en": "Failed dossiers (documents imported before the failure are "
+              "kept — retry imports only the rest):",
+        "vi": "Hồ sơ bị lỗi (đã nhập các mục xong trước khi lỗi — bấm lại "
+              "sẽ chỉ nhập phần còn lại):",
     },
 
     # ── Step 3 placeholder ──────────────────────────────────────────

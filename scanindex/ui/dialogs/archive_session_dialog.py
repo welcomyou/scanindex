@@ -17,7 +17,7 @@ Width-limited fields:
 """
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QIntValidator
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QLineEdit, QTextEdit,
@@ -79,6 +79,11 @@ class DossierInfoDialog(QDialog):
         if initial is not None:
             self._load_initial(initial)
         self._on_unstructured_toggled(self._cb_unstructured.isChecked())
+        # Cache gợi ý (mã phông→tên phông, phông|mục lục→tên mục lục,
+        # nhiệm kỳ gần nhất): điền lần đầu + tự điền khi người dùng gõ mã.
+        self._ed_ma_phong.textChanged.connect(self._autofill_from_cache)
+        self._ed_muc_luc.textChanged.connect(self._autofill_from_cache)
+        self._autofill_from_cache()
 
     # ── UI build ────────────────────────────────────────────────────
 
@@ -140,7 +145,7 @@ class DossierInfoDialog(QDialog):
             max_len=_TITLE_MAX,
         )
         self._ed_ho_so = self._mk_input(
-            placeholder=translations.get_text("arc_ph_ho_so"), max_len=5)
+            placeholder=translations.get_text("arc_ph_ho_so"), max_len=6)
         self._ed_title = self._mk_textarea(
             placeholder=translations.get_text("arc_ph_title"))
 
@@ -241,6 +246,15 @@ class DossierInfoDialog(QDialog):
         # Buttons
         btn_row = QHBoxLayout()
         btn_row.setSpacing(SP[1])
+        btn_clear_cache = QPushButton(
+            translations.get_text("arc_dossier_cache_clear"))
+        btn_clear_cache.setToolTip(
+            translations.get_text("arc_dossier_cache_clear_tip"))
+        btn_clear_cache.setStyleSheet(self._secondary_btn_style())
+        btn_clear_cache.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_clear_cache.clicked.connect(self._on_clear_cache)
+        btn_row.addWidget(btn_clear_cache)
+        self._btn_clear_cache = btn_clear_cache
         btn_row.addStretch()
         btn_cancel = QPushButton(translations.get_text("btn_cancel"))
         btn_cancel.setStyleSheet(self._secondary_btn_style())
@@ -378,6 +392,65 @@ class DossierInfoDialog(QDialog):
         self._ed_topic.setPlainText(initial.chuyen_de or "")
         self._ed_note.setPlainText(initial.chu_thich or "")
 
+    def set_title_suggestion(self, text: str) -> None:
+        """Điền gợi ý tên hồ sơ (ví dụ: tên thư mục người dùng chọn) — chỉ
+        điền khi ô Tiêu đề còn trống, không đè giá trị đã có (mục 5 kế hoạch)."""
+        text = str(text or "").strip()
+        if not text:
+            return
+        if not self._ed_title.toPlainText().strip():
+            self._ed_title.setPlainText(text[:getattr(self, "_TITLE_MAX", 1000)])
+
+    # ── cache gợi ý thông tin hồ sơ ─────────────────────────────────
+
+    def _autofill_from_cache(self, *_args) -> None:
+        """Điền các trường CÒN TRỐNG theo cache (chỉ chế độ theo mã): gõ mã
+        phông → hiện tên phông đã biết; gõ mục lục → tên mục lục; nhiệm kỳ
+        theo giá trị gần nhất. Không đè giá trị đã có."""
+        from scanindex.core.digitization import dossier_info_cache
+
+        if self._cb_unstructured.isChecked():
+            return
+        data = dossier_info_cache.load()
+        if not data:
+            return
+        ma_phong = self._ed_ma_phong.text().strip()
+        ma_ml = self._ed_muc_luc.text().strip()
+        if ma_phong and not self._ed_ten_phong.text().strip():
+            ten_phong = str(data.get("fonds", {}).get(ma_phong) or "").strip()
+            if ten_phong:
+                self._ed_ten_phong.setText(ten_phong)
+        if ma_phong and ma_ml and not self._ed_ten_muc_luc.text().strip():
+            ten_ml = str(
+                data.get("catalog", {}).get(f"{ma_phong}|{ma_ml}") or ""
+            ).strip()
+            if ten_ml:
+                self._ed_ten_muc_luc.setText(ten_ml)
+        if not self._ed_term.text().strip():
+            term = str(data.get("last_term") or "").strip()
+            if term:
+                self._ed_term.setText(term)
+
+    def _on_clear_cache(self) -> None:
+        from scanindex.core.digitization import dossier_info_cache
+
+        answer = QMessageBox.question(
+            self,
+            translations.get_text("arc_dossier_cache_clear"),
+            translations.get_text("arc_dossier_cache_confirm"),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        dossier_info_cache.clear()
+        self._btn_clear_cache.setText(
+            translations.get_text("arc_dossier_cache_cleared"))
+        QTimer.singleShot(
+            1500, self,
+            lambda: self._btn_clear_cache.setText(
+                translations.get_text("arc_dossier_cache_clear")))
+
     def _on_unstructured_toggled(self, checked: bool) -> None:
         # Disable the 4 codes when unstructured; the title becomes the
         # primary input. Codes stay readable (so user sees the auto-gen
@@ -485,7 +558,7 @@ class DossierInfoDialog(QDialog):
             errs.append(translations.get_text("arc_err_ma_phong_empty"))
         if not muc_luc or len(muc_luc) > 2:
             errs.append(translations.get_text("arc_err_muc_luc_format"))
-        if not ho_so or len(ho_so) > 5:
+        if not ho_so or len(ho_so) > 6:
             errs.append(translations.get_text("arc_err_ho_so_format"))
 
         if errs:
@@ -506,6 +579,11 @@ class DossierInfoDialog(QDialog):
             chuyen_de=topic,
             chu_thich=note,
         )
+        # Ghi cache gợi ý (mã phông→tên phông, phông|mục lục→tên mục lục,
+        # nhiệm kỳ) — lần nhập hồ sơ sau tự điền.
+        from scanindex.core.digitization import dossier_info_cache
+
+        dossier_info_cache.update(self._result)
         self.accept()
 
     def _confirm_page_mismatch(self, typed: str) -> bool:

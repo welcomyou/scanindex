@@ -78,6 +78,33 @@ class _SignItem:
     output_path: str = ""
     error: str = ""
     start_page: Optional[int] = None  # trang_so from Step 2 (starting page)
+    # ── nhiều hồ sơ (mục 8 kế hoạch) ────────────────────────────────
+    doc_id: str = ""            # _doc_id trong doc-dict Bước 2 (ID ổn định)
+    dossier_id: str = ""        # _dossier_id — resolve identity/thư mục ký
+    dossier_label: str = ""     # nhãn 4 mã hiển thị/tooltip
+    identity: object = None     # IdentityCodes CỦA HỒ SƠ này (không dùng chung)
+    checked: bool = True        # phạm vi ký: chỉ ký các hàng được tích
+    output_dir: str = ""        # thư mục ký của hồ sơ (tránh đè file khác hồ sơ)
+
+
+def _source_fingerprint(path: str) -> dict:
+    """Vân tay nhẹ (mtime + size) của bản KIE PDF lúc được ký — dùng phát
+    hiện 'quay lại sửa nội dung sau ký' (mục 8: bản ký hết hiệu lực)."""
+    try:
+        st = os.stat(path)
+        return {"path": os.path.abspath(path), "mtime": st.st_mtime_ns,
+                "size": st.st_size}
+    except OSError:
+        return {}
+
+
+def _fingerprint_matches(path: str, fingerprint: dict) -> bool:
+    if not fingerprint or not os.path.exists(path):
+        return False
+    cur = _source_fingerprint(path)
+    return (cur.get("path") == fingerprint.get("path")
+            and cur.get("mtime") == fingerprint.get("mtime")
+            and cur.get("size") == fingerprint.get("size"))
 
 
 def _pdf_has_digital_signature(pdf_path: str) -> bool:
@@ -198,8 +225,12 @@ class _SignWorker(QThread):
                 pdfa_temp = None  # để cleanup nếu PDF/A convert tạo file tạm
                 try:
                     page = _resolve_page(item, self._custom_page)
+                    # Nhiều hồ sơ: mỗi item mang thư mục ký của hồ sơ nó để
+                    # file đã ký của hồ sơ A không đè hồ sơ B (mục 8).
+                    out_dir = item.output_dir or self._output_dir
+                    os.makedirs(out_dir, exist_ok=True)
                     dst = _unique_output_path(
-                        item.source_path, self._output_dir, item.display_name
+                        item.source_path, out_dir, item.display_name
                     )
                     # Nguồn để ký = source gốc, hoặc PDF/A converted nếu user bật.
                     sign_input = item.source_path
@@ -234,6 +265,7 @@ class _SignWorker(QThread):
                     result = {
                         "index": idx,
                         "source_path": item.source_path,
+                        "doc_id": item.doc_id,
                         "output_path": dst,
                         "ok": True,
                         "error": "",
@@ -243,6 +275,7 @@ class _SignWorker(QThread):
                     result = {
                         "index": idx,
                         "source_path": item.source_path,
+                        "doc_id": item.doc_id,
                         "output_path": "",
                         "ok": False,
                         "error": str(exc),
@@ -276,6 +309,9 @@ class ArchiveStep3Sign(QWidget):
         # case _signed_dir() falls back to the OS temp dir.
         self._session = session
         self._items: list[_SignItem] = []
+        self._source_docs: list[dict] = []   # doc-dict gốc để ghi kết quả ký
+        self._row_of_item: dict = {}         # vị trí item → hàng bảng
+        self._item_at_row: list = []         # hàng bảng → vị trí item (None = tiêu đề hồ sơ)
         self._worker: Optional[_SignWorker] = None
 
         self.setStyleSheet(f"background: {COLOR_BG}; color: {COLOR_TEXT};")
@@ -394,18 +430,21 @@ class ArchiveStep3Sign(QWidget):
         hdr.addWidget(self._btn_clear)
         parent.addLayout(hdr)
 
-        self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["Tên tập tin", "Trang số", "Trạng thái", "File đã ký"])
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels([
+            translations.get_text("arc_step3_col_sign"),
+            "Tên tập tin", "Trang số", "Trạng thái", "File đã ký"])
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        # "Tên tập tin" fits the longest name; "Trang số"/"Trạng thái" fit
-        # their content; "File đã ký" stretches to absorb the remaining space.
+        # Cột "Ký" = phạm vi ký từng file (mục 8: chọn phạm vi ký / ký lại
+        # phần lỗi). Các cột còn lại như cũ; "File đã ký" dàn hết chỗ trống.
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
         self.table.setStyleSheet(f"""
             QTableWidget {{
                 background: {COLOR_BG};
@@ -459,8 +498,17 @@ class ArchiveStep3Sign(QWidget):
     # ------------------------------------------------------------- documents
 
     def _display_name_for_source(self, row_index: int, source_path: str,
-                                 doc: dict | None = None) -> str:
-        identity = getattr(self._session, "identity", None)
+                                 doc: dict | None = None,
+                                 identity=None) -> str:
+        # Nhiều hồ sơ: resolve identity THEO TÀI LIỆU (mục 8) — không dùng
+        # session.identity chung cho toàn phiên.
+        if identity is None and doc is not None and self._session is not None:
+            try:
+                identity = self._session.identity_for_doc(doc)
+            except Exception:
+                identity = None
+        if identity is None:
+            identity = getattr(self._session, "identity", None)
         # Prefer the doc's so_thu_tu so the Bước 3 display name matches the
         # ZIP export name; fall back to the 1-based row position.
         stt = row_index + 1
@@ -481,15 +529,24 @@ class ArchiveStep3Sign(QWidget):
         return _safe_pdf_name(os.path.basename(source_path))
 
     def _signed_output_path(self, item: _SignItem) -> str:
-        return _unique_output_path(item.source_path, self._signed_dir(), item.display_name)
+        return _unique_output_path(item.source_path,
+                                   item.output_dir or self._signed_dir(),
+                                   item.display_name)
 
-    def _refresh_identity_file_names(self, rename_signed: bool = False) -> int:
+    def _refresh_identity_file_names(self, rename_signed: bool = False,
+                                     dossier_id: str | None = None) -> int:
+        """Đổi tên hiển thị + (tùy chọn) file đã ký theo identity mới. Ở chế
+        độ nhiều hồ sơ chỉ phạm vi `dossier_id` bị đụng đến (mục 10: sửa
+        thông tin một hồ sơ không đổi hồ sơ khác)."""
         moved = 0
-        out_dir = self._signed_dir()
         for row, item in enumerate(self._items):
+            if dossier_id is not None and item.dossier_id != dossier_id:
+                continue
+            out_dir = item.output_dir or self._signed_dir()
             old_output = item.output_path
             old_display = item.display_name
-            item.display_name = self._display_name_for_source(row, item.source_path)
+            item.display_name = self._display_name_for_source(
+                row, item.source_path, identity=item.identity)
             if not rename_signed:
                 continue
             new_output = self._signed_output_path(item)
@@ -530,6 +587,7 @@ class ArchiveStep3Sign(QWidget):
                 item.output_path = new_output
                 if item.status == "Chờ ký":
                     item.status = "Đã ký"
+                self._stamp_signed_doc(item, new_output)
         if self._items:
             self._refresh_table()
         return moved
@@ -537,8 +595,11 @@ class ArchiveStep3Sign(QWidget):
     def set_documents(self, documents: list[dict], default_output_dir: str = ""):
         if self._worker and self._worker.isRunning():
             return
+        # Giữ tham chiếu doc-dict gốc (cùng object với Step 2) để kết quả ký
+        # ghi ngược vào tài liệu — main_window xuất/Kho đọc theo doc ID.
+        self._source_docs = list(documents or [])
         items: list[_SignItem] = []
-        for row, doc in enumerate(documents or []):
+        for row, doc in enumerate(self._source_docs):
             source = doc.get("output_path") or ""
             if not source or not os.path.exists(source):
                 continue
@@ -557,13 +618,44 @@ class ArchiveStep3Sign(QWidget):
                 start_page = int(raw_trang) if raw_trang else None
             except (ValueError, TypeError):
                 start_page = None
-            items.append(_SignItem(
+            # Nhiều hồ sơ: identity/thư mục ký theo TỪNG tài liệu.
+            dossier_id = str(doc.get("_dossier_id") or "")
+            identity = None
+            if self._session is not None:
+                try:
+                    identity = self._session.identity_for_doc(doc)
+                except Exception:
+                    identity = None
+            item = _SignItem(
                 source_path=os.path.abspath(source),
-                display_name=self._display_name_for_source(row, source, doc),
+                display_name=self._display_name_for_source(
+                    row, source, doc, identity=identity),
                 signature_page=sig_page,
                 start_page=start_page,
-            ))
-            # A reopened ZIP's PDFs are often already digitally signed at
+                doc_id=str(doc.get("_doc_id") or ""),
+                dossier_id=dossier_id,
+                dossier_label=str(doc.get("_dossier_label") or ""),
+                identity=identity,
+                output_dir=(self._signed_dir(dossier_id)
+                            if dossier_id and self._session is not None
+                            else ""),
+            )
+            items.append(item)
+            # ── bản ký còn hiệu lực? (mục 8) ────────────────────────────
+            # 1) Ký trong phiên này rồi (doc["_signed_path"]) nhưng người
+            #    dùng QUAY LẠI Bước 2 sửa/re-OCR: so vân tay nguồn (mtime +
+            #    size) — lệch ⇒ bản ký hết hiệu lực, phải ký lại. Chỉ đổi
+            #    tên/metadata ngoài PDF thì vân tay giữ nguyên ⇒ vẫn tính.
+            signed_path = str(doc.get("_signed_path") or "")
+            if signed_path and os.path.exists(signed_path):
+                if _fingerprint_matches(item.source_path,
+                                        doc.get("_signed_from")):
+                    item.status = "Đã ký"
+                    item.output_path = signed_path
+                    continue
+                # Bản ký cũ trỏ vào bản nguồn khác → không âm thầm dùng.
+                item.status = "Chưa ký (bản nguồn đã đổi)"
+            # 2) A reopened ZIP's PDFs are often already digitally signed at
             # export time — flag them so Step 3 shows "Đã ký" instead of
             # "Chờ ký". The output must point at a COPY inside _step3_signed/,
             # NOT at the source file itself: the source lives in _zip_input/
@@ -571,17 +663,17 @@ class ArchiveStep3Sign(QWidget):
             # would let _refresh_identity_file_names rename/move it out of
             # _zip_input/ on the next identity edit, breaking Step 2.
             if _pdf_has_digital_signature(source):
-                items[-1].status = "Đã ký (có sẵn)"
-                signed_copy = self._signed_output_path(items[-1])
+                item.status = "Đã ký (có sẵn)"
+                signed_copy = self._signed_output_path(item)
                 try:
                     os.makedirs(os.path.dirname(signed_copy), exist_ok=True)
                     if not os.path.exists(signed_copy):
                         shutil.copyfile(source, signed_copy)
-                    items[-1].output_path = signed_copy
+                    item.output_path = signed_copy
                 except Exception:
                     # If the copy fails, leave output_path empty so the
                     # operator can re-sign rather than corrupt Step 2's file.
-                    items[-1].output_path = ""
+                    item.output_path = ""
         self._items = items
         # `default_output_dir` is no longer threaded through — signed PDFs
         # always land in `<session_temp>/_step3_signed/` per the new
@@ -591,6 +683,24 @@ class ArchiveStep3Sign(QWidget):
             self._lbl_load_info.setText(f"Đã nạp {len(items)} file từ Bước 2")
         else:
             self._lbl_load_info.setText("Chưa có file từ Bước 2")
+
+    def _stamp_signed_doc(self, item: _SignItem, output_path: str) -> None:
+        """Ghi kết quả ký ngược vào doc-dict nguồn + registry theo ID: bản ký
+        kèm vân tay bản nguồn để lần sau vào Bước 3 phát hiện bản cũ hết
+        hiệu lực (mục 8)."""
+        if not item.doc_id:
+            return
+        for doc in getattr(self, "_source_docs", []) or []:
+            if str(doc.get("_doc_id") or "") == item.doc_id:
+                doc["_signed_path"] = output_path
+                doc["_signed_from"] = _source_fingerprint(item.source_path)
+                break
+        if self._session is not None:
+            try:
+                self._session.update_document_state(
+                    item.doc_id, signed_path=output_path)
+            except Exception:
+                pass
 
     def _add_item_path(self, path: str):
         path = os.path.abspath(os.path.normpath(path))
@@ -624,10 +734,15 @@ class ArchiveStep3Sign(QWidget):
         self._refresh_table()
 
     def _remove_selected(self):
-        rows = sorted({idx.row() for idx in self.table.selectedIndexes()}, reverse=True)
-        for row in rows:
-            if 0 <= row < len(self._items):
-                self._items.pop(row)
+        # Map hàng → tài liệu (bảng có dòng tiêu đề hồ sơ chen giữa).
+        positions = sorted(
+            {self._item_at_row[idx.row()]
+             for idx in self.table.selectedIndexes()
+             if 0 <= idx.row() < len(self._item_at_row)
+             and self._item_at_row[idx.row()] is not None},
+            reverse=True)
+        for pos in positions:
+            self._items.pop(pos)
         self._refresh_table()
 
     def _clear_items(self):
@@ -637,12 +752,63 @@ class ArchiveStep3Sign(QWidget):
         self._refresh_table()
 
     def _refresh_table(self):
-        self.table.setRowCount(len(self._items))
-        for row, item in enumerate(self._items):
-            self._set_table_item(row, 0, item.display_name, tooltip=item.source_path)
-            self._set_table_item(row, 1, self._page_label(item))
-            self._set_table_item(row, 2, item.status, status=item.status)
-            self._set_table_item(row, 3, os.path.basename(item.output_path), tooltip=item.output_path)
+        """Bảng có PHÂN TÁCH THEO HỒ SƠ (yêu cầu phản hồi): mỗi hồ sơ một
+        dòng tiêu đề chiếm trọn chiều rộng, bên dưới là các tài liệu của hồ
+        sơ đó. `_row_of_item` / `_item_at_row` giữ map hàng ↔ tài liệu vì
+        dòng tiêu đề làm lệch chỉ số bảng so với `self._items`."""
+        groups: list[tuple[str, list[int]]] = []
+        pos: dict[str, int] = {}
+        for i, item in enumerate(self._items):
+            key = item.dossier_id or ""
+            if key not in pos:
+                pos[key] = len(groups)
+                groups.append((key, []))
+            groups[pos[key]][1].append(i)
+
+        n_rows = sum(len(idxs) + 1 for _k, idxs in groups)
+        self.table.setRowCount(n_rows)
+        self._row_of_item = {}
+        self._item_at_row = []
+        row = 0
+        for key, idxs in groups:
+            first = self._items[idxs[0]] if idxs else None
+            label = (first.dossier_label
+                     if first is not None and first.dossier_label
+                     else ("Các file tự thêm" if not key else key))
+            sep = QTableWidgetItem(
+                translations.get_text("arc_step3_sep_row").format(
+                    label, len(idxs)))
+            sep.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            sep.setForeground(QBrush(QColor(COLOR_TEXT_SECONDARY)))
+            sep_font = sep.font()
+            sep_font.setBold(True)
+            sep.setFont(sep_font)
+            sep.setBackground(QBrush(QColor(COLOR_ELEVATED)))
+            self.table.setItem(row, 0, sep)
+            self.table.setSpan(row, 0, 1, 5)
+            self._item_at_row.append(None)
+            row += 1
+            for i in idxs:
+                item = self._items[i]
+                self._row_of_item[i] = row
+                self._item_at_row.append(i)
+                check = QTableWidgetItem()
+                check.setFlags(Qt.ItemFlag.ItemIsEnabled
+                               | Qt.ItemFlag.ItemIsUserCheckable)
+                check.setCheckState(Qt.CheckState.Checked if item.checked
+                                    else Qt.CheckState.Unchecked)
+                tip = translations.localize_text(
+                    "Bỏ tích để loại file này khỏi phạm vi ký/xuất")
+                check.setToolTip(tip)
+                self.table.setItem(row, 0, check)
+                name_tip = item.source_path
+                if item.dossier_label:
+                    name_tip = f"[{item.dossier_label}] {item.source_path}"
+                self._set_table_item(row, 1, item.display_name, tooltip=name_tip)
+                self._set_table_item(row, 2, self._page_label(item))
+                self._set_table_item(row, 3, item.status, status=item.status)
+                self._set_table_item(row, 4, os.path.basename(item.output_path), tooltip=item.output_path)
+                row += 1
         self.lbl_count.setText(f"{len(self._items)} file")
 
     def _set_table_item(self, row: int, col: int, text: str, tooltip: str = "", status: str = ""):
@@ -667,16 +833,19 @@ class ArchiveStep3Sign(QWidget):
 
     # ------------------------------------------------------------- signing
 
-    def _signed_dir(self) -> str:
+    def _signed_dir(self, dossier_id: str | None = None) -> str:
         """Resolve the per-session signed-output dir. Falls back to the OS
-        temp dir if no session is attached (standalone preview)."""
+        temp dir if no session is attached (standalone preview). Nhiều hồ sơ:
+        tách thư mục con theo hồ sơ để file trùng tên không đè nhau (mục 8)."""
         if self._session is not None:
             try:
-                return self._session.step3_signed_dir()
+                return self._session.step3_signed_dir(
+                    dossier_id or None)
             except Exception:
                 pass
         import tempfile as _tf
-        return os.path.join(_tf.gettempdir(), "_step3_signed")
+        base = os.path.join(_tf.gettempdir(), "_step3_signed")
+        return os.path.join(base, dossier_id) if dossier_id else base
 
     def _open_output_dir(self):
         folder = self._signed_dir()
@@ -688,6 +857,9 @@ class ArchiveStep3Sign(QWidget):
                                      f"Không mở được thư mục:\n{folder}\n{exc}")
 
     def _edit_dossier_info(self):
+        """Sửa thông tin hồ sơ. Nhiều hồ sơ: sửa hồ sơ của file đang chọn
+        (hoặc hồ sơ đầu tiên) — CHỈ hồ sơ đó đổi; luồng đơn giữ hành vi cũ
+        (session.identity)."""
         if self._session is None:
             QMessageBox.information(
                 self,
@@ -697,32 +869,73 @@ class ArchiveStep3Sign(QWidget):
             return
         from scanindex.ui.dialogs.archive_session_dialog import DossierInfoDialog
 
+        # Nhiều hồ sơ: xác định hồ sơ theo dòng đang chọn (map hàng → tài
+        # liệu vì bảng có dòng tiêu đề hồ sơ).
+        target_dossier_id = ""
+        if getattr(self._session, "multi_dossier", False):
+            rows = sorted({idx.row() for idx in self.table.selectedIndexes()})
+            target_dossier_id = ""
+            for r in rows:
+                pos = (self._item_at_row[r]
+                       if 0 <= r < len(getattr(self, "_item_at_row", []))
+                       else None)
+                if pos is not None and self._items[pos].dossier_id:
+                    target_dossier_id = self._items[pos].dossier_id
+                    break
+            if not target_dossier_id:
+                for it in self._items:
+                    if it.dossier_id:
+                        target_dossier_id = it.dossier_id
+                        break
+            dossier = self._session.dossier_by_id(target_dossier_id) \
+                if target_dossier_id else None
+            if dossier is None:
+                self.log_message.emit(
+                    "Archive Step 3: không tìm thấy hồ sơ để sửa thông tin")
+                return
+            initial = dossier.identity
+            seed = self._session.session_id
+            pages = self._total_scanned_pages(target_dossier_id)
+        else:
+            dossier = None
+            initial = getattr(self._session, "identity", None)
+            seed = getattr(self._session, "session_id", "step3")
+            pages = self._total_scanned_pages()
+
         dlg = DossierInfoDialog(
-            initial=getattr(self._session, "identity", None),
-            seed_for_unstructured=getattr(self._session, "session_id", "step3"),
+            initial=initial,
+            seed_for_unstructured=seed,
             parent=self,
-            actual_page_count=self._total_scanned_pages(),
+            actual_page_count=pages,
         )
         if not dlg.exec():
             return
         codes = dlg.result_codes()
         if codes is None:
             return
-        self._session.identity = codes
-        moved = self._refresh_identity_file_names(rename_signed=True)
+        if dossier is not None:
+            dossier.identity = codes
+            moved = self._refresh_identity_file_names(
+                rename_signed=True, dossier_id=dossier.id)
+        else:
+            self._session.identity = codes
+            moved = self._refresh_identity_file_names(rename_signed=True)
         msg = "Archive Step 3: dossier information updated"
         if moved:
             msg += f"; renamed {moved} signed PDF file(s)"
         self.log_message.emit(msg)
 
-    def _total_scanned_pages(self):
+    def _total_scanned_pages(self, dossier_id: str | None = None):
         """Total pages across all Step-3 sign items, for the dossier
-        dialog's "Số lượng trang" mismatch warning. None if unknown."""
+        dialog's "Số lượng trang" mismatch warning. None if unknown.
+        Ở chế độ nhiều hồ sơ có thể giới hạn phạm vi theo hồ sơ."""
         if not self._items:
             return None
         total = 0
         any_found = False
         for it in self._items:
+            if dossier_id is not None and it.dossier_id != dossier_id:
+                continue
             try:
                 n = _page_count(it.source_path)
             except Exception:
@@ -745,9 +958,22 @@ class ArchiveStep3Sign(QWidget):
         if cert is None:
             QMessageBox.warning(self, "Lỗi", "Hãy chọn chứng thư số.")
             return
-        items = [i for i in self._items if os.path.exists(i.source_path)]
+        # Phạm vi ký: đọc checkbox cột 0 (mục 8 — chọn phạm vi ký / ký lại
+        # phần lỗi bằng cách chỉ tích các file lỗi). Map hàng → tài liệu vì
+        # bảng có dòng tiêu đề hồ sơ chen giữa.
+        for row_idx, item_pos in enumerate(getattr(self, "_item_at_row", [])):
+            if item_pos is None:
+                continue
+            cell = self.table.item(row_idx, 0)
+            if cell is not None:
+                self._items[item_pos].checked = (
+                    cell.checkState() == Qt.CheckState.Checked)
+        items = [i for i in self._items
+                 if i.checked and os.path.exists(i.source_path)]
         if not items:
-            QMessageBox.warning(self, "Lỗi", "Chưa có file PDF hợp lệ để ký.")
+            QMessageBox.warning(
+                self, "Lỗi",
+                translations.get_text("arc_step3_no_checked_files"))
             return
         out_dir = self._signed_dir()
         os.makedirs(out_dir, exist_ok=True)
@@ -788,6 +1014,8 @@ class ArchiveStep3Sign(QWidget):
             tsa_url = ""
 
         for item in self._items:
+            if not item.checked:
+                continue   # ngoài phạm vi — giữ nguyên trạng thái hiện có
             item.status = "Chờ ký"
             item.output_path = ""
             item.error = ""
@@ -832,9 +1060,11 @@ class ArchiveStep3Sign(QWidget):
 
     def _on_sign_progress(self, done: int, total: int, result: dict):
         source_path = os.path.abspath(result.get("source_path") or "")
+        doc_id = str(result.get("doc_id") or "")
         idx = next(
             (i for i, item in enumerate(self._items)
-             if os.path.abspath(item.source_path) == source_path),
+             if (item.doc_id and item.doc_id == doc_id)
+             or os.path.abspath(item.source_path) == source_path),
             result.get("index", -1),
         )
         if 0 <= idx < len(self._items):
@@ -843,12 +1073,16 @@ class ArchiveStep3Sign(QWidget):
                 item.status = "Đã ký"
                 item.output_path = result.get("output_path", "")
                 item.error = ""
+                self._stamp_signed_doc(item, item.output_path)
             else:
                 item.status = "Lỗi"
                 item.output_path = ""
                 item.error = result.get("error", "")
-            self._set_table_item(idx, 2, item.status, tooltip=item.error, status=item.status)
-            self._set_table_item(idx, 3, os.path.basename(item.output_path), tooltip=item.output_path)
+            # Cập nhật đúng HÀNG của tài liệu (bảng có dòng tiêu đề hồ sơ).
+            row = getattr(self, "_row_of_item", {}).get(idx)
+            if row is not None:
+                self._set_table_item(row, 3, item.status, tooltip=item.error, status=item.status)
+                self._set_table_item(row, 4, os.path.basename(item.output_path), tooltip=item.output_path)
         name = (
             self._items[idx].display_name
             if 0 <= idx < len(self._items)

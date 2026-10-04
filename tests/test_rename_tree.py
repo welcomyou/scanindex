@@ -740,7 +740,7 @@ def test_tree_mouse_drag_reorders_within_dossier(tree, monkeypatch, tmp_path):
 
     received: list[tuple[list, str, int]] = []
     monkeypatch.setattr(
-        screen, "_handle_pdf_move",
+        screen._editor, "_handle_pdf_move",
         lambda rels, t, i=-1, **kw: received.append((list(rels), t, i)),
     )
 
@@ -1307,7 +1307,7 @@ def test_tree_drag_pdf_onto_other_dossier_requests_move(tree, monkeypatch,
 
     received: list[tuple[list, str, int]] = []
     monkeypatch.setattr(
-        screen, "_handle_pdf_move",
+        screen._editor, "_handle_pdf_move",
         lambda rels, t, i=-1, **kw: received.append((list(rels), t, i)),
     )
 
@@ -1350,7 +1350,7 @@ def test_tree_drag_ho_so_onto_muc_luc_requests_move(tree, monkeypatch,
 
     received: list[tuple[str, str, int]] = []
     monkeypatch.setattr(
-        screen, "_handle_ho_so_drop",
+        screen._editor, "_handle_ho_so_drop",
         lambda r, t, i=-1, **kw: received.append((r, t, i)),
     )
 
@@ -1393,7 +1393,7 @@ def test_tree_drag_ho_so_between_rows_places_at_position(tree, monkeypatch,
 
     received: list[tuple[str, str, int]] = []
     monkeypatch.setattr(
-        screen, "_handle_ho_so_drop",
+        screen._editor, "_handle_ho_so_drop",
         lambda r, t, i=-1, **kw: received.append((r, t, i)),
     )
 
@@ -1595,7 +1595,7 @@ def test_tree_multi_drag_pdf_group_requests_move(tree, monkeypatch, tmp_path):
 
     received: list[tuple[list, str, int]] = []
     monkeypatch.setattr(
-        screen, "_handle_pdf_move",
+        screen._editor, "_handle_pdf_move",
         lambda rels, t, i=-1, **kw: received.append((list(rels), t, i)),
     )
 
@@ -2002,7 +2002,7 @@ def test_screen_delayed_preview_does_not_interrupt_next_action(
     assert callbacks
     if busy:
         # Another undo has started and must retain exclusive disk access.
-        screen._executing = True
+        screen._editor._executing = True
     else:
         screen._show_pdf(f"{hs}/{n2}")
     expected = screen._current_pdf_rel
@@ -2011,5 +2011,5 @@ def test_screen_delayed_preview_does_not_interrupt_next_action(
         callback()
     assert not opened
     assert screen._current_pdf_rel == expected
-    screen._executing = False
+    screen._editor._executing = False
     screen.deleteLater()

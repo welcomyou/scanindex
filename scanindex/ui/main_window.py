@@ -290,6 +290,78 @@ class _KhoImportWorker(QThread):
             self.failed.emit(f"{e}\n{traceback.format_exc()}")
 
 
+class _KhoImportMultiWorker(QThread):
+    """Nhập Kho NHIỀU HỒ SƠ (mục 8.2): một kết nối store/index, nhập tuần
+    tự từng hồ sơ; lỗi một hồ sơ KHÔNG chặn các hồ sơ sau. `on_doc_done`
+    (chạy trên thread này) do caller cấp — đánh dấu tài liệu đã nhập theo
+    ID phiên để bấm nhập lại bỏ qua phần đã xong (phục hồi thao tác, không
+    phải kiểm trùng nội dung)."""
+
+    progress = Signal(object, int, int)      # ImportProgress, dossier_idx, dossier_total
+    finished_ok = Signal(list)               # list[{label, ok, prog, error}]
+    failed = Signal(str)
+
+    def __init__(self, archive_path, jobs, on_doc_done=None):
+        super().__init__()
+        self._archive_path = archive_path
+        self._jobs = list(jobs)              # list[(DossierCodes, docs, label)]
+        self._on_doc_done = on_doc_done
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
+
+    def run(self):
+        try:
+            from scanindex.core.repository.store import ArchiveStore
+            from scanindex.core.repository.indexer import HybridIndex
+            from scanindex.core.repository.importer import Importer
+            from scanindex.infra.data_versioning import get_active_db_filename
+            from scanindex.ui.repository.screen import (
+                _read_skip_duplicate_docs_setting,
+            )
+
+            # Căn cứ theo cấu hình hiện có (quyết định người dùng): ON bỏ
+            # trùng trong cùng hồ sơ; OFF nhập đủ nhưng vẫn báo duplicate.
+            skip_duplicates = _read_skip_duplicate_docs_setting()
+
+            store = ArchiveStore(
+                self._archive_path, db_filename=get_active_db_filename()
+            )
+            results = []
+            with store:
+                idx = HybridIndex(self._archive_path)
+                idx.open()
+                try:
+                    importer = Importer(store, idx)
+                    for i, (codes, docs, label) in enumerate(self._jobs):
+                        if self._cancel:
+                            break
+                        try:
+                            prog = importer.import_dossier(
+                                codes, docs,
+                                progress_cb=(
+                                    lambda p, _i=i: self.progress.emit(
+                                        p, _i, len(self._jobs))),
+                                cancel_check=lambda: self._cancel,
+                                skip_duplicates=skip_duplicates,
+                                on_doc_done=self._on_doc_done,
+                            )
+                            results.append(
+                                {"label": label, "ok": True,
+                                 "prog": prog, "error": ""})
+                        except Exception as e:
+                            results.append(
+                                {"label": label, "ok": False,
+                                 "prog": None, "error": str(e)})
+                finally:
+                    idx.close()
+            self.finished_ok.emit(results)
+        except Exception as e:
+            import traceback
+            self.failed.emit(f"{e}\n{traceback.format_exc()}")
+
+
 class MainWindow(QMainWindow):
     """Main application window."""
 
@@ -2018,6 +2090,7 @@ class MainWindow(QMainWindow):
             self._archive_runner = None
         self._arc_documents = []
         self._arc_completed_count = 0
+        self._arc_doc_index_by_id = {}
         self.is_processing = False
         try:
             self.archive_tab.reset_workflow()
@@ -2027,6 +2100,13 @@ class MainWindow(QMainWindow):
         self.log("Archive: workflow reset (temp wiped)", LOG_INFO)
 
     def _arc_browse_input(self):
+        """Chọn thư mục cho Bước 2 — nhập thư mục NHIỀU HỒ SƠ (mục 3-5 kế hoạch).
+
+        Quét cấu trúc chuẩn (thread nền): có hồ sơ hợp lệ → popup chọn hồ sơ
+        (DossierSelectionDialog nhúng editor cây dùng chung); không nhận diện
+        được hồ sơ nào → đề nghị gom toàn bộ PDF thành MỘT hồ sơ qua
+        DossierInfoDialog hiện có. Hủy popup/hộp thoại KHÔNG làm mất phiên
+        hiện tại — danh sách cũ chỉ được thay sau khi người dùng chốt."""
         # If Step 2 already has a populated document list, picking a new
         # folder will replace it — confirm + cancel any in-flight runner so
         # the user doesn't silently lose Step 1 results or interrupt KIE.
@@ -2047,28 +2127,83 @@ class MainWindow(QMainWindow):
                     prev.cancel()
                 except Exception:
                     pass
-            self.archive_tab.set_documents([])
         d = QFileDialog.getExistingDirectory(
             self, translations.localize_text("Chọn thư mục chứa PDF")
         )
         if not d:
             return
 
-        # After picking the folder we ALSO need dossier identity so the
-        # output filenames + Kho upsert key are well-defined. Same modal
-        # dialog as Step 1 — pre-fill with whatever the session already has.
-        from scanindex.ui.dialogs.archive_session_dialog import DossierInfoDialog
-        session = self.archive_tab.session
-        dlg = DossierInfoDialog(
-            initial=session.identity,
-            seed_for_unstructured=session.session_id,
-            parent=self,
-            actual_page_count=self.archive_tab.total_scanned_pages(),
-        )
-        if not dlg.exec():
-            self.log("Archive: folder pick cancelled (no identity)", LOG_INFO)
+        from scanindex.core.digitization.folder_scan import scan_archive_folder
+        scan = self._arc_scan_folder_blocking(d)
+        if scan is None:
             return
-        session.identity = dlg.result_codes()
+        if not scan.has_pdfs:
+            QMessageBox.information(
+                self,
+                translations.get_text("arc_browse_no_pdf_title"),
+                translations.get_text("arc_browse_no_pdf_body"),
+            )
+            return
+
+        session = self.archive_tab.session
+        if scan.valid_dossiers:
+            # Cấu trúc chuẩn → popup chọn hồ sơ (dùng editor cây chung).
+            from scanindex.ui.dialogs.dossier_selection_dialog import (
+                DossierSelectionDialog,
+            )
+            dlg = DossierSelectionDialog(d, scan=scan, parent=self)
+            dlg.editor.log_message.connect(
+                lambda m, lvl="info": self.signals.log_message.emit(
+                    str(m),
+                    LOG_SUCCESS if lvl == "success" else
+                    ("warning" if lvl == "warning" else LOG_INFO),
+                )
+            )
+            if not dlg.exec() or dlg.selection_result is None:
+                self.log("Archive: dossier selection cancelled", LOG_INFO)
+                return
+            self._arc_setup_multi_dossier_session(dlg.selection_result, d)
+        else:
+            # Không có cấu trúc chuẩn → đề nghị gom một hồ sơ (mục 5).
+            confirm = QMessageBox.question(
+                self,
+                translations.get_text("arc_browse_merge_title"),
+                translations.get_text("arc_browse_merge_body"),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if confirm != QMessageBox.StandardButton.Yes:
+                QMessageBox.information(
+                    self,
+                    translations.get_text("arc_browse_merge_title"),
+                    translations.get_text("arc_browse_merge_cancelled"),
+                )
+                return
+            from scanindex.ui.dialogs.archive_session_dialog import (
+                DossierInfoDialog,
+            )
+            dlg = DossierInfoDialog(
+                initial=session.identity,
+                seed_for_unstructured=session.session_id,
+                parent=self,
+                # Số trang thực tế chưa biết (chưa OCR từng PDF nguồn).
+                actual_page_count=None,
+            )
+            # Tên hồ sơ điền sẵn bằng tên thư mục người dùng chọn (gợi ý).
+            dlg.set_title_suggestion(os.path.basename(d.rstrip(os.sep)))
+            if not dlg.exec():
+                self.log("Archive: folder pick cancelled (no identity)", LOG_INFO)
+                return
+            identity = dlg.result_codes()
+            if identity is None:
+                return
+            pdf_files = []
+            for root, _, files in os.walk(d):
+                for name in files:
+                    if name.lower().endswith(".pdf"):
+                        pdf_files.append(os.path.join(root, name))
+            pdf_files.sort()
+            self._arc_setup_merged_dossier_session(d, identity, pdf_files)
 
         # Switch Step 2 back to "from folder" mode in case it was on step1
         try:
@@ -2091,6 +2226,79 @@ class MainWindow(QMainWindow):
         if confirm.clickedButton() is btn_process:
             self._arc_start_process()
 
+    def _arc_scan_folder_blocking(self, folder: str):
+        """Quét cấu trúc thư mục ở thread nền (chỉ đường dẫn, không OCR) —
+        cây lớn không treo UI (mục 3.1)."""
+        from scanindex.core.digitization.folder_scan import scan_archive_folder
+
+        result: dict = {}
+
+        def work():
+            try:
+                result["scan"] = scan_archive_folder(folder)
+            except Exception as exc:  # đường dẫn hỏng / quyền đọc
+                result["error"] = str(exc)
+
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            th = threading.Thread(target=work, daemon=True,
+                                  name="arc-folder-scan")
+            th.start()
+            while th.is_alive():
+                QApplication.processEvents()
+                time.sleep(0.02)
+        finally:
+            QApplication.restoreOverrideCursor()
+        scan = result.get("scan")
+        if scan is None:
+            QMessageBox.critical(
+                self,
+                translations.get_text("arc_browse_no_pdf_title"),
+                translations.get_text("arc_browse_scan_failed").format(
+                    error=result.get("error", "")),
+            )
+        return scan
+
+    def _arc_setup_multi_dossier_session(self, selection, folder: str) -> None:
+        """Chốt popup chọn hồ sơ → phiên nhiều hồ sơ (mục 6). Thay phiên cũ
+        CHỈ sau khi người dùng đã chốt; hủy popup không đụng dữ liệu cũ."""
+        from scanindex.core.digitization.dossier_model import (
+            build_from_selection,
+        )
+        session = self.archive_tab.session
+        session.clear_dossiers()
+        dossiers, documents = build_from_selection(selection)
+        docs = session.set_dossiers(dossiers, documents)
+        self._arc_documents = docs
+        self.archive_tab.set_documents(docs)
+        self.archive_tab.set_output_folder(session.step2_kie_dir())
+        self.log(
+            f"Archive: imported {len(dossiers)} dossier(s), "
+            f"{len(docs)} PDF file(s) from {folder}",
+            LOG_INFO,
+        )
+
+    def _arc_setup_merged_dossier_session(self, folder: str, identity,
+                                          pdf_files: list) -> None:
+        """Luồng "không chuẩn": gom toàn bộ PDF (mọi độ sâu) vào MỘT hồ sơ
+        (mục 5). Vẫn đi qua phiên nhiều hồ sơ (một DossierState) để Bước 2/3
+        và ký/xuất dùng chung cơ chế; PDF trùng basename giữ đường dẫn gốc."""
+        from scanindex.core.digitization.dossier_model import (
+            build_single_dossier,
+        )
+        session = self.archive_tab.session
+        session.clear_dossiers()
+        dossiers, documents = build_single_dossier(folder, identity, pdf_files)
+        docs = session.set_dossiers(dossiers, documents)
+        self._arc_documents = docs
+        self.archive_tab.set_documents(docs)
+        self.archive_tab.set_output_folder(session.step2_kie_dir())
+        self.log(
+            f"Archive: merged {len(docs)} PDF file(s) into one dossier "
+            f"from {folder}",
+            LOG_INFO,
+        )
+
     def _arc_start_process(self):
         """Start the new 3-stage archive pipeline (page-level OCR + correction
         + KIE) on every PDF in the input folder. KIE intermediates go to the
@@ -2107,52 +2315,109 @@ class MainWindow(QMainWindow):
         if os.path.basename(in_dir.rstrip(os.sep)) == "_zip_input":
             self._arc_start_process_from_zip()
             return
-        out_dir = self.archive_tab.session.step2_kie_dir()
+        session = self.archive_tab.session
+        out_dir = session.step2_kie_dir()
         self.archive_tab.set_output_folder(out_dir)
 
-        try:
-            pdf_files = []
-            for root, _, files in os.walk(in_dir):
-                for name in files:
-                    if name.lower().endswith(".pdf"):
-                        pdf_files.append(os.path.join(root, name))
-            pdf_files = sorted(pdf_files)
-        except Exception as e:
-            QMessageBox.critical(self, "Error", str(e))
-            return
-        if not pdf_files:
-            QMessageBox.information(self, "Info", "No PDF files found.")
-            return
-
-        self.log(
-            f"Archive: Found {len(pdf_files)} PDF file(s) recursively in {in_dir}"
+        # Nhiều hồ sơ (nhập thư mục chuẩn/gộp một hồ sơ): file_specs theo
+        # _doc_id (ID ổn định, không basename) + thư mục con tạm theo hồ sơ
+        # (mục 6). Callback theo ID vẫn đúng khi trùng tên file.
+        multi = (
+            session.multi_dossier
+            and bool(getattr(self, "_arc_documents", []))
+            and isinstance(self._arc_documents[0], dict)
+            and bool(self._arc_documents[0].get("_doc_id"))
         )
-
-        # Build the UI documents list. When the input came from an exported
-        # ZIP (zip_roundtrip), each PDF already carries a `metadata` dict
-        # parsed from the ZIP's MetaDuLieu.xlsx — preserve it so the operator's
-        # prior edits survive re-running OCR + KIE. Only pipeline-owned fields
-        # (output_path / json_path / status) reset for a fresh run.
-        prior_by_path = {}
-        for d in (getattr(self, "_arc_documents", None) or []):
-            p = d.get("pdf_path") or d.get("path")
-            if p:
-                prior_by_path[p] = d
-        self._arc_documents = []
-        for f in pdf_files:
-            prior = prior_by_path.get(f)
-            if prior is not None:
-                doc = dict(prior)
+        specs = None
+        if multi:
+            pdf_files = []
+            index_by_id: dict = {}
+            for i, doc in enumerate(self._arc_documents):
+                src = doc.get("pdf_path") or doc.get("path")
+                pdf_files.append(src)
+                index_by_id[str(doc["_doc_id"])] = i
+                # Pipeline-owned fields reset for a fresh run; metadata từ
+                # lần chạy trước (nếu có) được giữ như luồng đơn.
                 doc["output_path"] = None
                 doc["ocr_path"] = None
                 doc["json_path"] = None
                 doc["zones"] = {}
                 doc["status"] = "Pending"
-            else:
-                doc = {"pdf_path": f, "path": f, "output_path": None,
-                       "ocr_path": None, "json_path": None,
-                       "metadata": {}, "zones": {}, "status": "Pending"}
-            self._arc_documents.append(doc)
+            from scanindex.core.digitization.runner import FileSpec
+            specs = [
+                FileSpec(
+                    input_path=doc.get("pdf_path") or doc.get("path"),
+                    file_id=str(doc["_doc_id"]),
+                    output_subdir=str(doc.get("_dossier_id") or ""),
+                )
+                for doc in self._arc_documents
+            ]
+            self.log(
+                f"Archive: {len(session.dossiers)} dossier(s), "
+                f"{len(pdf_files)} PDF file(s) (multi-dossier import)",
+            )
+            self.signals.log_message.emit(
+                translations.get_text("arc_multi_process_started").format(
+                    n=len(session.dossiers), m=len(pdf_files)),
+                LOG_INFO,
+            )
+        else:
+            try:
+                pdf_files = []
+                for root, _, files in os.walk(in_dir):
+                    for name in files:
+                        if name.lower().endswith(".pdf"):
+                            pdf_files.append(os.path.join(root, name))
+                pdf_files = sorted(pdf_files)
+            except Exception as e:
+                QMessageBox.critical(self, "Error", str(e))
+                return
+            if not pdf_files:
+                QMessageBox.information(self, "Info", "No PDF files found.")
+                return
+
+            self.log(
+                f"Archive: Found {len(pdf_files)} PDF file(s) recursively in {in_dir}"
+            )
+
+            # Build the UI documents list. When the input came from an exported
+            # ZIP (zip_roundtrip), each PDF already carries a `metadata` dict
+            # parsed from the ZIP's MetaDuLieu.xlsx — preserve it so the operator's
+            # prior edits survive re-running OCR + KIE. Only pipeline-owned fields
+            # (output_path / json_path / status) reset for a fresh run.
+            prior_by_path = {}
+            for d in (getattr(self, "_arc_documents", None) or []):
+                p = d.get("pdf_path") or d.get("path")
+                if p:
+                    prior_by_path[p] = d
+            self._arc_documents = []
+            for f in pdf_files:
+                prior = prior_by_path.get(f)
+                if prior is not None:
+                    doc = dict(prior)
+                    doc["output_path"] = None
+                    doc["ocr_path"] = None
+                    doc["json_path"] = None
+                    doc["zones"] = {}
+                    doc["status"] = "Pending"
+                else:
+                    doc = {"pdf_path": f, "path": f, "output_path": None,
+                           "ocr_path": None, "json_path": None,
+                           "metadata": {}, "zones": {}, "status": "Pending"}
+                self._arc_documents.append(doc)
+
+        # Map event file_id → chỉ số dòng: nhiều hồ sơ = _doc_id; luồng đơn =
+        # basename (hành vi cũ, một hồ sơ nên không trùng tên).
+        if multi:
+            self._arc_doc_index_by_id = {
+                str(d["_doc_id"]): i
+                for i, d in enumerate(self._arc_documents)
+            }
+        else:
+            self._arc_doc_index_by_id = {
+                os.path.basename(d["path"]): i
+                for i, d in enumerate(self._arc_documents)
+            }
         self.archive_tab.set_documents(self._arc_documents)
         step2 = getattr(self.archive_tab, "_step2", None) \
             or getattr(self.archive_tab, "archive_tab", None)
@@ -2230,9 +2495,11 @@ class MainWindow(QMainWindow):
                     )
                 elif evt == EVENT_FILE_QUEUED:
                     self._arc_emit_preprocess_progress("hide")
-                for i, doc in enumerate(self._arc_documents):
-                    if os.path.basename(doc["path"]) != file_id:
-                        continue
+                # file_id = _doc_id (nhiều hồ sơ) hoặc basename (luồng đơn)
+                # — tra bảng dựng lúc start, không so basename trực tiếp.
+                i = self._arc_doc_index_by_id.get(file_id)
+                if i is not None:
+                    doc = self._arc_documents[i]
                     changed = False
                     if evt == EVENT_FILE_PREPROCESS_START:
                         doc["status"] = "Preprocess..."
@@ -2278,6 +2545,12 @@ class MainWindow(QMainWindow):
                             ann = getattr(task, "kie_annotation", None)
                             if ann:
                                 doc["annotation"] = ann
+                            if doc.get("_doc_id"):
+                                self.archive_tab.session.update_document_state(
+                                    str(doc["_doc_id"]),
+                                    ocr_path=task.output_pdf_path,
+                                    canonical_path=task.output_json_path,
+                                )
                         # Brief lull before FILE_COMPLETE — gray
                         doc["status"] = "Pending"
                         changed = True
@@ -2300,7 +2573,6 @@ class MainWindow(QMainWindow):
                         changed = True
                     if changed:
                         self.signals.status_updated.emit("archive", i, doc["status"])
-                    break
             if evt == EVENT_PIPELINE_DONE:
                 self._arc_emit_preprocess_progress("hide")
                 try:
@@ -2312,7 +2584,8 @@ class MainWindow(QMainWindow):
 
         self._archive_runner = ArchiveRunner(
             output_dir=out_dir,
-            input_dir=in_dir,
+            input_dir=None if multi else in_dir,
+            file_specs=specs,
             kie_mode=kie_mode,
             on_event=on_event,
             log_cb=lambda m: self.signals.log_message.emit(str(m), LOG_INFO),
@@ -2592,6 +2865,12 @@ class MainWindow(QMainWindow):
         document list is already populated in the GUI; here we just build
         FileSpecs (with pre-OCR cache from `session.ocr_cache`) and start
         the runner. Cancels any in-flight previous run first."""
+        # Luồng Step 1 là đơn hồ sơ — dọn state đa hồ sơ (nếu còn) để
+        # identity resolve luôn qua session.identity (mục 6).
+        try:
+            self.archive_tab.session.clear_dossiers()
+        except Exception:
+            pass
         from scanindex.core.digitization.runner import ArchiveRunner, FileSpec
         from scanindex.core.pipeline.batch_pipeline import (
             EVENT_FILE_QUEUED, EVENT_PAGE_DONE, EVENT_FILE_OCR_DONE,
@@ -2827,6 +3106,54 @@ class MainWindow(QMainWindow):
         stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", stem).strip(" .")
         return f"{stem or 'HSLTCQ'}.zip"
 
+    # ── nhiều hồ sơ: nhóm + kiểm tra bản ký (mục 8) ─────────────────
+
+    def _arc_multi_groups(self, documents: list) -> list:
+        """Nhóm doc theo `_dossier_id` GIỮ THỨ TỪ; trả [(DossierState|None,
+        [doc...])]."""
+        session = self.archive_tab.session
+        groups: list = []
+        pos: dict = {}
+        for doc in documents:
+            did = str(doc.get("_dossier_id") or "")
+            if did not in pos:
+                pos[did] = len(groups)
+                groups.append((session.dossier_by_id(did), []))
+            groups[pos[did]][1].append(doc)
+        return groups
+
+    def _arc_group_label(self, dossier) -> str:
+        if dossier is not None:
+            return dossier.composite_label()
+        return "(không rõ hồ sơ)"
+
+    def _arc_signed_pdf_for_doc(self, doc: dict, stt: int,
+                                identity) -> str:
+        """Bản ký CÒN HIỆU LỰC của tài liệu (mục 8): `_signed_path` khớp
+        vân tay bản nguồn, hoặc file theo tên segment trong thư mục ký của
+        hồ sơ. Bản stale (nguồn đã sửa/re-OCR sau ký) → trả "" — tuyệt đối
+        không âm thầm thay bằng bản OCR khi xuất."""
+        kie_pdf = doc.get("output_path") or ""
+        signed_path = str(doc.get("_signed_path") or "")
+        if signed_path and os.path.exists(signed_path):
+            from scanindex.ui.digitization.signing_step import (
+                _fingerprint_matches,
+            )
+            if _fingerprint_matches(kie_pdf, doc.get("_signed_from") or {}):
+                return signed_path
+            return ""   # bản nguồn đã đổi sau ký → bản ký hết hiệu lực
+        # Fallback: file đã ký theo tên canonical trong thư mục ký của hồ sơ
+        # (ký trước khi nâng cấp phiên bản, hoặc "Đã ký (có sẵn)" đã copy).
+        did = str(doc.get("_dossier_id") or "")
+        if did:
+            signed_dir = self.archive_tab.session.step3_signed_dir(did)
+            candidate = os.path.join(
+                signed_dir,
+                self._arc_export_pdf_name(identity, stt, kie_pdf))
+            if os.path.exists(candidate):
+                return candidate
+        return ""
+
     def _arc_export_external(self):
         """Step 3 button "Xuất hồ sơ nén" — bundle Excel metadata
         + the final PDFs (signed if present, else KIE overlay) for the
@@ -2859,6 +3186,11 @@ class MainWindow(QMainWindow):
         if not documents:
             QMessageBox.information(self, "Xuất hồ sơ nén",
                                      "Chưa có hồ sơ để xuất. Hãy chạy Bước 2 trước.")
+            return
+        # Nhiều hồ sơ: MỘT ZIP cho mỗi hồ sơ (mục 8.1) — luồng riêng, giữ
+        # đúng identity/metadata của từng hồ sơ.
+        if self.archive_tab.session.multi_dossier:
+            self._arc_export_external_multi(documents)
             return
         out_dir = QFileDialog.getExistingDirectory(
             self, translations.localize_text("Chọn thư mục để lưu file ZIP")
@@ -2990,6 +3322,164 @@ class MainWindow(QMainWindow):
         if ask.exec() == QMessageBox.StandardButton.Yes:
             self._arc_import_to_kho()
 
+    def _arc_export_external_multi(self, documents: list):
+        """Xuất ZIP cho luồng NHIỀU HỒ SƠ (mục 8.1): MỘT ZIP mỗi hồ sơ, chỉ
+        chứa PDF cuối (bản ký) + canonical sidecar + Excel metadata của đúng
+        hồ sơ đó. Tài liệu chưa ký/bản ký hết hiệu lực ⇒ hồ sơ KHÔNG đủ điều
+        kiện xuất — báo rõ và chỉ xuất các hồ sơ đủ điều kiện sau xác nhận
+        (không âm thầm thay bản OCR như bản đã ký)."""
+        out_dir = QFileDialog.getExistingDirectory(
+            self, translations.localize_text("Chọn thư mục để lưu file ZIP")
+        )
+        if not out_dir:
+            return
+        try:
+            import tempfile
+            import zipfile
+            from scanindex.core.digitization.runner import write_aggregated_excel
+            from scanindex.core.canonical_io import (
+                companion_for_pdf, resolve_companion,
+            )
+
+            include_canonical = bool(
+                self._saved.get("zip_include_canonical", True))
+            session = self.archive_tab.session
+
+            plans: list = []
+            for dossier, docs in self._arc_multi_groups(documents):
+                identity = session.identity_for_doc(docs[0])
+                entries, unsigned = [], []
+                for pos, doc in enumerate(docs, start=1):
+                    stt = self._arc_stt_for_doc(doc, pos)
+                    kie_pdf = doc.get("output_path") or ""
+                    signed = self._arc_signed_pdf_for_doc(
+                        doc, stt, identity) if kie_pdf else ""
+                    if not signed or not kie_pdf:
+                        unsigned.append(
+                            os.path.basename(kie_pdf)
+                            or str(doc.get("_doc_id") or "?"))
+                        continue
+                    entry = dict(doc)
+                    entry["export_source_path"] = signed
+                    entry["export_file_name"] = self._arc_export_pdf_name(
+                        identity, stt, signed)
+                    canonical_path = ""
+                    if include_canonical:
+                        json_path = doc.get("json_path") or ""
+                        if not json_path and kie_pdf:
+                            json_path = str(companion_for_pdf(kie_pdf))
+                        if json_path:
+                            resolved = resolve_companion(json_path)
+                            canonical_path = (
+                                str(resolved)
+                                if resolved is not None else "")
+                    entry["canonical_path"] = canonical_path
+                    entries.append(entry)
+                plans.append({
+                    "dossier": dossier,
+                    "label": self._arc_group_label(dossier),
+                    "identity": identity,
+                    "entries": entries,
+                    "unsigned": unsigned,
+                })
+
+            qualifying = [p for p in plans if p["entries"]
+                          and not p["unsigned"]]
+            blocked = [p for p in plans if p not in qualifying]
+            if not qualifying:
+                QMessageBox.warning(
+                    self, "Xuất hồ sơ nén",
+                    translations.get_text("arc_multi_export_none_qualify"),
+                )
+                return
+            if blocked:
+                detail = "\n".join(
+                    f"• {p['label']}: thiếu/hết hiệu lực "
+                    f"{len(p['unsigned'])} bản ký" for p in blocked[:15])
+                answer = QMessageBox.question(
+                    self,
+                    translations.get_text("arc_multi_unsigned_title"),
+                    translations.get_text("arc_multi_export_blocked_body")
+                    .format(detail),
+                    QMessageBox.StandardButton.Yes
+                    | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes,
+                )
+                if answer != QMessageBox.StandardButton.Yes:
+                    return
+
+            total_pdf = 0
+            total_zip = 0
+            for plan in qualifying:
+                tmp_xlsx = tempfile.NamedTemporaryFile(
+                    suffix=".xlsx", delete=False)
+                tmp_xlsx.close()
+                excel_tmp_path = tmp_xlsx.name
+                write_aggregated_excel(
+                    plan["entries"], excel_tmp_path,
+                    identity=plan["identity"])
+                zip_name = self._arc_export_zip_name(plan["identity"])
+                zip_path = os.path.join(out_dir, zip_name)
+                if os.path.exists(zip_path):
+                    # Xung đột đích: hậu tố _2.._999 — KHÔNG ghi đè (mục 8.1).
+                    base, ext = os.path.splitext(zip_name)
+                    for i in range(2, 1000):
+                        candidate = os.path.join(out_dir, f"{base}_{i}{ext}")
+                        if not os.path.exists(candidate):
+                            zip_path = candidate
+                            break
+                copied = 0
+                try:
+                    with zipfile.ZipFile(zip_path, "w",
+                                         zipfile.ZIP_DEFLATED) as zf:
+                        zf.write(excel_tmp_path,
+                                 "HSLTCQ/METADATA/MetaDuLieu.xlsx")
+                        for entry in plan["entries"]:
+                            zf.write(entry["export_source_path"],
+                                     f"HSLTCQ/METADATA/"
+                                     f"{entry['export_file_name']}")
+                            copied += 1
+                            canonical = entry.get("canonical_path") or ""
+                            if canonical and os.path.isfile(canonical):
+                                zf.write(
+                                    canonical,
+                                    f"HSLTCQ/METADATA/"
+                                    f"{entry['export_file_name']}.json.zst")
+                finally:
+                    try:
+                        os.unlink(excel_tmp_path)
+                    except Exception:
+                        pass
+                total_pdf += copied
+                total_zip += 1
+                self.log(
+                    f"Archive: ZIP exported — {plan['label']}: "
+                    f"{copied} PDF + Excel → {zip_path}",
+                    LOG_SUCCESS,
+                )
+            self.log(
+                f"Archive: exported {total_zip} ZIP ({total_pdf} PDF) for "
+                f"{len(qualifying)}/{len(plans)} dossier(s)",
+                LOG_SUCCESS,
+            )
+        except Exception as e:
+            self.log(f"Archive: Export failed: {e}", LOG_ERROR)
+            QMessageBox.critical(self, "Lỗi", f"Xuất thất bại: {e}")
+            return
+
+        ask = QMessageBox(self)
+        ask.setWindowTitle("Chuyển vào Kho?")
+        ask.setIcon(QMessageBox.Icon.Question)
+        ask.setText(translations.get_text("arc_multi_export_done_text"))
+        ask.setInformativeText(
+            translations.get_text("arc_multi_export_ask_kho"))
+        ask.setStandardButtons(
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        ask.setDefaultButton(QMessageBox.StandardButton.No)
+        if ask.exec() == QMessageBox.StandardButton.Yes:
+            self._arc_import_to_kho()
+
     def _arc_import_to_kho(self):
         """Step 3 button "Chuyển vào Kho" — push the current dossier into
         the internal Kho lưu trữ. Standalone: user can call this without
@@ -3007,6 +3497,9 @@ class MainWindow(QMainWindow):
             return
 
         session = self.archive_tab.session
+        if session.multi_dossier:
+            self._arc_import_to_kho_multi(documents)
+            return
         identity = getattr(session, "identity", None)
         if identity is None or not identity.is_complete():
             QMessageBox.warning(
@@ -3076,6 +3569,261 @@ class MainWindow(QMainWindow):
         )
 
         self._run_kho_import(codes, docs_to_import)
+
+    def _arc_import_to_kho_multi(self, documents: list):
+        """Chuyển vào Kho NHIỀU HỒ SƠ (mục 8.2): import từng hồ sơ với khóa
+        (ma_dinh_danh, fonds, catalog, dossier_code) của HỒ SƠ ĐÓ. Tài liệu
+        chưa ký đủ → hồ sơ không đủ điều kiện (báo rõ). Tài liệu đã nhập
+        trong phiên (`_kho_import_ok`) được bỏ qua khi bấm lại sau lỗi —
+        phục hồi thao tác, không phải kiểm trùng nội dung."""
+        session = self.archive_tab.session
+        jobs: list = []
+        plans: list = []
+        for dossier, docs in self._arc_multi_groups(documents):
+            identity = session.identity_for_doc(docs[0])
+            label = self._arc_group_label(dossier)
+            if identity is None or not identity.is_complete():
+                QMessageBox.warning(
+                    self, "Chuyển vào Kho",
+                    translations.get_text("arc_multi_kho_missing_codes")
+                    .format(label=label),
+                )
+                return
+            entries, unsigned, resume_skipped = [], [], 0
+            for pos, doc in enumerate(docs, start=1):
+                if doc.get("_kho_import_ok"):
+                    resume_skipped += 1
+                    continue
+                kie_pdf = doc.get("output_path") or ""
+                if not kie_pdf or not os.path.exists(kie_pdf):
+                    unsigned.append(
+                        str(doc.get("_doc_id") or "?"))
+                    continue
+                stt = self._arc_stt_for_doc(doc, pos)
+                signed = self._arc_signed_pdf_for_doc(doc, stt, identity)
+                if not signed:
+                    unsigned.append(os.path.basename(kie_pdf))
+                    continue
+                json_path = doc.get("json_path") or ""
+                if not json_path:
+                    from scanindex.core.canonical_io import companion_for_pdf
+                    json_path = str(companion_for_pdf(kie_pdf))
+                if json_path:
+                    from scanindex.core.canonical_io import resolve_companion
+                    resolved = resolve_companion(json_path)
+                    if resolved is not None:
+                        json_path = str(resolved)
+                if not json_path or not os.path.exists(json_path):
+                    unsigned.append(os.path.basename(kie_pdf))
+                    continue
+                entries.append({
+                    "pdf_path": signed,
+                    "canonical_json_path": json_path,
+                    "target_file_name": self._arc_export_pdf_name(
+                        identity, stt, signed),
+                    "metadata": dict(doc.get("metadata") or {}),
+                    "_doc_id": str(doc.get("_doc_id") or ""),
+                })
+            plans.append({
+                "label": label,
+                "dossier": dossier,
+                "identity": identity,
+                "entries": entries,
+                "unsigned": unsigned,
+                "resume_skipped": resume_skipped,
+            })
+
+        qualifying = [p for p in plans if p["entries"]
+                      and not p["unsigned"]]
+        blocked = [p for p in plans if p not in qualifying]
+        if not qualifying:
+            QMessageBox.warning(
+                self, "Chuyển vào Kho",
+                translations.get_text("arc_multi_kho_none_qualify"),
+            )
+            return
+        if blocked:
+            detail = "\n".join(
+                f"• {p['label']}: thiếu/hết hiệu lực "
+                f"{len(p['unsigned'])} bản ký" for p in blocked[:15])
+            answer = QMessageBox.question(
+                self,
+                translations.get_text("arc_multi_unsigned_title"),
+                translations.get_text("arc_multi_kho_blocked_body")
+                .format(detail),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+
+        from scanindex.core.repository.importer import DossierCodes
+        for plan in qualifying:
+            identity = plan["identity"]
+            codes = DossierCodes(
+                ma_dinh_danh=identity.ma_dinh_danh,
+                fonds=identity.ma_phong,
+                catalog=identity.muc_luc,
+                dossier_code=identity.ho_so,
+                fonds_name=getattr(identity, "ten_phong", ""),
+                catalog_name=getattr(identity, "ten_muc_luc", ""),
+                title=identity.title or f"Hồ sơ {identity.ho_so}",
+                is_unstructured=identity.is_unstructured,
+                retention=identity.thoi_han_bao_quan,
+                term=(identity.nhiem_ky or "")[:10],
+                storage_unit=identity.ho_so,        # Đơn vị bảo quản số = ho_so
+                physical_state=identity.tinh_trang_vat_ly,
+                topic=identity.chuyen_de,
+                note=identity.chu_thich,
+            )
+            jobs.append((codes, plan["entries"], plan["label"]))
+
+        resume_note = sum(p["resume_skipped"] for p in qualifying)
+        self._run_kho_import_multi(jobs, resume_skipped=resume_note)
+
+    def _run_kho_import_multi(self, jobs: list,
+                              *, resume_skipped: int = 0):
+        """Back-end nhập Kho nhiều hồ sơ: một store/index, tuần tự từng hồ
+        sơ; đánh dấu tài liệu đã nhập theo `_doc_id` ngay khi xong để bấm
+        lại sau lỗi không nhập trữ lại phần đã xong (mục 8.2)."""
+        repo_screen = self.repository_screen
+        archive_path = getattr(repo_screen, "_archive_path", None)
+        if getattr(repo_screen, "_store", None) is None or archive_path is None:
+            QMessageBox.warning(
+                self, "Kho lưu trữ",
+                "Kho lưu trữ chưa được mở (vị trí kho không còn hợp lệ).\n"
+                "Hãy mở màn hình Kho lưu trữ, chọn lại vị trí kho, rồi thử lại.",
+            )
+            return
+
+        total_docs = sum(len(entries) for _c, entries, _l in jobs)
+        progress = QProgressDialog(
+            "Đang chuyển vào Kho lưu trữ…", "Hủy",
+            0, max(1, total_docs), self,
+        )
+        progress.setWindowTitle("Chuyển vào Kho")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setValue(0)
+        progress.show()
+
+        def on_doc_done(entry: dict) -> None:
+            """Chạy trên thread worker: đánh dấu tài liệu đã vào Kho."""
+            doc_id = str((entry or {}).get("_doc_id") or "")
+            if not doc_id:
+                return
+            for d in (getattr(self, "_arc_documents", None) or []):
+                if str(d.get("_doc_id") or "") == doc_id:
+                    d["_kho_import_ok"] = True
+                    break
+
+        worker = _KhoImportMultiWorker(archive_path, jobs,
+                                       on_doc_done=on_doc_done)
+
+        try:
+            self.repository_screen.release_index_for_writer()
+        except Exception as e:
+            self.log(
+                f"Archive: could not release Repository index: {e}",
+                LOG_ERROR,
+            )
+
+        def _reopen_kho():
+            try:
+                self.repository_screen.reopen_index_after_writer()
+            except Exception as e:
+                self.log(
+                    f"Archive: could not reopen Repository index: {e}",
+                    LOG_ERROR,
+                )
+
+        def on_progress(p, dossier_idx, dossier_total):
+            done = p.imported + p.skipped + p.failed
+            label = jobs[dossier_idx][2] if 0 <= dossier_idx < len(jobs) else ""
+            progress.setLabelText(
+                f"[{dossier_idx + 1}/{dossier_total}] {label} — "
+                f"{p.current_file or ''}  ({done}/{p.total})"
+            )
+            base = sum(len(j[1]) for j in jobs[:dossier_idx])
+            progress.setValue(min(max(1, total_docs), base + done))
+
+        def on_finished_ok(results: list):
+            progress.close()
+            _reopen_kho()
+            ok_jobs = [r for r in results if r.get("ok")]
+            failed_jobs = [r for r in results if not r.get("ok")]
+            imported = sum(r["prog"].imported for r in ok_jobs)
+            duplicates = sum(r["prog"].duplicates for r in ok_jobs)
+            failed_docs = sum(r["prog"].failed for r in ok_jobs)
+            skip_duplicates_hint = bool(
+                self._saved.get("skip_duplicate_docs", True))
+            dup_kept = duplicates if not skip_duplicates_hint else 0
+            msg = translations.format_import_summary(
+                dossiers=len(ok_jobs),
+                imported=imported,
+                duplicates=duplicates,
+                failed=failed_docs,
+                duplicate_skipped=duplicates - dup_kept,
+                duplicate_kept=dup_kept,
+            )
+            if resume_skipped:
+                msg += "\n" + translations.get_text(
+                    "arc_multi_kho_resume_note").format(n=resume_skipped)
+            if failed_jobs:
+                detail = "\n".join(
+                    f"• {r['label']}: {r['error'][:200]}"
+                    for r in failed_jobs[:10])
+                msg += "\n\n" + translations.get_text(
+                    "arc_multi_kho_failed_dossiers") + "\n" + detail
+            QMessageBox.information(self, "Chuyển vào Kho hoàn tất", msg)
+            self.log(
+                f"Archive: imported into Repository — {imported} doc(s) "
+                f"across {len(ok_jobs)}/{len(jobs)} dossier(s)",
+                LOG_SUCCESS if not failed_jobs else LOG_ERROR,
+            )
+            all_ok = (not failed_jobs
+                      and all(r["prog"].failed == 0 for r in ok_jobs))
+            if all_ok and imported > 0:
+                ask = QMessageBox.question(
+                    self, "Xóa file tạm?",
+                    translations.get_text("arc_multi_kho_cleanup_ask"),
+                )
+                if ask == QMessageBox.StandardButton.Yes:
+                    try:
+                        self.archive_tab.reset_workflow()
+                    except Exception as e:
+                        self.log(
+                            f"Archive: cleanup after Repository import failed: {e}",
+                            LOG_ERROR,
+                        )
+
+        def on_failed(error_msg):
+            progress.close()
+            _reopen_kho()
+            self.log(
+                f"Archive: import to Repository failed: {error_msg}",
+                LOG_ERROR,
+            )
+            QMessageBox.critical(
+                self, "Lỗi",
+                f"Chuyển vào Kho thất bại:\n{error_msg}",
+            )
+
+        def on_thread_finished():
+            if getattr(self, "_arc_kho_worker", None) is worker:
+                self._arc_kho_worker = None
+            worker.deleteLater()
+
+        worker.progress.connect(on_progress)
+        worker.finished_ok.connect(on_finished_ok)
+        worker.failed.connect(on_failed)
+        worker.finished.connect(on_thread_finished)
+        progress.canceled.connect(worker.cancel)
+        # Hold a reference so Python doesn't GC the QThread mid-run.
+        self._arc_kho_worker = worker
+        worker.start()
 
     def _run_kho_import(self, codes, docs_to_import: list[dict],
                         *, offer_temp_cleanup: bool = True,
@@ -3322,6 +4070,11 @@ class MainWindow(QMainWindow):
             pass
         try:
             self.archive_tab._step2.set_input_folder(input_dir)
+        except Exception:
+            pass
+        # ZIP reopen là đơn hồ sơ — dọn state đa hồ sơ cũ (nếu còn).
+        try:
+            self.archive_tab.session.clear_dossiers()
         except Exception:
             pass
         self.archive_tab._step2.set_documents(

@@ -579,6 +579,7 @@ class Importer:
                        progress_cb: Optional[ProgressCallback] = None,
                        cancel_check: Optional[Callable[[], bool]] = None,
                        skip_duplicates: bool = True,
+                       on_doc_done: Optional[Callable[[dict], None]] = None,
                        ) -> ImportProgress:
         """Import one dossier whose docs are already OCRed.
 
@@ -598,6 +599,12 @@ class Importer:
         counted in both `skipped` and `duplicates`. With False the duplicate
         is still imported (unique suffixed doc_id) but remains counted in
         `duplicates` for reporting.
+
+        `on_doc_done(entry)` fires after each entry lands in Kho (inserted
+        OR counted as duplicate — both mean the document exists in the
+        dossier). Số-hóa dùng nó để đánh dấu tài liệu đã nhập theo ID phiên:
+        bấm nhập lại sau lỗi sẽ không nhập lại những mục đã xong (mục 8.2 —
+        phục hồi thao tác, không phải kiểm trùng nội dung).
         """
         prog = ImportProgress(total=len(documents))
         if not codes.ma_dinh_danh or not codes.fonds:
@@ -637,6 +644,11 @@ class Importer:
                         prog.skipped += 1
                     if warning and inserted:
                         prog.message = f"{pdf.name}: {warning}"
+                    if on_doc_done is not None:
+                        try:
+                            on_doc_done(entry)
+                        except Exception:
+                            pass
                 except Exception as e:
                     prog.failed += 1
                     prog.message = f"{pdf.name}: {e}"
@@ -967,11 +979,13 @@ class Importer:
             / codes.dossier_code
         )
         target_pdf = target_subdir / target_name
-        if duplicate and target_pdf.exists():
-            # Keeping a duplicate copy (skip_duplicates=False): the first
-            # copy already occupies `target_name`. Suffix the kept copy so
-            # each DB row owns a distinct physical file (deleting one row
-            # must never orphan the other).
+        if target_pdf.exists():
+            # (a) Keeping a duplicate copy (skip_duplicates=False): the first
+            # copy already occupies `target_name`. (b) Cùng tên đích nhưng
+            # KHÁC nội dung (vd. trùng STT trong cùng hồ sơ — xung đột định
+            # danh, mục 8.2 của kế hoạch nhập nhiều hồ sơ). Cả hai đều phải
+            # suffix để MỖI dòng DB sở hữu một file vật lý riêng — không bao
+            # giờ ghi đè file của tài liệu khác.
             for n in range(2, 1000):
                 alt = f"{target_pdf.stem}-{n}{target_pdf.suffix}"
                 candidate = target_subdir / alt

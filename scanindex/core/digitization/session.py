@@ -22,6 +22,12 @@ from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Optional
 
+from scanindex.core.digitization.dossier_model import (
+    DossierState,
+    DocumentState,
+    document_doc_dict,
+)
+
 
 def _new_session_id() -> str:
     """`YYYYMMDD_HHMMSS_xxxx` — local timestamp + 4 hex chars to avoid
@@ -159,6 +165,14 @@ class ArchiveSession:
         self.session_id: str = _new_session_id()
         self._temp_root: Optional[str] = None
 
+        # Nhiều hồ sơ (nhập thư mục tại Bước 2 — xem dossier_model): danh
+        # sách hồ sơ CÓ THỨ TỰ + registry tài liệu theo ID ổn định. Khi
+        # danh sách RỖNG, phiên chạy luồng đơn hồ sơ cũ qua `identity`.
+        # Luồng nhiều hồ sơ KHÔNG ĐỌC `identity` — resolve mã qua
+        # `identity_for_doc()` (một cửa duy nhất) để không có nguồn lệch nhau.
+        self.dossiers: list["DossierState"] = []
+        self.documents_by_id: dict[str, "DocumentState"] = {}
+
         # Step 1 source state
         self.source_pdf: Optional[str] = None
         self.source_page_count: int = 0
@@ -203,15 +217,71 @@ class ArchiveSession:
         os.makedirs(d, exist_ok=True)
         return d
 
-    def step2_kie_dir(self) -> str:
+    def step2_kie_dir(self, dossier_id: Optional[str] = None) -> str:
+        """KIE output dir; luồng nhiều hồ sơ tách THƯ MỤC CON theo hồ sơ để
+        PDF/JSON trùng tên nguồn không đè nhau (mục 6 của kế hoạch)."""
         d = os.path.join(self.temp_dir(), "_step2_kie")
+        if dossier_id:
+            d = os.path.join(d, dossier_id)
         os.makedirs(d, exist_ok=True)
         return d
 
-    def step3_signed_dir(self) -> str:
+    def step3_signed_dir(self, dossier_id: Optional[str] = None) -> str:
         d = os.path.join(self.temp_dir(), "_step3_signed")
+        if dossier_id:
+            d = os.path.join(d, dossier_id)
         os.makedirs(d, exist_ok=True)
         return d
+
+    # ── nhiều hồ sơ ─────────────────────────────────────────────────
+
+    def set_dossiers(self, dossiers, documents) -> list[dict]:
+        """Thay phiên nhiều hồ sơ: lưu state, trả doc-dicts cho Bước 2 theo
+        đúng thứ tự hồ sơ → tài liệu. Gọi SAU kiểm tra chưa-lưu của luồng cũ
+        (mục 7: chuẩn bị phiên mới xong mới thay phiên cũ)."""
+        self.dossiers = list(dossiers)
+        self.documents_by_id = {d.id: d for d in documents}
+        by_id = {d.id: d for d in self.dossiers}
+        doc_dicts = []
+        for doc in documents:
+            doc.status = "Pending"
+            doc_dicts.append(document_doc_dict(doc, by_id[doc.dossier_id]))
+        return doc_dicts
+
+    def clear_dossiers(self) -> None:
+        self.dossiers = []
+        self.documents_by_id = {}
+
+    @property
+    def multi_dossier(self) -> bool:
+        return bool(self.dossiers)
+
+    def dossier_by_id(self, dossier_id: str) -> Optional["DossierState"]:
+        return next((d for d in self.dossiers if d.id == dossier_id), None)
+
+    def document_by_id(self, doc_id: str) -> Optional["DocumentState"]:
+        return self.documents_by_id.get(doc_id)
+
+    def identity_for_doc(self, doc: dict) -> Optional[IdentityCodes]:
+        """Resolve identity THEO TÀI LIỆU — cửa vào duy nhất cho ký/xuất/
+        import (mục 6/8): luồng nhiều hồ sơ tra qua hồ sơ của tài liệu, luồng
+        cũ (Bước 1/ZIP) trả về `identity` chung như trước."""
+        dossier_id = doc.get("_dossier_id") if isinstance(doc, dict) else None
+        if dossier_id:
+            dossier = self.dossier_by_id(dossier_id)
+            if dossier is not None:
+                return dossier.identity
+        return self.identity
+
+    def update_document_state(self, doc_id: str, **fields) -> None:
+        """Đồng bộ kết quả xử lý vào registry theo ID (pipeline callback gọi
+        sau khi đã ghi doc-dict, hoặc ngược lại)."""
+        doc = self.documents_by_id.get(doc_id)
+        if doc is None:
+            return
+        for key, value in fields.items():
+            if hasattr(doc, key):
+                setattr(doc, key, value)
 
     def cleanup_temp(self) -> None:
         """Remove the per-session temp dir. Safe to call repeatedly."""

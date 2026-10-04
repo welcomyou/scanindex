@@ -176,5 +176,13 @@ config/sign_stamp_images/*.jpeg
 # Bulk-signing tool per-machine settings (input/output dirs of the last run).
 config/batch_sign_settings.json
 config/rename_tree_settings.json
+# Digitization audit + dossier import per-machine settings and caches
+# (runtime state, regenerated on every run — same policy as batch_sign).
+config/digitization_audit_settings.json
+config/digitization_audit_cache.json
+config/dossier_info_cache.json
 # Standalone dev benchmarks (not part of the app).
 benchmark_oneocr_vs_screenai.py
+# Local decompiled-source scratch and an accidental $TEMP dump folder.
+_decomp/
+$TEMP/

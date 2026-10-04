@@ -20,10 +20,14 @@ from PySide6.QtWidgets import (
     QLabel, QLineEdit, QTextEdit, QPushButton,
     QListWidget, QListWidgetItem, QScrollArea, QFrame,
     QMessageBox, QSizePolicy, QSplitter, QProgressBar,
-    QAbstractItemView,
+    QAbstractItemView, QHeaderView, QStackedWidget, QTreeWidget,
+    QTreeWidgetItem, QDialog, QToolButton,
 )
-from PySide6.QtCore import Qt, QTimer, Signal, QDate
-from PySide6.QtGui import QBrush, QColor, QTextOption
+from PySide6.QtCore import Qt, QTimer, Signal, QDate, QSize, QPointF
+from PySide6.QtGui import (
+    QBrush, QColor, QTextOption, QIcon, QPainter, QPainterPath, QPolygonF,
+    QPixmap,
+)
 
 from scanindex.ui.widgets.fuzzy_combobox import FuzzyComboBox
 
@@ -462,6 +466,214 @@ class _FieldLabel(QLabel):
         super().mousePressEvent(ev)
 
 
+class _DossierDocTree(QTreeWidget):
+    """Panel trái 2 cấp cho luồng NHIỀU HỒ SƠ (mục 7 của kế hoạch):
+
+        <MãĐD>-<Phông>-<MụcLục>-<Hồ sơ>      ← nhóm hồ sơ (header + counter)
+            PDF thứ nhất                     ← tài liệu (map chỉ số phẳng)
+            PDF thứ hai
+
+    Kéo-thả CHỈ xếp lại thứ tự tài liệu TRONG CÙNG hồ sơ — phát
+    ``order_changed(dossier_id, [chỉ số phẳng theo thứ tự mới])``; host phản
+    chiếu vào ``self._documents`` rồi dựng lại cây (không dùng native move
+    của QTreeWidget để cây luôn khớp danh sách nguồn). Double-click nhóm hồ
+    sơ → ``dossier_edit_requested`` (sửa thông tin hồ sơ)."""
+
+    current_doc_changed = Signal(int)      # chỉ số phẳng của tài liệu (-1 nếu nhóm)
+    order_changed = Signal(str, list)      # (dossier_id, thứ tự mới các chỉ số phẳng)
+    dossier_edit_requested = Signal(str)   # dossier_id
+
+    _IDX_ROLE = Qt.ItemDataRole.UserRole + 2        # leaf: chỉ số phẳng
+    _GROUP_ROLE = Qt.ItemDataRole.UserRole + 3      # group: dossier_id
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # Cột 0: tên hồ sơ (+ cảnh thiếu thông tin), cột 1: done/total,
+        # cột 2: nút sửa thông tin sát lề phải (yêu cầu phản hồi).
+        self.setColumnCount(3)
+        self.setHeaderHidden(True)
+        self.setUniformRowHeights(True)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.setExpandsOnDoubleClick(False)
+        self.setDragEnabled(True)
+        self.setAcceptDrops(True)
+        self.setDropIndicatorShown(True)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.setDefaultDropAction(Qt.DropAction.MoveAction)
+        header = self.header()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header.setStretchLastSection(False)
+        self.itemSelectionChanged.connect(self._emit_current)
+        self.itemDoubleClicked.connect(self._on_double_clicked)
+
+    # ── helpers ─────────────────────────────────────────────────────
+
+    def leaf_index(self, item):
+        if item is None or item.parent() is None:
+            return -1
+        return int(item.data(0, self._IDX_ROLE) or -1)
+
+    def _emit_current(self):
+        sel = self.selectedItems()
+        idx = self.leaf_index(sel[0]) if sel else -1
+        if idx >= 0:
+            self.current_doc_changed.emit(idx)
+
+    def _on_double_clicked(self, item, _col):
+        if item.parent() is None:
+            did = item.data(0, self._GROUP_ROLE)
+            if did:
+                self.dossier_edit_requested.emit(str(did))
+
+    def dropEvent(self, event):
+        """Kéo tài liệu trong CÙNG hồ sơ để đổi thứ tự — chặn native move,
+        báo host rebuilt từ danh sách nguồn."""
+        sel = self.selectedItems()
+        src = sel[0] if sel else None
+        src_idx = self.leaf_index(src)
+        if src_idx < 0 or src is None or src.parent() is None:
+            event.ignore()
+            return
+        group = src.parent()
+        target = self.itemAt(event.position().toPoint())
+        if target is None:
+            event.ignore()
+            return
+        if target is group:
+            insert_at = group.childCount()      # thả lên nhóm = cuối
+        elif target.parent() is group:
+            insert_at = group.indexOfChild(target)
+            if (self.dropIndicatorPosition()
+                    == QAbstractItemView.DropIndicatorPosition.BelowItem):
+                insert_at += 1
+        else:
+            event.ignore()
+            return  # cross-dossier drag không hỗ trợ ở phiên bản này
+        orig = [self.leaf_index(group.child(i))
+                for i in range(group.childCount())]
+        if len(orig) <= 1:
+            event.ignore()
+            return
+        order = list(orig)
+        order.remove(src_idx)
+        src_pos = orig.index(src_idx)
+        pos = insert_at if insert_at <= src_pos else insert_at - 1
+        pos = min(max(pos, 0), len(order))
+        order.insert(pos, src_idx)
+        if order == orig:
+            event.ignore()  # không đổi thứ tự gì
+            return
+        event.setDropAction(Qt.DropAction.MoveAction)
+        event.accept()
+        self.order_changed.emit(
+            str(group.data(0, self._GROUP_ROLE)), order)
+
+
+# Leaf ordinal trong hồ sơ (1..n) — lưu trên item để _apply_row_state dùng
+# đánh số TRONG PHẠM VI hồ sơ (mục 7: không tiếp bộ đếm từ hồ sơ khác).
+_DTL_ORD_ROLE = Qt.ItemDataRole.UserRole + 4
+
+
+class _TreeLeafAdapter:
+    """Trình bày leaf của ``_DossierDocTree`` theo API QListWidgetItem để
+    ``_apply_row_state`` (và các logic hàng khác) dùng chung cho cả list
+    phẳng lẫn cây đa hồ sơ — không nhân bản logic trạng thái hàng."""
+
+    def __init__(self, item: QTreeWidgetItem):
+        self._item = item
+
+    def data(self, role):
+        return self._item.data(0, role)
+
+    def text(self):
+        return self._item.text(0)
+
+    def setText(self, text):
+        self._item.setText(0, text)
+
+    def setForeground(self, brush):
+        self._item.setForeground(0, brush)
+
+    def setFlags(self, flags):
+        self._item.setFlags(flags)
+
+    def flags(self):
+        return self._item.flags()
+
+    def setToolTip(self, *_a):
+        pass  # tooltip (báo mật) gán một lần lúc dựng cây
+
+
+# Icon bút chì vẽ sẵn theo màu (cache) — không dùng glyph "✎" vì glyph
+# font chỉ có NÉT VIỀN, yêu cầu là icon ĐẶT phủ full màu.
+_PENCIL_ICON_CACHE: dict[str, QIcon] = {}
+
+
+def _pencil_icon(color: str) -> QIcon:
+    """Icon bút chì ĐẶC, ngòi quay về dưới-trái (bản lật ngang của "✎").
+    Vẽ bằng QPainter trong hệ toạ độ 24×24 (chuẩn Material "edit") để
+    không phụ thuộc font hệ thống hay asset PNG, và sắc nét ở mọi DPI."""
+    if color in _PENCIL_ICON_CACHE:
+        return _PENCIL_ICON_CACHE[color]
+    # 64px vật lý @ DPR 4 ⇒ mặt logical 16×16; painter vẽ theo toạ độ
+    # LOGICAL sau khi setDevicePixelRatio nên scale 24→16 (không phải 24→64).
+    pm = QPixmap(64, 64)
+    pm.setDevicePixelRatio(4.0)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    s = 16 / 24
+    ux, uy = 0.7071, -0.7071   # trục bút: dưới-trái → trên-phải
+    nx, ny = 0.7071, 0.7071    # pháp tuyến của trục bút
+    tx, ty = 3.4, 20.6          # chóp ngòi
+    body_len, half_w = 17.4, 2.25
+    bx, by = tx + 6.2 * ux, ty + 6.2 * uy          # chân ngòi / đầu thân
+    ex, ey = tx + body_len * ux, ty + body_len * uy  # đuôi bút
+
+    def pt(px, py):
+        return QPointF(px * s, py * s)
+
+    # Quanh bút chì: chóp ngòi → mép trên thân → đuôi → mép dưới → về chóp.
+    path = QPainterPath()
+    path.addPolygon(QPolygonF([
+        pt(tx, ty),
+        pt(bx - half_w * nx, by - half_w * ny),
+        pt(ex - half_w * nx, ey - half_w * ny),
+        pt(ex + half_w * nx, ey + half_w * ny),
+        pt(bx + half_w * nx, by + half_w * ny),
+    ]))
+    path.closeSubpath()
+    p.fillPath(path, QColor(color))
+    p.end()
+    icon = QIcon(pm)
+    _PENCIL_ICON_CACHE[color] = icon
+    return icon
+
+
+class _IconHoverButton(QToolButton):
+    """QToolButton đổi icon khi hover — QSS không đặt được màu icon, còn
+    QIcon Active mode không được style toolbutton dùng lúc hover nên phải
+    tự swap icon (bản xám mờ ↔ bản trắng)."""
+
+    def __init__(self, icon_normal: QIcon, icon_hover: QIcon, parent=None):
+        super().__init__(parent)
+        self._icon_normal = icon_normal
+        self._icon_hover = icon_hover
+        self.setIcon(icon_normal)
+        self.setIconSize(QSize(14, 14))
+
+    def enterEvent(self, event):
+        self.setIcon(self._icon_hover)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self.setIcon(self._icon_normal)
+        super().leaveEvent(event)
+
+
 class ArchiveStep2Kie(QWidget):
     """Bước 2 — danh sách + viewer + metadata KIE form."""
 
@@ -475,11 +687,19 @@ class ArchiveStep2Kie(QWidget):
     # button or drag&drop) to reopen it for editing in Step 2.
     zip_dropped = Signal(str)
 
-    def __init__(self, icons=None, parent=None):
+    def __init__(self, icons=None, parent=None, session=None):
         super().__init__(parent)
         self._icons = icons or {}
+        # Session (ArchiveSession) — chỉ dùng ở chế độ NHIỀU HỒ SƠ (đọc/
+        # sửa thông tin hồ sơ qua DossierInfoDialog). Luồng đơn (Bước 1/ZIP)
+        # không đụng session.identity.
+        self._session = session
         self._documents = []
         self._current_doc_idx = -1
+        # Chế độ nhiều hồ sơ: panel trái chuyển thành cây Hồ sơ → PDF
+        # (docs mang "_dossier_id"/"_dossier_label" từ phiên nhiều hồ sơ).
+        self._multi_mode = False
+        self._tree_items_by_idx: dict[int, object] = {}
         self._field_widgets = {}
         self._field_labels = {}
         self._lbl_so_trang_value = None  # read-only "Số trang" widget (built in _build_metadata_panel)
@@ -763,6 +983,27 @@ class ArchiveStep2Kie(QWidget):
         self.btn_stop.clicked.connect(self.stop_clicked.emit)
         self.btn_stop.setVisible(False)
         h.addWidget(self.btn_stop)
+
+        # Nhiều hồ sơ: sửa thông tin hồ sơ đang chọn (ẩn ở luồng đơn).
+        self._btn_edit_dossier = QPushButton(
+            translations.get_text("arc_step2_edit_dossier"))
+        self._btn_edit_dossier.setFixedHeight(_H)
+        self._btn_edit_dossier.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent; border: 1px solid {COLOR_BORDER};
+                border-radius: {_RAD}px; color: {COLOR_TEXT_SECONDARY};
+                font-size: {_FONT_SM}px; font-family: {FONT_UI};
+                font-weight: 600; padding: 0 12px;
+            }}
+            QPushButton:hover {{
+                background: {COLOR_ELEVATED}; color: {COLOR_TEXT};
+            }}
+        """)
+        self._btn_edit_dossier.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_edit_dossier.clicked.connect(
+            lambda: self._edit_dossier_info(None))
+        self._btn_edit_dossier.setVisible(False)
+        h.addWidget(self._btn_edit_dossier)
 
         parent_layout.addWidget(bar)
 
@@ -1160,7 +1401,31 @@ class ArchiveStep2Kie(QWidget):
         """)
         self.doc_list.currentRowChanged.connect(self._on_doc_selected)
         self.doc_list.order_changed.connect(self._on_doc_list_reordered)
-        layout.addWidget(self.doc_list, 1)
+
+        # Chế độ nhiều hồ sơ dùng cây 2 cấp Hồ sơ → PDF (cùng panel trái).
+        # Cây và list KHÔNG chạy đồng thời — QStackedWidget chuyển qua lại.
+        self.doc_tree = _DossierDocTree()
+        self.doc_tree.setStyleSheet(f"""
+            QTreeWidget {{
+                background: {COLOR_BG};
+                border: 1px solid {COLOR_BORDER};
+                border-radius: {_RAD}px;
+                outline: none;
+                font-size: {_FONT_SM}px;
+                font-family: {FONT_UI};
+            }}
+            QTreeWidget::item {{ padding: 3px 6px; }}
+            QTreeWidget::item:selected {{ background: {COLOR_ACCENT}; color: #fff; }}
+            QTreeWidget::item:hover:!selected {{ background: {COLOR_ELEVATED}; }}
+        """)
+        self.doc_tree.current_doc_changed.connect(self._on_doc_selected)
+        self.doc_tree.order_changed.connect(self._on_doc_tree_reordered)
+        self.doc_tree.dossier_edit_requested.connect(self._edit_dossier_info)
+
+        self._flist_stack = QStackedWidget()
+        self._flist_stack.addWidget(self.doc_list)   # trang 0: luồng đơn
+        self._flist_stack.addWidget(self.doc_tree)   # trang 1: nhiều hồ sơ
+        layout.addWidget(self._flist_stack, 1)
 
     # ── doc-list ordinal helpers ────────────────────────────────────
 
@@ -1331,11 +1596,11 @@ class ArchiveStep2Kie(QWidget):
 
     def _go_prev_file(self):
         if self._current_doc_idx > 0:
-            self.doc_list.setCurrentRow(self._current_doc_idx - 1)
+            self._set_current_doc_view(self._current_doc_idx - 1)
 
     def _go_next_file(self):
         if self._current_doc_idx < len(self._documents) - 1:
-            self.doc_list.setCurrentRow(self._current_doc_idx + 1)
+            self._set_current_doc_view(self._current_doc_idx + 1)
 
     def _update_doc_counter(self):
         total = len(self._documents)
@@ -1373,6 +1638,9 @@ class ArchiveStep2Kie(QWidget):
         self.btn_stop.setVisible(is_running)
         self._btn_browse_in.setEnabled(not is_running)
         self._btn_open_zip.setEnabled(not is_running)
+        # Nút "Thông tin hồ sơ" vẫn enable khi đang chạy — sửa thông tin
+        # hồ sơ không phụ thuộc kết quả OCR/KIE (identity đọc lúc xuất).
+        self._btn_edit_dossier.setVisible(self._multi_mode)
         if not is_running:
             self.hide_preprocess_progress()
 
@@ -1470,9 +1738,35 @@ class ArchiveStep2Kie(QWidget):
     def set_documents(self, documents, default_status: str = "Pending"):
         """Populate the list. With `default_status='OCR...'` (used when
         coming from Step 1) every row starts active — load spinner shown
-        until the pipeline marks it Done."""
+        until the pipeline marks it Done. Docs mang "_dossier_id" (phiên
+        nhiều hồ sơ) hiển thị thành cây Hồ sơ → PDF thay vì list phẳng."""
         self.hide_preprocess_progress()
         self._documents = documents
+        self._multi_mode = bool(documents) and all(
+            isinstance(d, dict) and d.get("_dossier_id") for d in documents
+        )
+        self._flist_stack.setCurrentIndex(1 if self._multi_mode else 0)
+        self._btn_edit_dossier.setVisible(self._multi_mode)
+        if self._multi_mode:
+            self.doc_tree.blockSignals(True)
+            self.doc_tree.clear()
+            self._tree_items_by_idx = {}
+            self.doc_tree.blockSignals(False)
+            self._rebuild_doc_tree(default_status=default_status)
+            self._current_doc_idx = -1
+            self._update_doc_counter()
+            target_row = -1
+            for i, d in enumerate(documents):
+                if self._is_preview_ready(d):
+                    target_row = i; break
+            if target_row >= 0 and not self._is_processing:
+                self._set_current_doc_view(target_row)
+            if documents:
+                try:
+                    self._ensure_trang_so_initialised()
+                except Exception:
+                    pass
+            return
         self.doc_list.blockSignals(True)
         self.doc_list.clear()
         for idx, doc in enumerate(documents, start=1):
@@ -1514,22 +1808,271 @@ class ArchiveStep2Kie(QWidget):
                 pass
 
     def update_doc_status(self, idx: int, status: str):
-        if not (0 <= idx < self.doc_list.count()):
-            return
         if not (0 <= idx < len(self._documents)):
             return
         self._documents[idx]["status"] = status
-        item = self.doc_list.item(idx)
-        if item is not None:
-            self._apply_row_state(item, self._documents[idx])
+        if self._multi_mode:
+            item = self._tree_items_by_idx.get(idx)
+            if item is not None:
+                self._apply_row_state(
+                    _TreeLeafAdapter(item), self._documents[idx],
+                    ordinal=item.data(0, _DTL_ORD_ROLE))
+            self._update_group_counters()
+        else:
+            if not (0 <= idx < self.doc_list.count()):
+                return
+            item = self.doc_list.item(idx)
+            if item is not None:
+                self._apply_row_state(item, self._documents[idx])
         if (
             not self._is_processing
             and self._current_doc_idx < 0
             and self._is_preview_ready(self._documents[idx])
         ):
-            self.doc_list.setCurrentRow(idx)
+            self._set_current_doc_view(idx)
 
-    def _apply_row_state(self, item: QListWidgetItem, doc: dict):
+    # ── nhiều hồ sơ: cây Hồ sơ → PDF ────────────────────────────────
+
+    def _doc_groups(self) -> list[tuple[str, list[int]]]:
+        """Nhóm chỉ số phẳng theo hồ sơ, GIỮ thứ tự trong `self._documents`.
+        Luồng đơn = một nhóm ẩn (toàn list) để tái dùng logic đánh số."""
+        if not self._multi_mode:
+            return [("", list(range(len(self._documents))))]
+        groups: list[tuple[str, list[int]]] = []
+        pos: dict[str, int] = {}
+        for i, d in enumerate(self._documents):
+            key = str(d.get("_dossier_id") or "")
+            if key not in pos:
+                pos[key] = len(groups)
+                groups.append((key, []))
+            groups[pos[key]][1].append(i)
+        return groups
+
+    def _rebuild_doc_tree(self, default_status: str = "Pending") -> None:
+        """Dựng lại cây Hồ sơ → PDF từ `self._documents` (nguồn sự thật)."""
+        from PySide6.QtGui import QFont
+        self.doc_tree.blockSignals(True)
+        try:
+            self.doc_tree.clear()
+            self._tree_items_by_idx = {}
+            for dossier_id, idxs in self._doc_groups():
+                label = str(
+                    self._documents[idxs[0]].get("_dossier_label")
+                    or dossier_id or "Hồ sơ")
+                group = QTreeWidgetItem(["", ""])
+                group.setData(0, _DossierDocTree._GROUP_ROLE, dossier_id)
+                font = QFont()
+                font.setBold(True)
+                group.setFont(0, font)
+                group.setFlags(group.flags()
+                               & ~Qt.ItemFlag.ItemIsSelectable)
+                self.doc_tree.addTopLevelItem(group)
+                # Nút "✎" sửa thông tin sát lề phải panel + cảnh "thiếu
+                # thông tin" (cam, in nghiêng) khi còn thiếu tên phông/tên
+                # mục lục/tên hồ sơ — nhập đủ thì về bình thường.
+                dossier = (self._session.dossier_by_id(dossier_id)
+                           if self._session is not None else None)
+                identity = getattr(dossier, "identity", None)
+                incomplete = identity is not None and (
+                    not str(getattr(identity, "ten_phong", "") or "").strip()
+                    or not str(getattr(identity, "ten_muc_luc", "") or "").strip()
+                    or not str(getattr(identity, "title", "") or "").strip())
+                if incomplete:
+                    hint = QLabel(
+                        translations.get_text(
+                            "arc_step2_missing_info_markup").format(
+                                label,
+                                translations.get_text(
+                                    "arc_step2_missing_info")))
+                    hint.setStyleSheet("background: transparent;")
+                    # setItemWidget KHÔNG ẩn text của item — QTreeWidget vẫn
+                    # tự vẽ text cột 0 bên dưới widget, nên phải để cột 0
+                    # trống (nhãn nằm trong hint) nếu không sẽ bị chữ đè chữ.
+                    self.doc_tree.setItemWidget(group, 0, hint)
+                else:
+                    group.setText(0, label)
+                btn_edit = _IconHoverButton(
+                    _pencil_icon("#9aa0a6"), _pencil_icon("#ffffff"))
+                btn_edit.setToolTip(translations.get_text(
+                    "arc_step2_edit_dossier_btn_tip"))
+                btn_edit.setCursor(Qt.CursorShape.PointingHandCursor)
+                btn_edit.setStyleSheet(
+                    "QToolButton { border: none; background: transparent;"
+                    " padding: 2px 6px; }"
+                    "QToolButton:hover {"
+                    " background: rgba(255,255,255,0.08);"
+                    " border-radius: 4px; }")
+                btn_edit.clicked.connect(
+                    lambda _=False, did=dossier_id:
+                    self.doc_tree.dossier_edit_requested.emit(did))
+                self.doc_tree.setItemWidget(group, 2, btn_edit)
+                for k, idx in enumerate(idxs, start=1):
+                    doc = self._documents[idx]
+                    if not doc.get("status"):
+                        doc["status"] = default_status
+                    name = os.path.basename(doc.get("pdf_path", ""))
+                    it = QTreeWidgetItem()
+                    it.setData(0, Qt.ItemDataRole.UserRole + 1, name)
+                    it.setData(0, Qt.ItemDataRole.UserRole, name)
+                    it.setData(0, _DossierDocTree._IDX_ROLE, idx)
+                    it.setData(0, _DTL_ORD_ROLE, k)
+                    secrecy = doc.get("_secrecy") if isinstance(doc, dict) else None
+                    if secrecy:
+                        it.setToolTip(0, f"Văn bản mật: {secrecy}")
+                    group.addChild(it)
+                    self._tree_items_by_idx[idx] = it
+                    self._apply_row_state(_TreeLeafAdapter(it), doc,
+                                          ordinal=k)
+            self.doc_tree.expandAll()
+        finally:
+            self.doc_tree.blockSignals(False)
+        self._update_group_counters()
+
+    def _update_group_counters(self) -> None:
+        """Header mỗi hồ sơ: 'done/total' theo trạng thái Done/Corrected."""
+        for dossier_id, idxs in self._doc_groups():
+            item = self._group_item(dossier_id)
+            if item is None:
+                continue
+            done = sum(
+                1 for i in idxs
+                if self._is_preview_ready(self._documents[i])
+            )
+            item.setText(1, f"{done}/{len(idxs)}")
+
+    def _group_item(self, dossier_id: str):
+        for i in range(self.doc_tree.topLevelItemCount()):
+            top = self.doc_tree.topLevelItem(i)
+            if str(top.data(0, _DossierDocTree._GROUP_ROLE) or "") == dossier_id:
+                return top
+        return None
+
+    def _tree_ordinal(self, idx: int):
+        item = self._tree_items_by_idx.get(idx)
+        return None if item is None else item.data(0, _DTL_ORD_ROLE)
+
+    def _set_current_doc_view(self, idx: int) -> None:
+        """Chọn tài liệu theo chỉ số phẳng trên widget đang dùng (signals
+        block) rồi gọi slot tải viewer trực tiếp — không chạy 2 lần."""
+        if self._multi_mode:
+            it = self._tree_items_by_idx.get(idx)
+            if it is not None:
+                self.doc_tree.blockSignals(True)
+                self.doc_tree.setCurrentItem(it)
+                self.doc_tree.blockSignals(False)
+        else:
+            self.doc_list.blockSignals(True)
+            self.doc_list.setCurrentRow(idx)
+            self.doc_list.blockSignals(False)
+        self._on_doc_selected(idx)
+
+    def _select_view_only(self, idx: int) -> None:
+        """Khôi phục selection thị giác khi người dùng HỦY đổi dòng (không
+        tải lại viewer)."""
+        if self._multi_mode:
+            it = self._tree_items_by_idx.get(idx)
+            if it is not None:
+                self.doc_tree.blockSignals(True)
+                self.doc_tree.setCurrentItem(it)
+                self.doc_tree.blockSignals(False)
+        else:
+            self.doc_list.blockSignals(True)
+            self.doc_list.setCurrentRow(idx)
+            self.doc_list.blockSignals(False)
+
+    def _on_doc_tree_reordered(self, dossier_id: str, new_order: list) -> None:
+        """Kéo-thả tài liệu trong cùng hồ sơ: phản chiếu vào `self._documents`
+        và đánh lại số trong phạm vi hồ sơ (mục 7: không tiếp bộ đếm từ hồ
+        sơ khác)."""
+        _, idxs = next(
+            ((g, ii) for g, ii in self._doc_groups() if g == dossier_id),
+            ("", []))
+        if not idxs or sorted(new_order) != sorted(idxs):
+            return
+        if not self._so_thu_tu_is_contiguous(idxs):
+            reply = QMessageBox.warning(
+                self,
+                translations.get_text("arc_step2_reorder_warn_title"),
+                translations.get_text("arc_step2_reorder_warn_body"),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                self._rebuild_doc_tree()   # nguồn chưa đổi — vẽ lại là xong
+                return
+        if self._form_dirty:
+            self._save_current_fields()
+        cur_idx = self._current_doc_idx
+        slice_docs = {i: self._documents[i] for i in idxs}
+        for pos, i in enumerate(new_order):
+            self._documents[idxs[pos]] = slice_docs[i]
+        self._resequence_so_thu_tu()
+        self._resequence_trang_so()
+        self._rebuild_doc_tree()
+        # Giữ selection trên tài liệu vừa kéo (nó đổi chỗ — theo dõi qua
+        # identity của dict, không phải chỉ số cũ).
+        if cur_idx in slice_docs:
+            moved = slice_docs[cur_idx]
+            for pos, i in enumerate(new_order):
+                if self._documents[idxs[pos]] is moved:
+                    self._current_doc_idx = idxs[pos]
+                    break
+        self._set_current_doc_view(self._current_doc_idx)
+
+    def _edit_dossier_info(self, dossier_id=None) -> None:
+        """Sửa thông tin MỘT hồ sơ (mục 7) — DossierInfoDialog hiện có,
+        chỉ ảnh hưởng hồ sơ đó; không đụng hồ sơ khác. Cho phép sửa ngay
+        cả khi OCR/KIE đang chạy: identity chỉ được đọc lúc xuất/ký ở
+        Bước 3, không nằm trong đường ồn worker."""
+        if not self._multi_mode:
+            return
+        if dossier_id is None:
+            cur = self._current_doc_idx
+            if 0 <= cur < len(self._documents):
+                dossier_id = str(
+                    self._documents[cur].get("_dossier_id") or "")
+        if not dossier_id or self._session is None:
+            return
+        dossier = self._session.dossier_by_id(dossier_id)
+        if dossier is None:
+            return
+        from scanindex.ui.dialogs.archive_session_dialog import (
+            DossierInfoDialog,
+        )
+        _, idxs = next(
+            ((g, ii) for g, ii in self._doc_groups() if g == dossier_id),
+            ("", []))
+        pages = sum(self._count_doc_pages(self._documents[i]) for i in idxs)
+        dlg = DossierInfoDialog(
+            initial=dossier.identity,
+            seed_for_unstructured=self._session.session_id,
+            parent=self,
+            actual_page_count=pages or None,
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        ident = dlg.result_codes()
+        if ident is None:
+            return
+        dossier.identity = ident
+        label = dossier.composite_label()
+        for i in idxs:
+            self._documents[i]["_dossier_label"] = label
+        self._rebuild_doc_tree()
+        self.log_message.emit(
+            translations.get_text("arc_step2_dossier_updated").format(
+                label=label))
+
+    def _row_item_data(self, item, role):
+        """Đọc data role của item ở CẢ hai loại widget: QListWidgetItem.data
+        (1 tham số) và QTreeWidgetItem.data (2 tham số)."""
+        try:
+            return item.data(role)
+        except TypeError:
+            return item.data(0, role)
+
+    def _apply_row_state(self, item: QListWidgetItem, doc: dict,
+                         ordinal=None):
         from PySide6.QtCore import Qt as _Qt
         status = doc.get("status", "") if isinstance(doc, dict) else ""
         # KIE_DONE populates json_path on the doc *before* FILE_COMPLETE
@@ -1554,13 +2097,15 @@ class ArchiveStep2Kie(QWidget):
             and status not in ("Pending", "", "OCR Done")
         )
 
-        name = (item.data(Qt.ItemDataRole.UserRole + 1)
-                or item.data(Qt.ItemDataRole.UserRole)
+        name = (self._row_item_data(item, Qt.ItemDataRole.UserRole + 1)
+                or self._row_item_data(item, Qt.ItemDataRole.UserRole)
                 or self._strip_state_prefix(item.text()))
         # Ordinal prefix is derived from the row position so the displayed
-        # number always matches the document's place in the list.
-        row = self.doc_list.row(item)
-        ordinal = row + 1 if row >= 0 else 0
+        # number always matches the document's place in the list. Ở chế độ
+        # nhiều hồ sơ, thứ tự tính TRONG PHẠM VI hồ sơ (ordinal truyền vào).
+        if ordinal is None:
+            row = self.doc_list.row(item)
+            ordinal = row + 1 if row >= 0 else 0
         selectable = item.flags() | _Qt.ItemFlag.ItemIsSelectable | _Qt.ItemFlag.ItemIsEnabled
         not_selectable = item.flags() & ~_Qt.ItemFlag.ItemIsSelectable & ~_Qt.ItemFlag.ItemIsEnabled
         if is_complete:
@@ -1603,6 +2148,21 @@ class ArchiveStep2Kie(QWidget):
     def _tick_spinner(self):
         self._spinner_idx = (self._spinner_idx + 1) % len(self._spinner_chars)
         char = self._spinner_chars[self._spinner_idx]
+        if self._multi_mode:
+            for item in self._tree_items_by_idx.values():
+                idx = int(item.data(0, _DossierDocTree._IDX_ROLE) or -1)
+                if not (0 <= idx < len(self._documents)):
+                    continue
+                status = self._documents[idx].get("status", "Pending")
+                if status in ("Pending", "Done", "Corrected", "OCR Done",
+                              "Failed", "Done (Export Failed)"):
+                    continue
+                txt = item.text(0)
+                for pos in range(len(txt)):
+                    if txt[pos] in self._spinner_chars:
+                        item.setText(0, txt[:pos] + char + txt[pos + 1:])
+                        break
+            return
         for i in range(self.doc_list.count()):
             item = self.doc_list.item(i)
             if not item or not (0 <= i < len(self._documents)):
@@ -1746,6 +2306,8 @@ class ArchiveStep2Kie(QWidget):
         self._lbl_docs.setText(translations.get_text("arc_doc_list"))
         self.btn_process.setText(translations.get_text("arc_btn_process"))
         self.btn_stop.setText(translations.get_text("arc_btn_stop"))
+        self._btn_edit_dossier.setText(
+            translations.get_text("arc_step2_edit_dossier"))
         self.set_source_mode(self._source_mode)
         self._lbl_saved_notice.setText(translations.get_text("arc_saved_notice"))
         for key, tr_key, _ in _FIELDS:
@@ -1949,9 +2511,7 @@ class ArchiveStep2Kie(QWidget):
         prev_row = self._current_doc_idx
         if prev_row != row and prev_row >= 0:
             if not self.confirm_unsaved_before_leave():
-                self.doc_list.blockSignals(True)
-                self.doc_list.setCurrentRow(prev_row)
-                self.doc_list.blockSignals(False)
+                self._select_view_only(prev_row)
                 return
         if self._form_dirty:
             self._save_current_fields()
@@ -2362,10 +2922,19 @@ class ArchiveStep2Kie(QWidget):
             meta[key] = self._field_value(key)
             self._recompute_so_thu_tu_from(idx)
 
+    def _group_end(self, anchor_idx: int) -> int:
+        """Chỉ số NGẮT của nhóm hồ sơ chứa anchor (cascade đánh số không
+        tràn sang hồ sơ khác — mục 7)."""
+        for _gid, idxs in self._doc_groups():
+            if anchor_idx in idxs:
+                return idxs[-1] + 1
+        return len(self._documents)
+
     def _recompute_trang_so_from(self, anchor_idx: int) -> None:
         """Recompute trang_so for docs after `anchor_idx` using each doc's
-        page count. Docs before/including the anchor keep their values."""
-        n = len(self._documents)
+        page count. Docs before/including the anchor keep their values.
+        Cascade dừng ở cuối CÙNG hồ sơ."""
+        n = self._group_end(anchor_idx)
         if anchor_idx < 0 or anchor_idx >= n:
             return
         try:
@@ -2387,8 +2956,9 @@ class ArchiveStep2Kie(QWidget):
 
     def _recompute_so_thu_tu_from(self, anchor_idx: int) -> None:
         """Recompute so_thu_tu for docs after `anchor_idx` as a +1
-        sequence. Docs before/including the anchor keep their values."""
-        n = len(self._documents)
+        sequence. Docs before/including the anchor keep their values.
+        Cascade dừng ở cuối CÙNG hồ sơ."""
+        n = self._group_end(anchor_idx)
         if anchor_idx < 0 or anchor_idx >= n:
             return
         try:
@@ -2405,11 +2975,14 @@ class ArchiveStep2Kie(QWidget):
             if i == self._current_doc_idx:
                 self._set_field_value("so_thu_tu", str(cur), block_signals=True)
 
-    def _so_thu_tu_values(self) -> list[int]:
+    def _so_thu_tu_values(self, indices=None) -> list[int]:
         """Collect each doc's ``so_thu_tu`` as ints; blanks become 0 so they
-        are clearly distinguishable from a valid 1."""
+        are clearly distinguishable from a valid 1. ``indices`` giới hạn
+        phạm vi (trong cùng hồ sơ ở chế độ nhiều hồ sơ)."""
         out: list[int] = []
-        for d in self._documents:
+        for i in (indices if indices is not None
+                  else range(len(self._documents))):
+            d = self._documents[i]
             raw = str((d.get("metadata", {}) or {}).get("so_thu_tu", "")).strip()
             try:
                 out.append(int(raw))
@@ -2417,14 +2990,15 @@ class ArchiveStep2Kie(QWidget):
                 out.append(0)
         return out
 
-    def _so_thu_tu_is_contiguous(self) -> bool:
+    def _so_thu_tu_is_contiguous(self, indices=None) -> bool:
         """True when the documents' so_thu_tu values form a complete
         1, 2, 3 … N sequence with no gaps and no blanks. A contiguous
         sequence means the operator can drag-reorder freely: the new order
         just re-stamps 1..N. A gap (e.g. 1,2,4,5,6,7 because slot 3 was
         skipped for a secret doc) means dragging would clobber that reserved
-        slot, so we warn first."""
-        vals = self._so_thu_tu_values()
+        slot, so we warn first. Ở chế độ nhiều hồ sơ kiểm tra TRONG PHẠM VI
+        hồ sơ (mỗi hồ sơ có bộ 1..N riêng)."""
+        vals = self._so_thu_tu_values(indices)
         if not vals:
             return True
         if any(v <= 0 for v in vals):
@@ -2433,29 +3007,35 @@ class ArchiveStep2Kie(QWidget):
 
     def _resequence_so_thu_tu(self) -> None:
         """Stamp every doc's so_thu_tu with its 1-based list position. Used
-        after a drag reorder that the operator confirmed."""
-        for i, d in enumerate(self._documents, start=1):
-            meta = d.setdefault("metadata", {})
-            meta["so_thu_tu"] = str(i)
-            if i - 1 == self._current_doc_idx:
-                self._set_field_value("so_thu_tu", str(i), block_signals=True)
+        after a drag reorder that the operator confirmed. Nhiều hồ sơ: đánh
+        số riêng từng hồ sơ (1..n trong hồ sơ)."""
+        for _gid, idxs in self._doc_groups():
+            for k, i in enumerate(idxs, start=1):
+                meta = self._documents[i].setdefault("metadata", {})
+                meta["so_thu_tu"] = str(k)
+                if i == self._current_doc_idx:
+                    self._set_field_value("so_thu_tu", str(k),
+                                          block_signals=True)
 
     def _resequence_trang_so(self) -> None:
         """Recompute trang_so for every doc as a cumulative running page
         numbering based on the NEW physical order. Doc 0 starts at 1; each
         subsequent doc starts at the previous doc's trang_so + that doc's
         page count. Used after a drag reorder so the starting-page column
-        stays consistent with the new document sequence."""
+        stays consistent with the new document sequence. Nhiều hồ sơ: bộ đếm
+        trang TÍNH RIÊNG từng hồ sơ, bắt đầu từ 1 trong hồ sơ (mục 7)."""
         if not self._documents:
             return
-        cur = 1
-        for i, d in enumerate(self._documents):
-            meta = d.setdefault("metadata", {})
-            meta["trang_so"] = str(cur)
-            if i == self._current_doc_idx:
-                self._set_field_value("trang_so", str(cur), block_signals=True)
-            pages = self._count_doc_pages(d)
-            cur = cur + max(1, pages)
+        for _gid, idxs in self._doc_groups():
+            cur = 1
+            for i in idxs:
+                meta = self._documents[i].setdefault("metadata", {})
+                meta["trang_so"] = str(cur)
+                if i == self._current_doc_idx:
+                    self._set_field_value("trang_so", str(cur),
+                                          block_signals=True)
+                pages = self._count_doc_pages(self._documents[i])
+                cur = cur + max(1, pages)
 
     def _on_doc_list_reordered(self, from_row: int, to_row: int) -> None:
         """Handle a drag-and-drop reorder inside the document list.
@@ -2508,43 +3088,48 @@ class ArchiveStep2Kie(QWidget):
         """First-run seeding: if no doc has a trang_so yet, assign the
         running numbering starting at 1. Also seeds so_thu_tu (1, 2, 3…).
         Called after KIE finishes so the export never ships empty Trang số
-        / Số thứ tự cells for VB that exist."""
+        / Số thứ tự cells for VB that exist. Nhiều hồ sơ: seed RIÊNG từng
+        hồ sơ — STT/trang số không tiếp bộ đếm từ hồ sơ trước (mục 7)."""
         n = len(self._documents)
         if n == 0:
             return
         from scanindex.core.digitization.metadata_export import (
             compute_trang_so, compute_so_thu_tu,
         )
-        need_trang = not any(
-            str((d.get("metadata", {}) or {}).get("trang_so", "")).strip()
-            for d in self._documents
-        )
-        need_stt = not any(
-            str((d.get("metadata", {}) or {}).get("so_thu_tu", "")).strip()
-            for d in self._documents
-        )
-        if not (need_trang or need_stt):
-            return  # both already populated — don't clobber user edits
-        page_counts = [self._count_doc_pages(d) for d in self._documents]
-        trang = compute_trang_so(page_counts, first_default=1)
-        stt = compute_so_thu_tu(n, first_default=1)
-        for i, d in enumerate(self._documents):
-            meta = d.setdefault("metadata", {})
-            if need_trang:
-                meta["trang_so"] = str(trang[i])
-            if need_stt:
-                meta["so_thu_tu"] = str(stt[i])
+        changed = False
+        for _gid, idxs in self._doc_groups():
+            need_trang = not any(
+                str((self._documents[i].get("metadata", {}) or {})
+                    .get("trang_so", "")).strip()
+                for i in idxs
+            )
+            need_stt = not any(
+                str((self._documents[i].get("metadata", {}) or {})
+                    .get("so_thu_tu", "")).strip()
+                for i in idxs
+            )
+            if not (need_trang or need_stt):
+                continue  # both already populated — don't clobber user edits
+            page_counts = [self._count_doc_pages(self._documents[i])
+                           for i in idxs]
+            trang = compute_trang_so(page_counts, first_default=1)
+            stt = compute_so_thu_tu(len(idxs), first_default=1)
+            for k, i in enumerate(idxs):
+                meta = self._documents[i].setdefault("metadata", {})
+                if need_trang:
+                    meta["trang_so"] = str(trang[k])
+                if need_stt:
+                    meta["so_thu_tu"] = str(stt[k])
+            changed = True
         # Refresh the visible row's widgets if their metadata was just seeded.
-        if 0 <= self._current_doc_idx < n:
+        if changed and 0 <= self._current_doc_idx < n:
             cur_meta = self._documents[self._current_doc_idx].get("metadata", {}) or {}
-            if need_trang:
-                self._set_field_value(
-                    "trang_so", str(cur_meta.get("trang_so", "")),
-                    block_signals=True)
-            if need_stt:
-                self._set_field_value(
-                    "so_thu_tu", str(cur_meta.get("so_thu_tu", "")),
-                    block_signals=True)
+            self._set_field_value(
+                "trang_so", str(cur_meta.get("trang_so", "")),
+                block_signals=True)
+            self._set_field_value(
+                "so_thu_tu", str(cur_meta.get("so_thu_tu", "")),
+                block_signals=True)
 
     def _show_saved_notice(self):
         self._lbl_saved_notice.setText(translations.get_text("arc_saved_notice"))
