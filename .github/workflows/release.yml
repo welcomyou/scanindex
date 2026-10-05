@@ -49,6 +49,11 @@ jobs:
           if ($config -notmatch '(?m)^language\s*=\s*vi\s*$') {
             throw 'settings.ini.example must default to Vietnamese for release builds.'
           }
+          $freshSettings = Join-Path $env:RUNNER_TEMP 'scanindex-fresh-settings.ini'
+          python -c "import sys; from scanindex.infra.translations import read_startup_language; assert read_startup_language(sys.argv[1]) == 'vi'" $freshSettings
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Fresh startup must use Vietnamese without a saved settings file.'
+          }
 
       - name: Download and verify offline models
         run: python scripts/download_offline_models.py
@@ -63,6 +68,11 @@ jobs:
           $version = (Get-Content -LiteralPath VERSION -Raw).Trim()
           $folder = "dist\ScanIndex-$version"
           $archive = "dist\ScanIndex-$version.7z"
+          $liveSettings = Get-ChildItem -LiteralPath $folder -File -Filter 'settings*.ini' |
+            Where-Object { $_.Name -ne 'settings.ini.example' }
+          if ($liveSettings) {
+            throw "Portable build contains a live settings file that could override Vietnamese."
+          }
           $screenAiDll = Get-ChildItem -LiteralPath "$folder\models\screen_ai" `
             -Recurse -File -Filter "chrome_screen_ai.dll" -ErrorAction SilentlyContinue |
             Select-Object -First 1

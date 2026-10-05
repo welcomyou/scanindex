@@ -1,6 +1,8 @@
 
+import configparser
 import re
 from functools import lru_cache
+from os import PathLike
 
 from scanindex.infra.ui_text_catalog import UI_TEXT_PAIRS
 from scanindex.infra.ui_log_text_catalog import UI_LOG_TEXT_PAIRS
@@ -835,6 +837,17 @@ class Localization:
 
 # Global instance
 current_locale = Localization("vi")
+
+
+def read_startup_language(settings_path: str | PathLike[str]) -> str:
+    """Use Vietnamese on a fresh install; honour a saved language choice."""
+    try:
+        config = configparser.ConfigParser()
+        config.read(settings_path, encoding="utf-8")
+        language = config.get("General", "Language", fallback="vi").strip().lower()
+    except (OSError, UnicodeError, configparser.Error):
+        return "vi"
+    return language if language in {"vi", "en"} else "vi"
 
 def get_text(key, *args):
     return current_locale.get(key, *args)

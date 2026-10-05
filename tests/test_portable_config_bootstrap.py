@@ -11,6 +11,7 @@ seeding and upgrade migration moved to :mod:`scanindex.infra.data_versioning`
 from pathlib import Path
 
 from scanindex.infra import paths
+from scanindex.infra.translations import read_startup_language
 
 
 def test_ensure_runtime_files_no_longer_seeds_config(tmp_path, monkeypatch):
@@ -34,3 +35,25 @@ def test_copy_failure_does_not_remove_an_existing_runtime_file(tmp_path):
     with __import__("pytest").raises(FileNotFoundError):
         paths._copy_file_if_missing(tmp_path / "missing.example", target_path)
     assert target_path.read_text(encoding="utf-8") == "keep-settings\n"
+
+
+def test_fresh_portable_startup_defaults_to_vietnamese(tmp_path):
+    settings = tmp_path / "settings-1.1.16.ini"
+    assert read_startup_language(settings) == "vi"
+    assert not settings.exists()  # reading the default does not create settings
+
+
+def test_saved_language_choice_is_respected(tmp_path):
+    settings = tmp_path / "settings-1.1.16.ini"
+    settings.write_text("[General]\nLanguage = en\n", encoding="utf-8")
+    assert read_startup_language(settings) == "en"
+    settings.write_text("[General]\nLanguage = vi\n", encoding="utf-8")
+    assert read_startup_language(settings) == "vi"
+
+
+def test_bad_settings_fall_back_to_vietnamese(tmp_path):
+    settings = tmp_path / "settings-1.1.16.ini"
+    settings.write_text("[General]\nLanguage = unknown\n", encoding="utf-8")
+    assert read_startup_language(settings) == "vi"
+    settings.write_text("[General\n", encoding="utf-8")
+    assert read_startup_language(settings) == "vi"

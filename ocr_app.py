@@ -146,15 +146,11 @@ def main():
     # language is respected from the first visible frame.
     from scanindex.infra import translations
     try:
-        import configparser
         from scanindex.infra.data_versioning import get_active_settings_path
-        _language_cfg = configparser.ConfigParser()
-        _language_cfg.read(get_active_settings_path(), encoding="utf-8")
-        translations.set_lang(
-            _language_cfg.get("General", "Language", fallback="en")
-        )
+        translations.set_lang(translations.read_startup_language(
+            get_active_settings_path()))
     except Exception:
-        translations.set_lang("en")
+        translations.set_lang("vi")
     translations.install_event_filter(app)
     app.setApplicationName("ScanIndex")
     app.setApplicationDisplayName(f"ScanIndex {_ver}")

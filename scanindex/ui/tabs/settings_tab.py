@@ -25,7 +25,7 @@ class SettingsTab(QWidget):
     log_panel_toggled = Signal(bool)
     reset_archive_requested = Signal()
 
-    def __init__(self, current_language: str = "en", parent=None):
+    def __init__(self, current_language: str = "vi", parent=None):
         super().__init__(parent)
         self._current_language = current_language
         self._current_theme = "dark"

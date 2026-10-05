@@ -13,7 +13,6 @@ import os
 import sys
 import threading
 import time
-import configparser
 from collections import OrderedDict, deque
 from functools import partial
 from pathlib import Path
@@ -4326,11 +4325,10 @@ def main():
     from scanindex.infra import translations
     try:
         from scanindex.infra.data_versioning import get_active_settings_path
-        cfg = configparser.ConfigParser()
-        cfg.read(get_active_settings_path(), encoding="utf-8")
-        translations.set_lang(cfg.get("General", "Language", fallback="en"))
+        translations.set_lang(translations.read_startup_language(
+            get_active_settings_path()))
     except Exception:
-        translations.set_lang("en")
+        translations.set_lang("vi")
     translations.install_event_filter(app)
     app.setStyle("Fusion")
     viewer = KieViewer()
