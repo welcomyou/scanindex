@@ -11,10 +11,11 @@ PDF/A. Tên file kiểm tra quy ước hồ sơ ``<MãĐĐ>-<Phông>-<ML 2 số>
 
 TIFF (qua Pillow — ``audit_tiff``): bản bảo hiểm lưu trữ 1 tệp = 1 trang,
 không nén (nén lossless chỉ cảnh báo, lossy trượt), DPI/màu như PDF và
-quy ước tên trang ``…-<Trang 3 số>.tif`` khớp thư mục cha + chuỗi trang
+quy ước tên trang ``<MãĐĐ>-<Phông>-<Mục lục>-<ĐVBC>-<Trang>.tif``
+khớp thư mục hồ sơ + chuỗi trang
 liên tục (chỉ cảnh báo). ``audit_file`` chọn hàm theo đuôi file.
 
-``scan_tree_stats`` đếm tài liệu/trang (PDF + TIFF) theo từng thư mục
+``scan_tree_stats`` đếm tệp/trang (PDF + TIFF) theo từng thư mục
 trong cây CSDL_SOHOA (cấp thư mục xem
 ``scanindex.core.rename_tree.level_of``).
 """
@@ -23,6 +24,7 @@ from __future__ import annotations
 import os
 import re
 import threading
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -515,16 +517,16 @@ _TIFF_COMPRESSION_NAMES = {
     32773: "PackBits", 32946: "Deflate", 34712: "JPEG 2000",
 }
 
-# Tên trang ``<MãĐĐ>-<Phông>-<ML 2 số>-<ĐVBC 4 số>-<Trang 3 số>`` — thống
-# nhất quy ước hồ sơ với PDF (_pdf_name_check), phông tùy ý chỉ cấm "-".
+# TIFF đánh số trang liên tục trong HỒ SƠ, độc lập với số văn bản PDF.
+# ĐVBC gồm 4 chữ số, có thể thêm ký tự phân biệt số trùng (vd. 0123a).
 _TIFF_NAME_RE = re.compile(
-    r"^(?P<mdd>[^-]+)-(?P<phong>[^-]+)-(?P<ml>\d{2})-(?P<dvbc>\d{4})"
-    r"-(?P<trang>\d{3})$")
+    r"^(?P<mdd>[^-]+)-(?P<phong>[0-9]{3})-(?P<ml>[0-9]{2})-"
+    r"(?P<dvbc>[0-9]{4}[A-Za-z]?)-(?P<trang>[0-9]{3})$")
 
 
 @dataclass(frozen=True)
 class TiffName:
-    """Tên trang TIFF ``<MãĐĐ>-<Phông>-<ML>-<ĐVBC>-<Trang>`` (đã khớp mẫu)."""
+    """Tên trang TIFF ``<MãĐĐ>-<Phông>-<ML>-<ĐVBC>-<Trang>``."""
     ma_dinh_danh: str
     ma_phong: str
     muc_luc: str
@@ -611,8 +613,8 @@ def _tiff_name_check(path: Path) -> tuple[bool | None, str, str]:
     sequence_warning)`` — vi phạm tên/chuỗi trang chỉ CẢNH BÁO."""
     parsed = parse_tiff_name(path.name)
     if parsed is None:
-        return False, ("không khớp quy ước <MãĐĐ>-<Phông>-<Mục lục 2 số>"
-                       "-<Đơn vị bảo quản 4 số>-<Trang 3 số>.tif"), ""
+        return False, ("không khớp quy ước <MãĐĐ>-<Phông 3 số>-<Mục lục 2 số>"
+                       "-<ĐVBC 4 số và ký tự trùng nếu có>-<Trang 3 số>.tif"), ""
     bad: list[str] = []
     parent = rt.parse_dossier_folder_name(path.parent.name)
     if parent is None:
@@ -621,31 +623,32 @@ def _tiff_name_check(path: Path) -> tuple[bool | None, str, str]:
           parent.ho_so) != (parsed.ma_dinh_danh, parsed.ma_phong,
                             parsed.muc_luc, parsed.don_vi_bao_quan):
         bad.append("4 mã đầu của tên file không khớp thư mục hồ sơ chứa")
-    seq_warn = ""
+    if int(parsed.trang) == 0:
+        bad.append("số trang phải bắt đầu từ 001")
     try:
         siblings = [e for e in path.parent.iterdir()
                     if e.suffix.lower() in (".tif", ".tiff")]
     except OSError:
         siblings = []
-    if len(siblings) > 1:
-        nums: list[int] = []
-        dupes: list[str] = []
-        for s in siblings:
-            q = parse_tiff_name(s.name)
-            if q is None or not q.trang.isdigit():
-                continue
-            n = int(q.trang)
-            if n in nums:
-                dupes.append(q.trang)
-            nums.append(n)
-        if dupes:
-            seq_warn = "số trang bị trùng: " + ", ".join(sorted(set(dupes)))
-        else:
-            missing = sorted(set(range(1, max(nums, default=0) + 1))
-                             - set(nums))
-            if missing:
-                seq_warn = ("thiếu trang: " + ", ".join(
-                    str(t).zfill(3) for t in missing[:10]))
+    nums: list[int] = []
+    for sibling in siblings:
+        other = parse_tiff_name(sibling.name)
+        if (other is not None and int(other.trang) > 0
+                and (other.ma_dinh_danh, other.ma_phong,
+                     other.muc_luc, other.don_vi_bao_quan)
+                == (parsed.ma_dinh_danh, parsed.ma_phong,
+                    parsed.muc_luc, parsed.don_vi_bao_quan)):
+            nums.append(int(other.trang))
+    warnings: list[str] = []
+    dupes = sorted(n for n, count in Counter(nums).items() if count > 1)
+    if dupes:
+        warnings.append("số trang bị trùng: " + ", ".join(
+            str(n).zfill(3) for n in dupes))
+    missing = sorted(set(range(1, max(nums, default=0) + 1)) - set(nums))
+    if missing:
+        warnings.append("thiếu trang: " + ", ".join(
+            str(n).zfill(3) for n in missing[:10]))
+    seq_warn = "; ".join(warnings)
     if bad:
         return False, "; ".join(bad), seq_warn
     return True, "", seq_warn
@@ -780,12 +783,15 @@ def audit_file(path: str | os.PathLike, *, quick: bool = False,
 @dataclass
 class FolderStats:
     root: str
-    total_docs: int = 0
+    total_docs: int = 0  # số tệp PDF/TIFF; TIFF không cho biết số văn bản
     total_pages: int = 0
-    # rel posix của thư mục ("": gốc) → (số tài liệu, số trang) toàn subtree.
+    # rel posix của thư mục ("": gốc) → (số tệp, số trang) toàn subtree.
     dir_stats: dict[str, tuple[int, int]] = field(default_factory=dict)
-    # rel posix của thư mục → tổng dung lượng subtree (byte, chỉ file PDF).
+    # rel posix của thư mục → tổng dung lượng PDF/TIFF trong subtree (byte).
     dir_sizes: dict[str, int] = field(default_factory=dict)
+    # Thư mục lá là hồ sơ; thống kê số hồ sơ trong từng nhánh.
+    dir_dossiers: dict[str, int] = field(default_factory=dict)
+    dirs_with_subfolders: set[str] = field(default_factory=set)
     total_size: int = 0
     level_counts: dict[str, int] = field(default_factory=lambda: {
         "mdd": 0, "phong": 0, "muc_luc": 0, "ho_so": 0})
@@ -801,6 +807,31 @@ class FolderStats:
         if not rel:
             return self.total_size
         return self.dir_sizes.get(rel, 0)
+
+    def dossier_count_of_rel(self, rel: str | None) -> int:
+        return self.dir_dossiers.get(rel or "", 0)
+
+    def has_subfolders(self, rel: str | None) -> bool:
+        return (rel or "") in self.dirs_with_subfolders
+
+
+def populate_dossier_folder_stats(stats: FolderStats) -> None:
+    """Count leaf dossier folders once for every ancestor folder."""
+    dirs = set(stats.dir_stats)
+    parents = set()
+    for rel in dirs:
+        if rel:
+            parents.add(rel.rsplit("/", 1)[0] if "/" in rel else "")
+    stats.dirs_with_subfolders = parents
+    counts: dict[str, int] = {}
+    for rel in dirs - parents - {""}:
+        current = rel
+        while True:
+            counts[current] = counts.get(current, 0) + 1
+            if not current:
+                break
+            current = current.rsplit("/", 1)[0] if "/" in current else ""
+    stats.dir_dossiers = counts
 
 
 def count_pages(path: Path, cache: dict | None = None) -> int:
@@ -825,7 +856,7 @@ def count_pages(path: Path, cache: dict | None = None) -> int:
 
 def scan_tree_stats(root: Path, *, page_cache: dict | None = None,
                     progress_cb=None, cancel_cb=None) -> FolderStats:
-    """Đếm tài liệu (PDF) + trang theo subtree cho từng thư mục dưới root.
+    """Đếm tệp PDF/TIFF + trang theo subtree cho từng thư mục dưới root.
 
     ``progress_cb(docs_so_far, pdf_path)`` báo tiến độ; ``cancel_cb`` trả
     True để dừng giữa chừng.
@@ -837,6 +868,7 @@ def scan_tree_stats(root: Path, *, page_cache: dict | None = None,
         nonlocal docs_seen
         docs = 0
         pages = 0
+        size = 0
         try:
             entries = sorted(path.iterdir(), key=lambda p: p.name.lower())
         except OSError:
@@ -848,6 +880,7 @@ def scan_tree_stats(root: Path, *, page_cache: dict | None = None,
             if entry.is_dir():
                 child_rel = entry.relative_to(root).as_posix()
                 sub_docs, sub_pages = walk(entry, child_rel)
+                size += stats.dir_sizes.get(child_rel, 0)
                 level = rt.level_of(Path(child_rel))
                 if level is rt.Level.MA_DINH_DANH:
                     stats.level_counts["mdd"] += 1
@@ -860,6 +893,10 @@ def scan_tree_stats(root: Path, *, page_cache: dict | None = None,
                 docs += sub_docs
                 pages += sub_pages
             elif entry.suffix.lower() == ".pdf":
+                try:
+                    size += entry.stat().st_size
+                except OSError:
+                    pass
                 docs_seen += 1
                 if progress_cb is not None:
                     progress_cb(docs_seen, entry)
@@ -871,6 +908,10 @@ def scan_tree_stats(root: Path, *, page_cache: dict | None = None,
                 docs += 1
                 pages += n
             elif entry.suffix.lower() in (".tif", ".tiff"):
+                try:
+                    size += entry.stat().st_size
+                except OSError:
+                    pass
                 # TIFF chuẩn là 1 tệp = 1 trang — không đọc file (.tif và
                 # .tiff cùng định dạng, đếm ngang hàng).
                 docs_seen += 1
@@ -879,7 +920,10 @@ def scan_tree_stats(root: Path, *, page_cache: dict | None = None,
                 docs += 1
                 pages += 1
         stats.dir_stats[rel] = (docs, pages)
+        stats.dir_sizes[rel] = size
         return docs, pages
 
     stats.total_docs, stats.total_pages = walk(root, "")
+    stats.total_size = stats.dir_sizes.get("", 0)
+    populate_dossier_folder_stats(stats)
     return stats

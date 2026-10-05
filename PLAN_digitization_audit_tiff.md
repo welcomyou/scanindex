@@ -1,5 +1,11 @@
 # Kế hoạch bổ sung Thẩm định số hóa cho file TIFF (+ rà soát thẩm định PDF)
 
+> **Đính chính 05/10/2026:** Tên TIFF có 5 đoạn:
+> `<MãĐĐ>-<Phông 3 số>-<Mục lục 2 số>-<ĐVBC 4 số, kèm ký tự số trùng nếu có>-<Trang 3 số>.tif`.
+> Ví dụ `A38-011-07-0123-001.tif`, `A38-011-07-0123-002.tif`.
+> Một tệp là một trang; số trang chạy liên tục trong hồ sơ, không theo số văn bản.
+> Các đoạn cũ nói phông TIFF tùy ý hoặc ĐVBC chỉ có đúng 4 ký tự đã được thay thế.
+
 > Trạng thái: **ĐÃ TRIỂN KHAI 03/10/2026** — core + UI + tests xong
 > (`test_digitization_audit.py` 28/28, `test_digitization_audit_screen.py`
 > 4/4 pass). Căn cứ: Hướng dẫn 40/HD-VPTW (07/11/2018) và
@@ -48,11 +54,12 @@ CV 14748 **bổ sung mã định danh vào tên thư mục** (trước khi sửa
 chỉ gồm phông–mục lục–đơn vị bảo quản):
 
 ```
-Thư mục hồ sơ:   <MãĐĐ>-<Phông 3 số>-<MụcLục 2 số>-<ĐVBC 4 số>        VD: A38-011-07-0123
+Thư mục hồ sơ:   <MãĐĐ>-<Phông 3 số>-<MụcLục 2 số>-<ĐVBC 4 số + ký tự trùng nếu có>  VD: A38-011-07-0123
 Thư mục tài liệu:<MãĐĐ>-<Phông>-<MụcLục>-<ĐVBC>-<STT 3 số>             VD: A38-011-07-0123-001
 Tệp .pdf:        <MãĐĐ>-<Phông>-<MụcLục>-<ĐVBC>-<STT 3 số>.pdf         VD: A38-011-07-0123-001.pdf
                  (có thể kèm siêu dữ liệu: …-001-BC-0001-1998.pdf)
-Tệp .tif:        <MãĐĐ>-<Phông>-<MụcLục>-<ĐVBC>-<Trang 3 số>.tif       VD: A38-011-07-0123-001.tif, -002.tif, -003.tif…
+Tệp .tif:        <MãĐĐ>-<Phông 3 số>-<MụcLục 2 số>-<ĐVBC 4 số + ký tự trùng nếu có>-<Trang 3 số>.tif
+                 VD: A38-011-07-0123-001.tif, A38-011-07-0123-002.tif…
 ```
 
 - Số thiếu ký tự phải pad 0 phía trước; dấu nối là `-` không có khoảng trắng.
@@ -167,14 +174,13 @@ trong `requirements.txt`, không thêm phụ thuộc):
 ### 4.2. Validator tên file — `parse_tiff_name()` trong cùng module
 
 ```python
-TIFF_NAME_RE   = r"^(?P<mdd>[^-]+)-(?P<phong>[^-]+)-(?P<ml>\d{2})-(?P<dvbc>\d{4})-(?P<trang>\d{3})$"
-FOLDER_NAME_RE = r"^(?P<mdd>[^-]+)-(?P<phong>[^-]+)-(?P<ml>\d{2})-(?P<dvbc>\d{4})$"
+TIFF_NAME_RE   = r"^(?P<mdd>[^-]+)-(?P<phong>[0-9]{3})-(?P<ml>[0-9]{2})-(?P<dvbc>[0-9]{4}[A-Za-z]?)-(?P<trang>[0-9]{3})$"
+FOLDER_NAME_RE = r"^(?P<mdd>[^-]+)-(?P<phong>[0-9]{3})-(?P<ml>[0-9]{2})-(?P<dvbc>[0-9]{4}[A-Za-z]?)$"
 ```
 
-- `<mdd>`, `<phong>`: **tùy ý** (chỉ cấm dấu "-", khớp nguyên tắc
-  `validate_component` của `rename_tree`) — nhận cả mã chấm phân cấp
-  `A29.244.01.002` lẫn mã số `A38`/`011`; `<ml>` 2 số, `<dvbc>` 4 số,
-  `<trang>` 3 số (thiếu thì pad 0).
+- `<mdd>` không chứa dấu "-"; `<phong>` 3 số, `<ml>` 2 số, `<dvbc>`
+  4 số với một ký tự phân biệt số trùng nếu có (ví dụ `0123a`), `<trang>`
+  3 số và bắt đầu từ 001. Số thiếu ký tự phải thêm 0 phía trước.
 - Kiểm tra: (1) tên file khớp mẫu; (2) **tên thư mục cha khớp mẫu và 4 mã đầu
   trùng với 4 mã của file**.
 - **Đuôi `.tif` / `.tiff`** (chốt lại 04/10/2026): hai đuôi là CÙNG định
@@ -183,8 +189,7 @@ FOLDER_NAME_RE = r"^(?P<mdd>[^-]+)-(?P<phong>[^-]+)-(?P<ml>\d{2})-(?P<dvbc>\d{4}
   không phân biệt hoa/thường trên đuôi).
 - **Chính sách:** tên lệch quy ước → `name_ok=False`, **chỉ cảnh báo vàng** như
   PDF (mục 5.3) — không trượt, không setting ép.
-- **Nhất quán với mục 5.3:** quy ước tên TIFF đã chốt thống nhất với PDF — phông
-  tùy ý, MụcLục 2 số, ĐVBC 4 số, Trang 3 số; khác PDF chỉ ở đoạn cuối là *trang*
+- **Đoạn cuối:** khác PDF ở đoạn cuối là *trang* trong hồ sơ
   thay vì *STT tài liệu*.
 - Tuần tự trang: nhóm file .tif theo thư mục cha, sort theo `trang`, báo
   "thiếu trang 005" / "trùng trang 003" / "không bắt đầu từ 001".
@@ -207,7 +212,7 @@ Nội dung thẻ chỉ tiêu TIFF (thay thẻ OCR/ký số không áp dụng):
 [Chế độ màu]    RGB 24 bit — xám/1-bit trượt (màu bắt buộc)   — nặng
 [Độ nén]        Không nén = xanh · lossless = vàng · lossy = đỏ — lossy mới trượt
 [Số trang/tệp]  Đúng 1 trang (n_frames == 1)          — nặng
-[Tên quy ước]   <MãĐĐ>-<Phông>-<ML 2 số>-<ĐVBC 4 số>-<Trang 3 số>.tif, khớp thư mục cha, trang liên tiếp — cảnh báo vàng
+[Tên quy ước]   <MãĐĐ>-<Phông 3 số>-<ML 2 số>-<ĐVBC 4 số + ký tự trùng>-<Trang 3 số>.tif, khớp thư mục cha, trang liên tiếp — cảnh báo vàng
 ```
 
 Verdict nặng của TIFF = `dpi_ok AND color_ok AND single_page_ok AND nén không
@@ -334,8 +339,8 @@ gây hại, chỉ xóa khi tiện.
    TIFF — nhận ngang hàng cả hai, không ép đuôi, không cảnh báo. Việc thống
    nhất một đuôi (nếu cần cho kho đồng bộ mẫu `*.tif`) là việc của công cụ
    đổi tên, không phải của thẩm định.
-4. **Tên TIFF:** thống nhất quy ước với PDF (mục 5.3) — phông **tùy ý**, MụcLục
-   2 số, ĐVBC 4 số, Trang 3 số; lệch quy ước = cảnh báo vàng, không trượt.
+4. **Tên TIFF:** MãĐĐ, phông 3 số, mục lục 2 số, ĐVBC 4 số với ký tự số
+   trùng nếu có, trang 3 số; lệch quy ước = cảnh báo vàng, không trượt.
 5. **Trước đó đã chốt:** tên PDF cảnh báo vàng theo quy ước CSDL_SOHOA (5.3);
    600 dpi cảnh báo vàng cho khổ ≤ ~70% A4, hằng số `A4_SMALL_SCALE = 0.72` để
    bao trọn A5 (5.2 — chỉnh 1 số nếu muốn đúng 0,70); OCR giữ cảnh báo vàng,

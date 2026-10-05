@@ -4,8 +4,8 @@ số hóa.
 Giao diện giống "Đổi tên theo cây thư mục": chọn thư mục gốc, cây 4 cấp
 CSDL_SOHOA với icon màu tương tự; KHÔNG đổi tên / kéo thả / sửa gì.
 
-  * Bấm thư mục → bên phải hiện Số tài liệu / Số trang / Dung lượng
-    (tính file PDF + TIFF — TIFF chuẩn 1 tệp = 1 trang; đếm nền).
+  * Bấm thư mục cha → Số hồ sơ / Số trang / Dung lượng; thư mục lá →
+    Số trang / Dung lượng (PDF + TIFF; TIFF chuẩn 1 tệp = 1 trang).
   * Bấm PDF/TIFF → preview (viewer PDF / ảnh TIFF) + thẻ chỉ tiêu 2 dòng
     kèm chip tổng kết. PDF: Scan màu, DPI, Độ nén, Đã OCR, Ký số, Đặt tên
     đúng. TIFF: Scan màu, DPI, Độ nén, Số trang/tệp, Đặt tên đúng. Màu
@@ -99,7 +99,7 @@ _COLOR_FAIL_FG = _STATUS_LOOK["fail"][0]
 class _TreeAuditWorker(QThread):
     """Một lượt đi duy nhất trên cây: quét nhanh từng file PDF/TIFF (TIFF
     đọc header rẻ nên luôn đầy đủ; PDF bỏ text/filter) để gắn dấu ❗, đồng
-    thời tích lũy Số tài liệu / Số trang / Dung lượng theo subtree (chỉ
+    thời tích lũy Số tệp / Số trang / Dung lượng theo subtree (chỉ
     tính PDF + .tif, bỏ qua file khác). Mỗi lần quét đều đọc lại file
     (không cache) để luôn phản ánh hiện trạng mới nhất."""
 
@@ -118,8 +118,8 @@ class _TreeAuditWorker(QThread):
         self._cancel = True
 
     def run(self):
-        # Lượt 1 (rẻ, không mở PDF): scandir liệt kê PDF + cộng dung lượng
-        # PDF (bỏ qua file khác). entry.stat() lấy size từ dir-entry nên
+        # Lượt 1 (rẻ, không mở tệp): scandir liệt kê PDF/TIFF và cộng
+        # dung lượng. entry.stat() lấy size từ dir-entry nên
         # gần như miễn phí.
         pdfs: list[Path] = []
         dir_rels: set[str] = set()
@@ -189,8 +189,8 @@ class _TreeAuditWorker(QThread):
         if self._cancel:
             return
 
-        # Tích lũy Số tài liệu / Số trang theo subtree (giữ semantics của
-        # scan_tree_stats: file lỗi đếm là tài liệu, 0 trang).
+        # Tích lũy Số tệp / Số trang theo subtree (file lỗi vẫn là 1 tệp,
+        # 0 trang; TIFF là tệp trang, không suy ra số văn bản trong hồ sơ).
         stats = da.FolderStats(root=str(self._root))
         stats.unreadable = unreadable
         dir_docs: dict[str, int] = {}
@@ -207,7 +207,8 @@ class _TreeAuditWorker(QThread):
         stats.total_pages = dir_pages.get("", 0)
         stats.dir_stats = {d: (dir_docs.get(d, 0), dir_pages.get(d, 0))
                            for d in dir_rels}
-        # Tổng dung lượng PDF theo subtree: dung lượng trực tiếp của từng
+        da.populate_dossier_folder_stats(stats)
+        # Tổng dung lượng PDF/TIFF theo subtree: dung lượng trực tiếp của từng
         # thư mục cộng lên tổ tiên.
         dir_sizes: dict[str, int] = {}
         for d, s in direct_size.items():
@@ -321,6 +322,12 @@ def _fmt_size(n: int) -> str:
                     translations.current_locale.lang == "vi" else value) + f" {unit}"
         v /= 1024
     return f"{n} B"
+
+
+def _fmt_count(n: int) -> str:
+    value = f"{n:,}"
+    return (value.replace(",", ".") if
+            translations.current_locale.lang == "vi" else value)
 
 
 def _audit_text(value: str) -> str:
@@ -540,9 +547,9 @@ class DigitizationAuditScreen(ScreenContent):
 
         self.info_stack = QStackedWidget()
 
-        # Trang 0: chưa chọn gì / file không phải PDF.
+        # Trang 0: chưa chọn gì / file không phải PDF/TIFF.
         empty = QLabel(
-            "Chọn một thư mục để xem Số tài liệu / Số trang,\n"
+            "Chọn một thư mục để xem thống kê trang và dung lượng,\n"
             "hoặc chọn file PDF/TIFF để thẩm định chất lượng số hóa.")
         empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
         empty.setStyleSheet(
@@ -550,14 +557,15 @@ class DigitizationAuditScreen(ScreenContent):
         )
         self.info_stack.addWidget(empty)               # trang 0
 
-        # Trang 1: thư mục — Số tài liệu / Số trang.
+        # Trang 1: thư mục cha có hồ sơ/trang/dung lượng, lá có trang/dung lượng.
         folder_page = QWidget()
         fv = QVBoxLayout(folder_page)
         fv.setContentsMargins(0, 0, 0, 0)
         fv.setSpacing(SP[2])
         cards = QHBoxLayout()
         cards.setSpacing(SP[2])
-        self.lbl_doc_count = self._stat_card(cards, "Số tài liệu")
+        self.lbl_doc_count = self._stat_card(cards, "Số hồ sơ")
+        self.card_dossier_count = self.lbl_doc_count.parentWidget()
         self.lbl_page_count = self._stat_card(cards, "Số trang")
         self.lbl_dir_size = self._stat_card(cards, "Dung lượng")
         fv.addLayout(cards)
@@ -649,7 +657,7 @@ class DigitizationAuditScreen(ScreenContent):
         return panel
 
     def _stat_card(self, layout: QHBoxLayout, title: str) -> QLabel:
-        """Một thẻ số liệu lớn (Số tài liệu / Số trang)."""
+        """Một thẻ số liệu lớn trong phần thống kê thư mục."""
         card = QFrame()
         card.setObjectName("StatCard")
         card.setStyleSheet(
@@ -776,7 +784,7 @@ class DigitizationAuditScreen(ScreenContent):
 
     def _start_tree_audit(self):
         """Một lượt đi duy nhất trên cây: quét nhanh từng file PDF/TIFF
-        để gắn dấu ❗, đồng thời đếm Số tài liệu / Số trang / Dung lượng.
+        để gắn dấu ❗, đồng thời đếm Số tệp / Số trang / Dung lượng.
         Luôn đọc lại file — không cache — để phản ánh đúng hiện trạng
         (thêm/sửa/xóa)."""
         if self._root is None:
@@ -824,7 +832,7 @@ class DigitizationAuditScreen(ScreenContent):
         if seq != self._tree_mark_seq:
             return
         self.lbl_stats.setText(translations.localize_text(
-            f"Đang quét… {docs} tài liệu · {pages} trang"))
+            f"Đang quét… {docs} tệp · {pages} trang"))
 
     def _on_tree_marked(self, rel: str, result, bad: bool, seq: int):
         if seq != self._tree_mark_seq:
@@ -843,7 +851,7 @@ class DigitizationAuditScreen(ScreenContent):
         if stats.unreadable:
             extra = (f" · {len(stats.unreadable)} PDF/TIFF không đọc được")
         self.lbl_stats.setText(translations.localize_text(
-            f"{stats.total_docs} tài liệu · "
+            f"{stats.total_docs} tệp · "
             f"{stats.total_pages} trang{extra}")
             + f" · {_fmt_size(stats.total_size)}")
         # Cập nhật ngay card thư mục nếu đang chọn một thư mục.
@@ -1020,34 +1028,40 @@ class DigitizationAuditScreen(ScreenContent):
         self._show_folder_info(rel)
 
     def _show_folder_info(self, rel: str):
-        """Đổ Số tài liệu / Số trang / Dung lượng của thư mục ``rel``."""
+        """Thư mục cha: hồ sơ/trang/dung lượng; lá: trang/dung lượng."""
         if self._stats is None:
+            has_subfolders = False
+            if self._root is not None:
+                folder = self._root if not rel else self._root / Path(rel)
+                try:
+                    with os.scandir(folder) as entries:
+                        has_subfolders = any(
+                            entry.is_dir(follow_symlinks=False) for entry in entries)
+                except OSError:
+                    pass
+            self.card_dossier_count.setVisible(has_subfolders)
             self.lbl_doc_count.setText("…")
             self.lbl_page_count.setText("…")
             self.lbl_dir_size.setText("…")
             self.lbl_folder_extra.setText(
                 translations.localize_text("Đang quét…"))
             return
-        docs, pages = self._stats.of_rel(rel)
-        self.lbl_doc_count.setText(f"{docs:,}".replace(",", "."))
-        self.lbl_page_count.setText(f"{pages:,}".replace(",", "."))
+        _, pages = self._stats.of_rel(rel)
+        has_subfolders = self._stats.has_subfolders(rel)
+        self.card_dossier_count.setVisible(has_subfolders)
+        if has_subfolders:
+            self.lbl_doc_count.setText(_fmt_count(
+                self._stats.dossier_count_of_rel(rel)))
+        self.lbl_page_count.setText(_fmt_count(pages))
         self.lbl_dir_size.setText(
             _fmt_size(self._stats.size_of_rel(rel)))
-        lc = self._stats.level_counts
-        parts = []
-        if lc.get("mdd"):
-            parts.append(f"{lc['mdd']} mã định danh")
-        if lc.get("phong"):
-            parts.append(f"{lc['phong']} phông")
-        if lc.get("muc_luc"):
-            parts.append(f"{lc['muc_luc']} mục lục")
-        if lc.get("ho_so"):
-            parts.append(f"{lc['ho_so']} hồ sơ")
-        if self._stats.unreadable:
-            parts.append(
-                f"{len(self._stats.unreadable)} PDF/TIFF không đọc được")
+        prefix = f"{rel}/" if rel else ""
+        unreadable = sum(
+            path.startswith(prefix) for path in self._stats.unreadable)
         self.lbl_folder_extra.setText(
-            " · ".join(translations.localize_text(p) for p in parts))
+            translations.localize_text(
+                f"{unreadable} PDF/TIFF không đọc được")
+            if unreadable else "")
 
     def _show_pdf(self, rel: str):
         if self._root is None:
@@ -1467,7 +1481,7 @@ class DigitizationAuditScreen(ScreenContent):
             extra = (f" · {len(self._stats.unreadable)} PDF/TIFF không đọc được"
                      if self._stats.unreadable else "")
             self.lbl_stats.setText(translations.localize_text(
-                f"{self._stats.total_docs} tài liệu · "
+                f"{self._stats.total_docs} tệp · "
                 f"{self._stats.total_pages} trang{extra}")
                 + f" · {_fmt_size(self._stats.total_size)}")
             item = self.tree.currentItem()

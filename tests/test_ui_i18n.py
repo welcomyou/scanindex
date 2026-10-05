@@ -299,10 +299,11 @@ def test_digitization_audit_text_is_bilingual():
     samples = {
         "Thẩm định số hóa": "Digitization audit",
         "Scan màu": "Colour scan",
-        "Đang quét… 2 tài liệu · 3 trang":
-            "Scanning… 2 documents · 3 pages",
+        "Đang quét… 2 tệp · 3 trang":
+            "Scanning… 2 files · 3 pages",
         "Không xác định được chế độ nén JPEG 2000":
             "Cannot determine JPEG 2000 compression mode",
+        "Số hồ sơ": "Dossiers",
     }
     for vietnamese, english in samples.items():
         assert translations.localize_text(vietnamese, "en") == english
@@ -316,7 +317,9 @@ def test_digitization_audit_text_is_bilingual():
 
 
 def test_digitization_audit_screen_retranslates_result(tmp_path, monkeypatch):
-    from scanindex.core.digitization_audit import PdfAuditResult
+    from scanindex.core.digitization_audit import (
+        FolderStats, PdfAuditResult, populate_dossier_folder_stats,
+    )
     from scanindex.ui.screens import digitization_audit_screen as audit_ui
 
     app = QApplication.instance() or QApplication([])
@@ -329,15 +332,31 @@ def test_digitization_audit_screen_retranslates_result(tmp_path, monkeypatch):
         name_note="mục lục phải là đúng 2 chữ số",
     ))
     assert screen.btn_pick.text() == "📂  Pick root folder…"
+    assert screen.info_stack.widget(0).text().startswith(
+        "Select a folder to see page and size statistics")
     assert screen.card_color.title.text() == "COLOUR SCAN"
     assert screen.chip_verdict.text() == "Undetermined"
     assert "Filename: catalog must be exactly two digits" in (
         screen.lbl_audit_detail.text())
 
+    stats = FolderStats(root=str(tmp_path), total_docs=3, total_pages=3,
+                        dir_stats={"": (3, 3), "A38-011-07-0123": (3, 3)},
+                        dir_sizes={"": 2048, "A38-011-07-0123": 2048})
+    populate_dossier_folder_stats(stats)
+    screen._stats = stats
+    screen._show_folder_info("")
+    assert not screen.card_dossier_count.isHidden()
+    assert screen.lbl_doc_count.text() == "1"
+    screen._show_folder_info("A38-011-07-0123")
+    assert screen.card_dossier_count.isHidden()
+    assert screen.lbl_page_count.text() == "3"
+
     translations.set_lang("vi")
     screen.update_texts()
     translations.retranslate_widget_tree(screen)
     assert screen.btn_pick.text() == "📂  Chọn thư mục gốc…"
+    assert screen.info_stack.widget(0).text().startswith(
+        "Chọn một thư mục để xem thống kê trang và dung lượng")
     assert screen.card_color.title.text() == "SCAN MÀU"
     assert screen.chip_verdict.text() == "Chưa xác định"
     screen.deleteLater()

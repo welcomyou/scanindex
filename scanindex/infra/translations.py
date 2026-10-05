@@ -695,10 +695,10 @@ The software prioritizes local processing when models and dependencies are insta
         "vi": "⏹  Dừng",
     },
     "audit_empty_hint": {
-        "en": "Pick a folder to see document / page counts,\nor a PDF file "
+        "en": "Pick a folder to see page and size statistics,\nor a PDF/TIFF file "
               "to review digitization quality.",
-        "vi": "Chọn một thư mục để xem Số tài liệu / Số trang,\n"
-              "hoặc chọn file PDF để thẩm định chất lượng số hóa.",
+        "vi": "Chọn một thư mục để xem thống kê trang và dung lượng,\n"
+              "hoặc chọn file PDF/TIFF để thẩm định chất lượng số hóa.",
     },
     "audit_span_markup": {
         "en": "<span style='color:{};'>{}</span>",

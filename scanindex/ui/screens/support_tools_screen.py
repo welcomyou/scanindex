@@ -265,8 +265,8 @@ class SupportToolsScreen(ScreenContent):
         digit_audit = _ToolTile(
             "✅",
             "Thẩm định số hóa",
-            "Chỉ đọc: duyệt cây CSDL_SOHOA, đếm tài liệu/trang theo thư mục, "
-            "kiểm tra PDF scan màu, độ nén, DPI và đã OCR theo chuẩn số hóa.",
+            "Chỉ đọc: duyệt cây CSDL_SOHOA, xem thống kê hồ sơ/trang/dung lượng theo thư mục, "
+            "kiểm tra PDF/TIFF scan màu, độ nén, DPI và OCR của PDF.",
         )
         digit_audit.clicked.connect(lambda: self._open_tool("digitization_audit"))
         grid.addWidget(digit_audit, 2, 0)
