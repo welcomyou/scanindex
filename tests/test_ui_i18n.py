@@ -304,6 +304,7 @@ def test_digitization_audit_text_is_bilingual():
         "Không xác định được chế độ nén JPEG 2000":
             "Cannot determine JPEG 2000 compression mode",
         "Số hồ sơ": "Dossiers",
+        "Số tài liệu": "Document count",
     }
     for vietnamese, english in samples.items():
         assert translations.localize_text(vietnamese, "en") == english
@@ -346,10 +347,23 @@ def test_digitization_audit_screen_retranslates_result(tmp_path, monkeypatch):
     screen._stats = stats
     screen._show_folder_info("")
     assert not screen.card_dossier_count.isHidden()
-    assert screen.lbl_doc_count.text() == "1"
+    assert screen.lbl_dossier_count.text() == "1"
+    assert screen.card_document_count.isHidden()
     screen._show_folder_info("A38-011-07-0123")
     assert screen.card_dossier_count.isHidden()
+    assert screen.card_document_count.isHidden()
     assert screen.lbl_page_count.text() == "3"
+
+    stats.total_pdf_documents = 2
+    stats.dir_pdf_documents = {"": 2, "A38-011-07-0123": 2}
+    screen._show_folder_info("")
+    assert not screen.card_dossier_count.isHidden()
+    assert not screen.card_document_count.isHidden()
+    assert screen.lbl_document_count.text() == "2"
+    screen._show_folder_info("A38-011-07-0123")
+    assert not screen.card_dossier_count.isHidden()
+    assert screen.lbl_dossier_count.text() == "1"
+    assert not screen.card_document_count.isHidden()
 
     translations.set_lang("vi")
     screen.update_texts()
@@ -361,6 +375,36 @@ def test_digitization_audit_screen_retranslates_result(tmp_path, monkeypatch):
     assert screen.chip_verdict.text() == "Chưa xác định"
     screen.deleteLater()
     app.processEvents()
+
+
+def test_audit_tree_worker_distinguishes_pdf_documents_from_tiff_pages(tmp_path):
+    import fitz
+    from PIL import Image
+    from scanindex.ui.screens.digitization_audit_screen import _TreeAuditWorker
+
+    pdf_dossier = tmp_path / "A38-011-07-0123"
+    tiff_dossier = tmp_path / "A38-011-07-0124"
+    pdf_dossier.mkdir()
+    tiff_dossier.mkdir()
+    for order in (1, 2):
+        doc = fitz.open()
+        doc.new_page()
+        doc.save(pdf_dossier / f"A38-011-07-0123-{order:03d}.pdf")
+        doc.close()
+    Image.new("RGB", (40, 40)).save(
+        tiff_dossier / "A38-011-07-0124-001.tif", dpi=(300, 300))
+
+    worker = _TreeAuditWorker(tmp_path)
+    completed = []
+    worker.stats_done.connect(completed.append)
+    worker.run()
+    assert len(completed) == 1
+    stats = completed[0]
+    assert stats.dossier_count_of_rel("") == 2
+    assert stats.document_count_of_rel("") == 2
+    assert stats.document_count_of_rel(pdf_dossier.name) == 2
+    assert stats.document_count_of_rel(tiff_dossier.name) == 0
+    assert stats.total_pages == 3
 
 
 def test_backend_activity_log_literals_have_a_bilingual_catalog_entry():

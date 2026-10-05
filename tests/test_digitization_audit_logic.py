@@ -132,6 +132,8 @@ def test_folder_stats_count_dossiers_and_pages_separately(tmp_path):
 
     stats = audit.scan_tree_stats(tmp_path)
     assert stats.total_docs == 5  # five image files, not five documents
+    assert stats.total_pdf_documents == 0
+    assert stats.document_count_of_rel("A38-011-07-0123") == 0
     assert stats.total_pages == 5
     assert stats.total_size == sum(path.stat().st_size
                                    for path in tmp_path.rglob("*.tif"))
@@ -142,3 +144,28 @@ def test_folder_stats_count_dossiers_and_pages_separately(tmp_path):
     assert stats.size_of_rel("A38-011-07-0123") == sum(
         path.stat().st_size
         for path in (tmp_path / "A38-011-07-0123").glob("*.tif"))
+
+
+def test_pdf_documents_are_counted_separately_from_tiff_pages(tmp_path):
+    pdf_dossier = tmp_path / "A38-011-07-0123"
+    tiff_dossier = tmp_path / "A38-011-07-0124"
+    pdf_dossier.mkdir()
+    tiff_dossier.mkdir()
+    for order in (1, 2):
+        document = fitz.open()
+        document.new_page()
+        document.save(pdf_dossier / f"A38-011-07-0123-{order:03d}.pdf")
+        document.close()
+    _save_tiff(tiff_dossier / "A38-011-07-0124-001.tif")
+
+    stats = audit.scan_tree_stats(tmp_path)
+    assert stats.dossier_count_of_rel("") == 2
+    assert stats.total_docs == 3  # two PDFs and one page image
+    assert stats.total_pdf_documents == 2
+    assert stats.document_count_of_rel(pdf_dossier.name) == 2
+    assert stats.document_count_of_rel(tiff_dossier.name) == 0
+    assert stats.total_pages == 3
+
+    single_dossier = audit.scan_tree_stats(pdf_dossier)
+    assert single_dossier.dossier_count_of_rel("") == 1
+    assert single_dossier.document_count_of_rel("") == 2

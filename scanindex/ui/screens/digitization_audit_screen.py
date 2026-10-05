@@ -4,8 +4,9 @@ số hóa.
 Giao diện giống "Đổi tên theo cây thư mục": chọn thư mục gốc, cây 4 cấp
 CSDL_SOHOA với icon màu tương tự; KHÔNG đổi tên / kéo thả / sửa gì.
 
-  * Bấm thư mục cha → Số hồ sơ / Số trang / Dung lượng; thư mục lá →
-    Số trang / Dung lượng (PDF + TIFF; TIFF chuẩn 1 tệp = 1 trang).
+  * Nhánh PDF → Số hồ sơ / Số tài liệu / Số trang / Dung lượng.
+    Nhánh TIFF → thư mục cha có Số hồ sơ / Số trang / Dung lượng,
+    thư mục lá có Số trang / Dung lượng (1 tệp TIFF = 1 trang).
   * Bấm PDF/TIFF → preview (viewer PDF / ảnh TIFF) + thẻ chỉ tiêu 2 dòng
     kèm chip tổng kết. PDF: Scan màu, DPI, Độ nén, Đã OCR, Ký số, Đặt tên
     đúng. TIFF: Scan màu, DPI, Độ nén, Số trang/tệp, Đặt tên đúng. Màu
@@ -194,19 +195,26 @@ class _TreeAuditWorker(QThread):
         stats = da.FolderStats(root=str(self._root))
         stats.unreadable = unreadable
         dir_docs: dict[str, int] = {}
+        dir_pdf_documents: dict[str, int] = {}
         dir_pages: dict[str, int] = {}
         for rel, n in pages_by_rel.items():
             d = rel.rsplit("/", 1)[0] if "/" in rel else ""
+            is_pdf = rel.lower().endswith(".pdf")
             while True:
                 dir_docs[d] = dir_docs.get(d, 0) + 1
+                if is_pdf:
+                    dir_pdf_documents[d] = dir_pdf_documents.get(d, 0) + 1
                 dir_pages[d] = dir_pages.get(d, 0) + n
                 if d == "":
                     break
                 d = d.rsplit("/", 1)[0] if "/" in d else ""
         stats.total_docs = dir_docs.get("", 0)
+        stats.total_pdf_documents = dir_pdf_documents.get("", 0)
         stats.total_pages = dir_pages.get("", 0)
         stats.dir_stats = {d: (dir_docs.get(d, 0), dir_pages.get(d, 0))
                            for d in dir_rels}
+        stats.dir_pdf_documents = {
+            d: dir_pdf_documents.get(d, 0) for d in dir_rels}
         da.populate_dossier_folder_stats(stats)
         # Tổng dung lượng PDF/TIFF theo subtree: dung lượng trực tiếp của từng
         # thư mục cộng lên tổ tiên.
@@ -557,15 +565,17 @@ class DigitizationAuditScreen(ScreenContent):
         )
         self.info_stack.addWidget(empty)               # trang 0
 
-        # Trang 1: thư mục cha có hồ sơ/trang/dung lượng, lá có trang/dung lượng.
+        # Trang 1: PDF có đủ 4 số liệu; TIFF ẩn tài liệu và hồ sơ ở lá.
         folder_page = QWidget()
         fv = QVBoxLayout(folder_page)
         fv.setContentsMargins(0, 0, 0, 0)
         fv.setSpacing(SP[2])
         cards = QHBoxLayout()
         cards.setSpacing(SP[2])
-        self.lbl_doc_count = self._stat_card(cards, "Số hồ sơ")
-        self.card_dossier_count = self.lbl_doc_count.parentWidget()
+        self.lbl_dossier_count = self._stat_card(cards, "Số hồ sơ")
+        self.card_dossier_count = self.lbl_dossier_count.parentWidget()
+        self.lbl_document_count = self._stat_card(cards, "Số tài liệu")
+        self.card_document_count = self.lbl_document_count.parentWidget()
         self.lbl_page_count = self._stat_card(cards, "Số trang")
         self.lbl_dir_size = self._stat_card(cards, "Dung lượng")
         fv.addLayout(cards)
@@ -1040,7 +1050,9 @@ class DigitizationAuditScreen(ScreenContent):
                 except OSError:
                     pass
             self.card_dossier_count.setVisible(has_subfolders)
-            self.lbl_doc_count.setText("…")
+            self.card_document_count.setVisible(False)
+            self.lbl_dossier_count.setText("…")
+            self.lbl_document_count.setText("…")
             self.lbl_page_count.setText("…")
             self.lbl_dir_size.setText("…")
             self.lbl_folder_extra.setText(
@@ -1048,10 +1060,15 @@ class DigitizationAuditScreen(ScreenContent):
             return
         _, pages = self._stats.of_rel(rel)
         has_subfolders = self._stats.has_subfolders(rel)
-        self.card_dossier_count.setVisible(has_subfolders)
-        if has_subfolders:
-            self.lbl_doc_count.setText(_fmt_count(
+        pdf_documents = self._stats.document_count_of_rel(rel)
+        show_dossiers = has_subfolders or pdf_documents > 0
+        self.card_dossier_count.setVisible(show_dossiers)
+        if show_dossiers:
+            self.lbl_dossier_count.setText(_fmt_count(
                 self._stats.dossier_count_of_rel(rel)))
+        self.card_document_count.setVisible(pdf_documents > 0)
+        if pdf_documents:
+            self.lbl_document_count.setText(_fmt_count(pdf_documents))
         self.lbl_page_count.setText(_fmt_count(pages))
         self.lbl_dir_size.setText(
             _fmt_size(self._stats.size_of_rel(rel)))

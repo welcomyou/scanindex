@@ -784,9 +784,12 @@ def audit_file(path: str | os.PathLike, *, quick: bool = False,
 class FolderStats:
     root: str
     total_docs: int = 0  # số tệp PDF/TIFF; TIFF không cho biết số văn bản
+    total_pdf_documents: int = 0
     total_pages: int = 0
     # rel posix của thư mục ("": gốc) → (số tệp, số trang) toàn subtree.
     dir_stats: dict[str, tuple[int, int]] = field(default_factory=dict)
+    # Chỉ tệp PDF là tài liệu; tệp TIFF tương ứng với trang.
+    dir_pdf_documents: dict[str, int] = field(default_factory=dict)
     # rel posix của thư mục → tổng dung lượng PDF/TIFF trong subtree (byte).
     dir_sizes: dict[str, int] = field(default_factory=dict)
     # Thư mục lá là hồ sơ; thống kê số hồ sơ trong từng nhánh.
@@ -811,6 +814,9 @@ class FolderStats:
     def dossier_count_of_rel(self, rel: str | None) -> int:
         return self.dir_dossiers.get(rel or "", 0)
 
+    def document_count_of_rel(self, rel: str | None) -> int:
+        return self.total_pdf_documents if not rel else self.dir_pdf_documents.get(rel, 0)
+
     def has_subfolders(self, rel: str | None) -> bool:
         return (rel or "") in self.dirs_with_subfolders
 
@@ -831,6 +837,8 @@ def populate_dossier_folder_stats(stats: FolderStats) -> None:
             if not current:
                 break
             current = current.rsplit("/", 1)[0] if "/" in current else ""
+    if not parents and stats.dir_stats.get("", (0, 0))[0] > 0:
+        counts[""] = 1  # chính thư mục gốc là một hồ sơ
     stats.dir_dossiers = counts
 
 
@@ -868,6 +876,7 @@ def scan_tree_stats(root: Path, *, page_cache: dict | None = None,
         nonlocal docs_seen
         docs = 0
         pages = 0
+        pdf_documents = 0
         size = 0
         try:
             entries = sorted(path.iterdir(), key=lambda p: p.name.lower())
@@ -880,6 +889,7 @@ def scan_tree_stats(root: Path, *, page_cache: dict | None = None,
             if entry.is_dir():
                 child_rel = entry.relative_to(root).as_posix()
                 sub_docs, sub_pages = walk(entry, child_rel)
+                pdf_documents += stats.dir_pdf_documents.get(child_rel, 0)
                 size += stats.dir_sizes.get(child_rel, 0)
                 level = rt.level_of(Path(child_rel))
                 if level is rt.Level.MA_DINH_DANH:
@@ -893,6 +903,7 @@ def scan_tree_stats(root: Path, *, page_cache: dict | None = None,
                 docs += sub_docs
                 pages += sub_pages
             elif entry.suffix.lower() == ".pdf":
+                pdf_documents += 1
                 try:
                     size += entry.stat().st_size
                 except OSError:
@@ -920,10 +931,12 @@ def scan_tree_stats(root: Path, *, page_cache: dict | None = None,
                 docs += 1
                 pages += 1
         stats.dir_stats[rel] = (docs, pages)
+        stats.dir_pdf_documents[rel] = pdf_documents
         stats.dir_sizes[rel] = size
         return docs, pages
 
     stats.total_docs, stats.total_pages = walk(root, "")
+    stats.total_pdf_documents = stats.dir_pdf_documents.get("", 0)
     stats.total_size = stats.dir_sizes.get("", 0)
     populate_dossier_folder_stats(stats)
     return stats

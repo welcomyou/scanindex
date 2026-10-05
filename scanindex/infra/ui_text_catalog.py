@@ -1624,6 +1624,7 @@ UI_DIGITIZATION_AUDIT_TEXT_PAIRS: tuple[tuple[str, str], ...] = (
     ("{} dossiers", "{} hồ sơ"),
     ("{} PDF/TIFF unreadable", "{} PDF/TIFF không đọc được"),
     ("Dossiers", "Số hồ sơ"),
+    ("Document count", "Số tài liệu"),
     ("Pages", "Số trang"),
     ("Size", "Dung lượng"),
     ("Cannot preview TIFF image.", "Không xem trước được ảnh TIFF."),
