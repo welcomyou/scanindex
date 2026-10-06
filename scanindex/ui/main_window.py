@@ -3502,12 +3502,16 @@ class MainWindow(QMainWindow):
             return
         identity = getattr(session, "identity", None)
         if identity is None or not identity.is_complete():
-            QMessageBox.warning(
-                self, "Chuyển vào Kho",
-                "Thiếu mã định danh hồ sơ. Hãy quay về Bước 1 nhập đủ "
-                "mã định danh, mã phông, mục lục, hồ sơ trước khi chuyển vào Kho.",
-            )
-            return
+            # Nới lỏng 1.1.17: không chặn khi thiếu mã định danh — tự sinh
+            # phần thiếu (cùng cơ chế auto_unstructured, ổn định theo seed
+            # phiên) và ghi log để truy vết.
+            from scanindex.core.digitization.session import IdentityCodes
+            identity = (identity or IdentityCodes()).completed_autofill(
+                session.session_id)
+            self.log(
+                "Archive: mã định danh chưa đủ — tự sinh phần thiếu: "
+                f"{identity.ma_dinh_danh}-{identity.ma_phong}-"
+                f"{identity.muc_luc}-{identity.ho_so}")
 
         # Pick final PDF + canonical JSON for each doc. We prefer the signed
         # variant (Step 3 output) but fall back to the KIE PDF for files the
@@ -3572,10 +3576,13 @@ class MainWindow(QMainWindow):
 
     def _arc_import_to_kho_multi(self, documents: list):
         """Chuyển vào Kho NHIỀU HỒ SƠ (mục 8.2): import từng hồ sơ với khóa
-        (ma_dinh_danh, fonds, catalog, dossier_code) của HỒ SƠ ĐÓ. Tài liệu
-        chưa ký đủ → hồ sơ không đủ điều kiện (báo rõ). Tài liệu đã nhập
-        trong phiên (`_kho_import_ok`) được bỏ qua khi bấm lại sau lỗi —
-        phục hồi thao tác, không phải kiểm trùng nội dung."""
+        (ma_dinh_danh, fonds, catalog, dossier_code) của HỒ SƠ ĐÓ. Ưu tiên
+        bản ký còn hiệu lực; tài liệu chưa ký / bản ký hết hiệu lực vẫn
+        được chuyển bằng bản KIE sau MỘT lần xác nhận — nhất quán với chế
+        độ một hồ sơ (_arc_pick_final_pdf), không còn chặn hồ sơ. Tài liệu
+        thiếu PDF/canonical JSON thì bỏ qua (báo rõ trong cùng hộp thoại).
+        Tài liệu đã nhập trong phiên (`_kho_import_ok`) được bỏ qua khi
+        bấm lại sau lỗi — phục hồi thao tác, không phải kiểm trùng."""
         session = self.archive_tab.session
         jobs: list = []
         plans: list = []
@@ -3583,26 +3590,26 @@ class MainWindow(QMainWindow):
             identity = session.identity_for_doc(docs[0])
             label = self._arc_group_label(dossier)
             if identity is None or not identity.is_complete():
-                QMessageBox.warning(
-                    self, "Chuyển vào Kho",
-                    translations.get_text("arc_multi_kho_missing_codes")
-                    .format(label=label),
-                )
-                return
-            entries, unsigned, resume_skipped = [], [], 0
+                # Nới lỏng 1.1.17: tự sinh mã thiếu thay vì chặn; seed theo
+                # TỪNG hồ sơ để hai hồ sơ không dính trùng mã sinh tự động.
+                from scanindex.core.digitization.session import IdentityCodes
+                seed = (f"{session.session_id}:"
+                        f"{getattr(dossier, 'id', '') or label}")
+                identity = (identity or IdentityCodes()).completed_autofill(
+                    seed)
+                self.log(
+                    f"Archive: hồ sơ {label} thiếu mã định danh — tự sinh "
+                    f"phần thiếu ({identity.ma_dinh_danh}-{identity.ma_phong}"
+                    f"-{identity.muc_luc}-{identity.ho_so})")
+            entries, unsigned, missing, resume_skipped = [], [], [], 0
             for pos, doc in enumerate(docs, start=1):
                 if doc.get("_kho_import_ok"):
                     resume_skipped += 1
                     continue
                 kie_pdf = doc.get("output_path") or ""
                 if not kie_pdf or not os.path.exists(kie_pdf):
-                    unsigned.append(
+                    missing.append(
                         str(doc.get("_doc_id") or "?"))
-                    continue
-                stt = self._arc_stt_for_doc(doc, pos)
-                signed = self._arc_signed_pdf_for_doc(doc, stt, identity)
-                if not signed:
-                    unsigned.append(os.path.basename(kie_pdf))
                     continue
                 json_path = doc.get("json_path") or ""
                 if not json_path:
@@ -3614,13 +3621,22 @@ class MainWindow(QMainWindow):
                     if resolved is not None:
                         json_path = str(resolved)
                 if not json_path or not os.path.exists(json_path):
-                    unsigned.append(os.path.basename(kie_pdf))
+                    missing.append(os.path.basename(kie_pdf))
                     continue
+                stt = self._arc_stt_for_doc(doc, pos)
+                # Ưu tiên bản ký còn hiệu lực; không có (chưa ký hoặc bản ký
+                # hết hiệu lực do nguồn đổi sau ký) → dùng bản KIE như chế độ
+                # một hồ sơ. Không âm thầm: hộp thoại xác nhận bên dưới liệt
+                # kê mọi hồ sơ có bản chưa ký.
+                signed = self._arc_signed_pdf_for_doc(doc, stt, identity)
+                final_pdf = signed or kie_pdf
+                if not signed:
+                    unsigned.append(os.path.basename(kie_pdf))
                 entries.append({
-                    "pdf_path": signed,
+                    "pdf_path": final_pdf,
                     "canonical_json_path": json_path,
                     "target_file_name": self._arc_export_pdf_name(
-                        identity, stt, signed),
+                        identity, stt, final_pdf),
                     "metadata": dict(doc.get("metadata") or {}),
                     "_doc_id": str(doc.get("_doc_id") or ""),
                 })
@@ -3630,26 +3646,36 @@ class MainWindow(QMainWindow):
                 "identity": identity,
                 "entries": entries,
                 "unsigned": unsigned,
+                "missing": missing,
                 "resume_skipped": resume_skipped,
             })
 
-        qualifying = [p for p in plans if p["entries"]
-                      and not p["unsigned"]]
-        blocked = [p for p in plans if p not in qualifying]
+        qualifying = [p for p in plans if p["entries"]]
         if not qualifying:
             QMessageBox.warning(
                 self, "Chuyển vào Kho",
                 translations.get_text("arc_multi_kho_none_qualify"),
             )
             return
-        if blocked:
+        # Bản chưa ký: KHÔNG chặn, KHÔNG hỏi (nới lỏng 1.1.17 — nhất quán
+        # với chế độ một hồ sơ, bản KIE thay bản ký); chỉ ghi log để truy
+        # vết sau này.
+        for p in plans:
+            if p["unsigned"]:
+                self.log(
+                    f"Archive: {p['label']}: {len(p['unsigned'])} bản chưa "
+                    f"ký số — chuyển vào Kho bằng bản chưa ký")
+        # Tài liệu thiếu PDF/canonical JSON thì không thể chuyển — vẫn hỏi
+        # vì đó là mất dữ liệu so với Bước 2, không phải vấn đề chữ ký.
+        missing_plans = [p for p in plans if p["missing"]]
+        if missing_plans:
             detail = "\n".join(
-                f"• {p['label']}: thiếu/hết hiệu lực "
-                f"{len(p['unsigned'])} bản ký" for p in blocked[:15])
+                f"• {p['label']}: {len(p['missing'])} bản thiếu "
+                f"PDF/canonical JSON" for p in missing_plans[:15])
             answer = QMessageBox.question(
                 self,
-                translations.get_text("arc_multi_unsigned_title"),
-                translations.get_text("arc_multi_kho_blocked_body")
+                translations.get_text("arc_multi_kho_missing_title"),
+                translations.get_text("arc_multi_kho_missing_body")
                 .format(detail),
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.Yes,

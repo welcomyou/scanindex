@@ -771,23 +771,23 @@ The software prioritizes local processing when models and dependencies are insta
               "kiện?",
     },
     "arc_multi_kho_none_qualify": {
-        "en": "No dossier qualifies for the Repository (not fully signed, "
-              "or canonical JSON missing).\nSign the documents in Step 3 "
-              "and try again.",
-        "vi": "Không có hồ sơ nào đủ điều kiện chuyển (chưa ký đủ hoặc "
-              "thiếu canonical JSON).\nHãy sang Bước 3 ký số rồi thử lại.",
+        "en": "No document can be loaded into the Repository (PDF or "
+              "canonical JSON missing).\nRun Step 2 first and check the "
+              "source files.",
+        "vi": "Không có tài liệu nào đủ điều kiện chuyển (thiếu PDF hoặc "
+              "canonical JSON).\nHãy chạy Bước 2 và kiểm tra lại file "
+              "nguồn.",
     },
-    "arc_multi_kho_blocked_body": {
-        "en": "These dossiers CANNOT be loaded into the Repository:\n\n{}\n\n"
-              "Load only the qualifying dossiers?",
-        "vi": "Các hồ sơ sau KHÔNG đủ điều kiện chuyển vào Kho:\n\n{}\n\n"
-              "Chỉ chuyển các hồ sơ đủ điều kiện?",
+    "arc_multi_kho_missing_title": {
+        "en": "Some documents will be skipped",
+        "vi": "Có tài liệu sẽ bị bỏ qua",
     },
-    "arc_multi_kho_missing_codes": {
-        "en": "Dossier {label} is missing complete identity codes. Edit the "
-              "dossier info before loading it into the Repository.",
-        "vi": "Hồ sơ {label} thiếu mã định danh đầy đủ. Hãy sửa thông tin "
-              "hồ sơ trước khi chuyển vào Kho.",
+    "arc_multi_kho_missing_body": {
+        "en": "These documents CANNOT be loaded into the Repository "
+              "(PDF or canonical JSON missing):\n\n{}\n\nLoad the remaining "
+              "documents?",
+        "vi": "Các tài liệu sau KHÔNG thể chuyển vào Kho (thiếu PDF hoặc "
+              "canonical JSON):\n\n{}\n\nVẫn chuyển các tài liệu còn lại?",
     },
     "arc_multi_kho_cleanup_ask": {
         "en": "All dossiers were safely loaded into the Repository.\n"

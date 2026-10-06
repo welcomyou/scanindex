@@ -19,7 +19,7 @@ import secrets
 import shutil
 import threading
 from datetime import datetime
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Optional
 
 from scanindex.core.digitization.dossier_model import (
@@ -141,6 +141,29 @@ class IdentityCodes:
             title=title.strip()[:1000],
             is_unstructured=True,
         )
+
+    def completed_autofill(self, seed: str) -> "IdentityCodes":
+        """Bản sao với các mã THIẾU được điền tự sinh từ `seed` — chuyển
+        vào Kho không còn bị chặn khi thiếu mã định danh (nới lỏng 1.1.17).
+        Cơ chế sinh GIỐNG auto_unstructured: cùng seed → cùng mã nên nhập
+        lại vào Kho vẫn khớp khóa composite. Mã người dùng đã nhập được
+        GIỮ NGUYÊN, chỉ điền vào chỗ trống; `seed` nên khác nhau theo hồ
+        sơ (ví dụ session_id + dossier id) để các hồ sơ không dính trùng
+        mã sinh tự động."""
+        if self.is_complete():
+            return self
+        import hashlib
+        h = hashlib.sha256(seed.encode("utf-8")).hexdigest()
+        filled = replace(
+            self,
+            ma_dinh_danh=self.ma_dinh_danh or "UNSTRUCT",
+            ma_phong=self.ma_phong or h[:8].upper(),
+            muc_luc=self.muc_luc or "00",
+            ho_so=self.ho_so or h[8:13].upper(),
+        )
+        if not filled.title:
+            filled.title = f"Hồ sơ {filled.ho_so}"
+        return filled
 
 
 @dataclass
