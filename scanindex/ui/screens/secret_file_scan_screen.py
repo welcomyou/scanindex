@@ -18,11 +18,12 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable
 
-from PySide6.QtCore import Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QRect, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QColor, QDesktopServices, QPainter
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
+    QComboBox,
     QFileDialog,
     QFrame,
     QGridLayout,
@@ -37,6 +38,9 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSplitter,
     QStackedWidget,
+    QStyle,
+    QStyleOptionButton,
+    QStyledItemDelegate,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -132,6 +136,12 @@ class SecretScanMatch:
     # madinhdanh_lookup.json; dấu "*" ở cuối đánh dấu đây là cơ quan theo
     # văn bản, không phải cơ quan xác định rõ qua danh mục.
     kie_org_name: str = ""
+    # Sửa tay trực tiếp trên bảng: mã/tên cơ quan người dùng gõ đè. Rỗng =
+    # chưa sửa, hiển thị & xuất Excel theo suy động (tên file → danh mục →
+    # dự phòng KIE). Dùng để gộp danh sách nhiều thư mục vẫn sửa được sai
+    # sót nhận dạng ngay trên bảng mà không cần sửa Excel.
+    org_code_override: str = ""
+    org_name_override: str = ""
     # Ngày cập nhật file (epoch giây) — chụp lúc quét để hiển thị lại cho
     # dòng có file đã bị xóa khỏi đĩa; file còn tồn tại thì hiển thị luôn
     # mtime hiện thời (xem _file_mtime_for_display).
@@ -1242,6 +1252,7 @@ def _collect_secret_matches(
     artifact_path: str,
     note: str,
     cancel_event: threading.Event,
+    stop_on_first: bool = False,
 ) -> list[SecretScanMatch]:
     matches: list[SecretScanMatch] = []
     # Chụp mtime một lần cho cả file — hiển thị "Ngày cập nhật" ở bảng/Excel.
@@ -1266,7 +1277,162 @@ def _collect_secret_matches(
                     file_mtime=file_mtime,
                 )
             )
+            if stop_on_first:
+                # Mọi chế độ Tìm kỹ: gặp trang đầu tiên có dấu là KẾT LUẬN —
+                # các trang sau không xét nữa (dấu nào tới trước tính theo
+                # thứ tự trang).
+                break
     return matches
+
+
+def _thorough_page_window(total_pages: int, page_limit: int) -> list[int]:
+    """Danh sách chỉ số trang cần xét ở nhánh "Tìm kỹ": toàn bộ trang, hoặc
+    CHỈ ``page_limit`` trang đầu khi ``page_limit`` > 0 ("Tìm kỹ 10 trang
+    đầu"). File ít trang hơn giới hạn thì xét hết file."""
+    total = max(0, int(total_pages))
+    if page_limit and int(page_limit) > 0:
+        return list(range(min(int(page_limit), total)))
+    return list(range(total))
+
+
+def _pdf_file_kind(pdf_path: str) -> str:
+    """File-level classify (digital/scan/…) — quyết định có cần xoay trang.
+    Lỗi → "scan" (an toàn: vẫn xoay như trước)."""
+    try:
+        from scanindex.core.preprocessing import preprocessing as _pre
+
+        return _pre.classify_pdf(pdf_path)
+    except Exception:
+        return "scan"
+
+
+def _stream_chunk_size() -> int:
+    """Số trang mỗi lượt OCR+dò ở chế độ streaming (Tìm kỹ).
+
+    Mặc định = đúng số worker của pool OCR dùng chung toàn app
+    (``direct_engine.get_parallel_capacity()`` — tức settings.ini
+    ``[OCR] MaxConcurrentOCR``): một lượt là một vòng pool, mọi worker đều
+    có việc trong lượt mà mức dừng sớm vẫn granular nhất có thể. Override
+    bằng biến môi trường SECRET_SCAN_STREAM_CHUNK (debug/tinh chỉnh)."""
+    raw = os.environ.get("SECRET_SCAN_STREAM_CHUNK", "").strip()
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            pass
+    try:
+        from scanindex.core.ocr import direct_engine
+
+        capacity = int(direct_engine.get_parallel_capacity())
+    except Exception:
+        capacity = 2
+    return max(2, capacity)
+
+
+def _process_and_detect_streaming(
+    scan_pdf: str,
+    source_path: str,
+    relative_path: str,
+    page_indices: list[int],
+    *,
+    mode: str,
+    artifact_path: str,
+    note: str,
+    cancel_event: threading.Event,
+    log_cb: Callable[[str], None],
+    dpi: int = _SECRET_SCAN_DPI,
+    json_path: str | None = None,
+    stop_on_first: bool = True,
+    rotate: bool = False,
+    ocr_workers: int | None = None,
+    file_work_dir: str = "",
+) -> tuple[dict, list[SecretScanMatch], list[int] | None]:
+    """OCR + dò dấu SONG SONG theo lượt nhỏ thay vì OCR xong hết mới dò.
+
+    Mỗi lượt ``_stream_chunk_size()`` trang: OCR xong là dò NGAY; gặp trang
+    dấu đầu tiên thì dừng hẳn — các trang còn lại KHÔNG bị OCR. Khi cần xoay
+    trang, từng lượt được cắt riêng rồi xoay riêng (tránh xoay cả file trước
+    khi biết dấu nằm ở đâu). Canonical ghép từ các lượt và ghi json ĐÚNG 1
+    lần ở cuối để pass KIE (năm/cơ quan) đọc đúng trang dấu. Trả về
+    (canonical, matches, rotations) — rotations là metadata kê khai (hiện
+    không có bản đọc), chỉ giữ khi MỌI lượt đều trả về đủ.
+    """
+    from scanindex.core.kie.json_utils import make_document_stub
+    from scanindex.core.ocr.text_normalizer import OCR_TEXT_NORMALIZATION
+
+    canonical = make_document_stub(
+        input_path=scan_pdf,
+        engine="direct_screen_ai",
+        ocr_dpi=dpi,
+        source_path=source_path,
+        text_normalization=OCR_TEXT_NORMALIZATION,
+        raw_text_preserved=True,
+    )
+    chunk_size = _stream_chunk_size()
+    matches: list[SecretScanMatch] = []
+    rotations: list[int] | None = []
+    for start in range(0, len(page_indices), chunk_size):
+        if cancel_event.is_set():
+            raise _ScanCancelled()
+        abs_chunk = list(page_indices[start:start + chunk_size])
+        # Khi xoay: cắt riêng lượt trang thành PDF con (chỉ số 0..n-1) rồi
+        # gán lại chỉ số tuyệt đối sau khi OCR; không xoay thì dùng thẳng
+        # chỉ số tuyệt đối trên scan_pdf.
+        rel_chunk = list(range(len(abs_chunk))) if rotate else abs_chunk
+        log_cb(
+            "Dò song song với OCR: xét trang "
+            f"{abs_chunk[0] + 1}–{abs_chunk[-1] + 1}..."
+        )
+        work_pdf = scan_pdf
+        if rotate:
+            chunk_pdf = os.path.join(file_work_dir, f"chunk_{start:05d}.pdf")
+            work_pdf = _extract_pdf_pages(scan_pdf, chunk_pdf, abs_chunk)
+            pre_pdf = os.path.join(
+                file_work_dir, f"chunk_{start:05d}_pre.pdf"
+            )
+            work_pdf, chunk_rotations = _preprocess_pdf_for_ocr(
+                work_pdf, pre_pdf, log_cb, max_workers=ocr_workers,
+            )
+            if chunk_rotations is None:
+                rotations = None
+            elif rotations is not None:
+                rotations.extend(int(r or 0) for r in chunk_rotations)
+        chunk_canonical = _process_pdf_per_page(
+            work_pdf,
+            source_path,
+            rel_chunk,
+            cancel_event,
+            log_cb,
+            dpi=dpi,
+        )
+        chunk_pages = chunk_canonical.get("pages") or []
+        for page_record, abs_idx in zip(chunk_pages, abs_chunk):
+            try:
+                page_record["page_index"] = int(abs_idx)
+            except (TypeError, ValueError):
+                continue
+        canonical["pages"].extend(chunk_pages)
+        matches.extend(
+            _collect_secret_matches(
+                canonical,
+                abs_chunk,
+                source_path=source_path,
+                relative_path=relative_path,
+                mode=mode,
+                artifact_path=artifact_path,
+                note=note,
+                cancel_event=cancel_event,
+                stop_on_first=stop_on_first,
+            )
+        )
+        if matches and stop_on_first:
+            log_cb(
+                f"Phát hiện dấu mật ở trang {matches[0].page_number} — "
+                "dừng; các trang sau không OCR/xét nữa."
+            )
+            break
+    _finalize_canonical(canonical, json_path)
+    return canonical, matches, rotations
 
 
 def _filter_matches_by_doc_start(
@@ -1665,7 +1831,11 @@ def _file_worker_count(total: int) -> int:
     override mọi thứ) → settings.ini [SecretScan] MaxFileWorkers → mặc
     định 2. Ở "Tìm nhanh" mỗi file chỉ cần 1 trang OCR, nên để dùng hết
     pool N worker OCR thì số file-worker cần cùng cỡ N (2 file-worker chỉ
-    bận 2/4 worker của pool MaxConcurrentOCR=4).
+    bận 2/4 worker của pool MaxConcurrentOCR=4). Ở "Tìm kỹ" streaming,
+    1 file-worker đã đẩy nguyên MỘT LƯỢT (= số worker pool) trang vào
+    pool, nên 2 file-worker là đủ để chồng việc chuẩn bị (mở/xoay/cắt
+    lượt) của file này với OCR của file kia — tăng cao hơn không làm OCR
+    nhanh hơn (pool mới là nút cổ chai), chỉ tốn thêm RAM.
 
     Mỗi thread tự mở PDF riêng bằng PyMuPDF trong cùng process (Document
     không chia sẻ chéo thread). Stress-test trên wheel 1.26.7 ổn định,
@@ -1695,6 +1865,8 @@ def scan_one_file_for_secret_artifact(
     cancel_event: threading.Event,
     log_cb: Callable[[str], None],
     ocr_workers: int | None = None,
+    *,
+    page_limit: int = 0,
 ) -> SecretScanArtifact:
     """Scan one file for classified-document stamps.
 
@@ -1711,17 +1883,29 @@ def scan_one_file_for_secret_artifact(
     Modes:
       - ``first_page_only=True``  ("Tìm nhanh"): preprocess hướng trang trang
         đầu, OCR trang đầu, detect the secrecy mark on it, no LightGBM.
-      - ``first_page_only=False`` ("Tìm kỹ"): preprocess hướng trang toàn
-        file, process ALL pages, detect secrecy on every page (cheap token
-        match), then run LightGBM doc-start only on the candidate pages to
-        filter false positives. For non-classified files (the common case)
-        there are no candidates, so LightGBM is skipped.
+      - ``first_page_only=False, page_limit=0`` ("Tìm kỹ"): preprocess hướng
+        trang toàn file, process ALL pages, detect secrecy page-by-page và
+        DỪNG NGAY khi gặp trang đầu tiên có dấu — các trang sau không được
+        xét nữa. Trang có dấu được LightGBM xác nhận là trang đầu văn bản;
+        bị loại thì file trả về không có dòng.
+      - ``first_page_only=False, page_limit=N>0`` ("Tìm kỹ N trang đầu"):
+        như "Tìm kỹ" nhưng chỉ cắt tối đa N trang đầu để xoay/OCR; phần còn
+        lại của file không bị đụng tới. Dừng sớm như trên vẫn áp dụng.
     """
     os.makedirs(file_work_dir, exist_ok=True)
     _precheck_source_readable(source_path)
     ext = os.path.splitext(source_path)[1].lower()
     word_document = ext in {".doc", ".docx"}
-    mode = "Trang đầu" if first_page_only else "Tìm kỹ"
+    if first_page_only:
+        mode = "Trang đầu"
+    elif page_limit and int(page_limit) > 0:
+        mode = f"Tìm kỹ {int(page_limit)} trang đầu"
+    else:
+        mode = "Tìm kỹ"
+    # Cửa sổ trang: chỉ cắt tối đa N trang đầu để xoay/OCR (page_limit > 0).
+    windowed = (not first_page_only) and bool(page_limit and int(page_limit) > 0)
+    # Dừng sớm: MỌI chế độ Tìm kỹ đều kết luận ở trang dấu đầu tiên.
+    stop_first = not first_page_only
     canonical_json_path = os.path.join(file_work_dir, "ocr.json.zst")
 
     # ── Word: always digital, native text, never OCR ──────────────────────
@@ -1739,6 +1923,11 @@ def scan_one_file_for_secret_artifact(
         page_indices = [0] if first_page_only else _all_page_indices(native_canonical)
         if first_page_only:
             note = f"{note}; DOC/DOCX trang đầu"
+        elif windowed:
+            page_indices = _thorough_page_window(
+                len(page_indices), int(page_limit or 0)
+            ) or [0]
+            note = f"{note}; DOC/DOCX tối đa {len(page_indices)} trang đầu"
         matches = _collect_secret_matches(
             native_canonical,
             page_indices,
@@ -1748,6 +1937,7 @@ def scan_one_file_for_secret_artifact(
             artifact_path=canonical_json_path,
             note=note,
             cancel_event=cancel_event,
+            stop_on_first=stop_first,
         )
         # Cơ quan dự phòng TRƯỚC, giải mật SAU: pass cơ quan là bên quyết định
         # có infer KIE cho trang hay không — pass năm đọc lại cache, một lần
@@ -1783,7 +1973,9 @@ def scan_one_file_for_secret_artifact(
     if first_page_only:
         page_indices = [0]
     else:
-        page_indices = list(range(total_pages))
+        # "Tìm kỹ" (page_limit=0): mọi trang. "Tìm kỹ N trang đầu": chỉ cửa
+        # sổ N trang đầu — phần còn lại của file không bị đụng tới.
+        page_indices = _thorough_page_window(total_pages, int(page_limit or 0))
 
     # For single-page PDFs, no need to extract a sub-PDF — classify + OCR in place.
     scan_pdf = source_pdf
@@ -1791,44 +1983,45 @@ def scan_one_file_for_secret_artifact(
         first_pdf = os.path.join(file_work_dir, "first_page.pdf")
         scan_pdf = _extract_pdf_pages(source_pdf, first_pdf, [0])
         page_indices = [0]
-
-    # Xoay đúng chiều TRƯỚC khi OCR/dò (cùng cơ chế classifier 4 hướng của
-    # Số hóa lưu trữ): sau khi trang đã đứng thẳng, dấu mật thật chỉ tồn
-    # tại ở góc trên-trái — mọi hit ngoài vùng đó bị coi là mảnh mộc/dấu
-    # tròn khác. PDF digital bỏ qua (không bao giờ xoay sai, lại tránh copy
-    # thừa). Tắt bằng SECRET_SCAN_DISABLE_ROTATE=1 khi cần tốc độ tối đa.
-    rotations: list[int] | None = None
-    if os.environ.get("SECRET_SCAN_DISABLE_ROTATE", "").lower() not in {"1", "true"}:
-        try:
-            from scanindex.core.preprocessing import preprocessing as _pre
-            file_kind = _pre.classify_pdf(scan_pdf)
-        except Exception:
-            file_kind = "scan"
-        if file_kind != "digital":
-            log_cb("Xoay đúng chiều trang trước khi dò (như Số hóa lưu trữ)...")
-            pre_pdf = os.path.join(file_work_dir, "preprocessed.pdf")
-            pre_out, rotations = _preprocess_pdf_for_ocr(
-                scan_pdf,
-                pre_pdf,
-                log_cb,
-                max_workers=ocr_workers,
-            )
-            if os.path.abspath(pre_out) != os.path.abspath(scan_pdf):
-                scan_pdf = pre_out
-                source_note = f"{source_note}; đã xoay đúng chiều"
-
-    canonical = _process_pdf_per_page(
-        scan_pdf,
-        source_path,
-        page_indices,
-        cancel_event,
-        log_cb,
-        dpi=_SECRET_SCAN_DPI,
-        json_path=canonical_json_path,
-    )
+    elif windowed and total_pages > len(page_indices):
+        window_pdf = os.path.join(file_work_dir, "window_pages.pdf")
+        scan_pdf = _extract_pdf_pages(source_pdf, window_pdf, page_indices)
+        log_cb(
+            f"Chế độ giới hạn trang: chỉ cắt {len(page_indices)} trang đầu "
+            "để xoay/OCR, phần còn lại của file không được xét."
+        )
 
     note = source_note
     if first_page_only:
+        # "Tìm nhanh": 1 trang — xoay + OCR + dò như cũ (chi phí không đáng kể).
+        rotations: list[int] | None = None
+        if (
+            os.environ.get("SECRET_SCAN_DISABLE_ROTATE", "").lower()
+            not in {"1", "true"}
+        ):
+            if _pdf_file_kind(scan_pdf) != "digital":
+                log_cb(
+                    "Xoay đúng chiều trang trước khi dò (như Số hóa lưu trữ)..."
+                )
+                pre_pdf = os.path.join(file_work_dir, "preprocessed.pdf")
+                pre_out, rotations = _preprocess_pdf_for_ocr(
+                    scan_pdf,
+                    pre_pdf,
+                    log_cb,
+                    max_workers=ocr_workers,
+                )
+                if os.path.abspath(pre_out) != os.path.abspath(scan_pdf):
+                    scan_pdf = pre_out
+                    note = f"{note}; đã xoay đúng chiều"
+        canonical = _process_pdf_per_page(
+            scan_pdf,
+            source_path,
+            page_indices,
+            cancel_event,
+            log_cb,
+            dpi=_SECRET_SCAN_DPI,
+            json_path=canonical_json_path,
+        )
         # "Tìm nhanh": detect secrecy on page 0 only, no LightGBM.
         matches = _collect_secret_matches(
             canonical,
@@ -1850,23 +2043,43 @@ def scan_one_file_for_secret_artifact(
             rotations=rotations,
         )
 
-    # "Tìm kỹ": detect secrecy on ALL pages first (cheap token match), then
-    # run LightGBM doc-start only on the candidate pages that matched a secrecy
-    # keyword. This is faster than running LightGBM across the whole document:
-    # detection is near-free regex, while LightGBM scores 8 features per page.
-    # For the common case (file is NOT classified) there are zero candidates,
-    # so LightGBM is skipped entirely via the early-return in
-    # _filter_matches_by_doc_start.
-    note = f"{note}; kiểm tất cả {len(page_indices)} trang"
-    matches = _collect_secret_matches(
-        canonical,
+    # "Tìm kỹ" (cả giới hạn 10 trang lẫn mọi trang): OCR + dò SONG SONG theo
+    # lượt nhỏ thay vì OCR xong hết mới dò — gặp trang dấu đầu tiên là dừng
+    # hẳn, các trang sau KHÔNG bị OCR nữa. Xoay trang cũng theo từng lượt
+    # (tránh xoay cả 300 trang rồi mới biết dấu nằm ở trang 3).
+    if windowed:
+        note = (
+            f"{note}; kiểm tối đa {len(page_indices)} trang đầu, "
+            "dừng khi gặp dấu đầu tiên"
+        )
+    else:
+        note = (
+            f"{note}; kiểm tất cả {len(page_indices)} trang, "
+            "dừng khi gặp dấu đầu tiên"
+        )
+    rotate = (
+        os.environ.get("SECRET_SCAN_DISABLE_ROTATE", "").lower()
+        not in {"1", "true"}
+        and _pdf_file_kind(scan_pdf) != "digital"
+    )
+    if rotate:
+        note = f"{note}; đã xoay đúng chiều"
+    canonical, matches, rotations = _process_and_detect_streaming(
+        scan_pdf,
+        source_path,
+        relative_path,
         page_indices,
-        source_path=source_path,
-        relative_path=relative_path,
         mode=mode,
         artifact_path=canonical_json_path,
         note=note,
         cancel_event=cancel_event,
+        log_cb=log_cb,
+        dpi=_SECRET_SCAN_DPI,
+        json_path=canonical_json_path,
+        stop_on_first=stop_first,
+        rotate=rotate,
+        ocr_workers=ocr_workers,
+        file_work_dir=file_work_dir,
     )
     matches = _filter_matches_by_doc_start(matches, canonical_json_path, log_cb)
     # Cơ quan dự phòng trước, giải mật sau — xem chú thích nhánh Word.
@@ -1888,6 +2101,8 @@ def scan_one_file_for_secret(
     cancel_event: threading.Event,
     log_cb: Callable[[str], None],
     ocr_workers: int | None = None,
+    *,
+    page_limit: int = 0,
 ) -> list[SecretScanMatch]:
     return scan_one_file_for_secret_artifact(
         source_path=source_path,
@@ -1897,6 +2112,7 @@ def scan_one_file_for_secret(
         cancel_event=cancel_event,
         log_cb=log_cb,
         ocr_workers=ocr_workers,
+        page_limit=page_limit,
     ).matches
 
 
@@ -2025,10 +2241,29 @@ def _kie_org_fallback_name(canonical_json_path: str, page_index: int) -> str:
 def _org_display_name(source_path: str, kie_org_name: str) -> str:
     """Tên cơ quan cho bảng/Excel: ưu tiên tên tra theo mã định danh trong
     tên file qua madinhdanh_lookup; không tra được thì dùng tên dự phòng KIE
-    bóc từ văn bản (kết thúc bằng "*", cơ quan theo văn bản)."""
+    bóc từ văn bản (kết thúc "*", cơ quan theo văn bản)."""
     org_code = _org_code_from_filename(source_path)
     name = _org_name_lookup().get(org_code, "") if org_code else ""
     return name or (kie_org_name or "").strip()
+
+
+def _effective_org_code(match: SecretScanMatch) -> str:
+    """Mã cơ quan có hiệu lực của một dòng: gõ đè tay trên bảng (nếu có)
+    thì theo tay, không thì suy từ tên file "<uuid>_<mã>-…"."""
+    return (
+        match.org_code_override or _org_code_from_filename(match.source_path)
+    ).strip()
+
+
+def _effective_org_name(match: SecretScanMatch) -> str:
+    """Tên cơ quan có hiệu lực của một dòng: gõ đè tay trên bảng → tên tra
+    theo mã hiệu lực qua madinhdanh_lookup → dự phòng KIE (kết thúc "*")."""
+    name = (match.org_name_override or "").strip()
+    if name:
+        return name
+    code = _effective_org_code(match)
+    looked = _org_name_lookup().get(code, "") if code else ""
+    return looked or (match.kie_org_name or "").strip()
 
 
 def _file_mtime_for_display(match: SecretScanMatch) -> float:
@@ -2098,11 +2333,11 @@ def export_matches_to_excel(matches: list[SecretScanMatch], output_path: str) ->
 
     One row per detected stamp — the same rows shown in the results table —
     plus the absolute path and bare file name so the list stays usable when
-    shared outside the app. "Mã cơ quan"/"Tên cơ quan" suy từ tên file
-    "<uuid>_<mã>-…"; tên không tra được trong madinhdanh_lookup thì dùng
-    tên dự phòng KIE bóc từ văn bản (kết thúc "*"). "Đáp ứng giải mật" chỉ
-    2 trạng thái: giá trị khi đến hạn, trống khi chưa đạt; chuỗi trong
-    "Ghi chú" giữ nguyên để file nạp lại không mâu thuẫn.
+    shared outside the app. "Mã cơ quan"/"Tên cơ quan" theo giá trị hiệu lực:
+    gõ đè tay trên bảng (nếu có) > suy từ tên file "<uuid>_<mã>-…" > tra
+    madinhdanh_lookup > dự phòng KIE bóc từ văn bản (kết thúc "*"). "Đáp ứng
+    giải mật" chỉ 2 trạng thái: giá trị khi đến hạn, trống khi chưa đạt;
+    chuỗi trong "Ghi chú" giữ nguyên để file nạp lại không mâu thuẫn.
     """
     import openpyxl
     from datetime import datetime
@@ -2128,7 +2363,7 @@ def export_matches_to_excel(matches: list[SecretScanMatch], output_path: str) ->
     green_font = Font(color="1D7A34", bold=True)
     for idx, match in enumerate(matches, start=1):
         row = idx + 1
-        org_code = _org_code_from_filename(match.source_path)
+        org_code = _effective_org_code(match)
         ws.cell(row=row, column=1, value=idx).alignment = center
         ws.cell(row=row, column=2, value=match.keyword)
         ws.cell(row=row, column=3, value=os.path.basename(match.source_path))
@@ -2136,7 +2371,7 @@ def export_matches_to_excel(matches: list[SecretScanMatch], output_path: str) ->
         ws.cell(
             row=row,
             column=5,
-            value=_org_display_name(match.source_path, match.kie_org_name),
+            value=_effective_org_name(match),
         )
         ws.cell(row=row, column=6, value=match.relative_path)
         ws.cell(row=row, column=7, value=match.source_path)
@@ -2175,6 +2410,57 @@ def _norm(path: str) -> str:
     """Chuẩn hóa key so sánh đường dẫn (cột checkbox / xóa theo file).
     Phải giữ ĐỒNG NHẤT công thức với ``secret_scan_progress._norm_path``."""
     return os.path.normcase(os.path.normpath(os.path.abspath(path)))
+
+
+# Cột bảng cho phép sửa TRỰC TIẾP (double-click / F2): Độ mật, Mã CQ,
+# Cơ quan, Ghi chú — kết quả sửa được ghi NGAY vào match của dòng nên
+# "Xuất Excel" dùng luôn giá trị mới. Các cột còn lại chỉ xem.
+_EDITABLE_COLS = frozenset({1, 3, 4, 8})
+
+# Thứ tự "nặng" của độ mật khi sắp xếp theo cột Độ mật (không rõ → sau cùng).
+_SEVERITY_RANK = {"TUYỆT MẬT": 0, "TỐI MẬT": 1, "MẬT": 2}
+
+
+def _match_scan_root(match: SecretScanMatch) -> str:
+    """Thư mục quét gốc của MỘT dòng (xem ``_derive_scan_root``)."""
+    return _derive_scan_root([match])
+
+
+def _dedupe_matches(
+    matches: list[SecretScanMatch],
+) -> tuple[list[SecretScanMatch], int]:
+    """Bỏ dòng trùng khi gộp nhiều danh sách: cùng file (đường dẫn chuẩn
+    hóa) + cùng trang + cùng độ mật là cùng một dấu → giữ dòng đầu tiên.
+    Trả về (danh sách đã lọc, số dòng bị bỏ)."""
+    unique: list[SecretScanMatch] = []
+    seen: set[tuple[str, int, str]] = set()
+    for m in matches:
+        key = (
+            _norm(m.source_path),
+            int(m.page_number or 1),
+            (m.keyword or "").strip(),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(m)
+    return unique, len(matches) - len(unique)
+
+
+def _clear_translatable_item(item) -> None:
+    """Gỡ binding dịch tự động khỏi một item bảng (UserRole+197/198/199).
+
+    Gọi khi người dùng SỬA TAY nội dung ô (Ghi chú) để không bị
+    ``retranslate_widget_tree`` dịch đè lên nội dung đã sửa."""
+    try:
+        from PySide6.QtCore import Qt as _Qt
+
+        role = int(_Qt.ItemDataRole.UserRole) + 197
+        item.setData(role, None)
+        item.setData(role + 1, None)
+        item.setData(role + 2, None)
+    except Exception:
+        pass
 
 
 def _permanent_delete(path: str) -> None:
@@ -2283,6 +2569,7 @@ def load_secret_matches_from_excel(xlsx_path: str) -> list[SecretScanMatch]:
         c_mode = col("Chế độ", 6)
         c_dec = col("Đáp ứng giải mật")
         c_note = col("Ghi chú", 7)
+        c_orgcode = col("Mã cơ quan")
         c_org = col("Tên cơ quan")
         c_date = col("Ngày cập nhật")
 
@@ -2329,6 +2616,23 @@ def load_secret_matches_from_excel(xlsx_path: str) -> list[SecretScanMatch]:
             # tra được từ danh mục thì để tra lại lúc hiển thị, không giữ
             # bản sao cũ lỡ danh mục đã đổi.
             org_cell = str(cell(r, c_org) or "").strip()
+            # Mã/tên cơ quan KHÁC với suy động hiện tại (tên file + danh
+            # mục) là dấu vết sửa tay lần trước → giữ lại để round-trip
+            # không mất; trùng thì bỏ trống để luôn theo giá trị mới nhất.
+            derived_code = _org_code_from_filename(source)
+            code_cell = str(cell(r, c_orgcode) or "").strip()
+            org_code_override = (
+                code_cell if code_cell and code_cell != derived_code else ""
+            )
+            org_name_override = ""
+            if org_cell and not org_cell.endswith("*"):
+                derived_name = (
+                    _org_name_lookup().get(derived_code, "")
+                    if derived_code
+                    else ""
+                )
+                if org_cell != derived_name:
+                    org_name_override = org_cell
             # "Ngày cập nhật": ưu tiên ô datetime thật của openpyxl; chuỗi
             # tay ("dd/mm/yyyy hh:mm" hoặc "dd/mm/yyyy") parse lại; lỗi → 0.
             file_mtime = 0.0
@@ -2361,6 +2665,8 @@ def load_secret_matches_from_excel(xlsx_path: str) -> list[SecretScanMatch]:
                     declass_due=declass_due,
                     source_version=source_version,
                     kie_org_name=org_cell if org_cell.endswith("*") else "",
+                    org_code_override=org_code_override,
+                    org_name_override=org_name_override,
                     file_mtime=file_mtime,
                 )
             )
@@ -2429,6 +2735,82 @@ class _BusySpinner(QWidget):
         painter.end()
 
 
+class _CheckAllHeader(QHeaderView):
+    """Header ngang có ô check "chọn tất cả" vẽ ngay trong ô cột 0 (cột
+    checkbox của bảng).
+
+    Bấm ô check: tích / bỏ tích MỌI DÒNG ĐANG HIỆN (dòng bị ẩn bởi bộ lọc
+    nhanh không bị động đến). Trạng thái ô header do màn hình cập nhật:
+    tích hết → checked, một phần → ba trạng thái, không có → unchecked.
+    """
+
+    check_toggled = Signal(bool)  # True = check hết các dòng đang hiện
+
+    def __init__(self, parent=None):
+        super().__init__(Qt.Orientation.Horizontal, parent)
+        self.setSectionsClickable(True)
+        self._check_state = Qt.CheckState.Unchecked
+
+    def check_state(self) -> Qt.CheckState:
+        return self._check_state
+
+    def set_check_state(self, state: Qt.CheckState) -> None:
+        if state != self._check_state:
+            self._check_state = state
+            self.updateSection(0)
+
+    def paintSection(self, painter, rect, logical_index) -> None:
+        super().paintSection(painter, rect, logical_index)
+        if logical_index != 0:
+            return
+        style = self.style()
+        opt = QStyleOptionButton()
+        opt.initFrom(self)
+        w = style.pixelMetric(QStyle.PixelMetric.PM_IndicatorWidth, opt, self)
+        h = style.pixelMetric(
+            QStyle.PixelMetric.PM_IndicatorHeight, opt, self
+        )
+        opt.rect = QRect(
+            rect.x() + max(0, (rect.width() - w) // 2),
+            rect.y() + max(0, (rect.height() - h) // 2),
+            w,
+            h,
+        )
+        opt.state |= QStyle.StateFlag.State_Enabled
+        if self._check_state == Qt.CheckState.Checked:
+            opt.state |= QStyle.StateFlag.State_On
+        elif self._check_state == Qt.CheckState.PartiallyChecked:
+            opt.state |= QStyle.StateFlag.State_NoChange
+        else:
+            opt.state |= QStyle.StateFlag.State_Off
+        style.drawControl(QStyle.ControlElement.CE_CheckBox, opt, painter)
+
+    def mousePressEvent(self, event) -> None:
+        if self.logicalIndexAt(event.position().toPoint()) == 0:
+            checked = self._check_state != Qt.CheckState.Checked
+            self.set_check_state(
+                Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+            )
+            self.check_toggled.emit(checked)
+        else:
+            super().mousePressEvent(event)
+
+
+class _ResultsDelegate(QStyledItemDelegate):
+    """Delegate mặc định + báo lại đúng ô vừa được SỬA qua editor.
+
+    Dùng signal ``edit_committed`` thay vì bắt ``itemChanged`` để phân biệt
+    rõ "người dùng vừa sửa xong một ô" với các lần chương trình tự set text
+    (thêm dòng, đổi ngôn ngữ, tô màu…) — write-back vào match chỉ xảy ra
+    khi có commit thật sự từ editor."""
+
+    edit_committed = Signal(object)  # QModelIndex
+
+    def setModelData(self, editor, model, index) -> None:
+        super().setModelData(editor, model, index)
+        self.edit_committed.emit(index)
+
+
 class _ResultsTable(QTableWidget):
     """Bảng kết quả phát thêm tín hiệu điều hướng bàn phím.
 
@@ -2484,6 +2866,9 @@ class SecretFileScanScreen(ScreenContent):
         # Dấu "không phải mật" tồn tại qua các phiên app: load 1 lần, dùng chung.
         self._not_secret = ssp.NotSecretMarks.load()
         self._loaded_from: str | None = None
+        # Toàn bộ file Excel đã load trong phiên (kể cả khi gộp) — "Xuất
+        # Excel" không bao giờ ghi đè lên chúng.
+        self._loaded_files: set[str] = set()
         self._checked_paths: set[str] = set()
         self._preview_current: SecretScanMatch | None = None
         self._preview_convert_gen = 0
@@ -2587,9 +2972,13 @@ class SecretFileScanScreen(ScreenContent):
         self.btn_load_file.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_load_file.setStyleSheet(self._secondary_btn_qss())
         self.btn_load_file.setToolTip(
-            "Nạp lại danh sách đã xuất ra file Excel (.xlsx) để tiếp tục xem,\n"
-            "xóa file hoặc xác nhận \"không phải mật\", rồi xuất ra file MỚI\n"
-            "(file đang load không bao giờ bị ghi đè)."
+            translations.localize_text(
+                "Chọn MỘT hoặc NHIỀU file Excel (.xlsx) danh sách văn bản mật\n"
+                "đã xuất để nạp lại: bảng đang trống thì nạp luôn; đang có nội\n"
+                "dung thì hỏi \"Gộp thêm\" (nối danh sách nhiều thư mục vào cùng\n"
+                "bảng, dòng trùng nhau bỏ qua) hoặc \"Thay thế\". Sau khi xem/\n"
+                "sửa/xóa, xuất ra file MỚI (file đã load không bao giờ bị ghi đè)."
+            )
         )
         self.btn_load_file.clicked.connect(self._load_from_file_clicked)
         row.addWidget(self.btn_load_file)
@@ -2657,20 +3046,27 @@ class SecretFileScanScreen(ScreenContent):
         )
         status_row.addWidget(self.history_checkbox)
 
-        self.fast_checkbox = QCheckBox("Tìm nhanh (trang đầu)")
-        self.fast_checkbox.setChecked(True)
-        self.fast_checkbox.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.fast_checkbox.setStyleSheet(
-            f"QCheckBox {{ color: {COLOR_TEXT}; font: 13px '{FONT_UI}';"
-            f" padding: 4px 8px; }}"
-            f"QCheckBox::indicator {{ width: 16px; height: 16px; }}"
+        # Chế độ quét: nhanh / kỹ giới hạn 10 trang / kỹ mọi trang.
+        self.mode_combo = QComboBox()
+        for label, key in (
+            ("Tìm nhanh (trang đầu)", "fast"),
+            ("Tìm kỹ 10 trang đầu", "thorough10"),
+            ("Tìm kỹ (mọi trang)", "thorough"),
+        ):
+            self.mode_combo.addItem(label, key)
+        self.mode_combo.setCurrentIndex(0)
+        self.mode_combo.setToolTip(
+            translations.localize_text(
+                "Tìm nhanh: chỉ xét trang đầu mỗi file, không dùng LightGBM\n"
+                "(rất nhanh, phù hợp dấu mật luôn ở trang đầu).\n"
+                "Tìm kỹ 10 trang đầu: cắt tối đa 10 trang đầu; OCR + dò chạy\n"
+                "SONG SONG theo lượt nhỏ, DỪNG ngay khi gặp trang đầu tiên có\n"
+                "dấu — OCR các trang sau cũng ngừng theo.\n"
+                "Tìm kỹ: như trên nhưng xét MỌI trang (không cắt bớt file;\n"
+                "chậm nhất khi file KHÔNG mật)."
+            )
         )
-        self.fast_checkbox.setToolTip(
-            "Bật: chỉ kiểm tra trang đầu mỗi tài liệu (rất nhanh).\n"
-            "Tắt: Tìm kỹ — quét toàn bộ trang, phát hiện dấu mật trên mọi trang "
-            "rồi chạy LightGBM để lọc các trang không phải trang đầu văn bản."
-        )
-        status_row.addWidget(self.fast_checkbox)
+        status_row.addWidget(self.mode_combo)
         picker_layout.addLayout(status_row)
         layout.addWidget(picker)
 
@@ -2682,7 +3078,15 @@ class SecretFileScanScreen(ScreenContent):
             ]
         )
         self.table.verticalHeader().setVisible(False)
-        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        # Sửa trực tiếp các cột thông tin (Độ mật, Mã CQ, Cơ quan, Ghi chú)
+        # bằng double-click hoặc F2; các cột còn lại không đặt cờ editable.
+        self.table.setEditTriggers(
+            QAbstractItemView.EditTrigger.DoubleClicked
+            | QAbstractItemView.EditTrigger.EditKeyPressed
+        )
+        self._delegate = _ResultsDelegate(self.table)
+        self.table.setItemDelegate(self._delegate)
+        self._delegate.edit_committed.connect(self._on_edit_committed)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.table.itemDoubleClicked.connect(self._open_result_file)
@@ -2692,7 +3096,10 @@ class SecretFileScanScreen(ScreenContent):
         self.table.itemChanged.connect(self._on_item_changed)
         # Phím mũi tên / PageUp / Home… đổi dòng chọn → preview theo file đó.
         self.table.keyboard_row_activated.connect(self._show_preview)
-        header = self.table.horizontalHeader()
+        # Header tùy biến: ô cột đầu tiên là ô check "chọn tất cả".
+        header = _CheckAllHeader(self.table)
+        self.table.setHorizontalHeader(header)
+        header.check_toggled.connect(self._on_select_all_toggled)
         # Cột Interactive: kéo rộng/hẹp từng cột bằng chuột (để thấy được tên
         # file dài); cột cuối (Ghi chú) tự chiếm phần bề ngang còn lại.
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
@@ -2734,6 +3141,43 @@ class SecretFileScanScreen(ScreenContent):
         )
         results_header.addWidget(self.lbl_total)
         results_header.addStretch(1)
+
+        self.sort_combo = QComboBox()
+        for label, key in (
+            ("Thứ tự: Mặc định", ""),
+            ("Sắp xếp: Đường dẫn (A→Z)", "path"),
+            ("Sắp xếp: Độ mật (nặng→nhẹ)", "keyword"),
+            ("Sắp xếp: Cơ quan (A→Z)", "org"),
+            ("Sắp xếp: Ngày cập nhật (mới→cũ)", "date"),
+        ):
+            self.sort_combo.addItem(label, key)
+        self.sort_combo.setToolTip(
+            translations.localize_text(
+                "Xếp lại toàn bộ dòng trong bảng.\n"
+                "\"Đường dẫn\" gom các file cùng thư mục gốc đứng cạnh nhau —\n"
+                "hữu ích khi bảng gộp danh sách từ nhiều lần quét khác nhau."
+            )
+        )
+        self.sort_combo.currentIndexChanged.connect(self._sort_combo_changed)
+        results_header.addWidget(self.sort_combo)
+
+        self.filter_edit = QLineEdit()
+        self.filter_edit.setPlaceholderText(
+            translations.localize_text("🔍 Gõ để lọc danh sách…")
+        )
+        self.filter_edit.setClearButtonEnabled(True)
+        self.filter_edit.setFixedWidth(230)
+        self.filter_edit.setToolTip(
+            translations.localize_text(
+                "Chỉ ẨN/hiện lại các dòng khớp (tìm trên mọi cột + đường dẫn đầy\n"
+                "đủ; nhiều từ cách nhau = phải có đủ). Không xóa dòng: \"Xuất\n"
+                "Excel\" vẫn xuất TOÀN BỘ danh sách kể cả dòng đang ẩn; ô check\n"
+                "\"chọn tất cả\" trên header chỉ check các dòng đang hiện."
+            )
+        )
+        self.filter_edit.textChanged.connect(self._apply_filter)
+        results_header.addWidget(self.filter_edit)
+
         self.btn_batch_not_secret = QPushButton("Không phải mật (đã chọn)")
         self.btn_batch_not_secret.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_batch_not_secret.setStyleSheet(self._success_btn_qss())
@@ -2928,6 +3372,25 @@ class SecretFileScanScreen(ScreenContent):
         if folder:
             self.folder_edit.setText(folder)
 
+    @staticmethod
+    def _scan_mode_for_key(key: str) -> tuple[str, bool, int]:
+        """Map key combo → (mode_key, first_page_only, page_limit).
+
+        Hàm thuần để test:
+        - "fast"       → ("fast", True, 0)   : Tìm nhanh, trang đầu.
+        - "thorough10" → ("thorough10", False, 10) : Tìm kỹ 10 trang đầu.
+        - "thorough"   → ("thorough", False, 0) : Tìm kỹ mọi trang.
+        Key lạ/rỗng → rơi về "fast" (chế độ mặc định, nhẹ nhất).
+        """
+        if key == "thorough10":
+            return "thorough10", False, 10
+        if key == "thorough":
+            return "thorough", False, 0
+        return "fast", True, 0
+
+    def _scan_mode(self) -> tuple[str, bool, int]:
+        return self._scan_mode_for_key(self.mode_combo.currentData() or "fast")
+
     def _run_clicked(self) -> None:
         folder = self.folder_edit.text().strip()
         if not folder or not os.path.isdir(folder):
@@ -2936,8 +3399,8 @@ class SecretFileScanScreen(ScreenContent):
         if self._busy:
             return
 
-        first_page_only = self.fast_checkbox.isChecked()
-        decision = self._resume_decision(folder, first_page_only)
+        mode_key, first_page_only, page_limit = self._scan_mode()
+        decision = self._resume_decision(folder, first_page_only, mode_key=mode_key)
         if decision is None:
             # Hủy / Esc / đóng hộp thoại: thao tác thoát, KHÔNG chạy worker,
             # KHÔNG reset bảng, KHÔNG tạo journal (review mục 1).
@@ -2988,7 +3451,7 @@ class SecretFileScanScreen(ScreenContent):
 
         thread = threading.Thread(
             target=self._run_worker,
-            args=(folder, first_page_only, decision),
+            args=(folder, first_page_only, decision, mode_key, page_limit),
             daemon=True,
             name="secret-file-scan",
         )
@@ -3046,7 +3509,10 @@ class SecretFileScanScreen(ScreenContent):
         return ResumeDecision.RESUME
 
     def _resume_decision(
-        self, folder: str, first_page_only: bool
+        self,
+        folder: str,
+        first_page_only: bool,
+        mode_key: str | None = None,
     ) -> ResumeDecision | None:
         """Hỏi người dùng cách xử lý phiên quét dở của (folder, mode).
 
@@ -3056,7 +3522,8 @@ class SecretFileScanScreen(ScreenContent):
             ssp.prune_stale()
         except Exception:
             pass
-        mode_key = "fast" if first_page_only else "thorough"
+        if mode_key is None:
+            mode_key = "fast" if first_page_only else "thorough"
         try:
             prog = ssp.SecretScanProgress.load(folder, mode_key)
         except Exception:
@@ -3183,7 +3650,7 @@ class SecretFileScanScreen(ScreenContent):
     def _set_running_ui(self, running: bool) -> None:
         self.btn_browse.setEnabled(not running)
         self.folder_edit.setEnabled(not running)
-        self.fast_checkbox.setEnabled(not running)
+        self.mode_combo.setEnabled(not running)
         self.history_checkbox.setEnabled(not running)
         self.btn_clear_history.setEnabled(not running)
         self.btn_load_file.setEnabled(not running)
@@ -3200,13 +3667,16 @@ class SecretFileScanScreen(ScreenContent):
         folder: str,
         first_page_only: bool,
         decision: "ResumeDecision | None" = None,
+        mode_key: str | None = None,
+        page_limit: int = 0,
     ) -> None:
         from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 
         started = time.strftime("%Y%m%d_%H%M%S")
         work_root = os.path.join(get_base_dir(), "temp", f"secret_scan_{started}")
         os.makedirs(work_root, exist_ok=True)
-        mode_key = "fast" if first_page_only else "thorough"
+        if mode_key is None:
+            mode_key = "fast" if first_page_only else "thorough"
         from scanindex.infra.version import get_version
 
         app_version = get_version()
@@ -3519,6 +3989,12 @@ class SecretFileScanScreen(ScreenContent):
                     )
                     return
 
+                # page_limit truyền theo kwargs CHỈ khi chế độ cửa sổ đang
+                # bật — giữ lời gọi 6 tham số vị trí cũ cho các nhánh còn
+                # lại (tương thích monkeypatch trong test).
+                scan_kwargs = (
+                    {"page_limit": page_limit} if page_limit else {}
+                )
                 matches = scan_one_file_for_secret(
                     path,
                     rel,
@@ -3526,6 +4002,7 @@ class SecretFileScanScreen(ScreenContent):
                     first_page_only,
                     self._cancel_event,
                     file_log,
+                    **scan_kwargs,
                 )
                 for match in matches:
                     match.source_version = app_version
@@ -4114,73 +4591,182 @@ class SecretFileScanScreen(ScreenContent):
                 folder if folder and os.path.isdir(folder)
                 else os.path.expanduser("~")
             )
-        path, _ = QFileDialog.getOpenFileName(
+        paths, _ = QFileDialog.getOpenFileNames(
             self,
             translations.localize_text(
-                "Load danh sách văn bản mật từ file Excel"
+                "Load danh sách văn bản mật từ file Excel (chọn được nhiều file)"
             ),
             start_dir,
             translations.localize_text("Excel (*.xlsx)"),
         )
-        if not path:
+        if not paths:
             return
-        try:
-            matches = load_secret_matches_from_excel(path)
-        except Exception as exc:
-            QMessageBox.critical(self, "Không đọc được file", f"{path}\n\n{exc}")
-            return
-        if not matches:
-            QMessageBox.information(
-                self, "Không có dòng nào",
-                "File không chứa dòng văn bản mật nào.",
-            )
-            return
-        if self.table.rowCount() > 0:
-            answer = QMessageBox.question(
-                self,
-                "Thay danh sách hiện tại?",
-                (
-                    "Danh sách đang hiển thị sẽ bị thay bằng nội dung file "
-                    "vừa load.\nCác chỉnh sửa chưa xuất ra Excel sẽ mất. "
-                    "Tiếp tục?"
+        matches: list[SecretScanMatch] = []
+        errors: list[str] = []
+        for path in paths:
+            try:
+                matches.extend(load_secret_matches_from_excel(path))
+            except Exception as exc:
+                errors.append(f"{path}\n→ {exc}")
+        if errors:
+            self._show_path_errors(
+                translations.localize_text(
+                    f"Không đọc được {len(errors)}/{len(paths)} file "
+                    "(các file còn lại vẫn được nạp nếu có dòng):"
                 ),
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
+                errors,
             )
-            if answer != QMessageBox.StandardButton.Yes:
+        if not matches:
+            if not errors:
+                QMessageBox.information(
+                    self, "Không có dòng nào",
+                    translations.localize_text(
+                        "Các file không chứa dòng văn bản mật nào."
+                    ),
+                )
+            return
+        # Gộp nhiều lần quét hay bị chen dòng trùng (cùng file quét 2 lần):
+        # cùng file + trang + độ mật là một dấu → chỉ giữ dòng đầu.
+        unique, dup_count = _dedupe_matches(matches)
+        if self.table.rowCount() > 0:
+            answer = self._ask_replace_or_merge(len(unique), dup_count)
+            if answer == "cancel":
                 return
-        self._reset_results()
-        self._loaded_from = os.path.abspath(path)
-        # Gán lại thư mục quét gốc (suy từ chính file Excel) để nút
-        # "Bắt đầu quét" sau đó chạy trên đúng thư mục đã xuất danh sách.
-        scan_root = _derive_scan_root(matches)
-        if scan_root:
-            self.folder_edit.setText(scan_root)
-        missing = 0
-        shown = 0
-        for m in matches:
-            gone = not os.path.exists(m.source_path)
-            if gone:
-                missing += 1
-            before = self.table.rowCount()
-            self._add_result(m, missing=gone)
-            if self.table.rowCount() > before:
-                shown += 1
-        skipped = len(matches) - shown
-        bits = [f"Đã load {shown} dòng từ: {self._loaded_from}"]
+            replace = answer == "replace"
+        else:
+            replace = True
+        shown, missing, skipped = self._load_matches_into_table(
+            unique, replace=replace
+        )
+        first = os.path.abspath(paths[0])
+        if replace:
+            self._loaded_from = first
+            self._loaded_files = {os.path.abspath(p) for p in paths}
+        else:
+            if not self._loaded_from:
+                self._loaded_from = first
+            self._loaded_files.update(os.path.abspath(p) for p in paths)
+        # Gán lại thư mục quét gốc cho nút "Bắt đầu quét" CHỈ khi toàn bộ
+        # dòng cùng một gốc; danh sách gộp đa thư mục thì giữ nguyên ô
+        # thư mục để người dùng tự chọn nơi quét tiếp.
+        roots: dict[str, str] = {}
+        for m in unique:
+            root = _match_scan_root(m)
+            if root:
+                roots.setdefault(_norm(root), root)
+        if len(roots) == 1:
+            self.folder_edit.setText(next(iter(roots.values())))
+        bits = [
+            f"Đã load {shown} dòng từ {len(paths)} file Excel"
+            + ("" if replace else " (gộp thêm)")
+        ]
+        if dup_count:
+            bits.append(f"{dup_count} dòng trùng bị bỏ qua")
         if missing:
             bits.append(
                 f"{missing} dòng có file không còn trên đĩa (hiển thị mờ)"
             )
         if skipped:
+            if replace:
+                bits.append(
+                    f"{skipped} dòng bị bỏ qua do đã xác nhận "
+                    '"không phải mật"'
+                )
+            else:
+                bits.append(
+                    f"{skipped} dòng bị bỏ qua (đã có trong bảng hoặc đã "
+                    'xác nhận "không phải mật")'
+                )
+        if len(roots) > 1:
             bits.append(
-                f"{skipped} dòng bị bỏ qua do đã xác nhận \"không phải mật\""
+                f"danh sách gồm {len(roots)} thư mục gốc — dùng \"Sắp xếp: "
+                "Đường dẫn\" để xem theo từng thư mục"
             )
         self._set_status(" • ".join(bits))
         self.log_message.emit("Quét file mật: " + " - ".join(bits), "info")
         QMessageBox.information(
             self, "Đã load danh sách", "\n\n".join(bits)
         )
+
+    def _ask_replace_or_merge(self, new_rows: int, dup_count: int) -> str:
+        """Hỏi xử lý danh sách vừa chọn khi bảng đang có nội dung:
+        "merge" (nối thêm) / "replace" (thay toàn bộ) / "cancel"."""
+        extra = (
+            f"\n({dup_count} dòng trùng trong phần vừa chọn sẽ bị bỏ qua)"
+            if dup_count
+            else ""
+        )
+        box = QMessageBox(self)
+        box.setWindowTitle(
+            translations.localize_text("Bảng đang có danh sách")
+        )
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setText(
+            translations.localize_text(
+                f"Bảng đang có {self.table.rowCount()} dòng.\n"
+                f"Danh sách vừa chọn có {new_rows} dòng.{extra}\n\n"
+                "• Gộp thêm: nối vào danh sách đang có — xem cùng lúc các file\n"
+                "  mật của nhiều thư mục, mỗi dòng vẫn giữ đúng đường dẫn của nó.\n"
+                "• Thay thế: bỏ danh sách đang có (chưa xuất Excel sẽ mất)."
+            )
+        )
+        merge_btn = box.addButton(
+            translations.localize_text("Gộp thêm"),
+            QMessageBox.ButtonRole.AcceptRole,
+        )
+        box.addButton(
+            translations.localize_text("Thay thế"),
+            QMessageBox.ButtonRole.AcceptRole,
+        )
+        cancel_btn = box.addButton("Hủy", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(merge_btn)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is merge_btn:
+            return "merge"
+        if clicked is cancel_btn:
+            return "cancel"
+        return "replace"
+
+    def _load_matches_into_table(
+        self, matches: list[SecretScanMatch], *, replace: bool
+    ) -> tuple[int, int, int]:
+        """Nạp danh sách match vào bảng (replace=True xóa bảng trước).
+
+        Khi gộp (replace=False): bỏ dòng trùng LẪN VỀ PHÍA BẢNG ĐANG CÓ —
+        cùng file (đường dẫn chuẩn hóa) + trang + độ mật là một dấu. Trả về
+        (số dòng hiển thị, số dòng file đã mất trên đĩa, số dòng bị bỏ qua
+        — trùng hoặc đã xác nhận "không phải mật")."""
+        if replace:
+            self._reset_results()
+
+        def key_of(m: SecretScanMatch) -> tuple[str, int, str]:
+            return (
+                _norm(m.source_path),
+                int(m.page_number or 1),
+                (m.keyword or "").strip(),
+            )
+
+        seen: set[tuple[str, int, str]] = set()
+        if not replace:
+            for existing in self._current_matches():
+                seen.add(key_of(existing))
+        missing = 0
+        shown = 0
+        for m in matches:
+            key = key_of(m)
+            if key in seen:
+                continue
+            seen.add(key)
+            gone = not os.path.exists(m.source_path)
+            if gone:
+                missing += 1
+            if self._add_result(m, missing=gone, quiet=True):
+                shown += 1
+        self._apply_filter()
+        self._update_select_all_state()
+        self._refresh_totals()
+        return shown, missing, len(matches) - shown
 
     def _set_status(self, text: str) -> None:
         self.status_label.setText(text)
@@ -4189,12 +4775,16 @@ class SecretFileScanScreen(ScreenContent):
         self.progress.setMaximum(max(1, total))
         self.progress.setValue(max(0, min(current, max(1, total))))
 
-    def _add_result(self, match: SecretScanMatch, missing: bool = False) -> None:
+    def _add_result(
+        self, match: SecretScanMatch, missing: bool = False, quiet: bool = False
+    ) -> bool:
+        """Thêm một dòng vào bảng. Trả False nếu dòng bị chặn (file đã xác
+        nhận "không phải mật" mà chưa đổi nội dung)."""
         # Cửa chặn duy nhất cho CẢ BA nguồn dòng mật (quét mới, resume dở,
         # cache "Tận dụng kết quả đã quét"): file đã được xác nhận "không
         # phải mật" và chưa đổi nội dung thì không bao giờ hiện lại.
         if self._not_secret.is_marked(match.source_path):
-            return
+            return False
         row = self.table.rowCount()
         self.table.insertRow(row)
         check_item = QTableWidgetItem()
@@ -4207,8 +4797,8 @@ class SecretFileScanScreen(ScreenContent):
         check_item.setData(Qt.ItemDataRole.UserRole, match.source_path)
         check_item.setData(Qt.ItemDataRole.UserRole + 1, match)
         self.table.setItem(row, 0, check_item)
-        org_code = _org_code_from_filename(match.source_path)
-        org_name = _org_display_name(match.source_path, match.kie_org_name)
+        org_code = _effective_org_code(match)
+        org_name = _effective_org_name(match)
         values = [
             match.keyword,
             match.relative_path,
@@ -4221,6 +4811,13 @@ class SecretFileScanScreen(ScreenContent):
         ]
         for col, value in enumerate(values, start=1):
             item = QTableWidgetItem(value)
+            # Chỉ các cột thông tin được sửa tay mới nhận cờ editable; ô
+            # không sửa được (File, Ngày, Trang, Chế độ) bỏ cờ để double-
+            # click vẫn mở file bên ngoài như cũ.
+            if col in _EDITABLE_COLS:
+                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable)
+            else:
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             if col == 7:
                 translations.set_translatable_item_text(
                     item, value, sync_tooltip=True
@@ -4239,10 +4836,25 @@ class SecretFileScanScreen(ScreenContent):
                 item.setForeground(QColor(COLOR_TEXT_SECONDARY))
             self.table.setItem(row, col, item)
         org_item = self.table.item(row, 4)
-        if org_item is not None and org_item.text().endswith("*"):
-            org_item.setToolTip(
-                "Cơ quan theo văn bản (bóc bằng KIE) — không tra được tên "
-                'xác định qua danh mục mã định danh (dấu "*")'
+        if org_item is not None:
+            if match.org_name_override:
+                org_item.setToolTip(
+                    translations.localize_text(
+                        "Tên cơ quan đã sửa tay trên bảng "
+                        "(ưu tiên khi xuất Excel)"
+                    )
+                )
+            elif org_item.text().endswith("*"):
+                org_item.setToolTip(
+                    "Cơ quan theo văn bản (bóc bằng KIE) — không tra được tên "
+                    'xác định qua danh mục mã định danh (dấu "*")'
+                )
+        code_item = self.table.item(row, 3)
+        if code_item is not None and match.org_code_override:
+            code_item.setToolTip(
+                translations.localize_text(
+                    "Mã cơ quan đã sửa tay trên bảng (không suy từ tên file)"
+                )
             )
         if not missing and _match_meets_declassification(match):
             note_item = self.table.item(row, 8)
@@ -4257,7 +4869,9 @@ class SecretFileScanScreen(ScreenContent):
                     )
                 )
         self.btn_export.setEnabled(True)
-        self._refresh_totals()
+        if not quiet:
+            self._refresh_totals()
+        return True
 
     def _on_results_replace(self, payload: dict) -> None:
         """Slot cho signal thay thế hàng theo file (nhánh quét lại).
@@ -4296,6 +4910,9 @@ class SecretFileScanScreen(ScreenContent):
 
     def _refresh_totals(self) -> None:
         rows = self.table.rowCount()
+        visible = sum(
+            1 for r in range(rows) if not self.table.isRowHidden(r)
+        )
         files = len(
             {
                 _norm(self._row_path(r))
@@ -4304,19 +4921,18 @@ class SecretFileScanScreen(ScreenContent):
             }
         )
         if rows == 0:
-            self.lbl_total.setText(
-                translations.localize_text("Tổng: 0 văn bản mật")
-            )
+            text = translations.localize_text("Tổng: 0 văn bản mật")
         elif rows == files:
-            self.lbl_total.setText(
-                translations.localize_text(f"Tổng: {files} văn bản mật")
-            )
+            text = translations.localize_text(f"Tổng: {files} văn bản mật")
         else:
-            self.lbl_total.setText(
-                translations.localize_text(
-                    f"Tổng: {files} văn bản mật ({rows} dòng)"
-                )
+            text = translations.localize_text(
+                f"Tổng: {files} văn bản mật ({rows} dòng)"
             )
+        if visible != rows:
+            text += translations.localize_text(
+                f" — đang lọc: hiện {visible}/{rows} dòng"
+            )
+        self.lbl_total.setText(text)
         self.btn_export.setEnabled(not self._busy and rows > 0)
         self._refresh_action_buttons()
 
@@ -4342,7 +4958,199 @@ class SecretFileScanScreen(ScreenContent):
             self._checked_paths.add(_norm(path))
         else:
             self._checked_paths.discard(_norm(path))
+        self._update_select_all_state()
         self._refresh_action_buttons()
+
+    # ------------------------------------------------------------------
+    # Sửa tay các cột thông tin (double-click / F2 → delegate commit)
+    # ------------------------------------------------------------------
+
+    def _on_edit_committed(self, index) -> None:
+        item = self.table.item(index.row(), index.column())
+        if item is not None:
+            self._apply_cell_edit(item)
+
+    def _apply_cell_edit(self, item: QTableWidgetItem) -> None:
+        """Ghi nội dung vừa sửa NGAY vào match của dòng — bảng là nguồn
+        chân lý nên "Xuất Excel"/đếm lại dùng luôn giá trị mới."""
+        match = item.data(Qt.ItemDataRole.UserRole + 1)
+        if not isinstance(match, SecretScanMatch):
+            return
+        col = item.column()
+        text = item.text().strip()
+        if col == 1:
+            match.keyword = text
+        elif col == 3:
+            match.org_code_override = text
+            self._refresh_org_cells(item.row())
+        elif col == 4:
+            match.org_name_override = text
+            self._refresh_org_cells(item.row())
+        elif col == 8:
+            match.note = text
+            # Nội dung tay — gỡ binding dịch để không bị dịch đè khi đổi
+            # ngôn ngữ giao diện.
+            _clear_translatable_item(item)
+
+    def _refresh_org_cells(self, row: int) -> None:
+        """Tính lại Mã CQ / Cơ quan của dòng theo thứ tự ưu tiên: gõ đè tay
+        > tra madinhdanh_lookup theo mã > dự phòng KIE (kết thúc "*")."""
+        item0 = self.table.item(row, 0)
+        if item0 is None:
+            return
+        match = item0.data(Qt.ItemDataRole.UserRole + 1)
+        if not isinstance(match, SecretScanMatch):
+            return
+        code_item = self.table.item(row, 3)
+        if code_item is not None:
+            code_item.setText(_effective_org_code(match))
+            if match.org_code_override:
+                code_item.setToolTip(
+                    translations.localize_text(
+                        "Mã cơ quan đã sửa tay trên bảng "
+                        "(không suy từ tên file)"
+                    )
+                )
+        name_item = self.table.item(row, 4)
+        if name_item is not None:
+            name_item.setText(_effective_org_name(match))
+            if match.org_name_override:
+                name_item.setToolTip(
+                    translations.localize_text(
+                        "Tên cơ quan đã sửa tay trên bảng "
+                        "(ưu tiên khi xuất Excel)"
+                    )
+                )
+            elif name_item.text().endswith("*"):
+                name_item.setToolTip(
+                    "Cơ quan theo văn bản (bóc bằng KIE) — không tra được tên "
+                    'xác định qua danh mục mã định danh (dấu "*")'
+                )
+
+    # ------------------------------------------------------------------
+    # Ô check "chọn tất cả" trên header
+    # ------------------------------------------------------------------
+
+    def _on_select_all_toggled(self, checked: bool) -> None:
+        state = (
+            Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+        )
+        for r in range(self.table.rowCount()):
+            if self.table.isRowHidden(r):
+                continue  # dòng đang ẩn bởi bộ lọc không bị động đến
+            item = self.table.item(r, 0)
+            if item is not None:
+                item.setCheckState(state)
+        self._refresh_action_buttons()
+
+    def _update_select_all_state(self) -> None:
+        header = self.table.horizontalHeader()
+        if not isinstance(header, _CheckAllHeader):
+            return
+        total = checked = 0
+        for r in range(self.table.rowCount()):
+            if self.table.isRowHidden(r):
+                continue
+            item = self.table.item(r, 0)
+            if item is None:
+                continue
+            total += 1
+            if item.checkState() == Qt.CheckState.Checked:
+                checked += 1
+        if total and checked == total:
+            state = Qt.CheckState.Checked
+        elif checked:
+            state = Qt.CheckState.PartiallyChecked
+        else:
+            state = Qt.CheckState.Unchecked
+        header.set_check_state(state)
+
+    # ------------------------------------------------------------------
+    # Lọc nhanh + sắp xếp
+    # ------------------------------------------------------------------
+
+    def _apply_filter(self) -> None:
+        """Bộ lọc nhanh: chỉ ẨN dòng không khớp — dữ liệu và "Xuất Excel"
+        vẫn giữ toàn bộ danh sách (lọc chỉ thay đổi cách xem)."""
+        terms = self.filter_edit.text().strip().lower().split()
+        for r in range(self.table.rowCount()):
+            if not terms:
+                self.table.setRowHidden(r, False)
+                continue
+            haystack = self._row_filter_text(r)
+            self.table.setRowHidden(
+                r, not all(term in haystack for term in terms)
+            )
+        self._update_select_all_state()
+        self._refresh_totals()
+
+    def _row_filter_text(self, row: int) -> str:
+        parts: list[str] = [self._row_path(row)]
+        for col in range(1, self.table.columnCount()):
+            item = self.table.item(row, col)
+            if item is not None:
+                parts.append(item.text())
+        return " ".join(parts).lower()
+
+    def _sort_combo_changed(self, _index: int) -> None:
+        self._sort_table()
+
+    def _sort_table(self) -> None:
+        """Xếp lại dòng trong bảng theo tiêu đề đang chọn. Sắp xếp theo
+        "Đường dẫn" gom file cùng thư mục gốc cạnh nhau — cách xem "từng
+        đường dẫn riêng" khi bảng gộp nhiều danh sách."""
+        key = self.sort_combo.currentData() or ""
+        if not key:
+            return
+        rows: list[tuple[SecretScanMatch, bool]] = []
+        for r in range(self.table.rowCount()):
+            item0 = self.table.item(r, 0)
+            if item0 is None:
+                continue
+            match = item0.data(Qt.ItemDataRole.UserRole + 1)
+            if not isinstance(match, SecretScanMatch):
+                continue
+            rows.append(
+                (match, item0.checkState() == Qt.CheckState.Checked)
+            )
+        if len(rows) < 2:
+            return
+
+        def sort_key(t):
+            m = t[0]
+            if key == "keyword":
+                return (
+                    _SEVERITY_RANK.get(m.keyword.strip().upper(), 9),
+                    _norm(m.source_path),
+                )
+            if key == "org":
+                return (
+                    _effective_org_name(m).lower(),
+                    _norm(m.source_path),
+                )
+            if key == "date":
+                return (-_file_mtime_for_display(m), _norm(m.source_path))
+            return _norm(m.source_path)
+
+        rows.sort(key=sort_key)
+        try:
+            self.table.setRowCount(0)
+            for match, was_checked in rows:
+                self._add_result(
+                    match,
+                    missing=not os.path.exists(match.source_path),
+                    quiet=True,
+                )
+                if was_checked:
+                    item0 = self.table.item(self.table.rowCount() - 1, 0)
+                    if item0 is not None:
+                        item0.setCheckState(Qt.CheckState.Checked)
+        finally:
+            self._apply_filter()
+        if self._preview_current is not None:
+            row = self._first_row_of(self._preview_current.source_path)
+            if row is not None:
+                self._select_result_row(row)
 
     def _on_row_clicked(self, item: QTableWidgetItem) -> None:
         if item.column() == 0:
@@ -4371,14 +5179,18 @@ class SecretFileScanScreen(ScreenContent):
             )
             self._set_preview_banner("", None)
             self._set_preview_busy(False)
+        self._update_select_all_state()
         self._refresh_totals()
 
     def _reset_results(self) -> None:
         self._loaded_from = None
+        self._loaded_files = set()
         self._checked_paths.clear()
         self._preview_current = None
         self._preview_convert_gen += 1  # vô hiệu hoá kết quả convert cũ
         self.table.setRowCount(0)
+        self.filter_edit.clear()  # mở lại mọi dòng bị ẩn bởi bộ lọc cũ
+        self._update_select_all_state()
         self.pdf_viewer.clear()
         self.preview_stack.setCurrentIndex(0)
         self.lbl_preview_empty.setText(
@@ -4518,8 +5330,9 @@ class SecretFileScanScreen(ScreenContent):
             return
         if not dest.lower().endswith(".xlsx"):
             dest += ".xlsx"
-        if self._loaded_from and os.path.abspath(dest) == self._loaded_from:
-            # Không bao giờ ghi đè file đang load — tự đổi tên kèm mốc giờ.
+        if os.path.abspath(dest) in self._loaded_files:
+            # Không bao giờ ghi đè file đã load (kể cả khi gộp nhiều file)
+            # — tự đổi tên kèm mốc giờ.
             dest = (
                 os.path.splitext(dest)[0]
                 + f"_moi_{time.strftime('%Y%m%d_%H%M%S')}.xlsx"
@@ -4528,7 +5341,7 @@ class SecretFileScanScreen(ScreenContent):
                 self,
                 "Không ghi đè file đang load",
                 translations.localize_text(
-                    f"File đang load không được ghi đè.\n"
+                    f"File đã load không được ghi đè.\n"
                     f"Danh sách sẽ xuất ra:\n{dest}"
                 ),
             )
