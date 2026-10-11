@@ -113,6 +113,7 @@ class PdfAuditResult:
     letters: int = 0                # tổng chữ cái latin trong text
     pdfa: str = ""                  # "1B", "2B", "3U"… — rỗng nếu không có
     signed: bool | None = None      # có chữ ký số (None = không xác định)
+    stamp_images_skipped: int = 0   # ảnh dấu/mộc chữ ký đã loại khỏi thống kê
     name_ok: bool | None = None     # tên khớp quy ước hồ sơ + thư mục cha
     name_note: str = ""             # mô tả vi phạm tên ('' = đạt)
     small_page_note: str = ""       # khổ ≤ ~70% A4 mà < 600 dpi ('' = không)
@@ -146,8 +147,12 @@ class PdfAuditResult:
     def dpi_detail(self) -> str:
         if self.min_dpi is None:
             return ""
-        return (f"{self.min_dpi:.0f}–{self.max_dpi:.0f} dpi "
-                f"({len(self.images)} ảnh)")
+        txt = (f"{self.min_dpi:.0f}–{self.max_dpi:.0f} dpi "
+               f"({len(self.images)} ảnh)")
+        if self.stamp_images_skipped:
+            txt += (f" · đã bỏ qua {self.stamp_images_skipped} "
+                    f"ảnh dấu chữ ký")
+        return txt
 
     def ocr_detail(self) -> str:
         parts = [f"{self.pages_with_text}/{self.pages} trang có text"]
@@ -331,6 +336,18 @@ def audit_pdf(path: str | os.PathLike, *, quick: bool = False,
                     infos = page.get_image_info(xrefs=not quick)
                 except Exception:
                     infos = []
+                # Ảnh dấu/mộc chữ ký (nằm trong appearance của SigField)
+                # không phải nội dung scan — loại khỏi thống kê chất lượng.
+                sig_rects = _signature_widget_rects(page)
+                if sig_rects:
+                    kept = []
+                    for im in infos:
+                        if _is_signature_stamp_image(
+                                im.get("bbox"), sig_rects, page.rect):
+                            result.stamp_images_skipped += 1
+                        else:
+                            kept.append(im)
+                    infos = kept
                 has_image = bool(infos)
                 page_entries = [_image_entry(i + 1, im, doc, quick=quick)
                                 for im in infos]
@@ -413,6 +430,57 @@ def _image_entry(page_no: int, im: dict, doc: "fitz.Document",
                  if xref and not quick else []),
         xref=xref,
     )
+
+
+def _signature_widget_rects(page) -> list:
+    """Rect các ô chữ ký số (SigField widget) trên trang.
+
+    Ảnh dấu/mộc do tool ký số (pyHanko, Adobe…) chèn nằm trong appearance
+    của widget chữ ký, nhưng MuPDF liệt kê chúng trong ``get_image_info``
+    như ảnh thường — làm sai thống kê DPI/nén của ảnh scan (ví dụ bản ký
+    của file scan 300 dpi bị tụt còn "287 dpi" vì dấu chỉ ~287 dpi).
+    """
+    rects = []
+    try:
+        widgets = page.widgets() or []
+    except Exception:
+        return rects
+    for widget in widgets:
+        try:
+            if (getattr(widget, "field_type_string", "") == "Signature"
+                    and widget.rect is not None):
+                rects.append(fitz.Rect(widget.rect))
+        except Exception:
+            continue
+    return rects
+
+
+def _is_signature_stamp_image(bbox, sig_rects, page_rect) -> bool:
+    """True khi ảnh là dấu/mộc chữ ký chèn bởi tool ký số.
+
+    Ảnh nằm ≥90% diện tích trong rect một ô chữ ký, và không phủ gần hết
+    trang (ảnh full-page là nội dung scan, dù hi hữu hiếm khi dấu tràn
+    trang thì vẫn giữ trong thống kê — an toàn hơn là mất dữ liệu scan).
+    """
+    if not sig_rects or bbox is None:
+        return False
+    try:
+        rect = fitz.Rect(bbox)
+    except Exception:
+        return False
+    area = rect.width * rect.height
+    page_area = page_rect.width * page_rect.height
+    if area <= 1e-6 or page_area <= 1e-6:
+        return False
+    if area / page_area >= 0.9:
+        return False
+    for sr in sig_rects:
+        ix0, iy0 = max(rect.x0, sr.x0), max(rect.y0, sr.y0)
+        ix1, iy1 = min(rect.x1, sr.x1), min(rect.y1, sr.y1)
+        inter = max(0.0, ix1 - ix0) * max(0.0, iy1 - iy0)
+        if inter / area >= 0.9:
+            return True
+    return False
 
 
 def _has_signature(doc: "fitz.Document") -> bool:

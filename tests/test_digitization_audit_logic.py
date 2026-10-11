@@ -169,3 +169,96 @@ def test_pdf_documents_are_counted_separately_from_tiff_pages(tmp_path):
     single_dossier = audit.scan_tree_stats(pdf_dossier)
     assert single_dossier.dossier_count_of_rel("") == 1
     assert single_dossier.document_count_of_rel("") == 2
+
+
+# -------------------------------------------------------------------------- #
+# Ảnh dấu/mộc chữ ký không được tính vào thống kê chất lượng scan
+# -------------------------------------------------------------------------- #
+
+def test_is_signature_stamp_image_geometry():
+    page_rect = fitz.Rect(0, 0, 842, 595)
+    sig = [fitz.Rect(739.9, 10.0, 832.1, 81.3)]
+    # ảnh dấu nằm trọn trong ô chữ ký → loại
+    assert audit._is_signature_stamp_image((740.0, 10.5, 831.5, 80.5),
+                                           sig, page_rect)
+    # ảnh phủ gần hết trang → là nội dung scan, giữ lại
+    assert not audit._is_signature_stamp_image((0, 0, 842, 595),
+                                               sig, page_rect)
+    # ảnh thường ngoài ô chữ ký → giữ lại
+    assert not audit._is_signature_stamp_image((100, 100, 300, 300),
+                                               sig, page_rect)
+    # không có ô chữ ký trên trang → giữ lại
+    assert not audit._is_signature_stamp_image((740.0, 10.5, 831.5, 80.5),
+                                               [], page_rect)
+    assert not audit._is_signature_stamp_image(None, sig, page_rect)
+
+
+def _self_signed_cert_info():
+    import datetime as _dt
+
+    from cryptography import x509 as cx509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = cx509.Name([
+        cx509.NameAttribute(NameOID.COMMON_NAME, "TEST SIGNER"),
+        cx509.NameAttribute(NameOID.ORGANIZATION_NAME, "Test Org"),
+    ])
+    now = _dt.datetime.now(_dt.timezone.utc)
+    cert = (cx509.CertificateBuilder()
+            .subject_name(name).issuer_name(name)
+            .public_key(key.public_key())
+            .serial_number(cx509.random_serial_number())
+            .not_valid_before(now - _dt.timedelta(days=1))
+            .not_valid_after(now + _dt.timedelta(days=365))
+            .sign(key, hashes.SHA256()))
+    return {
+        "der": cert.public_bytes(serialization.Encoding.DER),
+        "cn": "TEST SIGNER", "org": "Test Org", "ou": "Test OU",
+        "subject": "CN=TEST SIGNER", "issuer": "CN=TEST SIGNER",
+        "serial": "0A1B2C",
+        "not_after": (now + _dt.timedelta(days=365)).date(),
+    }
+
+
+def test_signed_pdf_keeps_scan_dpi_verdict(tmp_path, monkeypatch):
+    """File scan 300 dpi sau khi ký vẫn phải 'Đạt' 300 dpi.
+
+    pyHanko chèn ảnh bitmap dấu (~287 dpi) vào appearance của ô chữ ký;
+    MuPDF liệt kê ảnh này trong get_image_info như ảnh thường nên trước
+    đây min_dpi tụt từ 300 xuống 287 → file đã ký bị 'Không đạt' oan."""
+    from scanindex.core.pdf import signer as signer_mod
+
+    document = fitz.open()
+    page = document.new_page(width=100, height=141.4)
+    pixels = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 417, 590))
+    pixels.set_rect(pixels.irect, (235, 233, 228))
+    page.insert_image(page.rect, stream=pixels.tobytes("png"))
+    src = tmp_path / "scan300.pdf"
+    document.save(src)
+    document.close()
+
+    result = audit.audit_pdf(src)
+    assert result.dpi_ok is True
+    assert result.stamp_images_skipped == 0
+
+    monkeypatch.setattr(
+        signer_mod, "sign_data",
+        lambda cert_info, data, hash_alg="sha256": b"\x5a" * 256)
+    signed = tmp_path / "scan300_signed.pdf"
+    signer_mod.sign_single_pdf(
+        str(src), str(signed), _self_signed_cert_info(),
+        sig_box=(0, 0, 220, 60), page=0,
+        stamp_template="Xác nhận ... {datetime}",
+        avoid_text_overlap=True,
+    )
+
+    result = audit.audit_pdf(signed)
+    assert result.signed is True
+    assert result.stamp_images_skipped == 1
+    assert len(result.images) == 1          # chỉ còn ảnh scan
+    assert result.min_dpi >= audit.DPI_MIN - 1.0
+    assert result.dpi_ok is True
+    assert "ảnh dấu chữ ký" in result.dpi_detail()

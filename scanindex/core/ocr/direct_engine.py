@@ -907,16 +907,13 @@ def _build_text_page_words_legacy(page, words_data, font_path):
 
 
 def _estimate_page_native_dpi(page) -> int:
-    """Best-effort DPI of the largest image on the page.
+    """Best-effort DPI của ảnh lớn nhất trên trang.
 
-    When a page is a full-page scan with an embedded native text layer
-    (scan_ocr_low), we rasterize it to drop that text before the ScreenAI
-    overlay. Re-rendering at the embedded image's own DPI keeps the file
-    from ballooning: rendering at 300 DPI when the source is only
-    150-200 DPI just invents pixels and bloats the output. DPI is clamped to
-    [72, 300]: 72 floors nonsensical metadata readings, 300 caps high-DPI
-    scans (still preserves print quality while avoiding oversized JPEGs).
-    Returns OCR_DPI as a safe fallback when no usable image is found.
+    Khi trang là scan tràn trang kèm text layer (scan_ocr_low) mà phải
+    rasterize để bỏ text cũ, render đúng DPI gốc của ảnh nhúng giữ nguyên
+    độ phân giải: render thấp hơn làm giảm DPI (600 → 300), render cao hơn
+    chỉ phình file không thêm chi tiết. DPI chỉ kẹp trần 1200 để chặn
+    metadata hỏng gây render khổng lồ; trả về OCR_DPI khi không đo được.
     """
     import fitz  # PyMuPDF - lazy import
     page_rect = page.rect
@@ -929,30 +926,60 @@ def _estimate_page_native_dpi(page) -> int:
             ih = img[3]
             if not iw or not ih:
                 continue
-            # Find the display rect(s) of this image on the page.
-            coverage = 0.0
+            # Find the display rect(s) of this image on the page; DPI tính
+            # theo rect CÓ ĐỘ PHỦ LỚN NHẤT (rect cuối trong list không phải
+            # rect lớn nhất khi ảnh được đặt nhiều lần).
+            best_rect = None
+            best_rect_area = 0.0
             for r in page.get_image_rects(xref):
-                coverage = max(coverage, (r.width * r.height) / max(page_rect.width * page_rect.height, 1))
+                area = r.width * r.height
+                if area > best_rect_area:
+                    best_rect_area = area
+                    best_rect = r
+            if best_rect is None:
+                continue
+            coverage = best_rect_area / max(page_rect.width * page_rect.height, 1)
             if coverage < 0.5:  # not a full-page image, skip
                 continue
-            dpi = round(((iw / r.width if r.width else 0) + (ih / r.height if r.height else 0)) * 72 / 2)
+            dpi = round(((iw / best_rect.width if best_rect.width else 0)
+                         + (ih / best_rect.height if best_rect.height else 0)) * 72 / 2)
             if coverage > best_coverage:
                 best_coverage = coverage
-                best_dpi = max(72, min(dpi, 300))
+                best_dpi = max(72, min(dpi, 1200))
     except Exception:
         pass
     return best_dpi or OCR_DPI
+
+
+def _dominant_image_cs_name(page) -> str:
+    """cs-name của ảnh tràn trang trên trang ('' nếu không có)."""
+    import fitz  # PyMuPDF - lazy import
+    page_area = max(float(page.rect.width * page.rect.height), 1.0)
+    best_name = ""
+    best_cov = 0.0
+    try:
+        for info in page.get_image_info(xrefs=True) or []:
+            bbox = fitz.Rect(info.get("bbox") or (0, 0, 0, 0))
+            cov = (bbox.width * bbox.height) / page_area
+            if cov > best_cov:
+                best_cov = cov
+                best_name = str(info.get("cs-name") or "")
+    except Exception:
+        pass
+    return best_name if best_cov >= 0.5 else ""
 
 
 def _rasterize_page_to_jpeg_background(doc, src_page, *, page_w, page_h, bake_angle=0, jpeg_quality=85):
     """Create a fresh text-free page whose visual is a JPEG rasterization of
     ``src_page``.
 
-    Used for scan_ocr_low pages: they carry a native (often OCR-quality) text
-    layer that would double up with the ScreenAI overlay. Rasterizing drops
-    the text layer while keeping the scanned image. JPEG encoding (not the
-    default PNG/Flate) keeps the output size close to the source — a 200 DPI
-    scan stays ~0.5 MB instead of the ~16 MB an uncompressed pixmap costs.
+    Used for scan_ocr_low pages that are NOT a single full-page image (those
+    get the verbatim-image rebuild in ``_rebuild_text_page_with_original_images``
+    instead). Rasterizing drops the text layer while keeping the scanned
+    image, rendered at the embedded image's own DPI (giữ nguyên DPI gốc —
+    xem ``_estimate_page_native_dpi``). A grayscale scan renders grayscale
+    (không bị đổi thành RGB). JPEG encoding (not the default PNG/Flate)
+    keeps the output size close to the source.
     """
     import fitz  # PyMuPDF - lazy import
     dpi = _estimate_page_native_dpi(src_page)
@@ -960,7 +987,12 @@ def _rasterize_page_to_jpeg_background(doc, src_page, *, page_w, page_h, bake_an
     matrix = fitz.Matrix(zoom, zoom)
     if bake_angle:
         matrix = matrix * fitz.Matrix(fitz.Identity).prerotate(bake_angle)
-    pix = src_page.get_pixmap(matrix=matrix, annots=True)
+    cs_name = _dominant_image_cs_name(src_page).upper()
+    if "GRAY" in cs_name:
+        pix = src_page.get_pixmap(matrix=matrix, annots=True,
+                                  colorspace=fitz.csGRAY)
+    else:
+        pix = src_page.get_pixmap(matrix=matrix, annots=True)
     # Save as JPEG and insert the JPEG stream directly. PyMuPDF's
     # insert_image(pixmap=...) re-encodes as PNG/Flate (~20-30x larger for a
     # scan); passing a JPEG filename embeds the DCT stream verbatim.
@@ -978,6 +1010,70 @@ def _rasterize_page_to_jpeg_background(doc, src_page, *, page_w, page_h, bake_an
             os.remove(jpg_path)
         except OSError:
             pass
+
+
+# Định dạng ảnh được phép chèn lại nguyên stream (extract_image trả về đúng
+# bytes gốc — JPEG giữ nguyên từng byte, PNG/JPX lossless) khi dựng lại trang
+# scan + text layer mà không rasterize.
+_VERBATIM_IMAGE_EXTS = {"jpeg", "jpg", "jpx", "jp2", "png"}
+
+
+def _rebuild_text_page_with_original_images(doc_out, doc_in, src_page,
+                                            page_w, page_h, bake_angle=0):
+    """Xây lại trang 'scan + text layer' giữ NGUYÊN ảnh gốc (không rasterize).
+
+    Trang scan kèm text layer (scan_ocr_low) trước đây bị rasterize: render
+    lại cả trang + re-encode JPEG làm mất một thế hệ nén, và gray bị thành
+    RGB. Khi trang chỉ gồm đúng MỘT ảnh tràn trang (đúng dạng scan thật),
+    ta chèn lại chính stream ảnh gốc lên trang mới không có text:
+    - JPEG: byte giữ nguyên 100% (md5 giống hệt) → DPI/màu/nén không đổi;
+    - PNG/JPX: chèn lossless (pixel giống hệt).
+    Trả về trang mới, hoặc None khi trang không đúng dạng (nhiều ảnh, có
+    smask trong suốt, ảnh không tràn trang…) — caller rasterize như cũ.
+    """
+    import fitz  # PyMuPDF - lazy import
+    try:
+        images = src_page.get_images(full=True) or []
+    except Exception:
+        return None
+    if len(images) != 1:
+        return None
+    img = images[0]
+    xref, smask, iw, ih = img[0], img[1], img[2], img[3]
+    if smask or not iw or not ih:
+        return None
+    try:
+        rects = src_page.get_image_rects(xref)
+    except Exception:
+        return None
+    if len(rects) != 1:
+        return None
+    page_area = max(float(src_page.rect.width * src_page.rect.height), 1.0)
+    if (rects[0].width * rects[0].height) / page_area < 0.7:
+        return None
+    try:
+        info = doc_in.extract_image(xref)
+    except Exception:
+        return None
+    if not isinstance(info, dict):
+        return None
+    ext = str(info.get("ext") or "").lower()
+    img_bytes = info.get("image") or b""
+    if ext not in _VERBATIM_IMAGE_EXTS or not img_bytes:
+        return None
+    # Chèn lại ĐÚNG rect gốc (giữ nguyên vị trí/tỉ lệ như trang nguồn);
+    # bake_angle=180 chỉ xử lý được khi ảnh gần tràn trang (rect xoay 180°
+    # trùng rect cũ), lệch nhau thì trả None cho caller rasterize.
+    use_rect = rects[0]
+    if bake_angle:
+        if (rects[0].width * rects[0].height) / page_area < 0.99:
+            return None
+        import fitz  # PyMuPDF - lazy import
+        use_rect = fitz.Rect(0, 0, page_w, page_h)
+    new_page = doc_out.new_page(width=page_w, height=page_h)
+    new_page.insert_image(use_rect, stream=img_bytes,
+                          rotate=int(bake_angle or 0))
+    return new_page
 
 
 def _copy_source_page_background(doc_out, doc_in, page_idx, page_w, page_h, bake_angle=0):
@@ -1000,6 +1096,13 @@ def _copy_source_page_background(doc_out, doc_in, page_idx, page_w, page_h, bake
     import fitz  # PyMuPDF - lazy import
     src_page = doc_in[page_idx]
     if _page_has_text_layer(src_page):
+        # Ưu tiên chèn lại ảnh gốc nguyên vẹn (không mất chất); chỉ
+        # rasterize khi trang không đúng dạng "1 ảnh tràn trang".
+        rebuilt = _rebuild_text_page_with_original_images(
+            doc_out, doc_in, src_page, page_w, page_h, bake_angle=bake_angle
+        )
+        if rebuilt is not None:
+            return rebuilt
         return _rasterize_page_to_jpeg_background(
             doc_out, src_page, page_w=page_w, page_h=page_h, bake_angle=bake_angle
         )

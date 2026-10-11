@@ -287,6 +287,66 @@ def render_stamp_template(
     return template.format(**values).strip()
 
 
+def _wrap_stamp_lines(lines: List[str], font_size_pt: float,
+                      font_path: Optional[str], max_width_pt: float,
+                      compact_scale: float = 0.86,
+                      dpi_scale: int = 4) -> List[str]:
+    """Word-wrap lines to *max_width_pt* at the given font size (PIL metrics,
+    matching the bitmap renderer). Without wrapping, one long template line
+    at a big font makes the natural unit enormous and the fit-scale shrinks
+    the whole stamp back down — cancelling the manual font size entirely."""
+    if not _HAS_PIL:
+        return list(lines)
+    size_px = max(1, int(round(font_size_pt * dpi_scale)))
+    try:
+        if font_path:
+            font = ImageFont.truetype(font_path, size_px)
+        else:
+            try:
+                font = ImageFont.load_default(size=size_px)
+            except TypeError:   # Pillow < 9.2: fixed-size default font
+                font = ImageFont.load_default()
+    except Exception:
+        font = ImageFont.load_default()
+    probe = Image.new("L", (1, 1))
+    draw = ImageDraw.Draw(probe)
+
+    def width_px(text: str) -> float:
+        bbox = draw.textbbox((0, 0), text or "", font=font)
+        return max(1.0, float(bbox[2] - bbox[0])) * compact_scale
+
+    limit = max(1.0, float(max_width_pt) * dpi_scale)
+    # 3% tolerance: int-metric rounding must not hard-break a word that is
+    # visually fine (e.g. "2026-10-11" at the exact boundary).
+    tolerant = limit * 1.03
+    out: List[str] = []
+    for line in lines:
+        if width_px(line) <= tolerant:
+            out.append(line)
+            continue
+        cur = ""
+        for word in (line or "").split(" "):
+            candidate = word if not cur else cur + " " + word
+            if not cur:
+                # Single word longer than the line: hard-break it.
+                piece = ""
+                for ch in word:
+                    if piece and width_px(piece + ch) > tolerant:
+                        out.append(piece)
+                        piece = ch
+                    else:
+                        piece += ch
+                cur = piece
+            elif width_px(candidate) <= tolerant:
+                cur = candidate
+            else:
+                out.append(cur)
+                cur = word
+        if cur:
+            out.append(cur)
+    return out or list(lines) or [""]
+
+
 def _render_text_image(
     lines: List[str],
     box_w_pt: float,
@@ -320,7 +380,10 @@ def _render_text_image(
                 return ImageFont.truetype(font_path, size=size_px)
             except Exception:
                 pass
-        return ImageFont.load_default()
+        try:
+            return ImageFont.load_default(size=size_px)
+        except TypeError:   # Pillow < 10.1: default font has a fixed size
+            return ImageFont.load_default()
 
     def line_size(font, text: str) -> Tuple[int, int]:
         probe = Image.new("L", (1, 1), 0)
@@ -378,9 +441,28 @@ def _render_signature_image(
     stamp_image_path: Optional[str] = None,
     stamp_text_position: str = STAMP_TEXT_BELOW,
 ) -> Image.Image:
+    """Render seal image + text into the (white) box:
+
+    - the text renders at *font_size_pt* (the configured size) wrapped to
+      the FULL box width — trailing white space of the strip is used;
+    - the seal then takes the leftover height (below layout) or width
+      (right layout): bigger than 3/4 when the text is compact, floored at
+      _SEAL_MIN_PT, capped by its natural size;
+    - only when the text physically cannot leave _SEAL_MIN_PT does the font
+      scale down (floor _MIN_FONT_EFF). The caller computes an AUTO font
+      against the 1/4 text zone, so automatic mode lands on the balanced
+      3/4 seal + 1/4 text split.
+    """
+    # Wrap long lines to the box width FIRST — otherwise a big font on a
+    # long template line inflates the natural unit and the fit-scale undoes
+    # the font size. Applies to the text-only path too.
+    wrapped = _wrap_stamp_lines(
+        lines, font_size_pt, font_path, max(1.0, box_w_pt - 2 * padding_pt),
+        compact_scale=compact_scale, dpi_scale=dpi_scale,
+    )
     if not stamp_image_path:
         return _render_text_image(
-            lines,
+            wrapped,
             box_w_pt,
             box_h_pt,
             font_size_pt=font_size_pt,
@@ -396,7 +478,7 @@ def _render_signature_image(
     seal = _load_stamp_image(stamp_image_path)
     if seal is None:
         return _render_text_image(
-            lines,
+            wrapped,
             box_w_pt,
             box_h_pt,
             font_size_pt=font_size_pt,
@@ -406,59 +488,92 @@ def _render_signature_image(
             dpi_scale=dpi_scale,
         )
 
-    width_px = max(1, int(round(box_w_pt * dpi_scale)))
-    height_px = max(1, int(round(box_h_pt * dpi_scale)))
-    pad_px = max(0, int(round(padding_pt * dpi_scale)))
-    gap_px = max(1, int(round(_STAMP_IMAGE_GAP_PT * dpi_scale)))
-    avail_w = max(1, width_px - 2 * pad_px)
-    avail_h = max(1, height_px - 2 * pad_px)
-    canvas = Image.new("RGBA", (width_px, height_px), (255, 255, 255, 0))
     position = _normalise_stamp_text_position(stamp_text_position)
+    gap = _STAMP_IMAGE_GAP_PT
+    content_w = max(1.0, box_w_pt - 2 * padding_pt)
+    content_h = max(1.0, box_h_pt - 2 * padding_pt)
+    sw, sh = _stamp_image_natural_size_pt(seal)
 
-    if position == STAMP_TEXT_RIGHT and avail_w > gap_px + 2:
-        max_img_w = max(1, min(avail_w - gap_px - 1, int(round(avail_w * 0.42))))
-        img_w, img_h = _scaled_size(seal.width, seal.height, max_img_w, avail_h)
-        seal_resized = seal.resize((img_w, img_h), Image.Resampling.LANCZOS)
-        img_x = pad_px
-        img_y = pad_px + max(0, (avail_h - img_h) // 2)
-        canvas.alpha_composite(seal_resized, (img_x, img_y))
-
-        text_w = max(1, avail_w - img_w - gap_px)
-        text_h = avail_h
-        text_img = _render_text_image(
-            lines,
-            text_w / dpi_scale,
-            text_h / dpi_scale,
+    def _layout(orient: str):
+        """Max font + geometry for one orientation. BELOW: text at the
+        configured size across the full width, seal takes the leftover
+        height (target 3/4 — the caller computes AUTO fonts against that
+        1/4 text zone). RIGHT: seal left (3/4 of the width), text right."""
+        if orient == STAMP_TEXT_RIGHT:
+            # Seal left (3/4 of the WIDTH), text right (1/4).
+            text_w_max = max(12.0, content_w * 0.25)
+            content_base = content_h
+        else:
+            # Below layout: seal top (3/4 of the HEIGHT), text bottom (1/4).
+            text_w_max = content_w
+            content_base = content_h
+        wrapped_o = _wrap_stamp_lines(
+            lines, font_size_pt, font_path, text_w_max,
+            compact_scale=compact_scale, dpi_scale=dpi_scale,
+        )
+        tw, th = _measure_text_image_box(
+            wrapped_o,
             font_size_pt=font_size_pt,
             font_path=font_path,
             compact_scale=compact_scale,
             padding_pt=0.0,
             dpi_scale=dpi_scale,
         )
-        canvas.alpha_composite(text_img, (pad_px + img_w + gap_px, pad_px))
-        return canvas
+        font_eff = font_size_pt
+        if orient == STAMP_TEXT_RIGHT:
+            if tw > text_w_max:
+                font_eff = max(_MIN_FONT_EFF,
+                               font_size_pt * (text_w_max / max(tw, 0.01)))
+        elif th > content_base:
+            font_eff = max(_MIN_FONT_EFF,
+                           font_size_pt * (content_base / max(th, 0.01)))
+        ratio = font_eff / max(font_size_pt, 0.01)
+        tw, th = tw * ratio, th * ratio
+        if orient == STAMP_TEXT_RIGHT:
+            seal_base = max(_SEAL_MIN_PT, min(sw, content_w - tw - gap))
+            img_w, img_h = _scaled_size(
+                seal.width, seal.height,
+                max(1, int(round(seal_base * dpi_scale))),
+                max(1, int(round(content_h * dpi_scale))))
+        else:
+            seal_base = max(_SEAL_MIN_PT, min(sh, content_h - th - gap))
+            img_w, img_h = _scaled_size(
+                seal.width, seal.height,
+                max(1, int(round(content_w * dpi_scale))),
+                max(1, int(round(seal_base * dpi_scale))))
+        return font_eff, wrapped_o, tw, th, img_w, img_h
 
-    max_img_h = max(1, min(avail_h - gap_px - 1, int(round(avail_h * 0.58))))
-    img_w, img_h = _scaled_size(seal.width, seal.height, avail_w, max_img_h)
+    text_budget_max = max(_TEXT_BUDGET_MIN_PT, content_h / 4.0)
+    # Race both orientations, user's radio preference first (stable sort
+    # keeps it on ties), then keep whichever renders the text largest.
+    layouts = [(STAMP_TEXT_BELOW, *_layout(STAMP_TEXT_BELOW)),
+               (STAMP_TEXT_RIGHT, *_layout(STAMP_TEXT_RIGHT))]
+    layouts.sort(key=lambda t: t[1], reverse=True)
+    position, font_eff, wrapped, tw, th, img_w, img_h = layouts[0]
+
     seal_resized = seal.resize((img_w, img_h), Image.Resampling.LANCZOS)
-    img_x = pad_px + max(0, (avail_w - img_w) // 2)
-    img_y = pad_px
-    canvas.alpha_composite(seal_resized, (img_x, img_y))
-
-    text_y = pad_px + img_h + gap_px
-    text_w = avail_w
-    text_h = max(1, height_px - pad_px - text_y)
     text_img = _render_text_image(
-        lines,
-        text_w / dpi_scale,
-        text_h / dpi_scale,
-        font_size_pt=font_size_pt,
+        wrapped,
+        tw,
+        th,
+        font_size_pt=font_eff,
         font_path=font_path,
         compact_scale=compact_scale,
         padding_pt=0.0,
         dpi_scale=dpi_scale,
     )
-    canvas.alpha_composite(text_img, (pad_px, text_y))
+    width_px = max(1, int(round(box_w_pt * dpi_scale)))
+    height_px = max(1, int(round(box_h_pt * dpi_scale)))
+    canvas = Image.new("RGBA", (width_px, height_px), (255, 255, 255, 0))
+    pad_px = max(1, int(round(padding_pt * dpi_scale)))
+    gap_px = max(1, int(round(gap * dpi_scale)))
+    if position == STAMP_TEXT_RIGHT:
+        canvas.alpha_composite(seal_resized, (pad_px, pad_px))
+        canvas.alpha_composite(text_img, (pad_px + img_w + gap_px, pad_px))
+        return canvas
+
+    canvas.alpha_composite(seal_resized, (pad_px, pad_px))
+    canvas.alpha_composite(text_img, (pad_px, pad_px + img_h + gap_px))
     return canvas
 
 
@@ -481,7 +596,10 @@ def _measure_text_image_box(
                 return ImageFont.truetype(font_path, size=size_px)
             except Exception:
                 pass
-        return ImageFont.load_default()
+        try:
+            return ImageFont.load_default(size=size_px)
+        except TypeError:   # Pillow < 10.1: default font has a fixed size
+            return ImageFont.load_default()
 
     def line_size(font, text: str) -> Tuple[int, int]:
         probe = Image.new("L", (1, 1), 0)
@@ -874,16 +992,464 @@ def _shrink_box_to_text_gap(
     return (left, top, max(min_size, right - left), max(min_size, bottom - top))
 
 
+# ── Pixel-based white-region detection (pages without a text layer) ──────────
+# When the page carries no extractable text, "avoid overlap" can't use word
+# boxes — so we render the page and measure the white paper area anchored at
+# the signature's top-left corner instead. The signature box then becomes
+# min(configured size, measured white size) per dimension.
+_WHITE_DETECT_RENDER_DPI = 100
+_WHITE_LUMA_DROP = 40.0     # ink = pixel darker than paper level minus this
+_WHITE_LUMA_MIN = 150.0     # clamp for dark/yellowed scans
+_WHITE_LUMA_MAX = 245.0
+_WHITE_MIN_BOX_PT = 12.0    # white area smaller than this → keep config box
+_WHITE_BORDER_IGNORE_PT = 10.0   # scan black/gray page edges this wide are
+                                 # artifacts, not content
+_WHITE_ANCHOR_STEP_PT = 8.0      # anchor nudge grid when the anchor sits
+_WHITE_ANCHOR_MAX_STEPS = 6      # on ink: search down/right up to 48pt
+_WHITE_BLOB_MIN_SIDE_PX = 10     # dark blobs smaller than this in BOTH
+                                 # dimensions are scan dirt, not content
+_SEAL_MIN_PT = 3.0               # seal sliver floor when the box is too
+                                 # short to hold seal + text
+_MIN_TEXT_SCALE = 0.3            # text never shrinks below this by choice
+_HSTRIP_MIN_PT = 30.0            # horizontal strip thinner than this → the
+                                 # tall column candidate is preferred
+_MIN_FONT_EFF = 4.0              # rendered stamp text never goes below this
+_VSTRIP_MAX_PT = 200.0           # tall-column candidate depth cap (enough
+                                 # room for seal + many wrapped text lines)
+_NGANG_W_EXPAND = 2.5            # wide strips may exceed the configured
+                                 # width up to this multiple ("dòng chữ dài
+                                 # ra hết" — trailing white space is used)
+_TEXT_BUDGET_MIN_PT = 8.0        # text zone floor for the 1/4 split
+
+
+def _render_page_gray(page, dpi: int):
+    """Render the displayed page to a 2-D uint8 grayscale numpy array."""
+    import fitz
+    import numpy as np
+    zoom = dpi / 72.0
+    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), colorspace=fitz.csGRAY)
+    arr = np.frombuffer(pix.samples, dtype=np.uint8)
+    arr = arr.reshape(pix.height, pix.stride)[:, :pix.width]
+    return np.ascontiguousarray(arr)
+
+
+def _run_len_along(mask, axis: int):
+    """Run length of the True-run containing each pixel, along *axis*."""
+    import numpy as np
+    out = np.zeros(mask.shape, dtype=np.int32)
+    view = mask if axis == 0 else mask.T
+    res = out if axis == 0 else out.T
+    for r in range(view.shape[0]):
+        idx = np.flatnonzero(view[r])
+        if idx.size == 0:
+            continue
+        gaps = np.flatnonzero(np.diff(idx) > 1)
+        starts = np.concatenate(([0], gaps + 1))
+        ends = np.concatenate((gaps, [idx.size - 1]))
+        for s, e in zip(starts, ends):
+            res[r, idx[s]:idx[e] + 1] = e - s + 1
+    return out
+
+
+def _white_mask_for_page(gray):
+    """Boolean mask of 'paper' pixels.
+
+    Three cleanup layers, so scan dirt never masquerades as content:
+    - the ink threshold is anchored to the page's PAPER level (85th
+      percentile): dirty/yellowed scans carry paper at ~200-235 gray while
+      ink sits far darker, and a median-based threshold lands INSIDE the
+      paper range and marks dirty margins as ink;
+    - a pixel only survives as ink when its 3×3 neighbourhood holds ≥2 dark
+      pixels (single-pixel JPEG specks disappear);
+    - dark blobs smaller than ``_WHITE_BLOB_MIN_SIDE_PX`` in BOTH dimensions
+      are dropped — dirt, staple and punch marks — while real content
+      (glyph strokes, rules: thin in one axis but LONG in the other) stays.
+    """
+    import numpy as np
+    paper = float(np.percentile(gray, 85))
+    threshold = min(max(paper - _WHITE_LUMA_DROP, _WHITE_LUMA_MIN), _WHITE_LUMA_MAX)
+    dark = gray < threshold
+    if dark.any():
+        h, w = dark.shape
+        padded = np.pad(dark, 1)
+        count = np.zeros((h, w), dtype=np.uint8)
+        for dy in (0, 1, 2):
+            for dx in (0, 1, 2):
+                count += padded[dy:dy + h, dx:dx + w]
+        dark = count >= 2
+    if dark.any():
+        h_runs = _run_len_along(dark, axis=1)
+        v_runs = _run_len_along(dark, axis=0)
+        dark = dark & ((h_runs >= _WHITE_BLOB_MIN_SIDE_PX)
+                       | (v_runs >= _WHITE_BLOB_MIN_SIDE_PX))
+    return ~dark
+
+
+def _white_box_candidates(page, box_tl: Tuple[float, float, float, float]
+                          ) -> List[Tuple[float, float, float, float]]:
+    """Anchored white-rectangle candidates, in pt, best-shape first:
+
+    [0] max-area rectangle (a wide strip above a heading usually wins);
+    [1] tall column (full white depth × min white run) — returned only when
+        strictly taller than [0]; the better shape for a tall seal+text unit.
+
+    Scan artifacts are tolerated: an edge band of ``_WHITE_BORDER_IGNORE_PT``
+    is treated as paper, and a stuck anchor is nudged down/right on a grid
+    to the nearest clear spot.
+    """
+    import numpy as np
+    gray = _render_page_gray(page, _WHITE_DETECT_RENDER_DPI)
+    if gray.size == 0:
+        return []
+    scale = _WHITE_DETECT_RENDER_DPI / 72.0
+    h_px, w_px = gray.shape
+    white = _white_mask_for_page(gray)
+
+    band = int(round(_WHITE_BORDER_IGNORE_PT * scale))
+    if band:
+        white[:band, :] = True
+        white[h_px - band:, :] = True
+        white[:, :band] = True
+        white[:, w_px - band:] = True
+
+    left, top, width, height = [float(v) for v in box_tl]
+    cw_px = max(1, int(math.ceil(width * scale)))
+    ch_px = max(1, int(math.ceil(height * scale)))
+    anchor_x = min(max(int(round(left * scale)), 0), w_px - 1)
+    anchor_y = min(max(int(round(top * scale)), 0), h_px - 1)
+    step_px = max(1, int(round(_WHITE_ANCHOR_STEP_PT * scale)))
+    max_steps = _WHITE_ANCHOR_MAX_STEPS
+    # Candidates use the FULL white extent (page-capped) — the configured
+    # box is only the anchor/minimum, never a ceiling: a wide white strip
+    # must be usable across its whole width ("dòng chữ dài ra hết").
+    depth_cap_px = min(h_px - anchor_y, int(round(_VSTRIP_MAX_PT * scale)))
+
+    def measure(ax: int, ay: int):
+        """White-run profile along the strip + total depth from this anchor.
+        Runs stop inside the ignored edge band (the stamp never extends into
+        scan-border territory). ([], 0) when the anchor sits on ink."""
+        runs = []
+        limit = w_px - band - ax
+        depth = 0
+        for i in range(depth_cap_px):
+            if not white[ay + i, ax] or limit <= 0:
+                break
+            row = white[ay + i, ax:ax + limit]
+            stop = row.size if row.all() else int(np.argmin(row))
+            if stop <= 0:
+                break
+            runs.append(stop)
+            depth = i + 1
+        return runs, depth
+
+    def area_best(runs, cap_px: int):
+        """Largest-by-area (w, h) with the run width capped at *cap_px*."""
+        best_area = 0
+        best_w = 0
+        best_h = 0
+        run = cap_px
+        for i, stop in enumerate(runs):
+            run = min(run, stop)
+            area = run * (i + 1)
+            if area > best_area:
+                best_area, best_w, best_h = area, run, i + 1
+        return best_w, best_h
+
+    tried = [(anchor_x, anchor_y)]
+    for ring in range(1, max_steps + 1):
+        for k in range(ring + 1):
+            tried.append((anchor_x + k * step_px, anchor_y + (ring - k) * step_px))
+
+    for ax, ay in tried:
+        if ay >= h_px or ax >= w_px or not white[ay, ax]:
+            continue
+        runs, depth = measure(ax, ay)
+        if not runs:
+            continue
+        strip_pt = depth / scale
+        thin = strip_pt < _HSTRIP_MIN_PT
+        cands_here = []
+
+        # Ô ngang: dải trên đầu — rộng theo run (mở rộng khi dải đủ dày),
+        # cao = chiều sâu của dải (cắt bởi chiều cao cấu hình).
+        cap_px = (min(int(round(cw_px * _NGANG_W_EXPAND)), w_px - band - ax)
+                  if not thin else cw_px)
+        aw, ah = area_best(runs, cap_px)
+        if aw > 0 and ah > 0:
+            w_pt = aw / scale
+            h_pt = min(ah, ch_px) / scale
+            if (w_pt >= _WHITE_MIN_BOX_PT and h_pt >= _WHITE_MIN_BOX_PT):
+                cands_here.append((left + (ax - anchor_x) / scale,
+                                   top + (ay - anchor_y) / scale,
+                                   w_pt, h_pt))
+
+        # Ô dọc: chiều cao dài (đến hết vùng trắng / trần _VSTRIP_MAX_PT),
+        # rộng theo run hẹp nhất qua toàn bộ chiều sâu.
+        col_w = min(runs) if runs else 0
+        if depth > (cands_here[0][3] * scale if cands_here else 0):
+            w_pt = col_w / scale
+            h_pt = depth / scale
+            if (w_pt >= _WHITE_MIN_BOX_PT and h_pt >= _WHITE_MIN_BOX_PT):
+                cand_col = (left + (ax - anchor_x) / scale,
+                            top + (ay - anchor_y) / scale,
+                            w_pt, h_pt)
+                if not cands_here or cand_col[3] > cands_here[0][3] + 0.5:
+                    cands_here.append(cand_col)
+        if cands_here:
+            return cands_here
+    return []
+
+
+def _anchored_white_box(page, box_tl: Tuple[float, float, float, float]
+                        ) -> Optional[Tuple[float, float, float, float]]:
+    """Largest-by-area anchored white rectangle (candidate [0])."""
+    cands = _white_box_candidates(page, box_tl)
+    return cands[0] if cands else None
+
+
+def _pick_shape_box(candidates: List[Tuple[float, float, float, float]]
+                    ) -> Tuple[float, float, float, float]:
+    """Shape-based pick per the placement rule:
+
+    - the horizontal strip (candidates[0], height = the SHORT clear height
+      above the first obstacle) is preferred;
+    - the tall column (candidates[1], height = the LONG clear depth) is used
+      only when the strip is thinner than ``_HSTRIP_MIN_PT`` and the column
+      is taller — a thin strip cannot host a readable seal+text stamp."""
+    if len(candidates) >= 2:
+        strip, column = candidates[0], candidates[1]
+        if strip[3] < _HSTRIP_MIN_PT and column[3] > strip[3]:
+            return column
+    return candidates[0]
+
+
+# ── Placement presets (VGCA SignPDFTool parity) ──────────────────────────────
+_CORNER_PRESETS = ("top_left", "top_right", "bottom_left", "bottom_right")
+_CORNER_MARGIN_PT = 10.0
+# Góc trên: mốc neo sát mép giấy hơn (3pt thay vì 10pt). Dải trắng ngang ở
+# góc trên được đo XUỐNG TỪ mốc neo, nên mỗi pt lùi xuống là pt chiều cao
+# mất đi của dấu — kéo mốc lên cho hình dấu (chiếm 3/4 chiều cao hộp) thêm
+# chỗ. An toàn vì 10pt mép ngoài vốn đã được _white_box_candidates coi là
+# giấy (bỏ qua bẩn viền scan), nên mốc 3pt vẫn nằm trên nền giấy trắng.
+_CORNER_TOP_MARGIN_PT = 3.0
+
+
+def _corner_signature_box(input_path: str, page_idx: int,
+                          sig_box: Tuple[float, float, float, float],
+                          preset: str) -> Tuple[float, float, float, float]:
+    """Anchor the box at one of the page corners, keeping the configured
+    width/height. Mirrors VGCA's 'Góc trên/dưới bên trái/phải'. Góc trên
+    neo sát mép (_CORNER_TOP_MARGIN_PT) để dải trắng đo xuống từ mốc sâu
+    hơn — dấu có thêm chiều cao cho hình; góc dưới giữ margin 10pt vì hộp
+    neo theo cạnh TRÊN nên margin dưới không ăn bớt nội dung."""
+    try:
+        import fitz
+        with fitz.open(input_path) as doc:
+            page = doc[int(page_idx)]
+            page_w = float(page.rect.width)
+            page_h = float(page.rect.height)
+    except Exception:
+        return sig_box
+    left, top, width, height = [float(v) for v in sig_box]
+    width = min(width, page_w - 2 * _CORNER_MARGIN_PT)
+    height = min(height, page_h - 2 * _CORNER_MARGIN_PT)
+    y_margin = _CORNER_TOP_MARGIN_PT if preset.startswith("top") \
+        else _CORNER_MARGIN_PT
+    x = _CORNER_MARGIN_PT if preset.endswith("left") \
+        else page_w - width - _CORNER_MARGIN_PT
+    y = y_margin if preset.startswith("top") \
+        else page_h - height - _CORNER_MARGIN_PT
+    return (max(_CORNER_MARGIN_PT, x), max(y_margin, y), width, height)
+
+
+def resolve_signature_box(
+    input_path: str,
+    page_idx: int,
+    sig_box: Tuple[float, float, float, float],
+    *,
+    anchor_text: str = "",
+    position_preset: str = "custom",
+    avoid_text_overlap: bool = True,
+) -> Tuple[float, float, float, float]:
+    """Full placement chain for one page. Priority:
+
+    1. Corner preset (Góc trên/dưới trái/phải) — moves the anchor to that
+       page corner, keeping the configured size;
+    2. explicit ``anchor_text`` — stamp right after/below the matched line;
+    3. fallback — X/Y anchor with text-gap shrink + pixel white-area cap.
+
+    Returns the final (left, top, w, h) in displayed page coordinates.
+    """
+    preset = (position_preset or "custom").strip()
+    if preset in _CORNER_PRESETS:
+        sig_box = _corner_signature_box(input_path, page_idx, sig_box, preset)
+
+    if not avoid_text_overlap:
+        return sig_box
+
+    if (anchor_text or "").strip():
+        anchored = find_anchor_signature_box(
+            input_path, page_idx, anchor_text, sig_box)
+    else:
+        anchored = None
+
+    if anchored is not None:
+        # Belt and braces: keep the pixel-level white cap so scan dirt or a
+        # dark background under the anchor line still shrinks the stamp.
+        try:
+            import fitz
+            with fitz.open(input_path) as doc:
+                capped = _anchored_white_box(doc[int(page_idx)], anchored)
+            return capped if capped is not None else anchored
+        except Exception:
+            return anchored
+
+    return find_text_clear_signature_box(input_path, page_idx, sig_box)
+
+
+def compute_stamp_font_size(cert_info: dict, box_w: float, box_h: float, *,
+                            font_size_pt: float = 0.0,
+                            stamp_template: Optional[str] = None,
+                            reason: Optional[str] = None,
+                            location: Optional[str] = None,
+                            stamp_text_position: str = STAMP_TEXT_BELOW,
+                            stamp_image_path: Optional[str] = None,
+                            ) -> float:
+    """Font size for the stamp: an explicit user setting (> 0) wins;
+    0 = auto-fit the box (clamped 5–14pt by compute_fit_font_size)."""
+    if font_size_pt and float(font_size_pt) > 0:
+        return float(font_size_pt)
+    return compute_fit_font_size(
+        cert_info, box_w, box_h,
+        stamp_template=stamp_template, reason=reason, location=location,
+        stamp_text_position=stamp_text_position,
+        stamp_image_path=stamp_image_path,
+    )
+
+
+def find_anchor_signature_box(
+    input_path: str,
+    page_idx: int,
+    anchor_text: str,
+    sig_box: Tuple[float, float, float, float] = SIG_BOX_DEFAULT,
+) -> Optional[Tuple[float, float, float, float]]:
+    """Text-anchored placement (the mechanism VGCA's folder signing uses).
+
+    Locate *anchor_text* on the page (PDF text layer or OCR text — anything
+    fitz can search) and place the stamp:
+    - on the SAME line, right after the match (stamp bottom aligned with the
+      text bottom), when the page is wide enough; otherwise
+    - BELOW the match, aligned to its left edge.
+
+    Returns the (left, top, w, h) box clamped to the page, or None when the
+    text is not found / nothing fits — the caller then falls back to the
+    normal X/Y placement.
+    """
+    anchor = (anchor_text or "").strip()
+    if not anchor:
+        return None
+    try:
+        import fitz
+    except Exception:
+        return None
+    try:
+        with fitz.open(input_path) as doc:
+            if not (0 <= int(page_idx) < doc.page_count):
+                return None
+            page = doc[int(page_idx)]
+            rects = page.search_for(anchor)
+            if not rects:
+                return None
+            rect = rects[0]
+            gap = 4.0
+            page_w = float(page.rect.width)
+            page_h = float(page.rect.height)
+            left, top, width, height = [float(v) for v in sig_box]
+            width = min(width, page_w - 2 * gap)
+            height = min(height, page_h - 2 * gap)
+            # Same line, right of the match — stamp bottom on the text bottom.
+            if rect.x1 + gap + width <= page_w - gap:
+                box_top = max(gap, min(rect.y1 - height, page_h - height - gap))
+                return (rect.x1 + gap, box_top, width, height)
+            # Below the match, aligned to its left edge.
+            if rect.y1 + gap + height <= page_h - gap:
+                box_left = max(gap, min(rect.x0, page_w - width - gap))
+                return (box_left, rect.y1 + gap, width, height)
+            return None
+    except Exception:
+        return None
+
+
+# Text layer chỉ được tin tuyệt đối khi nó "giải thích" được mực thật trên
+# trang. Nếu tỉ lệ pixel mực nằm NGOÀI các ô chữ vượt ngưỡng này (OCR cũ
+# sai vị trí, thiếu từ, text rác), box đã né text vẫn bị chốt thêm bằng
+# vùng trắng đo từ ảnh trang.
+_TEXT_UNTRUSTED_INK_RATIO = 0.03
+
+
+def _ink_outside_text_ratio(page, text_rects) -> float:
+    """Tỉ lệ (0..1) pixel mực nằm ngoài các ô chữ của text layer.
+
+    Cao ⇒ text layer không khớp nội dung ảnh (OCR kém) ⇒ không được phép
+    tin hộp đã né text một cách mù quáng. Thấp ⇒ text bám sát chữ thật
+    (OCR tốt / text digital) ⇒ giữ nguyên hành vi né theo text.
+    """
+    import numpy as np
+    gray = _render_page_gray(page, _WHITE_DETECT_RENDER_DPI)
+    if gray.size == 0:
+        return 0.0
+    ink = ~_white_mask_for_page(gray)          # True = mực
+    total = int(ink.sum())
+    if total == 0:
+        return 0.0
+    h, w = gray.shape
+    scale = _WHITE_DETECT_RENDER_DPI / 72.0
+    text_mask = np.zeros((h, w), dtype=bool)
+    for x0, y0, x1, y1 in text_rects:
+        px0, py0 = max(0, int(x0 * scale)), max(0, int(y0 * scale))
+        px1 = min(w, max(px0 + 1, int(round(x1 * scale))))
+        py1 = min(h, max(py0 + 1, int(round(y1 * scale))))
+        text_mask[py0:py1, px0:px1] = True
+    return float((ink & ~text_mask).sum()) / float(total)
+
+
+def _cap_box_by_page_white(page, box_tl: Tuple[float, float, float, float]
+                           ) -> Tuple[float, float, float, float]:
+    """Thu hẹp box theo vùng trắng đo từ ảnh trang — CHỈ THẮT, không nới.
+
+    Chỉ can thiệp khi candidate trắng được đo tại ĐÚNG anchor của box (không
+    bị dời sang chỗ khác); ngược lại trả box nguyên vẹn. Dùng làm "phanh
+    an toàn" khi text layer đáng ngờ để chữ ký không đè lên mực thật.
+    """
+    try:
+        cands = _white_box_candidates(page, box_tl)
+    except Exception:
+        return box_tl
+    if not cands:
+        return box_tl
+    left, top, width, height = [float(v) for v in box_tl]
+    cl, ct, cw, ch = [float(v) for v in cands[0]]
+    if abs(cl - left) > 0.5 or abs(ct - top) > 0.5:
+        return box_tl      # anchor đã bị dời — không tin cap này
+    return (left, top, min(width, cw), min(height, ch))
+
+
 def find_text_clear_signature_box(
     input_path: str,
     page_idx: int,
     sig_box: Tuple[float, float, float, float] = SIG_BOX_DEFAULT,
 ) -> Tuple[float, float, float, float]:
-    """Shrink a top-left signature box into the immediate text-free gap.
+    """Fit the signature box into clear space on the target page.
 
-    The function relies on the PDF text/OCR layer. If the page has no
-    extractable words, it returns the requested box clamped to page bounds.
-    The top-left anchor is preserved; only width/height are reduced.
+    With a text layer: shrink the top-left-anchored box into the immediate
+    text-free gap (word boxes from the PDF text/OCR layer).
+
+    Then — on EVERY page, text layer or not — the box is capped by the white
+    area the page IMAGE offers from the (possibly nudged) anchor: the
+    horizontal strip is preferred, the tall column only when the strip is
+    thinner than ``_HSTRIP_MIN_PT``, so images, logos, scan borders and
+    other wordless ink can't be stamped over. If no usable white area is
+    found, the text-fitted (or configured) box is returned unchanged.
     """
     try:
         import fitz
@@ -897,19 +1463,37 @@ def find_text_clear_signature_box(
             page = doc[int(page_idx)]
             page_w = float(page.rect.width)
             page_h = float(page.rect.height)
-            page_clamped = _clamp_signature_box_to_page(
+            base_box = _clamp_signature_box_to_page(
                 sig_box, page_w, page_h, margin=0.0
             )
             text_rects = _page_text_rects_for_autoplace(page, page_w, page_h)
-            if not text_rects:
-                return page_clamped
+            if text_rects:
+                # Text layer present: the word-gap shrink is authoritative
+                # (exact to the word) — the pixel candidates would only
+                # loosen it back over the text.
+                left, top, width, height = base_box
+                own_rect = (left, top, left + width, top + height)
+                if any(_rect_intersection_area(own_rect, r) > 0.0
+                       for r in text_rects):
+                    base_box = _shrink_box_to_text_gap(base_box, text_rects)
+                # Text layer cũ (OCR kém) có thể sai vị trí/thiếu từ — khi
+                # một phần mực đáng kể nằm ngoài các ô chữ, chốt thêm box
+                # bằng vùng trắng đo từ ảnh trang để dấu không đè lên nội
+                # dung thật. Text tốt (bám sát mực) → không đụng vào.
+                try:
+                    if (_ink_outside_text_ratio(page, text_rects)
+                            > _TEXT_UNTRUSTED_INK_RATIO):
+                        base_box = _cap_box_by_page_white(page, base_box)
+                except Exception:
+                    pass
+                return base_box
 
-            left, top, width, height = page_clamped
-            own_rect = (left, top, left + width, top + height)
-            if not any(_rect_intersection_area(own_rect, r) > 0.0 for r in text_rects):
-                return page_clamped
-
-            return _shrink_box_to_text_gap(page_clamped, text_rects)
+            # No text layer (plain scan): cap the box by the white area
+            # measured from the page image.
+            cands = _white_box_candidates(page, base_box)
+            if cands:
+                return _pick_shape_box(cands)
+            return base_box
     except Exception:
         return sig_box
 
@@ -1123,22 +1707,17 @@ def compute_fit_font_size(cert_info: dict, box_w: float, box_h: float,
                           stamp_text_position: str = STAMP_TEXT_BELOW,
                           ) -> float:
     """
-    Fixed-box auto-fit: given a fixed signature box, compute the
-    largest font size such that all stamp lines fit within the box.
+    Fixed-box auto-fit: given a fixed signature box, compute the largest
+    font size such that the stamp lines, WORD-WRAPPED to the box's text
+    width, fit within the box height.
 
-    The user picks the rect, and the text scales to fill it.
+    Without wrapping, one long template line pins the font to the box WIDTH
+    (tiny) even when there is plenty of vertical room. The user picks the
+    rect, and the wrapped text scales to fill it.
 
     Returns a float pt size, clamped to [min_size, max_size].
     """
-    factory = _load_font_factory(int(max_size))
-    if factory is None:
-        return 9.0
-
-    try:
-        from pyhanko.pdf_utils.writer import PdfFileWriter
-        writer = PdfFileWriter()
-        engine = factory.create_font_engine(writer)
-    except Exception:
+    if not _HAS_PIL:
         return 9.0
 
     sample_ts = "0000-00-00T00:00:00+0700"
@@ -1154,43 +1733,33 @@ def compute_fit_font_size(cert_info: dict, box_w: float, box_h: float,
     if not text_lines:
         return 9.0
 
-    # x_advance returned by harfbuzz is in font-em units already scaled so
-    # that `width_pt = x_advance * font_size`. So at font_size=1, the
-    # rendered width equals the raw x_advance value.
-    max_unit_w = 0.0
-    for line in text_lines:
-        try:
-            r = engine.shape(line)
-            if r.x_advance > max_unit_w:
-                max_unit_w = r.x_advance
-        except Exception:
-            continue
-    if max_unit_w <= 0:
-        return 9.0
-
-    text_box_w, text_box_h = _signature_text_area_for_box(
+    font_path = _find_windows_font_path()
+    text_area_w, text_area_h = _signature_text_area_for_box(
         box_w,
         box_h,
         stamp_image_path=stamp_image_path,
         stamp_text_position=stamp_text_position,
         padding_pt=2.0,
     )
-
-    # Inner padding (left+right, top+bottom) — keep some breathing room.
-    pad_x = 4.0
-    pad_y = 4.0
-    leading_factor = 1.15        # leading ≈ 1.15 × font_size (typical)
-    n = len(text_lines)
-
-    avail_w = max(text_box_w - pad_x, 1.0)
-    avail_h = max(text_box_h - pad_y, 1.0)
-
-    size_by_w = avail_w / max(max_unit_w * compact_scale, 0.1)
-    size_by_h = avail_h / (n * leading_factor)
-
-    fit = min(size_by_w, size_by_h)
-    fit = max(min_size, min(max_size, fit))
-    return round(fit, 1)
+    wrap_w = max(1.0, text_area_w - 4.0)
+    max_h = max(1.0, text_area_h - 4.0)
+    size = float(max_size)
+    while size > min_size:
+        wrapped = _wrap_stamp_lines(
+            text_lines, size, font_path, wrap_w,
+            compact_scale=compact_scale,
+        )
+        _, h_pt = _measure_text_image_box(
+            wrapped,
+            font_size_pt=size,
+            font_path=font_path,
+            compact_scale=compact_scale,
+            padding_pt=0.0,
+        )
+        if h_pt <= max_h:
+            return round(size, 1)
+        size -= 0.5
+    return round(min_size, 1)
 
 
 def _load_font_factory(font_size: int):
@@ -1242,6 +1811,9 @@ def sign_single_pdf(
     stamp_image_path: Optional[str] = None,
     stamp_text_position: str = STAMP_TEXT_BELOW,
     avoid_text_overlap: bool = False,
+    anchor_text: Optional[str] = None,
+    position_preset: str = "custom",
+    font_size_pt: float = 0.0,
 ) -> None:
     """Sign one PDF file, writing to *output_path*."""
 
@@ -1256,15 +1828,23 @@ def sign_single_pdf(
         certify=False,
     )
 
-    # Fixed-box auto-fit: the user fixes the box, we scale the
-    # font down to make all 4 stamp lines fit inside.
-    if avoid_text_overlap:
-        sig_box = find_text_clear_signature_box(input_path, page, sig_box)
+    # Full placement chain (corner presets / text anchor / X/Y + white cap)
+    # — see resolve_signature_box.
+    sig_box = resolve_signature_box(
+        input_path, page, sig_box,
+        anchor_text=anchor_text or "",
+        position_preset=position_preset,
+        avoid_text_overlap=avoid_text_overlap,
+    )
     box_w, box_h = sig_box[2], sig_box[3]
-    fit_font_size = compute_fit_font_size(
-        cert_info, box_w, box_h,
+    # Font size: explicit user setting wins — text renders at that size
+    # across the full box width (text-first). AUTO (0) computes the font
+    # against the 1/4 text zone so the seal keeps ~3/4 of the box.
+    fit_font_size = compute_stamp_font_size(
+        cert_info, box_w,
+        box_h / 4.0 if stamp_image_path else box_h,
+        font_size_pt=font_size_pt,
         stamp_template=stamp_template, reason=reason, location=location,
-        stamp_image_path=stamp_image_path,
         stamp_text_position=stamp_text_position,
     )
 

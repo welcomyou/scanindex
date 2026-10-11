@@ -2,7 +2,9 @@
 
 A standalone tool under the "Công cụ" menu: pick an input folder, pick an
 output folder, load the PDF list, press Start, and every PDF is digitally
-signed into the output folder.
+signed into the output folder. The output tree MIRRORS the input tree: a
+PDF at ``<in>/A/sub/x.pdf`` is signed to ``<out>/A/sub/x.pdf`` with the
+same file name.
 
 Layout (two distinct config zones):
   * **Top bar — tool's own config**: input/output folder pickers + the
@@ -64,6 +66,21 @@ _RAD = 4
 _SETTINGS_FILE = os.path.join(get_base_dir(), "config", "batch_sign_settings.json")
 
 
+def _mirrored_output_dir(source_path: str, input_dir: str, output_dir: str) -> str:
+    """Thư mục đích của một file để cây đầu ra phản chiếu cây đầu vào.
+
+    Trả về ``output_dir`` + phần đường dẫn TƯƠNG ĐỐI của thư mục chứa
+    ``source_path`` so với ``input_dir`` — file ở ``<in>/A/sub/x.pdf`` ký ra
+    ``<out>/A/sub/x.pdf`` (tên file giữ nguyên, do caller quyết định). Nếu
+    relpath thất bại (khác ổ đĩa), rơi về ``output_dir`` phẳng như hành vi cũ.
+    """
+    try:
+        rel_dir = os.path.dirname(os.path.relpath(source_path, input_dir))
+    except ValueError:
+        return output_dir
+    return os.path.join(output_dir, rel_dir) if rel_dir else output_dir
+
+
 # --------------------------------------------------------------------------- #
 # Worker: OCR (optional) + sign, per file
 # --------------------------------------------------------------------------- #
@@ -97,6 +114,9 @@ class _BatchSignWorker(QThread):
         enable_pdfa: bool = False,
         avoid_text_overlap: bool = True,
         auto_ocr: bool = True,
+        anchor_text: str = "",
+        position_preset: str = "custom",
+        font_size: float = 0.0,
         parent=None,
     ):
         super().__init__(parent)
@@ -116,6 +136,12 @@ class _BatchSignWorker(QThread):
         self._enable_pdfa = bool(enable_pdfa)
         self._avoid_text_overlap = bool(avoid_text_overlap)
         self._auto_ocr = bool(auto_ocr)
+        self._anchor_text = str(anchor_text or "").strip()
+        self._position_preset = str(position_preset or "custom").strip()
+        try:
+            self._font_size = max(0.0, float(font_size or 0.0))
+        except (TypeError, ValueError):
+            self._font_size = 0.0
         self._cancelled = False
 
     def cancel(self):
@@ -292,7 +318,15 @@ class _BatchSignWorker(QThread):
                     # --- Optional OCR so "avoid text overlap" can find gaps ---
                     if self._auto_ocr:
                         pdf_type = self._classify(item.source_path)
-                        if pdf_type in ("scan_no_text", "scan_ocr_low"):
+                        if pdf_type == "scan_ocr_low":
+                            # Đã có text layer: text hiện có đủ cho "tự tránh
+                            # vùng có chữ" — ký TRỰC TIẾP bản gốc. OCR lại sẽ
+                            # phải dựng lại trang (bỏ text cũ tránh double
+                            # text) và làm thay đổi chất ảnh gốc (rasterize/
+                            # re-encode) — không cần thiết cho việc ký.
+                            ocr_note = ("Đã có text layer — ký trực tiếp "
+                                        "bản gốc (không OCR lại)")
+                        elif pdf_type == "scan_no_text":
                             # Emit an "ocr phase" marker before the long work
                             # so the UI can show "Đang OCR ...".
                             self.progress.emit(idx, total, {
@@ -328,8 +362,12 @@ class _BatchSignWorker(QThread):
 
                     # --- Sign ---
                     page = _resolve_page(item, self._custom_page)
+                    # Mirror cây thư mục input: file nằm ở <in>/A/sub/x.pdf
+                    # ký ra <out>/A/sub/x.pdf (tên file giữ nguyên).
+                    out_dir = item.output_dir or self._output_dir
+                    os.makedirs(out_dir, exist_ok=True)
                     dst = _unique_output_path(
-                        item.source_path, self._output_dir, item.display_name
+                        item.source_path, out_dir, item.display_name
                     )
                     sign_single_pdf(
                         sign_input,
@@ -344,6 +382,9 @@ class _BatchSignWorker(QThread):
                         stamp_image_path=self._stamp_image_path or None,
                         stamp_text_position=self._stamp_text_position,
                         avoid_text_overlap=self._avoid_text_overlap,
+                        anchor_text=self._anchor_text,
+                        position_preset=self._position_preset,
+                        font_size_pt=self._font_size,
                     )
                     result = {
                         "index": idx,
@@ -519,7 +560,11 @@ class BatchSigningScreen(ScreenContent):
         self._edit_input = QLineEdit()
         self._edit_input.setReadOnly(True)
         self._edit_input.setPlaceholderText("Chọn thư mục chứa các file PDF cần ký…")
-        self._edit_input.setToolTip("Chỉ các file .pdf trong thư mục (và thư mục con) được nạp.")
+        self._edit_input.setToolTip(
+            "Chỉ các file .pdf trong thư mục (và thư mục con) được nạp. "
+            "Cấu trúc thư mục con được giữ nguyên ở thư mục đầu ra, "
+            "tên file sau khi ký không đổi."
+        )
         self._edit_input.setFixedHeight(_H)
         self._style_line_edit(self._edit_input)
         in_row.addWidget(self._edit_input, 1)
@@ -558,8 +603,9 @@ class BatchSigningScreen(ScreenContent):
         self.chk_ocr.setToolTip(
             "Các file là ảnh scan (chưa có text layer) sẽ được OCR trước khi ký "
             "để chữ ký tránh đè lên nội dung văn bản. File PDF điện tử (đã có text) "
-            "được trích text trực tiếp, không OCR. Nếu tắt, file scan sẽ ký ở đúng "
-            "vị trí X/Y đã chọn (không tránh được chữ vì không có text layer)."
+            "được trích text trực tiếp, không OCR. Nếu tắt, file scan vẫn được dò "
+            "vùng trắng bằng ảnh trang: kích thước dấu = min(kích thước đã cấu "
+            "hình, vùng trắng đo được tính từ điểm X/Y)."
         )
         self.chk_ocr.stateChanged.connect(lambda *_: self._save_settings())
         v.addWidget(self.chk_ocr)
@@ -841,6 +887,14 @@ class BatchSigningScreen(ScreenContent):
 
     # ---------------------------------------------------------- signing
 
+    def _assign_mirror_output_dirs(self, items: list[_SignItem]):
+        """Gán thư mục đích từng file sao cho cây đầu ra phản chiếu cây đầu
+        vào. Gọi ngay trước khi ký (worker đọc ``item.output_dir``)."""
+        for item in items:
+            item.output_dir = _mirrored_output_dir(
+                item.source_path, self._input_dir, self._output_dir
+            )
+
     def _start_signing(self):
         if not _DEPS_OK:
             QMessageBox.critical(self, "Thiếu thư viện", _IMPORT_ERR)
@@ -893,6 +947,8 @@ class BatchSigningScreen(ScreenContent):
             return
         out_dir = self._output_dir
         os.makedirs(out_dir, exist_ok=True)
+        # Cây thư mục đầu ra phản chiếu cây đầu vào, tên file giữ nguyên.
+        self._assign_mirror_output_dirs(items)
 
         stamp_template = self._panel.get_stamp_template()
         stamp_image_path = self._panel.get_stamp_image_path()
@@ -968,6 +1024,9 @@ class BatchSigningScreen(ScreenContent):
             enable_pdfa=self._panel.is_pdfa(),
             avoid_text_overlap=self._panel.is_avoid_overlap(),
             auto_ocr=auto_ocr,
+            anchor_text=self._panel.get_anchor_text(),
+            position_preset=self._panel.get_position_mode(),
+            font_size=self._panel.get_font_size(),
             parent=self,
         )
         self._worker.progress.connect(self._on_sign_progress)
