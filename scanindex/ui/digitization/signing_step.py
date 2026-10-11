@@ -190,6 +190,9 @@ class _SignWorker(QThread):
         tsa_url: str = "",
         enable_pdfa: bool = False,
         avoid_text_overlap: bool = True,
+        anchor_text: str = "",
+        position_preset: str = "custom",
+        font_size: float = 0.0,
         parent=None,
     ):
         super().__init__(parent)
@@ -208,6 +211,12 @@ class _SignWorker(QThread):
         self._tsa_url = str(tsa_url or "").strip()
         self._enable_pdfa = bool(enable_pdfa)
         self._avoid_text_overlap = bool(avoid_text_overlap)
+        self._anchor_text = str(anchor_text or "").strip()
+        self._position_preset = str(position_preset or "custom").strip()
+        try:
+            self._font_size = max(0.0, float(font_size or 0.0))
+        except (TypeError, ValueError):
+            self._font_size = 0.0
         self._cancelled = False
 
     def cancel(self):
@@ -261,6 +270,9 @@ class _SignWorker(QThread):
                         stamp_image_path=self._stamp_image_path or None,
                         stamp_text_position=self._stamp_text_position,
                         avoid_text_overlap=self._avoid_text_overlap,
+                        anchor_text=self._anchor_text,
+                        position_preset=self._position_preset,
+                        font_size_pt=self._font_size,
                     )
                     result = {
                         "index": idx,
@@ -1051,6 +1063,9 @@ class ArchiveStep3Sign(QWidget):
             tsa_url=tsa_url,
             enable_pdfa=self._panel.is_pdfa(),
             avoid_text_overlap=self._panel.is_avoid_overlap(),
+            anchor_text=self._panel.get_anchor_text(),
+            position_preset=self._panel.get_position_mode(),
+            font_size=self._panel.get_font_size(),
             parent=self,
         )
         self._worker.progress.connect(self._on_sign_progress)

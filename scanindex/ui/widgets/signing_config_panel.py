@@ -398,6 +398,17 @@ class SigningConfigPanel(QWidget):
         self.spin_y = self._coord_spin(defaults[1])
         self.spin_w = self._coord_spin(defaults[2])
         self.spin_h = self._coord_spin(defaults[3])
+        # Cỡ chữ dấu: 0 = Tự động (auto-fit theo khung), >0 = ép cỡ chữ pt.
+        self.spin_font_size = QSpinBox()
+        self.spin_font_size.setRange(0, 28)
+        self.spin_font_size.setValue(0)
+        self.spin_font_size.setSpecialValueText("Tự động")
+        self.spin_font_size.setSuffix(" pt")
+        self.spin_font_size.setToolTip(
+            "Tự động: tính cỡ chữ lớn nhất khớp khung. Chọn số cụ thể (4–28pt) "
+            "để ép cỡ chữ — dấu và hình sẽ co/giãn đồng bộ để lọt khung."
+        )
+        self.spin_font_size.valueChanged.connect(lambda *_: self._user_edit())
         # Auto-save the current template when a position field is finished
         # editing (editingFinished fires on focus loss / Enter, not on every
         # arrow press, so it won't thrash the disk).
@@ -408,15 +419,22 @@ class SigningConfigPanel(QWidget):
         pos_grid = QGridLayout()
         pos_grid.setHorizontalSpacing(8)
         pos_grid.setVerticalSpacing(6)
-        for row, (label, widget) in enumerate((
-            ("Trang:", self.spin_page),
-            ("X:", self.spin_x),
-            ("Y:", self.spin_y),
-            ("Rộng:", self.spin_w),
-            ("Cao:", self.spin_h),
+        # (label, widget, chỉ thuộc chế độ Vị trí X/Y tuỳ chỉnh) — nhóm X/Y/
+        # Rộng/Cao bị ẨN hẳn khi chọn góc có sẵn.
+        self._xy_field_pairs = []
+        for row, (label, widget, xy_only) in enumerate((
+            ("Trang:", self.spin_page, False),
+            ("X:", self.spin_x, True),
+            ("Y:", self.spin_y, True),
+            ("Rộng:", self.spin_w, True),
+            ("Cao:", self.spin_h, True),
+            ("Cỡ chữ:", self.spin_font_size, False),
         )):
-            pos_grid.addWidget(self._form_label(label), row, 0)
+            lbl = self._form_label(label)
+            pos_grid.addWidget(lbl, row, 0)
             pos_grid.addWidget(widget, row, 1)
+            if xy_only:
+                self._xy_field_pairs.append((lbl, widget))
         pos_grid.setColumnStretch(1, 1)
         layout.addLayout(pos_grid)
 
@@ -428,10 +446,11 @@ class SigningConfigPanel(QWidget):
         self._btn_fit.clicked.connect(self.auto_fit_box)
         layout.addWidget(self._btn_fit, alignment=Qt.AlignmentFlag.AlignLeft)
 
-        hint = QLabel("X/Y là góc trên trái. Tự khớp chỉ đổi Rộng/Cao.")
-        hint.setWordWrap(True)
-        hint.setStyleSheet(f"color: {COLOR_TEXT_MUTED}; font-size: {_FONT_SM}px;")
-        layout.addWidget(hint)
+        self._lbl_xy_hint = QLabel("X/Y là góc trên trái. Tự khớp chỉ đổi Rộng/Cao.")
+        self._lbl_xy_hint.setWordWrap(True)
+        self._lbl_xy_hint.setStyleSheet(
+            f"color: {COLOR_TEXT_MUTED}; font-size: {_FONT_SM}px;")
+        layout.addWidget(self._lbl_xy_hint)
 
         self.chk_avoid_text_overlap = QCheckBox("Tự tránh vùng có chữ khi đặt chữ ký")
         self.chk_avoid_text_overlap.setChecked(True)
@@ -441,11 +460,63 @@ class SigningConfigPanel(QWidget):
         self.chk_avoid_text_overlap.setToolTip(
             "Trước khi ký, phần mềm đọc text/OCR trên trang rồi thu nhỏ khung "
             "chữ ký theo khoảng trống từ vị trí X/Y, có chừa khoảng hở "
-            "với text PDF. Nếu trang không có text layer hoặc không tìm được vùng "
-            "trống phù hợp thì dùng vị trí hiện tại."
+            "với text PDF. Nếu trang không có text layer (scan thuần), phần mềm "
+            "đo vùng trắng từ ảnh trang tính từ điểm X/Y và giới hạn khung chữ "
+            "ký = min(kích thước đã cấu hình, vùng trắng đo được). Nếu không dò "
+            "được vùng trắng phù hợp thì dùng vị trí hiện tại."
         )
         self.chk_avoid_text_overlap.stateChanged.connect(lambda *_: self._user_edit())
         layout.addWidget(self.chk_avoid_text_overlap)
+
+        # Vị trí ký: X/Y tuỳ chỉnh, 4 góc trang, hoặc tự động theo tên
+        # người ký / tên tổ chức trong chứng thư (cơ chế VGCA ký thư mục).
+        mode_row = QHBoxLayout()
+        mode_lbl = QLabel("Vị trí ký:")
+        mode_lbl.setStyleSheet(
+            f"color: {COLOR_TEXT_SECONDARY}; font-size: {_FONT_SM}px;"
+        )
+        mode_row.addWidget(mode_lbl)
+        self.combo_position_mode = QComboBox()
+        for key, label in (
+            ("custom", "Vị trí X/Y (tuỳ chỉnh)"),
+            ("top_left", "Góc trên bên trái"),
+            ("top_right", "Góc trên bên phải"),
+            ("bottom_left", "Góc dưới bên trái"),
+            ("bottom_right", "Góc dưới bên phải"),
+        ):
+            self.combo_position_mode.addItem(label, key)
+        self.combo_position_mode.setToolTip(
+            "custom: dùng toạ độ X/Y bên trên. 4 góc: đặt dấu vào góc trang "
+            "tương ứng (chừa lề 10pt), giữ nguyên Rộng/Cao đã cấu hình — "
+            "các ô X/Y/Rộng/Cao chỉ chỉnh được ở chế độ tuỳ chỉnh."
+        )
+        self.combo_position_mode.currentIndexChanged.connect(
+            self._on_position_mode_changed)
+        mode_row.addWidget(self.combo_position_mode, 1)
+        layout.addLayout(mode_row)
+        # Áp dụng trạng thái ẩn/hiện nhóm X/Y theo chế độ ban đầu.
+        self._sync_position_fields(True)
+
+        # Neo chữ ký theo dòng chữ (cơ chế VGCA): tìm dòng chứa text này trên
+        # trang rồi đặt dấu ngay sau/dưới nó — mọi trang có text layer hoặc
+        # qua OCR đều tìm được.
+        anchor_row = QHBoxLayout()
+        anchor_lbl = QLabel("Neo theo dòng chữ:")
+        anchor_lbl.setStyleSheet(
+            f"color: {COLOR_TEXT_SECONDARY}; font-size: {_FONT_SM}px;"
+        )
+        anchor_row.addWidget(anchor_lbl)
+        self.edit_anchor_text = QLineEdit()
+        self.edit_anchor_text.setPlaceholderText("Tuỳ chọn — vd: Số:")
+        self.edit_anchor_text.setToolTip(
+            "Tìm dòng chứa chuỗi này trên trang ký rồi đặt chữ ký NGAY SAU "
+            "dòng đó (hết chỗ ngang thì đặt xuống dưới). Trang cần có text "
+            "layer (PDF điện tử hoặc đã OCR). Để trống thì dùng vị trí X/Y "
+            "như cũ."
+        )
+        self.edit_anchor_text.editingFinished.connect(lambda *_: self._user_edit())
+        anchor_row.addWidget(self.edit_anchor_text, 1)
+        layout.addLayout(anchor_row)
 
         # PDF/A-2b conversion option (chuẩn lưu trữ dài hạn).
         # Convert TRƯỚC khi ký số: signature trong PDF/A-2 vẫn valid.
@@ -1079,6 +1150,23 @@ class SigningConfigPanel(QWidget):
                     bool(data.get("avoid_text_overlap", True))
                 )
                 self.chk_avoid_text_overlap.blockSignals(False)
+            if hasattr(self, "edit_anchor_text"):
+                self.edit_anchor_text.setText(
+                    str(data.get("anchor_text", "") or "").strip())
+            if hasattr(self, "combo_position_mode"):
+                mode = str(data.get("position_mode", "custom") or "custom")
+                idx = self.combo_position_mode.findData(mode)
+                if idx >= 0:
+                    self.combo_position_mode.setCurrentIndex(idx)
+            if hasattr(self, "spin_font_size"):
+                self.spin_font_size.blockSignals(True)
+                try:
+                    self.spin_font_size.setValue(
+                        int(float(data.get("font_size", 0) or 0)))
+                except (TypeError, ValueError):
+                    self.spin_font_size.setValue(0)
+                self.spin_font_size.blockSignals(False)
+            self._sync_position_fields(True)
             if hasattr(self, "chk_tsa"):
                 self.chk_tsa.blockSignals(True)
                 self.chk_tsa.setChecked(bool(data.get("tsa_enabled", True)))
@@ -1155,6 +1243,18 @@ class SigningConfigPanel(QWidget):
             "avoid_text_overlap": (
                 bool(self.chk_avoid_text_overlap.isChecked())
                 if hasattr(self, "chk_avoid_text_overlap") else True
+            ),
+            "anchor_text": (
+                (self.edit_anchor_text.text() or "").strip()
+                if hasattr(self, "edit_anchor_text") else ""
+            ),
+            "position_mode": (
+                self.combo_position_mode.currentData()
+                if hasattr(self, "combo_position_mode") else "custom"
+            ) or "custom",
+            "font_size": (
+                int(self.spin_font_size.value())
+                if hasattr(self, "spin_font_size") else 0
             ),
             "tsa_enabled": bool(self.chk_tsa.isChecked()) if hasattr(self, "chk_tsa") else True,
             "tsa_url": self.edit_tsa_url.text().strip() if hasattr(self, "edit_tsa_url") else DEFAULT_TSA_URL,
@@ -1375,6 +1475,29 @@ class SigningConfigPanel(QWidget):
     def get_tsa_url(self) -> str:
         return self.edit_tsa_url.text().strip() if hasattr(self, "edit_tsa_url") else ""
 
+    def get_anchor_text(self) -> str:
+        """Dòng chữ mốc để neo chữ ký (tuỳ chọn, rỗng = tắt)."""
+        return (self.edit_anchor_text.text() or "").strip() \
+            if hasattr(self, "edit_anchor_text") else ""
+
+    def get_position_mode(self) -> str:
+        """Chế độ đặt dấu: custom / góc trên trái phải dưới trái phải."""
+        if not hasattr(self, "combo_position_mode"):
+            return "custom"
+        return self.combo_position_mode.currentData() or "custom"
+
+    def get_font_size(self) -> float:
+        """Cỡ chữ dấu (pt); 0 = tự động theo khung."""
+        if not hasattr(self, "spin_font_size"):
+            return 0.0
+        return float(self.spin_font_size.value())
+
+    def _on_position_mode_changed(self, *_):
+        self._user_edit()
+        # Chế độ góc có sẵn thì khóa X/Y/Rộng/Cao; trạng thái enabled chung
+        # của panel đang là True vì combo chỉ bấm được khi không đang ký.
+        self._sync_position_fields(self.combo_position_mode.isEnabled())
+
     def minimum_visible_stamp_height(self, cert: dict, stamp_template: str) -> float:
         """Keep multi-line bitmap appearances from silently dropping lines."""
         if not _DEPS_OK:
@@ -1441,6 +1564,8 @@ class SigningConfigPanel(QWidget):
             self._btn_stamp_image_choose, self._btn_stamp_image_clear,
             self.radio_text_below, self.radio_text_right,
             self.spin_page, self.spin_x, self.spin_y, self.spin_w, self.spin_h,
+            self.spin_font_size,
+            self.combo_position_mode, self.edit_anchor_text,
             self.text_template, self.chk_avoid_text_overlap, self.chk_tsa, self.edit_tsa_url,
             self._btn_fit,
         ]:
@@ -1449,6 +1574,21 @@ class SigningConfigPanel(QWidget):
             self._update_delete_button_state()
             self._update_stamp_image_preview()
         self._sync_tsa_enabled(enabled)
+        self._sync_position_fields(enabled)
+
+    def _sync_position_fields(self, signing_enabled: bool):
+        """Chế độ góc có sẵn: ẨN hẳn nhóm X/Y/Rộng/Cao (kèm nút Tự khớp và
+        ghi chú) — chỉ chế độ Vị trí X/Y tuỳ chỉnh mới hiển thị nhóm này."""
+        custom = self.get_position_mode() == "custom"
+        for lbl, widget in getattr(self, "_xy_field_pairs", []):
+            lbl.setVisible(custom)
+            widget.setVisible(custom)
+        self._btn_fit.setVisible(custom)
+        self._lbl_xy_hint.setVisible(custom)
+        enabled = signing_enabled and custom
+        for widget in (self.spin_x, self.spin_y, self.spin_w, self.spin_h,
+                       self._btn_fit):
+            widget.setEnabled(enabled)
 
     # ------------------------------------------------------------- lifecycle
 
