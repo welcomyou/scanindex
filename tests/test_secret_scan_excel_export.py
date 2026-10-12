@@ -18,6 +18,8 @@ from scanindex.ui.screens.secret_file_scan_screen import (
     _org_code_from_filename,
     _org_display_name,
     _org_name_lookup,
+    _scan_mode_label,
+    _summary_conclusion,
     export_matches_to_excel,
     load_secret_matches_from_excel,
 )
@@ -615,3 +617,140 @@ def test_load_excel_parses_text_update_date(tmp_path) -> None:
         loaded[0].file_mtime
         - dt.strptime("05/09/2026 14:30", "%d/%m/%Y %H:%M").timestamp()
     ) < 1
+
+
+# ---------------------------------------------------------------------------
+# Minh chứng rà soát: sheet "Tom tat" đứng SAU sheet danh sách — load không
+# bao giờ đọc nhầm (wb.active phải là sheet danh sách)
+# ---------------------------------------------------------------------------
+
+def _scan_summary(found: int = 0, status: str = "Hoàn tất") -> dict:
+    return {
+        "folder": r"D:\tailieu\hocbao",
+        "started": "12/10/2026 08:00:00",
+        "finished": "12/10/2026 08:03:21",
+        "mode": "thorough",
+        "status": status,
+        "total": 120,
+        "scanned": 118,
+        "skipped": 2,
+        "cache_skipped": 0,
+        "junk": 1,
+        "failures": 0,
+        "updated": 0,
+        "kept_old": 0,
+        "found": found,
+        "app_version": get_version(),
+    }
+
+
+def test_export_with_summary_keeps_data_sheet_first_and_loadable(
+    tmp_path,
+) -> None:
+    """Có sheet tóm tắt → sheet danh sách vẫn active; round-trip không đổi."""
+    import openpyxl
+
+    dest = str(tmp_path / "co_tom_tat.xlsx")
+    m = _match(source_path=_UUID_P9)
+    export_matches_to_excel([m], dest, scan_summary=_scan_summary(found=1))
+
+    wb = openpyxl.load_workbook(dest)
+    assert wb.sheetnames == ["Van ban mat", "Tom tat"]
+    assert wb.active.title == "Van ban mat"
+    ws = wb.active
+    assert ws.cell(row=1, column=1).value == "STT"
+    assert ws.cell(row=2, column=1).value == 1
+    summary = wb["Tom tat"]
+    values = {
+        summary.cell(row=r, column=1).value: summary.cell(row=r, column=2).value
+        for r in range(1, summary.max_row + 1)
+    }
+    assert values["Thư mục rà soát"] == r"D:\tailieu\hocbao"
+    assert values["Chế độ quét"] == "Tìm kỹ (mọi trang)"
+    assert values["Trạng thái lượt quét"] == "Hoàn tất"
+    assert values["Số dòng mật phát hiện"] == 1
+    assert values["Kết luận"] == (
+        "Phát hiện 1 dòng văn bản mật (xem sheet danh sách)"
+    )
+
+    # Luồng nạp đọc wb.active — phải cho đúng danh sách dù có thêm sheet.
+    loaded = load_secret_matches_from_excel(dest)
+    assert len(loaded) == 1
+    assert loaded[0].source_path == m.source_path
+
+
+def test_export_evidence_zero_matches_loads_empty(tmp_path) -> None:
+    """0 phát hiện: sheet danh sách chỉ có header + sheet tóm tắt; nạp lại
+    ra [] không lỗi — đúng luồng "Các file không chứa dòng nào" sẵn có."""
+    import openpyxl
+
+    dest = str(tmp_path / "minh_chung.xlsx")
+    export_matches_to_excel([], dest, scan_summary=_scan_summary())
+
+    wb = openpyxl.load_workbook(dest)
+    assert wb.sheetnames == ["Van ban mat", "Tom tat"]
+    assert wb.active.title == "Van ban mat"
+    assert wb.active.max_row == 1  # chỉ header
+    summary = wb["Tom tat"]
+    values = {
+        summary.cell(row=r, column=1).value: summary.cell(row=r, column=2).value
+        for r in range(1, summary.max_row + 1)
+    }
+    assert values["Kết luận"] == (
+        "Không phát hiện văn bản mật nào trong thư mục rà soát"
+    )
+
+    assert load_secret_matches_from_excel(dest) == []
+
+
+def test_export_without_summary_stays_single_sheet(tmp_path) -> None:
+    """Không truyền scan_summary (xuất danh sách thuần) → 1 sheet như cũ."""
+    import openpyxl
+
+    dest = str(tmp_path / "thuan.xlsx")
+    export_matches_to_excel([_match()], dest)
+    wb = openpyxl.load_workbook(dest)
+    assert wb.sheetnames == ["Van ban mat"]
+    assert load_secret_matches_from_excel(dest)[0].source_path == (
+        r"D:\tailieu\hocbao\congvan_01.pdf"
+    )
+
+
+def test_export_summary_partial_dict_no_crash(tmp_path) -> None:
+    """Dict thiếu trường (lượt quét cũ) → chỉ bỏ dòng tương ứng, không lỗi."""
+    import openpyxl
+
+    dest = str(tmp_path / "rieng_phan.xlsx")
+    export_matches_to_excel(
+        [], dest, scan_summary={"folder": r"D:\kho", "status": "Hoàn tất"}
+    )
+    summary = openpyxl.load_workbook(dest)["Tom tat"]
+    values = {
+        summary.cell(row=r, column=1).value: summary.cell(row=r, column=2).value
+        for r in range(1, summary.max_row + 1)
+    }
+    assert values["Thư mục rà soát"] == r"D:\kho"
+    assert "Tổng số file trong thư mục" not in values
+    assert values["Kết luận"] == (
+        "Không phát hiện văn bản mật nào trong thư mục rà soát"
+    )
+
+
+def test_summary_conclusion_honest_for_stopped_scan() -> None:
+    stopped = _summary_conclusion(
+        _scan_summary(status="Đã dừng giữa chừng"), found=0
+    )
+    assert "dừng" in stopped
+    assert "chưa đủ điều kiện" in stopped
+    done = _summary_conclusion(_scan_summary(), found=3)
+    assert "3 dòng" in done
+    none = _summary_conclusion(_scan_summary(), found=0)
+    assert "Không phát hiện" in none
+
+
+def test_scan_mode_label_maps_combo_keys() -> None:
+    assert _scan_mode_label("fast") == "Tìm nhanh (trang đầu)"
+    assert _scan_mode_label("thorough10") == "Tìm kỹ 10 trang đầu"
+    assert _scan_mode_label("thorough") == "Tìm kỹ (mọi trang)"
+    assert _scan_mode_label("junk") == "junk"
+    assert _scan_mode_label("") == ""

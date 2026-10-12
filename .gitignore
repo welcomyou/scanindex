@@ -175,8 +175,9 @@ train-convert/**/artifacts/
 
 # --- Local user data (private, machine-specific) ---
 # Signature stamp images chosen by the operator (private seals/dấu đỏ).
-config/sign_stamp_images/*.jpg
-config/sign_stamp_images/*.jpeg
+# ALL extensions — a real seal+signature PNG slipped through the *.jpg/*.jpeg
+# rule once and landed on the public repo. Never track anything in here.
+config/sign_stamp_images/*
 # Bulk-signing tool per-machine settings (input/output dirs of the last run).
 config/batch_sign_settings.json
 config/rename_tree_settings.json
@@ -190,3 +191,7 @@ benchmark_oneocr_vs_screenai.py
 # Local decompiled-source scratch and an accidental $TEMP dump folder.
 _decomp/
 $TEMP/
+  
+# Local security audit reports - never publish audit findings to the public repo.  
+/SECURITY_REVIEW_*.md  
+/FORTIFY_*.md  

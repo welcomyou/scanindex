@@ -41,6 +41,9 @@ ZST_SUFFIX = ".json.zst"
 # First 4 bytes of every zstd stream.
 _ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 
+# Cap on the DECOMPRESSED size of one canonical sidecar read from disk.
+_MAX_CANONICAL_DECOMPRESSED = 256 * 1024 * 1024
+
 # Public profile aliases. The stored value is always the versioned form.
 LAYOUTLMV3_RUNTIME_PROFILE = "layoutlmv3_runtime"
 LAYOUTLMV3_RUNTIME_PROFILE_V1 = "layoutlmv3_runtime_v1"
@@ -167,6 +170,10 @@ def load_canonical(path: PathLike) -> dict:
     `.json.zst` is the production format. Plain JSON is still parseable when
     explicitly passed for developer migration/debugging, but `resolve_companion`
     never selects it implicitly.
+
+    Sidecars come from outside the app on the ZIP round-trip path, so the
+    decompressed size is capped (decompression-bomb guard). Real OCR/KIE
+    sidecars land in the low tens of MB; 256 MB is ~5-10x generous.
     """
     p = Path(path)
     with p.open("rb") as fh:
@@ -175,9 +182,21 @@ def load_canonical(path: PathLike) -> dict:
         is_zst = str(path).endswith(ZST_SUFFIX) or head == _ZSTD_MAGIC
         if is_zst:
             import zstandard as zstd
+            chunks: list[bytes] = []
+            total = 0
             with zstd.ZstdDecompressor().stream_reader(fh) as reader:
-                with io.TextIOWrapper(reader, encoding="utf-8") as text:
-                    return json.load(text)
+                while True:
+                    chunk = reader.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > _MAX_CANONICAL_DECOMPRESSED:
+                        raise ValueError(
+                            "Canonical JSON vượt hạn mức giải nén "
+                            f"({_MAX_CANONICAL_DECOMPRESSED} byte): {p}"
+                        )
+                    chunks.append(chunk)
+            return json.loads(b"".join(chunks).decode("utf-8"))
         with io.TextIOWrapper(fh, encoding="utf-8") as text:
             return json.load(text)
 

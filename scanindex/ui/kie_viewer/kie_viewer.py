@@ -12,7 +12,6 @@ import json
 import os
 import sys
 import threading
-import time
 from collections import OrderedDict, deque
 from functools import partial
 from pathlib import Path
@@ -165,8 +164,8 @@ def _load_path_config():
                     value = loaded.get(key)
                     if isinstance(value, str) and value.strip():
                         config[key] = value.strip()
-        except Exception as exc:
-            print(f"Error reading viewer config {CONFIG_PATH}: {exc}")
+        except Exception:
+            pass
 
     for key in DEFAULT_CONFIG:
         env_key = f"KIE_VIEWER_{key.upper()}"
@@ -847,12 +846,9 @@ class KieViewer(QMainWindow):
         def _warm_orientation_session():
             try:
                 from scanindex.core.preprocessing.preprocessing import _get_orientation_classifier_session
-                t0 = time.perf_counter()
                 _get_orientation_classifier_session()
-                dt_ms = (time.perf_counter() - t0) * 1000.0
-                print(f"[warm] orientation classifier session ready ({dt_ms:.0f}ms)")
-            except Exception as e:
-                print(f"[warm] orientation classifier warm-up failed: {e}")
+            except Exception:
+                pass  # best-effort warm-up; first real use retries via lru_cache
         threading.Thread(target=_warm_orientation_session, daemon=True).start()
 
     # ═══════════════════════════════════════════════════
@@ -1889,10 +1885,9 @@ class KieViewer(QMainWindow):
         if self._is_loading:
             return
         self._is_loading = True
-        # Stamp click-to-load start so _render_pdf can report elapsed timings
-        # from the user's perspective (file switch → first page visible).
-        self._load_click_t0 = time.perf_counter()
-        t_click = self._load_click_t0
+        self._json_read_error = False
+        self._pdf_open_error = False
+        self._render_page_error = False
         try:
             stem = self.current_stem
             if not stem:
@@ -1900,7 +1895,6 @@ class KieViewer(QMainWindow):
             self.output_json = self._read_json(self.output_files.get(stem))
             self.input_json = self._read_json(self.input_files.get(stem))
             self.canonical_json = self._load_canonical()
-            t_json = time.perf_counter()
 
             if self.fitz_doc:
                 self.fitz_doc.close()
@@ -1909,21 +1903,14 @@ class KieViewer(QMainWindow):
             if pdf_path:
                 try:
                     self.fitz_doc = fitz.open(pdf_path)
-                except Exception as e:
-                    print(f"Error loading PDF: {e}")
-            t_fitz = time.perf_counter()
+                except Exception:
+                    self._pdf_open_error = True
 
             # Don't clear old page widgets here — _render_pdf clears them
             # INSIDE its setUpdatesEnabled(False) batch so the transition
             # (old content → new content) happens in one paint with no
             # intermediate blank viewport.
             self._zoom_fit_silent()
-            t_prep = time.perf_counter()
-            print(
-                f"[load]   stem={stem} json_read={((t_json-t_click)*1000):.0f}ms "
-                f"fitz_open={((t_fitz-t_json)*1000):.0f}ms "
-                f"fit={((t_prep-t_fitz)*1000):.0f}ms"
-            )
 
             self._render_pdf()
             self._render_fields()
@@ -1952,8 +1939,10 @@ class KieViewer(QMainWindow):
             return None
         try:
             return _fast_json_load(path)
-        except Exception as e:
-            print(f"Error reading {path}: {e}")
+        except Exception:
+            # Corrupt/unreadable JSON — surfaced as a fixed generic status
+            # warning; never echo path or exception content.
+            self._json_read_error = True
             return None
 
     def _refresh(self):
@@ -2354,7 +2343,6 @@ class KieViewer(QMainWindow):
 
         priority_idx = (n_pages - 1) if self.chk_last_page.isChecked() else 0
 
-        t_loop0 = time.perf_counter()
         cached_style = (
             "QLabel { "
             "  background: #1f1f1f; "
@@ -2404,12 +2392,10 @@ class KieViewer(QMainWindow):
 
             # Render priority page SYNC so the transition paint already shows
             # content (no placeholder flash on the target page).
-            t_prio0 = time.perf_counter()
             try:
                 self._render_single_page_into_placeholder(priority_idx)
-            except Exception as e:
-                print(f"Render priority page {priority_idx} failed: {e}")
-            t_prio1 = time.perf_counter()
+            except Exception:
+                self._render_page_error = True
             # Draw bbox overlays INSIDE the same updates-disabled batch so the
             # priority page appears WITH its fields highlighted in one paint,
             # not "pixmap first → bboxes popping in a frame later" (which was
@@ -2418,38 +2404,20 @@ class KieViewer(QMainWindow):
             # full _draw_overlays would do N-1 no-op iterations for placeholders.
             try:
                 self._apply_overlays_to_page(priority_idx)
-            except Exception as e:
-                print(f"Apply overlays to priority page failed: {e}")
+            except Exception:
+                pass
         finally:
             self.pdf_pages_widget.setUpdatesEnabled(True)
-        t_loop1 = time.perf_counter()
-        print(
-            f"[render] placeholders+priority={((t_loop1-t_loop0)*1000):.0f}ms "
-            f"(priority_render={((t_prio1-t_prio0)*1000):.0f}ms)"
-        )
 
         # Priority page is rendered. Mark it in the queued set so viewport
         # scanning won't re-enqueue it.
         self._render_queued.add(priority_idx)
         self._render_total = n_pages
 
-        # Telemetry state captured in closure so supersede/drain events can
-        # report elapsed time even after a new file swap overrides gen.
-        t0 = getattr(self, "_load_click_t0", None) or time.perf_counter()
-        stem = self.current_stem or "?"
-        first_ms = (time.perf_counter() - t0) * 1000.0
-        print(
-            f"[render] gen={my_gen} stem={stem} pages={n_pages} "
-            f"zoom={self.zoom:.2f} first_page_visible_at={first_ms:.0f}ms "
-            f"(page_idx={priority_idx})"
-        )
-        state = {
-            "gen": my_gen,
-            "stem": stem,
-            "n_pages": n_pages,
-            "t_start": t0,
-            "viewport_done_logged": False,
-        }
+        # Render-queue state shared with the viewport scanner / drain loop;
+        # "viewport_done_logged" makes the finish hook (prefetch scheduling)
+        # run exactly once per generation — reset when the viewport expands.
+        state = {"viewport_done_logged": False}
         self._render_state = state
 
         # Enqueue viewport pages on the NEXT event-loop tick so the scroll
@@ -2504,22 +2472,16 @@ class KieViewer(QMainWindow):
         if newly_queued and not self._render_active:
             QTimer.singleShot(0, lambda: self._drain_render_queue(my_gen, state))
         elif not self._render_queue and not self._render_active:
-            self._log_viewport_done(state)
+            self._finish_viewport(state)
             self._hide_render_overlay()
 
     def _drain_render_queue(self, my_gen: int, state: dict):
         """Render one queued page per tick; keep scheduling while queue lasts."""
         if my_gen != self._render_gen:
-            elapsed = (time.perf_counter() - state["t_start"]) * 1000.0
-            print(
-                f"[render] gen={state['gen']} stem={state['stem']} SUPERSEDED "
-                f"with {state.get('rendered_at_supersede', '?')} pages complete "
-                f"({elapsed:.0f}ms)"
-            )
             return
         if not self._render_queue:
             self._render_active = False
-            self._log_viewport_done(state)
+            self._finish_viewport(state)
             self._hide_render_overlay()
             return
 
@@ -2528,29 +2490,25 @@ class KieViewer(QMainWindow):
         try:
             self._render_single_page_into_placeholder(page_idx)
             self._apply_overlays_to_page(page_idx)
-        except Exception as e:
-            print(f"Render page {page_idx} failed: {e}")
+        except Exception:
+            self._render_page_error = True
+            self._update_status()
         self._render_active = False
 
         rendered = len(self._render_queued) - len(self._render_queue)
-        state["rendered_at_supersede"] = rendered
         self._update_render_overlay(rendered, self._render_total)
 
         if self._render_queue:
             QTimer.singleShot(0, lambda: self._drain_render_queue(my_gen, state))
         else:
-            self._log_viewport_done(state)
+            self._finish_viewport(state)
             self._hide_render_overlay()
 
-    def _log_viewport_done(self, state: dict):
+    def _finish_viewport(self, state: dict):
+        """Viewport render finished — runs exactly once per generation and
+        schedules the adjacent-file prefetch after the foreground paint."""
         if state is None or state.get("viewport_done_logged"):
             return
-        elapsed = (time.perf_counter() - state["t_start"]) * 1000.0
-        rendered = state.get("rendered_at_supersede", 1)
-        print(
-            f"[render] gen={state['gen']} stem={state['stem']} VIEWPORT_READY "
-            f"rendered={rendered}/{state['n_pages']} pages ({elapsed:.0f}ms)"
-        )
         state["viewport_done_logged"] = True
         # Warm the cache for neighbouring files once the current viewport is
         # fully rendered. Deferred via singleShot so the foreground render
@@ -2578,8 +2536,8 @@ class KieViewer(QMainWindow):
         self._enqueue_viewport_pages(self._render_gen, state)
         after = len(self._render_queued)
         if after > before:
-            # Viewport expanded — reset the "done" log so it fires again when
-            # this new batch completes.
+            # Viewport expanded — reset the finish hook so it fires again
+            # when this new batch completes.
             state["viewport_done_logged"] = False
             self._show_render_overlay(self._render_total)
 
@@ -2622,8 +2580,7 @@ class KieViewer(QMainWindow):
             return
         try:
             input_json = _fast_json_load(input_json_path)
-        except Exception as e:
-            print(f"[prefetch] {stem}: read input_json failed: {e}")
+        except Exception:
             self._prefetch_submitted.discard(stem)
             return
         pdf_path = self._resolve_pdf_path(stem, input_json)
@@ -2634,7 +2591,6 @@ class KieViewer(QMainWindow):
         emitter = self._prefetch_emitter
 
         def worker():
-            t0 = time.perf_counter()
             try:
                 doc = fitz.open(pdf_path)
                 n = len(doc)
@@ -2652,13 +2608,8 @@ class KieViewer(QMainWindow):
                 ).copy()
                 doc.close()
                 emitter.prefetch_done.emit(stem, priority_idx, zoom, 0, img)
-                dt_ms = (time.perf_counter() - t0) * 1000.0
-                print(
-                    f"[prefetch] stem={stem} page={priority_idx} "
-                    f"rendered in {dt_ms:.0f}ms (worker)"
-                )
-            except Exception as e:
-                print(f"[prefetch] {stem}: render failed: {e}")
+            except Exception:
+                pass
             finally:
                 # Always clear the in-flight marker, even on failure
                 pass  # cleared in _on_prefetch_done / or below on exception
@@ -2678,8 +2629,8 @@ class KieViewer(QMainWindow):
             cache_key = (stem, int(page_idx), round(float(zoom), 4),
                          int(rotation) % 360)
             self._pixmap_cache.put(cache_key, pm)
-        except Exception as e:
-            print(f"[prefetch] {stem}: cache seed failed: {e}")
+        except Exception:
+            pass
         finally:
             with self._prefetch_lock:
                 self._prefetch_submitted.discard(stem)
@@ -4302,6 +4253,18 @@ class KieViewer(QMainWindow):
             parts.append(translations.localize_text(f"{len(fields)} trường KIE"))
         if self.dirty:
             parts.append(translations.localize_text("* chưa lưu"))
+        # Fixed, generic warnings for unreadable inputs — deliberately no
+        # paths, no exception text (Fortify Privacy Violation fix); the
+        # flags are set by the silent except branches and reset per load.
+        if getattr(self, "_pdf_open_error", False):
+            parts.append(translations.localize_text(
+                "⚠ Không đọc được PDF (tệp hỏng hoặc không đúng định dạng)"))
+        elif getattr(self, "_json_read_error", False):
+            parts.append(translations.localize_text(
+                "⚠ Không đọc được tệp kết quả JSON"))
+        if getattr(self, "_render_page_error", False):
+            parts.append(translations.localize_text(
+                "⚠ Một số trang không hiển thị được"))
         self.status_left.setText(" | ".join(parts) if parts else "--")
 
     def closeEvent(self, event):

@@ -373,6 +373,17 @@ def extract_crx3(crx_path, dest_dir):
         return False
 
 
+def verify_installed_library(lib_path: str) -> None:
+    """Re-verify an on-disk ScreenAI DLL right before it is loaded.
+
+    Install-time verification cannot protect later runs: the portable
+    folder is user-writable, so a DLL swapped after installation would
+    otherwise be loaded unchecked. Callers must invoke this immediately
+    before ctypes.CDLL(). Raises ScreenAIIntegrityError on failure.
+    """
+    _verify_authenticode_google_signed(lib_path)
+
+
 def get_installed_version(model_dir):
     """
     Check what version is installed locally.

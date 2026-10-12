@@ -2328,7 +2328,11 @@ def _apply_kie_org_fallback(
             continue
 
 
-def export_matches_to_excel(matches: list[SecretScanMatch], output_path: str) -> str:
+def export_matches_to_excel(
+    matches: list[SecretScanMatch],
+    output_path: str,
+    scan_summary: dict | None = None,
+) -> str:
     """Write the scan results to a one-sheet .xlsx workbook.
 
     One row per detected stamp — the same rows shown in the results table —
@@ -2338,6 +2342,12 @@ def export_matches_to_excel(matches: list[SecretScanMatch], output_path: str) ->
     madinhdanh_lookup > dự phòng KIE bóc từ văn bản (kết thúc "*"). "Đáp ứng
     giải mật" chỉ 2 trạng thái: giá trị khi đến hạn, trống khi chưa đạt;
     chuỗi trong "Ghi chú" giữ nguyên để file nạp lại không mâu thuẫn.
+
+    ``scan_summary`` (tuỳ chọn, từ lượt quét trong phiên): khi có, ghi thêm
+    sheet "Tom tat" ĐẰNG SAU sheet danh sách — bằng chứng rà soát (thư mục,
+    thời gian, số liệu, kết luận). Sheet danh sách phải luôn đứng đầu và là
+    sheet active: ``load_secret_matches_from_excel`` đọc ``wb.active`` nên
+    sheet tóm tắt không được phép chiếm vị trí đó.
     """
     import openpyxl
     from datetime import datetime
@@ -2401,9 +2411,95 @@ def export_matches_to_excel(matches: list[SecretScanMatch], output_path: str) ->
     last_col = get_column_letter(len(EXCEL_HEADERS))
     ws.auto_filter.ref = f"A1:{last_col}{max(1, len(matches) + 1)}"
 
+    if scan_summary:
+        _write_summary_sheet(wb, scan_summary, len(matches))
+
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     wb.save(output_path)
     return output_path
+
+
+# Cặp (nhận các key của scan_summary, tiêu đề hiển thị). Thứ tự hiển thị
+# trên sheet "Tom tat"; key thiếu trong dict thì bỏ dòng.
+_SUMMARY_ROWS = [
+    ("folder", "Thư mục rà soát"),
+    ("started", "Thời điểm bắt đầu"),
+    ("finished", "Thời điểm kết thúc"),
+    ("mode", "Chế độ quét"),
+    ("status", "Trạng thái lượt quét"),
+    ("total", "Tổng số file trong thư mục"),
+    ("scanned", "File quét mới"),
+    ("skipped", "File kế thừa lượt quét trước"),
+    ("cache_skipped", "File bỏ qua nhờ cache (không đổi)"),
+    ("junk", "File hỏng bỏ qua"),
+    ("failures", "File lỗi"),
+    ("updated", "File mật cập nhật kết quả"),
+    ("kept_old", "File mật giữ kết quả cũ"),
+    ("found", "Số dòng mật phát hiện"),
+    ("app_version", "Phiên bản ứng dụng"),
+]
+
+# Sheet tóm tắt dùng ASCII như sheet "Van ban mat" (nhất quán, an toàn tên
+# sheet qua các bản Excel/openpyxl).
+_SUMMARY_SHEET = "Tom tat"
+
+
+def _scan_mode_label(mode_key: str) -> str:
+    """Nhãn chế độ quét cho sheet tóm tắt (khớp item của mode_combo)."""
+    return {
+        "fast": "Tìm nhanh (trang đầu)",
+        "thorough10": "Tìm kỹ 10 trang đầu",
+        "thorough": "Tìm kỹ (mọi trang)",
+    }.get(mode_key, str(mode_key or ""))
+
+
+def _summary_conclusion(summary: dict, found: int) -> str:
+    """Câu kết luận của minh chứng rà soát — trạng thái dở phải thành thật."""
+    status = str(summary.get("status") or "")
+    if status and status != "Hoàn tất":
+        return (
+            f"Lượt quét {status.lower()} — file minh chứng chưa đủ điều kiện "
+            "làm kết luận cuối cùng"
+        )
+    if found:
+        return f"Phát hiện {found} dòng văn bản mật (xem sheet danh sách)"
+    return "Không phát hiện văn bản mật nào trong thư mục rà soát"
+
+
+def _write_summary_sheet(wb, summary: dict, found: int) -> None:
+    """Ghi sheet "Tom tat" — bằng chứng lượt quét, đứng SAU sheet danh sách.
+
+    Key/value mỗi dòng một cặp để dễ đọc in; chỉ nhận key có trong dict nên
+    lượt quét cũ thiếu trường mới vẫn xuất được mà không lỗi.
+    """
+    from openpyxl.styles import Alignment, Font
+
+    ws = wb.create_sheet(_SUMMARY_SHEET)
+    bold = Font(bold=True)
+    ws.cell(row=1, column=1, value="Hạng mục").font = bold
+    ws.cell(row=1, column=2, value="Giá trị").font = bold
+
+    row = 2
+    for key, label in _SUMMARY_ROWS:
+        if key not in summary or summary[key] in (None, ""):
+            continue
+        value = summary[key]
+        if key == "mode":
+            value = _scan_mode_label(str(value))
+        ws.cell(row=row, column=1, value=label)
+        ws.cell(row=row, column=2, value=value)
+        row += 1
+    conclusion = _summary_conclusion(summary, found)
+    ws.cell(row=row, column=1, value="Kết luận").font = bold
+    concl_cell = ws.cell(row=row, column=2, value=conclusion)
+    if not found:
+        concl_cell.font = Font(bold=True, color="1D7A34")
+
+    ws.column_dimensions["A"].width = 34
+    ws.column_dimensions["B"].width = 72
+    ws.cell(row=row, column=2).alignment = Alignment(
+        horizontal="left", vertical="center", wrap_text=True
+    )
 
 
 def _norm(path: str) -> str:
@@ -2869,6 +2965,10 @@ class SecretFileScanScreen(ScreenContent):
         # Toàn bộ file Excel đã load trong phiên (kể cả khi gộp) — "Xuất
         # Excel" không bao giờ ghi đè lên chúng.
         self._loaded_files: set[str] = set()
+        # Thông tin lượt quét gần nhất trong phiên (đặt ở _on_finished):
+        # cho phép "Xuất Excel" làm minh chứng ngay cả khi 0 phát hiện —
+        # bị xóa trong _reset_results để không bám nhầm lần xuất sau.
+        self._last_scan_summary: dict | None = None
         self._checked_paths: set[str] = set()
         self._preview_current: SecretScanMatch | None = None
         self._preview_convert_gen = 0
@@ -3654,8 +3754,12 @@ class SecretFileScanScreen(ScreenContent):
         self.history_checkbox.setEnabled(not running)
         self.btn_clear_history.setEnabled(not running)
         self.btn_load_file.setEnabled(not running)
-        # Chỉ bật lại nút xuất khi hết bận VÀ đang có kết quả để xuất.
-        self.btn_export.setEnabled(not running and self.table.rowCount() > 0)
+        # Bật lại nút xuất khi hết bận VÀ có kết quả, HOẶC vừa có lượt quét
+        # trong phiên — lượt quét 0 phát hiện vẫn xuất được làm minh chứng.
+        self.btn_export.setEnabled(
+            not running
+            and (self.table.rowCount() > 0 or bool(self._last_scan_summary))
+        )
         self.btn_run.setVisible(not running)
         self.btn_stop.setVisible(running)
         # Xóa file / "Không phải mật" vẫn dùng được trong lúc quét — xem
@@ -3673,6 +3777,7 @@ class SecretFileScanScreen(ScreenContent):
         from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 
         started = time.strftime("%Y%m%d_%H%M%S")
+        started_display = time.strftime("%d/%m/%Y %H:%M:%S")
         work_root = os.path.join(get_base_dir(), "temp", f"secret_scan_{started}")
         os.makedirs(work_root, exist_ok=True)
         if mode_key is None:
@@ -4210,6 +4315,11 @@ class SecretFileScanScreen(ScreenContent):
                     "app_version": app_version,
                     "updated": updated[0],
                     "kept_old": kept_old[0],
+                    # Nguồn cho minh chứng rà soát (sheet "Tom tat" của file
+                    # xuất) — đủ để tái hiện bối cảnh lượt quét.
+                    "folder": folder,
+                    "started": started_display,
+                    "mode": mode_key,
                 }
             )
 
@@ -4933,7 +5043,12 @@ class SecretFileScanScreen(ScreenContent):
                 f" — đang lọc: hiện {visible}/{rows} dòng"
             )
         self.lbl_total.setText(text)
-        self.btn_export.setEnabled(not self._busy and rows > 0)
+        # 0 dòng vẫn bật xuất nếu vừa có lượt quét — minh chứng "không phát
+        # hiện" cần file Excel làm bằng chứng như lượt có phát hiện.
+        self.btn_export.setEnabled(
+            not self._busy
+            and (rows > 0 or bool(self._last_scan_summary))
+        )
         self._refresh_action_buttons()
 
     def _refresh_action_buttons(self) -> None:
@@ -5185,6 +5300,9 @@ class SecretFileScanScreen(ScreenContent):
     def _reset_results(self) -> None:
         self._loaded_from = None
         self._loaded_files = set()
+        # Bảng đổi nguồn (quét mới / nạp file thay bảng) → minh chứng lượt
+        # quét cũ không còn đúng bối cảnh, không được bám vào lần xuất sau.
+        self._last_scan_summary = None
         self._checked_paths.clear()
         self._preview_current = None
         self._preview_convert_gen += 1  # vô hiệu hoá kết quả convert cũ
@@ -5205,7 +5323,6 @@ class SecretFileScanScreen(ScreenContent):
 
     def _on_finished(self, payload: dict) -> None:
         self._busy = False
-        self._set_running_ui(False)
         total = int(payload.get("total") or 0)
         scanned = int(payload.get("scanned") or 0)
         skipped = int(payload.get("skipped") or 0)
@@ -5217,6 +5334,26 @@ class SecretFileScanScreen(ScreenContent):
         kept_old = int(payload.get("kept_old") or 0)
         app_version = str(payload.get("app_version") or "")
         found = self.table.rowCount()
+        # Thông tin minh chứng lượt quét — đặt TRƯỚC _set_running_ui vì điều
+        # kiện bật nút xuất có tính đến nó (quét 0 phát hiện vẫn xuất được).
+        self._last_scan_summary = {
+            "folder": str(payload.get("folder") or ""),
+            "started": str(payload.get("started") or ""),
+            "finished": time.strftime("%d/%m/%Y %H:%M:%S"),
+            "mode": str(payload.get("mode") or ""),
+            "status": "Đã dừng giữa chừng" if cancelled else "Hoàn tất",
+            "total": total,
+            "scanned": scanned,
+            "skipped": skipped,
+            "cache_skipped": cache_skipped,
+            "junk": junk,
+            "failures": failures,
+            "updated": updated,
+            "kept_old": kept_old,
+            "found": found,
+            "app_version": app_version,
+        }
+        self._set_running_ui(False)
         prefix = "Đã dừng" if cancelled else "Hoàn tất"
         detail = f"quét {scanned + skipped + cache_skipped}/{total} file"
         notes = []
@@ -5302,7 +5439,8 @@ class SecretFileScanScreen(ScreenContent):
 
     def _export_clicked(self) -> None:
         matches = self._current_matches()
-        if not matches:
+        summary = self._last_scan_summary
+        if not matches and not summary:
             QMessageBox.information(
                 self,
                 "Chưa có kết quả",
@@ -5319,6 +5457,9 @@ class SecretFileScanScreen(ScreenContent):
             start_dir = folder
         else:
             start_dir = os.path.expanduser("~")
+        # 0 phát hiện nhưng đã quét → vẫn xuất được: file cùng định dạng
+        # (sheet danh sách + sheet tóm tắt lượt quét), cùng cách đặt tên —
+        # đây là bằng chứng đã rà thư mục, không phải loại file riêng.
         default_name = f"DanhSachVanBanMat_{time.strftime('%Y%m%d_%H%M%S')}.xlsx"
         dest, _ = QFileDialog.getSaveFileName(
             self,
@@ -5346,7 +5487,7 @@ class SecretFileScanScreen(ScreenContent):
                 ),
             )
         try:
-            export_matches_to_excel(matches, dest)
+            export_matches_to_excel(matches, dest, scan_summary=summary)
         except Exception as exc:
             QMessageBox.critical(
                 self, "Lỗi", f"Không thể xuất file Excel:\n{exc}"

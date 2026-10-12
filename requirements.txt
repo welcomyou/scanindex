@@ -2,7 +2,7 @@
 # verified to run the PDF-to-DOCX OCR pipeline. Broad ranges made GitHub
 # Actions resolve newer native wheels than local builds.
 PySide6==6.10.2
-pypdf==6.6.0
+pypdf==6.7.1
 selenium==4.40.0
 webdriver-manager==4.0.2
 huggingface_hub==0.36.2
@@ -24,9 +24,9 @@ scikit-learn==1.8.0
 openpyxl==3.1.5
 pyhanko[opentype]==0.34.1
 pyhanko-certvalidator==0.30.2
-cryptography==46.0.7
+cryptography==48.0.1
 asn1crypto==1.5.1
-Pillow==12.1.0
+Pillow==12.2.0
 tzlocal==5.3.1
 
 opencv-contrib-python-headless==4.9.0.80

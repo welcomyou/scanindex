@@ -5,6 +5,7 @@ Works with any USB token whose driver registers a CSP/KSP in Windows.
 PIN prompt is handled by the token driver.
 """
 
+import asyncio
 import ctypes
 import ctypes.wintypes as wintypes
 import hashlib
@@ -261,6 +262,14 @@ def list_certificates(store_name: str = "MY", signing_only: bool = True) -> List
                 )
                 signing_eligible = _is_vgca_signing_certificate(cert, now)
 
+                # Soft chain check (H3, phương án mềm): verify the issuer
+                # chain reaches a trusted root — never raises, never blocks.
+                # chain_ok tri-state: True/False/None (= not determined).
+                try:
+                    chain_ok, chain_msg = validate_cert_chain_soft({"der": der})
+                except Exception:
+                    chain_ok, chain_msg = None, ""
+
                 # Duplicate context so it stays valid after store closes
                 p_dup = _crypt32.CertDuplicateCertificateContext(p_ctx)
                 if not p_dup:
@@ -287,6 +296,8 @@ def list_certificates(store_name: str = "MY", signing_only: bool = True) -> List
                     "der":         der,
                     "cert_ctx":    p_dup,   # PCCERT_CONTEXT, must be freed
                     "display":     display,
+                    "chain_ok":    chain_ok,
+                    "chain_msg":   chain_msg,
                 }
                 certs.append(entry)
                 if signing_eligible:
@@ -313,6 +324,87 @@ def free_cert_contexts(cert_list: List[Dict]) -> None:
         if ctx:
             _crypt32.CertFreeCertificateContext(ctx)
             c["cert_ctx"] = None
+
+
+def _load_system_store_certs(store_name: str) -> List[asn1_x509.Certificate]:
+    """Enumerate every certificate in a Windows system store ("ROOT", "CA").
+
+    Used to build the trust anchors and intermediates for the soft chain
+    check — no network, everything the machine already trusts.
+    """
+    h_store = _crypt32.CertOpenSystemStoreW(0, store_name)
+    if not h_store:
+        return []
+    out: List[asn1_x509.Certificate] = []
+    p_ctx = None
+    try:
+        while True:
+            p_ctx = _crypt32.CertEnumCertificatesInStore(h_store, p_ctx)
+            if not p_ctx:
+                break
+            cert_ctx = ctypes.cast(p_ctx, POINTER(_CERT_CONTEXT)).contents
+            der = bytes(cert_ctx.pbCertEncoded[: cert_ctx.cbCertEncoded])
+            try:
+                out.append(asn1_x509.Certificate.load(der))
+            except Exception:
+                continue
+    finally:
+        # CertEnumCertificatesInStore takes ownership of the last context;
+        # CertCloseStore frees it.
+        _crypt32.CertCloseStore(h_store, 0)
+    return out
+
+
+def _to_asn1_cert(c):
+    """Accept either asn1crypto or cryptography certificate objects."""
+    if isinstance(c, asn1_x509.Certificate):
+        return c
+    # cryptography-style: expose DER via public_bytes(Encoding.DER)
+    from cryptography.hazmat.primitives import serialization
+    return asn1_x509.Certificate.load(
+        c.public_bytes(serialization.Encoding.DER)
+    )
+
+
+def validate_cert_chain_soft(
+    cert_info: Dict, *,
+    trust_roots: Optional[List[asn1_x509.Certificate]] = None,
+    intermediate_certs: Optional[List[asn1_x509.Certificate]] = None,
+) -> Tuple[bool, str]:
+    """Best-effort certificate-chain validation (soft mode — NEVER raises).
+
+    Verifies the certificate chains to a trusted root (Windows ROOT store
+    by default, or caller-supplied roots) through the Windows CA store
+    intermediates. Fully offline: AIA/CRL fetching is disabled and
+    revocation soft-fails.
+
+    Returns ``(ok, reason)``. ``ok=False`` does NOT block signing (phương
+    án mềm — the UI shows a ⚠ warning); it means the issuer text could not
+    be verified against a real trust anchor: self-made cert, expired
+    chain, or missing root/intermediate.
+    """
+    try:
+        from pyhanko_certvalidator import CertificateValidator, ValidationContext
+
+        cert = asn1_x509.Certificate.load(cert_info["der"])
+        roots = [_to_asn1_cert(r) for r in trust_roots] \
+            if trust_roots is not None else _load_system_store_certs("ROOT")
+        if not roots:
+            return False, "không có root tin cậy nào để đối chiếu"
+        inter = [_to_asn1_cert(c) for c in intermediate_certs] \
+            if intermediate_certs is not None else _load_system_store_certs("CA")
+        ctx = ValidationContext(
+            trust_roots=roots,
+            allow_fetching=False,   # offline: no AIA/CRL fetches
+        )
+        validator = CertificateValidator(
+            cert, intermediate_certs=inter, validation_context=ctx,
+        )
+        asyncio.run(validator.async_validate_path())
+        return True, ""
+    except Exception as exc:  # noqa: BLE001 — soft mode: report, don't raise
+        msg = str(exc).strip() or exc.__class__.__name__
+        return False, msg[:300]
 
 
 def sign_data(cert_info: Dict, data: bytes, hash_alg: str = "sha256") -> bytes:

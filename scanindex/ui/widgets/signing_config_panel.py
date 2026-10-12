@@ -1399,8 +1399,12 @@ class SigningConfigPanel(QWidget):
                     text = self._cert_display(c)
                     self.combo_cert.addItem(text)
                     row = self.combo_cert.count() - 1
+                    tooltip = c.get("display", text)
+                    if c.get("chain_ok") is False:
+                        tooltip += ("\n⚠ Chuỗi chứng thư không xác thực được: "
+                                    + (c.get("chain_msg") or ""))
                     self.combo_cert.setItemData(
-                        row, c.get("display", text), Qt.ItemDataRole.ToolTipRole
+                        row, tooltip, Qt.ItemDataRole.ToolTipRole
                     )
                 self.combo_cert.setCurrentIndex(0)
             else:
@@ -1419,18 +1423,31 @@ class SigningConfigPanel(QWidget):
             name = name[:12] + "..." + name[-10:]
         not_after = cert.get("not_after") or ""
         if hasattr(not_after, "strftime"):
-            return f"{name} ({not_after.strftime('%Y-%m-%d')})"
-        return name
+            text = f"{name} ({not_after.strftime('%Y-%m-%d')})"
+        else:
+            text = name
+        if cert.get("chain_ok") is False:
+            text = "⚠ " + text
+        return text
 
     def _on_cert_change(self):
         idx = self.combo_cert.currentIndex()
         if 0 <= idx < len(self._certs):
             c = self._certs[idx]
-            self.lbl_cert_detail.setText(
+            detail = (
                 f"CN:     {c.get('cn', '')}\n"
                 f"OU:     {c.get('ou', '')}\n"
                 f"ORG:    {c.get('org', '')}"
             )
+            if c.get("chain_ok") is False:
+                detail += (
+                    "\n⚠ Chuỗi chứng thư KHÔNG xác thực được với root tin cậy "
+                    "(cert có thể tự tạo/giả mạo). Vẫn cho phép ký — hãy kiểm tra kỹ."
+                )
+                msg = str(c.get("chain_msg") or "")
+                if msg:
+                    detail += f"\n  Chi tiết: {msg}"
+            self.lbl_cert_detail.setText(detail)
         else:
             self.lbl_cert_detail.setText("")
 

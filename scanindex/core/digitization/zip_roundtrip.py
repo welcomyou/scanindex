@@ -96,6 +96,20 @@ _HOSO_COLUMN_TO_IDENTITY = {
 # order stable across the ZIP listing and the workbook rows.
 _PDF_ORDINAL_RE = re.compile(r"-(\d{3})\.pdf$", re.IGNORECASE)
 
+# Resource caps for untrusted archive-export ZIPs (decompression-bomb guard).
+# Generous for real dossiers (a big one is a few hundred MB across a few
+# hundred PDFs; scanned PDFs barely compress, ratio ~1-2x), far below what a
+# bomb needs. Copy streams in chunks and counts ACTUAL bytes — the
+# `file_size` declared in the central directory can lie.
+_MAX_ZIP_ENTRIES = 10_000
+_MAX_ENTRY_UNCOMPRESSED = 2 * 1024 ** 3        # 2 GB per entry
+_MAX_TOTAL_UNCOMPRESSED = 4 * 1024 ** 3        # 4 GB per ZIP
+_MAX_ENTRY_RATIO = 100                          # file_size / compress_size
+# Ratio guard only kicks in above this declared size — a few-KB entry that
+# deflates 200:1 is harmless, and sparse-but-legit small files must not be
+# rejected. Large output is always stopped by the byte counters regardless.
+_RATIO_CHECK_MIN_SIZE = 10 * 1024 * 1024
+
 # `<MãĐD>-<MãPhông>-<MụcLục>-<HồSơ>.zip` — the 4 leading dash-separated parts
 # of the exported ZIP name. Each part is `[A-Za-z0-9]+` (codes are stripped of
 # punctuation by `_arc_export_zip_name`), so a plain dash split is safe as long
@@ -291,6 +305,34 @@ def _pdf_ordinal(name: str) -> int:
     return int(m.group(1)) if m else 999999
 
 
+def _copy_zip_entry_bounded(zf, entry: str, target: str, budget: dict) -> None:
+    """Stream one entry to disk under the decompression caps, counting the
+    bytes actually read (the declared file_size is not trusted)."""
+    info = zf.getinfo(entry)
+    ratio = info.file_size / max(info.compress_size, 1)
+    if info.file_size > _RATIO_CHECK_MIN_SIZE and ratio > _MAX_ENTRY_RATIO:
+        raise ZipRoundtripError(
+            f"Entry có tỉ lệ nén bất thường ({ratio:.0f}:1): {entry}"
+        )
+    written = 0
+    with zf.open(entry) as src, open(target, "wb") as dst:
+        while True:
+            chunk = src.read(1024 * 1024)
+            if not chunk:
+                break
+            written += len(chunk)
+            budget["total"] += len(chunk)
+            if written > _MAX_ENTRY_UNCOMPRESSED:
+                raise ZipRoundtripError(
+                    f"Entry vượt hạn mức giải nén {_MAX_ENTRY_UNCOMPRESSED} byte: {entry}"
+                )
+            if budget["total"] > _MAX_TOTAL_UNCOMPRESSED:
+                raise ZipRoundtripError(
+                    f"ZIP vượt hạn mức giải nén tổng {_MAX_TOTAL_UNCOMPRESSED} byte"
+                )
+            dst.write(chunk)
+
+
 def _extract_export_zip(zip_path: str, out_dir: str) -> tuple[list[str], str]:
     """Extract an archive-export ZIP's `HSLTCQ/METADATA/` contents into
     `out_dir`: the workbook (as `_MetaDuLieu.xlsx`), every PDF, and every
@@ -298,8 +340,9 @@ def _extract_export_zip(zip_path: str, out_dir: str) -> tuple[list[str], str]:
     `companion_for_pdf` finds it next to each extracted PDF).
 
     Returns `(pdf_names, xlsx_path)`. Only base names are used when writing
-    (no zip-slip). Raises `ZipRoundtripError` if the ZIP is not a recognized
-    archive export or has no PDFs."""
+    (no zip-slip); per-entry and total decompression sizes are capped
+    (see _copy_zip_entry_bounded). Raises `ZipRoundtripError` if the ZIP is
+    not a recognized archive export, has no PDFs, or breaches a cap."""
     if not os.path.isfile(zip_path):
         raise ZipRoundtripError(f"File not found: {zip_path}")
 
@@ -307,9 +350,14 @@ def _extract_export_zip(zip_path: str, out_dir: str) -> tuple[list[str], str]:
 
     pdf_names: list[str] = []
     xlsx_tmp_path: Optional[str] = None
+    budget = {"total": 0}
     try:
         with zipfile.ZipFile(zip_path, "r") as zf:
             names = zf.namelist()
+            if len(names) > _MAX_ZIP_ENTRIES:
+                raise ZipRoundtripError(
+                    f"ZIP có quá nhiều entry ({len(names)} > {_MAX_ZIP_ENTRIES})."
+                )
             # The export layout uses forward slashes inside the archive.
             metadata_entries = [
                 n for n in names
@@ -326,19 +374,16 @@ def _extract_export_zip(zip_path: str, out_dir: str) -> tuple[list[str], str]:
                 low = base.lower()
                 if low.endswith(".xlsx") and low.startswith("metadulieu"):
                     target = os.path.join(out_dir, "_MetaDuLieu.xlsx")
-                    with zf.open(entry) as src, open(target, "wb") as dst:
-                        dst.write(src.read())
+                    _copy_zip_entry_bounded(zf, entry, target, budget)
                     xlsx_tmp_path = target
                 elif low.endswith(".pdf"):
                     target = os.path.join(out_dir, base)
-                    with zf.open(entry) as src, open(target, "wb") as dst:
-                        dst.write(src.read())
+                    _copy_zip_entry_bounded(zf, entry, target, budget)
                     pdf_names.append(base)
                 elif low.endswith(".json.zst"):
                     # Canonical sidecar bundled by the exporter (optional).
                     target = os.path.join(out_dir, base)
-                    with zf.open(entry) as src, open(target, "wb") as dst:
-                        dst.write(src.read())
+                    _copy_zip_entry_bounded(zf, entry, target, budget)
     except ZipRoundtripError:
         raise
     except Exception as e:  # noqa: BLE001 — surface a readable message

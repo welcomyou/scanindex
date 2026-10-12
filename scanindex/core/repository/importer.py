@@ -557,6 +557,35 @@ class DossierCodes:
         return f"{self.ma_dinh_danh}-{self.fonds}-{self.catalog}-{self.dossier_code}"
 
 
+# Dossier codes are glued into per-dossier PDF paths (see _import_one_pdf).
+# A workbook cell or ZIP-name part of "..", an absolute path or a component
+# carrying separators must never reach the filesystem (path traversal).
+_INVALID_PATH_PART_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]+')
+
+
+def _validate_code_part(label: str, value: str) -> str:
+    """Reject path-hostile dossier code parts at the import boundary.
+
+    Mirrors admin._validate_code_part (admin imports this module, so the
+    canonical copy lives here). Empty is allowed for catalog/dossier_code —
+    pre-existing behaviour; hostile patterns are not.
+    """
+    text = str(value or "").strip()
+    if _INVALID_PATH_PART_RE.search(text) or text in {".", ".."}:
+        raise ValueError(f"{label} chứa ký tự/đường dẫn không hợp lệ: {text!r}")
+    return text
+
+
+def _validate_dossier_codes(codes: DossierCodes) -> None:
+    """Validate the 4 identity codes in place; raises ValueError on the
+    first hostile part. Single choke point shared by every import path
+    (Step 3, Excel folder import, ZIP round-trip)."""
+    codes.ma_dinh_danh = _validate_code_part("mã định danh", codes.ma_dinh_danh)
+    codes.fonds = _validate_code_part("mã phông", codes.fonds)
+    codes.catalog = _validate_code_part("mã mục lục", codes.catalog)
+    codes.dossier_code = _validate_code_part("mã hồ sơ", codes.dossier_code)
+
+
 class Importer:
     def __init__(self, store: ArchiveStore, index: HybridIndex):
         self.store = store
@@ -805,6 +834,7 @@ class Importer:
         return dossier_rows, doc_rows
 
     def _upsert_dossier_from_codes(self, codes: DossierCodes) -> int:
+        _validate_dossier_codes(codes)
         conn = self.store.connect()
         row = conn.execute(
             "SELECT dossier_id FROM dossiers "
@@ -973,6 +1003,8 @@ class Importer:
         target_name = str(target_file_name or "").strip()
         if not target_name:
             target_name = _strip_ocr_suffix(pdf.name) if rename_strip_ocr else pdf.name
+        elif _INVALID_PATH_PART_RE.search(target_name) or Path(target_name).name != target_name:
+            raise ValueError(f"Tên tệp đích không hợp lệ: {target_name!r}")
         target_subdir = (
             self.store.archive_path / C.PDF_SUBDIR
             / codes.ma_dinh_danh / codes.fonds / codes.catalog
@@ -993,6 +1025,17 @@ class Importer:
                     target_name = alt
                     target_pdf = candidate
                     break
+        # Containment gate BEFORE any write: the post-write relative_to()
+        # check downstream is bookkeeping only — by then the file already
+        # landed. Codes are validated in _upsert_dossier_from_codes; this
+        # catches any remaining path construction gap (symlinks, junctions,
+        # absolute components) fail-closed.
+        _pdf_root = (self.store.archive_path / C.PDF_SUBDIR).resolve()
+        if not target_pdf.resolve().is_relative_to(_pdf_root):
+            raise ValueError(
+                "Đích ghi nằm ngoài kho lưu trữ — mã hồ sơ có thành phần "
+                f"đường dẫn không hợp lệ: {target_pdf}"
+            )
         _replace_pdf_file(pdf, target_pdf)
         _copy_companion_if_present(canonical_path or pdf, target_pdf)
 

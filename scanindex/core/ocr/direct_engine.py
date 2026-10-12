@@ -577,9 +577,14 @@ def install_ocr(status, progress_callback=None, log_callback=None):
 
 def _find_screen_ai_paths():
     """Auto-detect DLL and model directory using downloader."""
-    from scanindex.core.ocr.screen_ai_downloader import check_screen_ai, ScreenAIStatus
+    from scanindex.core.ocr.screen_ai_downloader import (
+        check_screen_ai, ScreenAIStatus, verify_installed_library,
+    )
     status = check_screen_ai(_get_model_dir())
     if status.status == ScreenAIStatus.FOUND_LOCAL:
+        # Re-verify on EVERY load: install-time checks don't protect a
+        # user-writable portable folder against later DLL swapping.
+        verify_installed_library(status.lib_path)
         return status.lib_path, status.model_path
     return None, None
 
