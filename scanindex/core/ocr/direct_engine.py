@@ -111,7 +111,8 @@ _mp_pool = None  # multiprocessing.Pool with NUM_PAGE_WORKERS processes
 _mp_pool_lock = threading.Lock()
 # Recycle a worker after this many tasks (guards against native DLL leaks).
 # Default unchanged; env override exists for long-run leak/RSS measurement
-# only — see REVIEW_ocr_assembly_speedup.md §7.2 before changing the default.
+# only — benchmark before changing the default (higher values trade RSS
+# containment for per-process warm-up).
 _MP_MAXTASKSPERCHILD = _env_int("DIRECT_OCR_MAXTASKSPERCHILD", 100)
 
 OCR_DPI = 240

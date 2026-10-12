@@ -195,3 +195,6 @@ $TEMP/
 # Local security audit reports - never publish audit findings to the public repo.  
 /SECURITY_REVIEW_*.md  
 /FORTIFY_*.md  
+# Internal AI-workflow planning and review docs - keep local only.  
+/PLAN_*.md  
+/REVIEW_*.md  
