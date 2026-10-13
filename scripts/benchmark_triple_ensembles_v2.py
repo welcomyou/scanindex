@@ -1,3 +1,4 @@
+import os
 from __future__ import annotations
 
 import argparse
@@ -713,7 +714,7 @@ def main() -> int:
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--suite", choices=["all", "groundtruth", "external", "ctdar"], default="all")
     parser.add_argument("--ocr-dir", type=Path, default=ROOT / "temp" / "groundtruth5_pipeline")
-    parser.add_argument("--groundtruth-dir", type=Path, default=Path(r"C:\Users\nhquan\Downloads\groundtruth"))
+    parser.add_argument("--groundtruth-dir", type=Path, default=Path(os.environ.get("GROUNDTRUTH_DIR", "groundtruth")))
     parser.add_argument("--gt03-docx", type=Path, default=ROOT / "temp" / "groundtruth4_scan_word" / "groundtruth03_converted.docx")
     parser.add_argument("--scans", nargs="+", default=["01", "02", "03", "04", "05"])
     parser.add_argument("--manifest", type=Path, default=ROOT / "temp" / "external" / "table_gt_samples" / "manifest.json")

@@ -1,3 +1,4 @@
+import os
 from __future__ import annotations
 
 import argparse
@@ -365,7 +366,7 @@ def run_scan(engine: RapidTable,
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--ocr-dir", type=Path, default=Path(r"D:\App\ocrtool\temp\groundtruth4_pipeline"))
-    parser.add_argument("--groundtruth-dir", type=Path, default=Path(r"C:\Users\nhquan\Downloads\groundtruth"))
+    parser.add_argument("--groundtruth-dir", type=Path, default=Path(os.environ.get("GROUNDTRUTH_DIR", "groundtruth")))
     parser.add_argument("--gt03-docx", type=Path, default=Path(r"D:\App\ocrtool\temp\groundtruth4_scan_word\groundtruth03_converted.docx"))
     parser.add_argument("--current-dir", type=Path, default=Path(r"D:\App\ocrtool\temp\groundtruth4_pipeline"))
     parser.add_argument("--out-dir", type=Path, default=Path(r"D:\App\ocrtool\temp\rapidtable_slanet_bench"))

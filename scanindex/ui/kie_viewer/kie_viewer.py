@@ -138,12 +138,14 @@ except Exception:  # pragma: no cover - viewer still opens without secrecy detec
     detect_secrecy_mark = None
 
 # ═══════════════════════════════════════════════════════
-# DEFAULT PATHS
+# DEFAULT PATHS — no machine-specific paths in the repo. Configure via the
+# Cấu hình dialog (saved to kie_viewer_config.json next to this file, or
+# point KIE_VIEWER_CONFIG at another location) or the KIE_VIEWER_* env vars.
 # ═══════════════════════════════════════════════════════
 DEFAULT_CONFIG = {
-    "input_dir": r"D:\tmp\Train_20260413_143844_kie\json_input",
-    "output_dir": r"D:\tmp\Train_20260413_143844_kie\json_output_labeled",
-    "ocr_dir": r"D:\tmp\Train_20260413_143844_kie\ocr",
+    "input_dir": "",
+    "output_dir": "",
+    "ocr_dir": "",
 }
 
 CONFIG_PATH = Path(

@@ -12,6 +12,7 @@ source PDF so on-disk temp folders never collide between runs.
 """
 from __future__ import annotations
 
+import logging
 import os
 import io
 import json
@@ -22,11 +23,19 @@ from datetime import datetime
 from dataclasses import dataclass, field, replace
 from typing import Optional
 
+from scanindex.core.canonical_io import read_zstd_json_bounded
 from scanindex.core.digitization.dossier_model import (
     DossierState,
     DocumentState,
     document_doc_dict,
 )
+
+logger = logging.getLogger(__name__)
+
+# Decompressed cap for ONE cached page's OCR/KIE JSON. A real single-page
+# entry lands well under a few MB; 64 MiB is ~20x generous while still
+# bounding the blast radius of a corrupted or tampered cache file.
+_MAX_PAGE_CACHE_JSON = 64 * 1024 * 1024
 
 
 def _new_session_id() -> str:
@@ -400,12 +409,16 @@ class ArchiveSession:
         if not path or not os.path.exists(path):
             return None
         try:
-            import zstandard as zstd
             with open(path, "rb") as fh:
-                with zstd.ZstdDecompressor().stream_reader(fh) as reader:
-                    with io.TextIOWrapper(reader, encoding="utf-8") as text:
-                        return json.load(text)
+                return read_zstd_json_bounded(fh, _MAX_PAGE_CACHE_JSON)
         except Exception:
+            # Corrupt or over-limit cache — drop it and let the caller re-OCR
+            # the page. Log the reason without file content.
+            logger.warning(
+                "get_cached_page(%s): cached JSON rejected "
+                "(corrupt or over %s-byte limit); page will be re-OCRed",
+                page_idx, _MAX_PAGE_CACHE_JSON,
+            )
             return None
 
     def has_cached_page(self, page_idx: int) -> bool:

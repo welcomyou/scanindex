@@ -43,6 +43,33 @@ _ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 
 # Cap on the DECOMPRESSED size of one canonical sidecar read from disk.
 _MAX_CANONICAL_DECOMPRESSED = 256 * 1024 * 1024
+# Cap on the RAW size of an uncompressed `.json` read (debug/migration path).
+_MAX_PLAIN_JSON_BYTES = 256 * 1024 * 1024
+
+
+def read_zstd_json_bounded(fh, max_output: int = _MAX_CANONICAL_DECOMPRESSED) -> dict:
+    """Read one zstd-compressed JSON stream from ``fh`` under a hard cap.
+
+    Counts DECOMPRESSED bytes in 1 MiB chunks and refuses to parse anything
+    past ``max_output`` — declared sizes are never trusted. Shared by the
+    canonical sidecar reader and the archive-session page cache so a
+    corrupted/tampered cache file cannot exhaust RAM.
+    """
+    import zstandard as zstd
+    chunks: list[bytes] = []
+    total = 0
+    with zstd.ZstdDecompressor().stream_reader(fh) as reader:
+        while True:
+            chunk = reader.read(1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_output:
+                raise ValueError(
+                    f"JSON vượt hạn mức giải nén ({max_output} byte)"
+                )
+            chunks.append(chunk)
+    return json.loads(b"".join(chunks).decode("utf-8"))
 
 # Public profile aliases. The stored value is always the versioned form.
 LAYOUTLMV3_RUNTIME_PROFILE = "layoutlmv3_runtime"
@@ -171,9 +198,10 @@ def load_canonical(path: PathLike) -> dict:
     explicitly passed for developer migration/debugging, but `resolve_companion`
     never selects it implicitly.
 
-    Sidecars come from outside the app on the ZIP round-trip path, so the
-    decompressed size is capped (decompression-bomb guard). Real OCR/KIE
-    sidecars land in the low tens of MB; 256 MB is ~5-10x generous.
+    Sidecars come from outside the app on the ZIP round-trip path, so both
+    the decompressed (zstd) and raw (plain `.json`) read sizes are capped
+    (decompression-bomb guard). Real OCR/KIE sidecars land in the low tens
+    of MB; 256 MB is ~5-10x generous.
     """
     p = Path(path)
     with p.open("rb") as fh:
@@ -181,24 +209,13 @@ def load_canonical(path: PathLike) -> dict:
         fh.seek(0)
         is_zst = str(path).endswith(ZST_SUFFIX) or head == _ZSTD_MAGIC
         if is_zst:
-            import zstandard as zstd
-            chunks: list[bytes] = []
-            total = 0
-            with zstd.ZstdDecompressor().stream_reader(fh) as reader:
-                while True:
-                    chunk = reader.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    total += len(chunk)
-                    if total > _MAX_CANONICAL_DECOMPRESSED:
-                        raise ValueError(
-                            "Canonical JSON vượt hạn mức giải nén "
-                            f"({_MAX_CANONICAL_DECOMPRESSED} byte): {p}"
-                        )
-                    chunks.append(chunk)
-            return json.loads(b"".join(chunks).decode("utf-8"))
-        with io.TextIOWrapper(fh, encoding="utf-8") as text:
-            return json.load(text)
+            return read_zstd_json_bounded(fh, _MAX_CANONICAL_DECOMPRESSED)
+        payload = fh.read(_MAX_PLAIN_JSON_BYTES + 1)
+        if len(payload) > _MAX_PLAIN_JSON_BYTES:
+            raise ValueError(
+                f"JSON vượt hạn mức đọc ({_MAX_PLAIN_JSON_BYTES} byte): {p}"
+            )
+        return json.loads(payload.decode("utf-8"))
 
 
 def _stream_json_to_binary_writer(data: dict, writer) -> None:

@@ -1,3 +1,4 @@
+import os
 from __future__ import annotations
 
 import argparse
@@ -273,7 +274,7 @@ def run_scan(scan: str, args) -> dict[str, Any]:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--ocr-dir", type=Path, default=Path(r"D:\App\ocrtool\temp\groundtruth5_pipeline"))
-    parser.add_argument("--groundtruth-dir", type=Path, default=Path(r"C:\Users\nhquan\Downloads\groundtruth"))
+    parser.add_argument("--groundtruth-dir", type=Path, default=Path(os.environ.get("GROUNDTRUTH_DIR", "groundtruth")))
     parser.add_argument("--gt03-docx", type=Path, default=Path(r"D:\App\ocrtool\temp\groundtruth4_scan_word\groundtruth03_converted.docx"))
     parser.add_argument("--out-dir", type=Path, default=Path(r"D:\App\ocrtool\temp\cpu_table_bench_current"))
     parser.add_argument("--scans", nargs="+", default=["01", "02", "03", "04", "05"])
