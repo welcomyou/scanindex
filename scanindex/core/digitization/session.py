@@ -32,10 +32,10 @@ from scanindex.core.digitization.dossier_model import (
 
 logger = logging.getLogger(__name__)
 
-# Decompressed cap for ONE cached page's OCR/KIE JSON. A real single-page
-# entry lands well under a few MB; 64 MiB is ~20x generous while still
-# bounding the blast radius of a corrupted or tampered cache file.
-_MAX_PAGE_CACHE_JSON = 64 * 1024 * 1024
+# Decompressed cap for ONE cached page's OCR/KIE JSON (matches the request:
+# 256 MB, same cap as the canonical sidecar). A real single-page entry lands
+# well under a few MB, so this bounds only a corrupted/tampered cache file.
+_MAX_PAGE_CACHE_JSON = 256 * 1024 * 1024
 
 
 def _new_session_id() -> str:

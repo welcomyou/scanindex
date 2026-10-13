@@ -44,7 +44,7 @@ _ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 # Cap on the DECOMPRESSED size of one canonical sidecar read from disk.
 _MAX_CANONICAL_DECOMPRESSED = 256 * 1024 * 1024
 # Cap on the RAW size of an uncompressed `.json` read (debug/migration path).
-_MAX_PLAIN_JSON_BYTES = 256 * 1024 * 1024
+_MAX_PLAIN_JSON_BYTES = 512 * 1024 * 1024
 
 
 def read_zstd_json_bounded(fh, max_output: int = _MAX_CANONICAL_DECOMPRESSED) -> dict:
@@ -201,7 +201,7 @@ def load_canonical(path: PathLike) -> dict:
     Sidecars come from outside the app on the ZIP round-trip path, so both
     the decompressed (zstd) and raw (plain `.json`) read sizes are capped
     (decompression-bomb guard). Real OCR/KIE sidecars land in the low tens
-    of MB; 256 MB is ~5-10x generous.
+    of MB; the caps (256 MB zstd / 512 MB plain) are several-x generous.
     """
     p = Path(path)
     with p.open("rb") as fh:
