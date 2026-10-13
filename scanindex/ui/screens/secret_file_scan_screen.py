@@ -2513,9 +2513,6 @@ def _norm(path: str) -> str:
 # "Xuất Excel" dùng luôn giá trị mới. Các cột còn lại chỉ xem.
 _EDITABLE_COLS = frozenset({1, 3, 4, 8})
 
-# Thứ tự "nặng" của độ mật khi sắp xếp theo cột Độ mật (không rõ → sau cùng).
-_SEVERITY_RANK = {"TUYỆT MẬT": 0, "TỐI MẬT": 1, "MẬT": 2}
-
 
 def _match_scan_root(match: SecretScanMatch) -> str:
     """Thư mục quét gốc của MỘT dòng (xem ``_derive_scan_root``)."""
@@ -3147,6 +3144,9 @@ class SecretFileScanScreen(ScreenContent):
         status_row.addWidget(self.history_checkbox)
 
         # Chế độ quét: nhanh / kỹ giới hạn 10 trang / kỹ mọi trang.
+        # Mặc định "Tìm kỹ (mọi trang)": bản release tải về chạy lần đầu
+        # KHÔNG được bỏ sót dấu mật nằm sau trang 1 — muốn nhanh thì người
+        # dùng tự chuyển "Tìm nhanh" trong phiên.
         self.mode_combo = QComboBox()
         for label, key in (
             ("Tìm nhanh (trang đầu)", "fast"),
@@ -3154,7 +3154,9 @@ class SecretFileScanScreen(ScreenContent):
             ("Tìm kỹ (mọi trang)", "thorough"),
         ):
             self.mode_combo.addItem(label, key)
-        self.mode_combo.setCurrentIndex(0)
+        self.mode_combo.setCurrentIndex(
+            max(0, self.mode_combo.findData("thorough"))
+        )
         self.mode_combo.setToolTip(
             translations.localize_text(
                 "Tìm nhanh: chỉ xét trang đầu mỗi file, không dùng LightGBM\n"
@@ -3240,33 +3242,16 @@ class SecretFileScanScreen(ScreenContent):
             f"color: {COLOR_TEXT}; font: 600 13px '{FONT_UI}';"
         )
         results_header.addWidget(self.lbl_total)
-        results_header.addStretch(1)
-
-        self.sort_combo = QComboBox()
-        for label, key in (
-            ("Thứ tự: Mặc định", ""),
-            ("Sắp xếp: Đường dẫn (A→Z)", "path"),
-            ("Sắp xếp: Độ mật (nặng→nhẹ)", "keyword"),
-            ("Sắp xếp: Cơ quan (A→Z)", "org"),
-            ("Sắp xếp: Ngày cập nhật (mới→cũ)", "date"),
-        ):
-            self.sort_combo.addItem(label, key)
-        self.sort_combo.setToolTip(
-            translations.localize_text(
-                "Xếp lại toàn bộ dòng trong bảng.\n"
-                "\"Đường dẫn\" gom các file cùng thư mục gốc đứng cạnh nhau —\n"
-                "hữu ích khi bảng gộp danh sách từ nhiều lần quét khác nhau."
-            )
-        )
-        self.sort_combo.currentIndexChanged.connect(self._sort_combo_changed)
-        results_header.addWidget(self.sort_combo)
 
         self.filter_edit = QLineEdit()
         self.filter_edit.setPlaceholderText(
             translations.localize_text("🔍 Gõ để lọc danh sách…")
         )
         self.filter_edit.setClearButtonEnabled(True)
-        self.filter_edit.setFixedWidth(230)
+        # Co giãn theo hàng thay vì cố định 230px: hàng điều khiển không còn
+        # ghim chiều rộng tối thiểu của panel trái — splitter luôn còn quãng
+        # để kéo bảng / khung xem trước trên màn hình nhỏ.
+        self.filter_edit.setMinimumWidth(120)
         self.filter_edit.setToolTip(
             translations.localize_text(
                 "Chỉ ẨN/hiện lại các dòng khớp (tìm trên mọi cột + đường dẫn đầy\n"
@@ -3276,20 +3261,12 @@ class SecretFileScanScreen(ScreenContent):
             )
         )
         self.filter_edit.textChanged.connect(self._apply_filter)
-        results_header.addWidget(self.filter_edit)
+        results_header.addWidget(self.filter_edit, 1)
 
-        self.btn_batch_not_secret = QPushButton("Không phải mật (đã chọn)")
-        self.btn_batch_not_secret.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_batch_not_secret.setStyleSheet(self._success_btn_qss())
-        self.btn_batch_not_secret.setEnabled(False)
-        self.btn_batch_not_secret.setToolTip(
-            "Loại các file đã check (theo file, không theo từng dòng) khỏi danh sách.\n"
-            "KHÔNG xóa file trên đĩa. Các lượt quét sau sẽ tự bỏ qua chúng\n"
-            "cho đến khi file thay đổi nội dung."
-        )
-        self.btn_batch_not_secret.clicked.connect(self._batch_not_secret_clicked)
-        results_header.addWidget(self.btn_batch_not_secret)
-        self.btn_batch_delete = QPushButton("🗑  Xóa file (đã chọn)")
+        # "Không phải mật (đã chọn)" đã bỏ để gọn hàng điều khiển (màn hình
+        # nhỏ): thao tác này vẫn còn ở thanh công cụ của khung xem trước
+        # (btn_preview_not_secret) sau khi bấm chọn một dòng.
+        self.btn_batch_delete = QPushButton("🗑  Xóa")
         self.btn_batch_delete.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_batch_delete.setStyleSheet(self._danger_btn_qss())
         self.btn_batch_delete.setEnabled(False)
@@ -3307,14 +3284,16 @@ class SecretFileScanScreen(ScreenContent):
         splitter.addWidget(self._build_preview_panel())
         splitter.setCollapsible(0, False)
         splitter.setCollapsible(1, False)
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 2)
+        # KHÔNG đặt stretch factor (3:2 cũ): có stretch thì mỗi lần cửa sổ
+        # đổi cỡ, QSplitter chia lại phần dư theo 60/40 và "cướp" mất tỷ lệ
+        # người dùng vừa kéo tay. Không stretch → phần dư chia theo tỷ lệ
+        # hiện có, vị trí tay nắm người dùng kéo được giữ nguyên.
         splitter.setSizes([760, 440])
-        # Tay nắm 8px + đổi màu khi rê chuột: kéo tự do đổi tỷ lệ
-        # bảng danh sách / khung xem trước bằng chuột.
-        splitter.setHandleWidth(8)
+        # Tay nắm mảnh 2px (1/4 độ dày cũ 8px theo yêu cầu) + đổi màu accent
+        # khi rê chuột để dễ định vị khi kéo đổi tỷ lệ bảng / khung xem trước.
+        splitter.setHandleWidth(2)
         splitter.setStyleSheet(
-            f"QSplitter::handle {{ background: {COLOR_BORDER}; border-radius: 2px; }}"
+            f"QSplitter::handle {{ background: {COLOR_BORDER}; border-radius: 1px; }}"
             f"QSplitter::handle:hover {{ background: {COLOR_ACCENT}; }}"
         )
         layout.addWidget(splitter, 1)
@@ -3325,6 +3304,12 @@ class SecretFileScanScreen(ScreenContent):
             f"QFrame {{ background: {COLOR_PANEL}; border: 1px solid {COLOR_BORDER};"
             f" border-radius: {RADIUS_MD}px; }}"
         )
+        # Min tường minh NHỎ hơn minimumSizeHint tự nhiên (~600px do tổng
+        # chiều rộng nút trên thanh công cụ PDF): splitter dựa trên giá trị
+        # này để chặn tay nắm — không có nó thì khung xem trước không thể
+        # thu hẹp/kéo rộng tùy ý trên màn hình nhỏ (nút bị cắt mép khi kéo
+        # sát là chấp nhận được).
+        panel.setMinimumWidth(300)
         vbox = QVBoxLayout(panel)
         vbox.setContentsMargins(SP[3], SP[3], SP[3], SP[3])
         vbox.setSpacing(SP[2])
@@ -3444,15 +3429,6 @@ class SecretFileScanScreen(ScreenContent):
             f" font: 600 13px '{FONT_UI}'; }}"
             "QPushButton:hover { background: #bd2130; }"
             "QPushButton:disabled { background: #555; color: #aaa; }"
-        )
-
-    def _success_btn_qss(self) -> str:
-        return (
-            f"QPushButton {{ background: {COLOR_GREEN}; color: white;"
-            f" border: none; padding: 8px 16px; border-radius: {RADIUS_MD}px;"
-            f" font: 600 13px '{FONT_UI}'; }}"
-            f"QPushButton:hover {{ background: {COLOR_GREEN_HOVER}; }}"
-            f"QPushButton:disabled {{ background: #555; color: #aaa; }}"
         )
 
     def _preview_action_btn_qss(self, bg: str, hover: str) -> str:
@@ -4517,9 +4493,6 @@ class SecretFileScanScreen(ScreenContent):
     def _batch_delete_clicked(self) -> None:
         self._delete_files(sorted(self._checked_paths))
 
-    def _batch_not_secret_clicked(self) -> None:
-        self._mark_not_secret(sorted(self._checked_paths))
-
     def _preview_delete_clicked(self) -> None:
         if self._preview_current is None:
             return
@@ -5058,7 +5031,6 @@ class SecretFileScanScreen(ScreenContent):
         # file, giữ dòng, thử lại sau (worker thấy file mất sẽ tự "skip").
         has_check = bool(self._checked_paths)
         self.btn_batch_delete.setEnabled(has_check)
-        self.btn_batch_not_secret.setEnabled(has_check)
         has_preview = self._preview_current is not None
         self.btn_preview_delete.setEnabled(has_preview)
         self.btn_preview_not_secret.setEnabled(has_preview)
@@ -5206,66 +5178,6 @@ class SecretFileScanScreen(ScreenContent):
             if item is not None:
                 parts.append(item.text())
         return " ".join(parts).lower()
-
-    def _sort_combo_changed(self, _index: int) -> None:
-        self._sort_table()
-
-    def _sort_table(self) -> None:
-        """Xếp lại dòng trong bảng theo tiêu đề đang chọn. Sắp xếp theo
-        "Đường dẫn" gom file cùng thư mục gốc cạnh nhau — cách xem "từng
-        đường dẫn riêng" khi bảng gộp nhiều danh sách."""
-        key = self.sort_combo.currentData() or ""
-        if not key:
-            return
-        rows: list[tuple[SecretScanMatch, bool]] = []
-        for r in range(self.table.rowCount()):
-            item0 = self.table.item(r, 0)
-            if item0 is None:
-                continue
-            match = item0.data(Qt.ItemDataRole.UserRole + 1)
-            if not isinstance(match, SecretScanMatch):
-                continue
-            rows.append(
-                (match, item0.checkState() == Qt.CheckState.Checked)
-            )
-        if len(rows) < 2:
-            return
-
-        def sort_key(t):
-            m = t[0]
-            if key == "keyword":
-                return (
-                    _SEVERITY_RANK.get(m.keyword.strip().upper(), 9),
-                    _norm(m.source_path),
-                )
-            if key == "org":
-                return (
-                    _effective_org_name(m).lower(),
-                    _norm(m.source_path),
-                )
-            if key == "date":
-                return (-_file_mtime_for_display(m), _norm(m.source_path))
-            return _norm(m.source_path)
-
-        rows.sort(key=sort_key)
-        try:
-            self.table.setRowCount(0)
-            for match, was_checked in rows:
-                self._add_result(
-                    match,
-                    missing=not os.path.exists(match.source_path),
-                    quiet=True,
-                )
-                if was_checked:
-                    item0 = self.table.item(self.table.rowCount() - 1, 0)
-                    if item0 is not None:
-                        item0.setCheckState(Qt.CheckState.Checked)
-        finally:
-            self._apply_filter()
-        if self._preview_current is not None:
-            row = self._first_row_of(self._preview_current.source_path)
-            if row is not None:
-                self._select_result_row(row)
 
     def _on_row_clicked(self, item: QTableWidgetItem) -> None:
         if item.column() == 0:

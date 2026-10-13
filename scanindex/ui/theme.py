@@ -483,19 +483,21 @@ QListWidget::item:hover {{
     background: {p["elevated"]};
 }}
 
-/* ---- ScrollBar (thin) ---- */
+/* ---- ScrollBar (nổi bật: handle 12px tương phản, track nền nổi —
+     bản "thin" cũ 6px handle #555 trên nền #3a3a3a gần như vô hình) ---- */
 QScrollBar:vertical {{
-    width: 6px;
-    background: transparent;
+    width: 12px;
+    background: {p["elevated"]};
+    border-radius: 6px;
     margin: 2px;
 }}
 QScrollBar::handle:vertical {{
-    background: {p["border_default"]};
-    border-radius: 3px;
-    min-height: 24px;
+    background: {p["text_muted"]};
+    border-radius: 4px;
+    min-height: 32px;
 }}
 QScrollBar::handle:vertical:hover {{
-    background: {p["text_muted"]};
+    background: {p["text_secondary"]};
 }}
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
     height: 0;
@@ -504,17 +506,18 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
     background: transparent;
 }}
 QScrollBar:horizontal {{
-    height: 6px;
-    background: transparent;
+    height: 12px;
+    background: {p["elevated"]};
+    border-radius: 6px;
     margin: 2px;
 }}
 QScrollBar::handle:horizontal {{
-    background: {p["border_default"]};
-    border-radius: 3px;
-    min-width: 24px;
+    background: {p["text_muted"]};
+    border-radius: 4px;
+    min-width: 32px;
 }}
 QScrollBar::handle:horizontal:hover {{
-    background: {p["text_muted"]};
+    background: {p["text_secondary"]};
 }}
 QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{
     width: 0;

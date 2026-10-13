@@ -795,9 +795,10 @@ class RenameTreeEditor(QWidget):
         splitter.setStretchFactor(0, 2)
         splitter.setStretchFactor(1, 3)
         splitter.setSizes([520, 680])
-        splitter.setHandleWidth(8)
+        # Tay nắm mảnh 2px (đồng bộ màn quét file mật) + accent khi rê chuột.
+        splitter.setHandleWidth(2)
         splitter.setStyleSheet(
-            f"QSplitter::handle {{ background: {COLOR_BORDER}; border-radius: 2px; }}"
+            f"QSplitter::handle {{ background: {COLOR_BORDER}; border-radius: 1px; }}"
             f"QSplitter::handle:hover {{ background: {COLOR_ACCENT}; }}"
         )
         outer.addWidget(splitter, 1)

@@ -241,7 +241,6 @@ def test_checkbox_updates_checked_paths_and_buttons(qapp, tmp_path) -> None:
     item.setCheckState(__import__("PySide6").QtCore.Qt.CheckState.Checked)
     assert screen._checked_paths == {_norm(path)}
     assert screen.btn_batch_delete.isEnabled()
-    assert screen.btn_batch_not_secret.isEnabled()
 
     item.setCheckState(__import__("PySide6").QtCore.Qt.CheckState.Unchecked)
     assert not screen._checked_paths
@@ -259,7 +258,6 @@ def test_action_buttons_stay_enabled_while_scanning(qapp, tmp_path) -> None:
     screen._busy = True  # đang quét
     screen._refresh_action_buttons()
     assert screen.btn_batch_delete.isEnabled()
-    assert screen.btn_batch_not_secret.isEnabled()
 
     screen._preview_current = _match(path)
     screen._refresh_action_buttons()
