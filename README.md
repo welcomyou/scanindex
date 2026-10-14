@@ -23,7 +23,7 @@ Các màn hình UI chính:
 - **Số hóa lưu trữ** — pipeline 3 bước: split PDF dài → KIE/metadata → ký số + đóng gói HSLTCQ
 - **Kho lưu trữ** — search metadata + full-text trên kho nội bộ
 - **Đo độ chính xác OCR** — so PDF OCR vs ground truth (CER/WER)
-- **Phát hiện file mật** — quét folder, OCR trang đầu, nhận dạng dấu MẬT/TỐI MẬT/TUYỆT MẬT
+- **Rà soát file mật** — quét folder, OCR trang đầu, nhận dạng dấu MẬT/TỐI MẬT/TUYỆT MẬT
 - **Công cụ hỗ trợ** — utilities khác
 
 ## Lưu ý bản quyền: Google ScreenAI

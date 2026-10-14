@@ -73,7 +73,7 @@ CHỨC NĂNG CHÍNH
 
 6. Một số công cụ hỗ trợ:
     • Đo độ chính xác OCR: so sánh PDF OCR với ground truth bằng CER/WER.
-    • Phát hiện file mật trong thư mục: OCR trang đầu hoặc các trang đầu văn bản do LightGBM xác định để tìm dấu MẬT/TỐI MẬT/TUYỆT MẬT.
+    • Rà soát file mật trong thư mục: OCR trang đầu hoặc các trang đầu văn bản do LightGBM xác định để tìm dấu MẬT/TỐI MẬT/TUYỆT MẬT.
 
 CÔNG NGHỆ CHÍNH
     • Giao diện: Python, PySide6/Qt.
@@ -318,7 +318,7 @@ The software prioritizes local processing when models and dependencies are insta
             "multithreading crashes (fully sequential, slower)."
         ),
         "vi": (
-            "Số tài liệu quét đồng thời ở màn Phát hiện file mật (mặc định 2).\n"
+            "Số tài liệu quét đồng thời ở màn Rà soát file mật (mặc định 2).\n"
             "Đặt ngang \"Số trang OCR song song\" để chế độ Tìm nhanh dùng hết "
             "pool OCR.\nĐặt 1 nếu nghi crash 0xc0000409 liên quan PyMuPDF đa "
             "luồng (chạy tuần tự, chậm hơn)."

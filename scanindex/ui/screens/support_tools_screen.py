@@ -122,7 +122,7 @@ class SupportToolsScreen(ScreenContent):
     MENU_TITLE = "Một số công cụ hỗ trợ"
     TOOL_TITLES = {
         "accuracy": "Đo độ chính xác OCR",
-        "secret_scan": "Phát hiện file mật trong thư mục",
+        "secret_scan": "Rà soát file mật trong thư mục",
         "batch_sign": "Ký số hàng loạt",
         "rename_tree": "Đổi tên theo cây thư mục",
         "digitization_audit": "Rà soát chất lượng số hóa",
@@ -239,7 +239,7 @@ class SupportToolsScreen(ScreenContent):
 
         secret_scan = _ToolTile(
             "🔒",
-            "Phát hiện file mật trong thư mục",
+            "Rà soát file mật trong thư mục",
             "Quét PDF, ảnh và Word để tìm dấu MẬT, TỐI MẬT, TUYỆT MẬT.",
         )
         secret_scan.clicked.connect(lambda: self._open_tool("secret_scan"))

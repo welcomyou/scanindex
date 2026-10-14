@@ -1163,7 +1163,7 @@ class MainWindow(QMainWindow):
                     )
 
                 if "SecretScan" in self.config:
-                    # Số tài liệu quét song song ở màn "Phát hiện file mật"
+                    # Số tài liệu quét song song ở màn "Rà soát file mật"
                     # (tầng file, tách khỏi MaxConcurrentOCR — tầng trang).
                     try:
                         sfw = int(
@@ -1271,7 +1271,7 @@ class MainWindow(QMainWindow):
         val_exp = 1
         self.max_export_workers = val_exp
 
-        # Số tài liệu quét song song ở màn "Phát hiện file mật". Clamp 1..8 —
+        # Số tài liệu quét song song ở màn "Rà soát file mật". Clamp 1..8 —
         # mỗi file-worker mở PDF riêng bằng PyMuPDF trong process chính
         # (stress-test ổn định ở mức thấp; xem docstring _file_worker_count).
         try:

@@ -129,7 +129,7 @@ class SettingsTab(QWidget):
         form.addRow(self.lbl_concurrency, self.entry_concurrency)
 
         # Tầng song song KHÁC của dòng trên: số TÀI LIỆU xử lý đồng thời ở
-        # màn "Phát hiện file mật trong thư mục" — mỗi tài liệu bỏ trang vào
+        # màn "Rà soát file mật trong thư mục" — mỗi tài liệu bỏ trang vào
         # pool OCR chung. "Tìm nhanh" chỉ cần 1 trang/tài liệu nên để dùng
         # hết pool thì số này nên ngang số trang OCR song song.
         self.entry_secret_file_workers = QLineEdit("2")

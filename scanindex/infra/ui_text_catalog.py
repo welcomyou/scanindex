@@ -205,7 +205,7 @@ UI_TEXT_PAIRS: tuple[tuple[str, str], ...] = (
     (
         "Measure OCR accuracy, detect classified files, bulk-sign PDFs, "
         "rename by folder tree, and audit digitization.",
-        "Đo độ chính xác OCR, phát hiện file mật, ký số hàng loạt, "
+        "Đo độ chính xác OCR, rà soát file mật, ký số hàng loạt, "
         "đổi tên theo cây thư mục, rà soát chất lượng số hóa.",
     ),
     ("Settings", "Cấu hình"),
@@ -238,7 +238,7 @@ UI_TEXT_PAIRS: tuple[tuple[str, str], ...] = (
     ("Some supporting tools", "Một số công cụ hỗ trợ"),
     ("OCR accuracy", "Đo độ chính xác OCR"),
     ("Compare an OCR PDF with ground truth using CER/WER.", "So sánh PDF OCR với ground truth bằng CER/WER."),
-    ("Detect classified files in a folder", "Phát hiện file mật trong thư mục"),
+    ("Detect classified files in a folder", "Rà soát file mật trong thư mục"),
     (
         "Scan PDF, image, and Word files for MẬT, TỐI MẬT, and TUYỆT MẬT markings.",
         "Quét PDF, ảnh và Word để tìm dấu MẬT, TỐI MẬT, TUYỆT MẬT.",
