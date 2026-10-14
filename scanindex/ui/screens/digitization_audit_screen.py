@@ -1,4 +1,4 @@
-"""Thẩm định số hóa — công cụ CHỈ ĐỌC kiểm tra chất lượng file PDF/TIFF
+"""Rà soát chất lượng số hóa — công cụ CHỈ ĐỌC kiểm tra chất lượng file PDF/TIFF
 số hóa.
 
 Giao diện giống "Đổi tên theo cây thư mục": chọn thư mục gốc, cây 4 cấp
@@ -355,7 +355,7 @@ def _audit_text(value: str) -> str:
 # --------------------------------------------------------------------------- #
 
 class DigitizationAuditScreen(ScreenContent):
-    """Công cụ thẩm định số hóa (view-only)."""
+    """Công cụ rà soát chất lượng số hóa (view-only)."""
 
     log_message = Signal(str, str)
 
@@ -724,7 +724,7 @@ class DigitizationAuditScreen(ScreenContent):
         self._start_tree_audit()
         self._save_settings()
         self.log_message.emit(
-            translations.localize_text(f"Thẩm định số hóa: đã mở {self._root}"),
+            translations.localize_text(f"Rà soát chất lượng số hóa: đã mở {self._root}"),
             "info",
         )
 
@@ -1176,7 +1176,7 @@ class DigitizationAuditScreen(ScreenContent):
         if result.error:
             self.log_message.emit(
                 translations.localize_text(
-                    f"Thẩm định số hóa: {result.error} ({path})"),
+                    f"Rà soát chất lượng số hóa: {result.error} ({path})"),
                 "warning",
             )
 
@@ -1471,7 +1471,7 @@ class DigitizationAuditScreen(ScreenContent):
         except OSError as exc:
             self.log_message.emit(
                 translations.localize_text(
-                    f"Thẩm định số hóa: không mở được thư mục ({exc})"),
+                    f"Rà soát chất lượng số hóa: không mở được thư mục ({exc})"),
                 "warning",
             )
 

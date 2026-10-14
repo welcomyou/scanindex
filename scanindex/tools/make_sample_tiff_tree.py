@@ -1,4 +1,4 @@
-"""Tạo cây thư mục TIFF mẫu để thử công cụ Thẩm định số hóa.
+"""Tạo cây thư mục TIFF mẫu để thử công cụ Rà soát chất lượng số hóa.
 
 Cấu trúc theo quy ước CV 14748: tên tệp trang
 ``<MãĐĐ>-<Phông>-<Mục lục>-<Đơn vị bảo quản>-<Trang 3 số>.tif``
@@ -81,9 +81,9 @@ def _draw_page(size: tuple[int, int], mode: str, color) -> Image.Image:
 def make_tree(out_dir: Path) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     lines = [
-        "CÂY TIFF MẪU ĐỂ THẨM ĐỊNH SỐ HÓA",
+        "CÂY TIFF MẪU ĐỂ RÀ SOÁT CHẤT LƯỢNG SỐ HÓA",
         "=" * 60,
-        "Chọn thư mục này làm 'Thư mục gốc' trong màn Thẩm định số hóa.",
+        "Chọn thư mục này làm 'Thư mục gốc' trong màn Rà soát chất lượng số hóa.",
         "Quy ước tên: <MãĐĐ>-<Phông>-<Mục lục>-<ĐVBC>-<Trang 3 số>.tif,",
         "1 tệp = 1 trang; số trang chạy liên tục trong thư mục hồ sơ.",
         "",

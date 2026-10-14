@@ -297,7 +297,7 @@ def test_digitization_audit_text_is_bilingual():
 
     assert translations.Localization().lang == "vi"
     samples = {
-        "Thẩm định số hóa": "Digitization audit",
+        "Rà soát chất lượng số hóa": "Digitization audit",
         "Scan màu": "Colour scan",
         "Đang quét… 2 tệp · 3 trang":
             "Scanning… 2 files · 3 pages",

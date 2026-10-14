@@ -125,7 +125,7 @@ class SupportToolsScreen(ScreenContent):
         "secret_scan": "Phát hiện file mật trong thư mục",
         "batch_sign": "Ký số hàng loạt",
         "rename_tree": "Đổi tên theo cây thư mục",
-        "digitization_audit": "Thẩm định số hóa",
+        "digitization_audit": "Rà soát chất lượng số hóa",
     }
 
     def __init__(self, parent: QWidget | None = None):
@@ -264,7 +264,7 @@ class SupportToolsScreen(ScreenContent):
 
         digit_audit = _ToolTile(
             "✅",
-            "Thẩm định số hóa",
+            "Rà soát chất lượng số hóa",
             "Chỉ đọc: duyệt cây CSDL_SOHOA, xem thống kê hồ sơ/trang/dung lượng theo thư mục, "
             "kiểm tra PDF/TIFF scan màu, độ nén, DPI và OCR của PDF.",
         )

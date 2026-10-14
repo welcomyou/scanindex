@@ -206,7 +206,7 @@ UI_TEXT_PAIRS: tuple[tuple[str, str], ...] = (
         "Measure OCR accuracy, detect classified files, bulk-sign PDFs, "
         "rename by folder tree, and audit digitization.",
         "Đo độ chính xác OCR, phát hiện file mật, ký số hàng loạt, "
-        "đổi tên theo cây thư mục, thẩm định số hóa.",
+        "đổi tên theo cây thư mục, rà soát chất lượng số hóa.",
     ),
     ("Settings", "Cấu hình"),
     ("Adjust processing speed, models, language, and advanced options.", "Tùy chỉnh tốc độ xử lý, model, ngôn ngữ và tùy chọn nâng cao."),
@@ -1616,7 +1616,7 @@ UI_TEXT_PAIRS += UI_REPOSITORY_STORE_TEXT_PAIRS
 
 # Digitization audit: tree, check cards, PDF/TIFF result notes and errors.
 UI_DIGITIZATION_AUDIT_TEXT_PAIRS: tuple[tuple[str, str], ...] = (
-    ("Digitization audit", "Thẩm định số hóa"),
+    ("Digitization audit", "Rà soát chất lượng số hóa"),
     ("Read only: browse the CSDL_SOHOA tree, view dossier/page/size statistics by folder, and check scanned PDF/TIFF colour, compression, DPI and PDF OCR.",
      "Chỉ đọc: duyệt cây CSDL_SOHOA, xem thống kê hồ sơ/trang/dung lượng theo thư mục, kiểm tra PDF/TIFF scan màu, độ nén, DPI và OCR của PDF."),
     ("📂  Pick root folder…", "📂  Chọn thư mục gốc…"),
@@ -1679,10 +1679,10 @@ UI_DIGITIZATION_AUDIT_TEXT_PAIRS: tuple[tuple[str, str], ...] = (
     ("Failed", "Không đạt"),
     ("Undetermined", "Chưa xác định"),
     ("Passed", "Đạt"),
-    ("Digitization audit: opened {}", "Thẩm định số hóa: đã mở {}"),
-    ("Digitization audit: {} ({})", "Thẩm định số hóa: {} ({})"),
+    ("Digitization audit: opened {}", "Rà soát chất lượng số hóa: đã mở {}"),
+    ("Digitization audit: {} ({})", "Rà soát chất lượng số hóa: {} ({})"),
     ("Digitization audit: could not open folder ({})",
-     "Thẩm định số hóa: không mở được thư mục ({})"),
+     "Rà soát chất lượng số hóa: không mở được thư mục ({})"),
     ("Cannot read folder: {}", "Không đọc được thư mục: {}"),
     ("Cannot open PDF: {}", "Không mở được PDF: {}"),
     ("PDF structure read error: {}", "Lỗi đọc cấu trúc PDF: {}"),
