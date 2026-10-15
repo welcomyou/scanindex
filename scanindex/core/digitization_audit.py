@@ -1,6 +1,7 @@
 """Thẩm định chất lượng số hóa PDF/TIFF — chỉ đọc cấu trúc file, không sửa.
 
-PDF (qua PyMuPDF): DPI ảnh (≥ 300; khổ ≤ ~70% A4 còn phải ≥ 600 dpi — chỉ
+PDF (qua PyMuPDF): DPI ảnh (quy định ≥ 300, trượt khi dưới 297 — dung sai
+DPI_TOLERANCE; khổ ≤ ~70% A4 còn phải ≥ 600 dpi — chỉ
 cảnh báo), chế độ màu (chỉ cần CÓ ảnh màu — RGB/CMYK — là đạt; 100% ảnh
 đen-trắng/xám mới trượt), độ nén (không nén hoặc lossless — JPEG/DCT,
 JBIG2, JPEG 2000 lossy 9/7 là trượt), lớp text OCR (trang scan phải có
@@ -38,6 +39,10 @@ from scanindex.core import rename_tree as rt
 # --------------------------------------------------------------------------- #
 
 DPI_MIN = 300
+# Dung sai DPI: dưới 297 mới trượt — máy quét nạp giấy lệch ±1 dpi mỗi trục
+# (ảnh 2486px trải trên khổ ~595pt ra 298,99…) nên giữ 3 để không trượt đỏ
+# vì sai số thiết bị.
+DPI_TOLERANCE = 3.0
 # Quy định 600 dpi cho khổ nhỏ hơn A4: "khổ nhỏ" = tỉ lệ cạnh ≤ ~70% A4
 # (chọn 0,72 để bao trọn A5 — A5/A4 = 70,7% — mà vẫn bỏ qua khổ chỉ "bé
 # hơn A4 một xíu"). Chỉ CẢNH BÁO, không trượt: máy quét cắt lề làm khổ đo
@@ -50,6 +55,26 @@ A4_MM = (210.0, 297.0)
 OCR_MIN_CHARS = 10
 # Tỉ lệ dấu tiếng Việt / chữ cái dưới ngưỡng này (khi text đủ dài) → cảnh báo.
 VN_DIACRITIC_RATIO_WARN = 0.01
+
+# Phạm vi thẩm định theo từng tiêu chí. Legacy xét mọi trang như trước;
+# v1 (chính sách người dùng chốt): DPI chỉ trang 1, OCR chỉ cần MỘT trang
+# có text trong tối đa OCR_SCOPE_PAGES trang đầu. Màu/nén luôn toàn tài
+# liệu. Không phải tối ưu tương đương — đổi phạm vi là đổi kết luận.
+POLICY_LEGACY = "legacy_all_pages"
+POLICY_V1 = "dpi_first_ocr_any_first5_v1"
+DEFAULT_AUDIT_POLICY = POLICY_LEGACY
+OCR_SCOPE_PAGES = 5
+
+# Filter stream mất dữ liệu — xuất hiện ở bất kỳ ảnh resource nào của trang
+# thì trang đó phải rơi về đường decode (xrefs=True) để kết luận theo đúng
+# placement, tránh oan/miss ảnh không được vẽ.
+_LOSSY_FILTERS = {"DCTDecode", "JBIG2Decode", "JPXDecode"}
+
+# Toán tử ảnh inline (BI…EI) trong content stream — inline không nằm trong
+# resource nên đường fast-path phải nhường về decode.
+_INLINE_IMAGE_RE = re.compile(rb"BI\s*/[A-Za-z]{1,3}[\s/>]")
+# Ngàn đọc content stream khi tìm inline; to quá thì coi như nghi ngờ.
+_INLINE_SCAN_LIMIT = 16_000_000
 
 _VN_DIACRITIC_RE = re.compile(
     r"[ăâđêôơưáàảãạấầẩẫậắằẳẵặéèẻẽẹếềểễệíìỉĩịóòỏõọốồổỗộớờởỡợ"
@@ -120,6 +145,22 @@ class PdfAuditResult:
     file_size: int = 0
     error: str = ""                 # không rỗng = không thẩm định được
     quick: bool = False             # True = quét nhanh (chưa có nén/OCR)
+    policy: str = POLICY_LEGACY     # phạm vi thẩm định đã dùng
+    dpi_scope_page: int = 0         # 0 = mọi trang; 1 = chỉ trang 1 (v1)
+    ocr_scope_pages: int = 0        # 0 = mọi trang; K = K trang đầu (v1)
+    ocr_detected_page: int | None = None  # trang tìm thấy text (v1)
+    ocr_text_pages_tried: int = 0   # số trang đã trích text (v1 — theo phạm vi)
+    ocr_stop_reason: str = ""       # found|limit_reached|error|not_run
+    pages_decoded: int = 0          # số trang phải decode ảnh (xrefs=True)
+    fast_filters: list[str] = field(default_factory=list)  # filter an toàn
+    # thu thập từ fast-path resource (đều không mất dữ liệu); _conclude
+    # gộp vào result.filters.
+
+    def dpi_scope_images(self) -> list[ImageInfo]:
+        """Tập ảnh dùng cho kết luận DPI theo policy hiện hành."""
+        if self.policy == POLICY_V1:
+            return [im for im in self.images if im.page_no == 1]
+        return self.images
 
     # ------------------------------------------------------------ mô tả
 
@@ -147,14 +188,28 @@ class PdfAuditResult:
     def dpi_detail(self) -> str:
         if self.min_dpi is None:
             return ""
-        txt = (f"{self.min_dpi:.0f}–{self.max_dpi:.0f} dpi "
-               f"({len(self.images)} ảnh)")
+        if self.policy == POLICY_V1:
+            n_first = sum(1 for im in self.images if im.page_no == 1)
+            txt = (f"{self.min_dpi:.0f}–{self.max_dpi:.0f} dpi "
+                   f"(trang 1: {n_first} ảnh)")
+        else:
+            txt = (f"{self.min_dpi:.0f}–{self.max_dpi:.0f} dpi "
+                   f"({len(self.images)} ảnh)")
         if self.stamp_images_skipped:
             txt += (f" · đã bỏ qua {self.stamp_images_skipped} "
                     f"ảnh dấu chữ ký")
         return txt
 
     def ocr_detail(self) -> str:
+        if self.policy == POLICY_V1 and not self.quick:
+            if self.ocr_detected_page is not None:
+                return (f"Có lớp text — phát hiện ở trang "
+                        f"{self.ocr_detected_page} trong "
+                        f"{self.ocr_scope_pages} trang đầu")
+            if self.ocr_stop_reason == "error":
+                return "Không xác định được lớp text (lỗi đọc trang)"
+            return (f"Chưa phát hiện OCR trong {self.ocr_scope_pages} "
+                    "trang đầu")
         parts = [f"{self.pages_with_text}/{self.pages} trang có text"]
         if self.pages_with_image:
             parts.append(f"{self.pages_with_image} trang scan")
@@ -234,7 +289,8 @@ def _jpx_transform(data: bytes) -> int | None:
     return None
 
 
-def _compression_note(doc: "fitz.Document", im: ImageInfo) -> str | None:
+def _compression_note(doc: "fitz.Document", im: ImageInfo,
+                      note_cache: dict | None = None) -> str | None:
     """Mô tả vi phạm nén ('' = đạt, None = không xác định).
 
     Chuẩn cho phép: KHÔNG NÉN hoặc nén KHÔNG MẤT DỮ LIỆU — LZW, Flate
@@ -248,16 +304,61 @@ def _compression_note(doc: "fitz.Document", im: ImageInfo) -> str | None:
     if "JBIG2Decode" in im.filters:
         return f"trang {im.page_no}: JBIG2 nén mất dữ liệu"
     if "JPXDecode" in im.filters:
-        try:
-            with FITZ_LOCK:
-                raw = doc.xref_stream_raw(im.xref)
-        except Exception:
-            return None
-        transform = _jpx_transform(raw[:2_000_000])
+        if note_cache is not None and im.xref in note_cache:
+            transform = note_cache[im.xref]
+        else:
+            try:
+                with FITZ_LOCK:
+                    raw = doc.xref_stream_raw(im.xref)
+            except Exception:
+                return None
+            transform = _jpx_transform(raw[:2_000_000])
+            if note_cache is not None:
+                note_cache[im.xref] = transform
         if transform == 0:
             return f"trang {im.page_no}: JPEG 2000 lossy (wavelet 9/7)"
         return "" if transform == 1 else None
     return ""
+
+
+def _page_fast_filters(doc: "fitz.Document", page) -> tuple[bool, list[str], list[int]]:
+    """Tập filter ảnh của trang qua resource list (KHÔNG decode ảnh).
+
+    Trả ``(usable, filters, xrefs)``. ``usable=False`` khi không đọc được
+    resource hoặc gặp filter mất dữ liệu — khi đó caller phải fallback về
+    ``get_image_info(xrefs=True)`` để kết luận theo đúng placement (resource
+    thừa/không được vẽ không được phép làm kết luận sai).
+    """
+    try:
+        images = page.get_images(full=True) or []
+    except Exception:
+        return False, [], []
+    xrefs = [int(im[0]) for im in images if im[0]]
+    filters: list[str] = []
+    for xref in xrefs:
+        for f in _stream_filters(doc, xref):
+            if f in _LOSSY_FILTERS:
+                return False, [], []
+            if f not in filters:
+                filters.append(f)
+    return True, filters, xrefs
+
+
+def _page_has_inline_images(page) -> bool:
+    """Trang có ảnh inline (BI…EI) không — inline không nằm trong resource.
+
+    Đọc content stream tìm dấu hiệu ``BI`` kèm khóa dict ảnh. Không đọc
+    được nội dung (hoặc stream quá lớn) thì coi như nghi ngờ → fallback.
+    """
+    try:
+        content = page.read_contents()
+    except Exception:
+        return True
+    if not content:
+        return False            # trang rỗng — không có inline
+    if len(content) > _INLINE_SCAN_LIMIT:
+        return True             # quá lớn — coi như nghi ngờ, nhường decode
+    return _INLINE_IMAGE_RE.search(content) is not None
 
 
 def _pdf_name_check(path: str | os.PathLike) -> tuple[bool | None, str]:
@@ -298,14 +399,24 @@ def _pdf_name_check(path: str | os.PathLike) -> tuple[bool | None, str]:
 # --------------------------------------------------------------------------- #
 
 def audit_pdf(path: str | os.PathLike, *, quick: bool = False,
+              policy: str = DEFAULT_AUDIT_POLICY,
               progress_cb=None, cancel_cb=None) -> PdfAuditResult:
     """Thẩm định một file PDF theo chuẩn số hóa. Không ghi/sửa file.
 
     ``quick=True``: chỉ lấy những gì cần để gắn dấu ❗ trên cây (trang,
     ảnh, DPI, màu, PDF/A) — bỏ extract text và dò filter stream nên nhanh
     hơn hẳn; ``compression_ok``/``ocr_ok`` giữ None và ``quick=True``.
+
+    ``policy``: ``POLICY_LEGACY`` xét DPI/OCR mọi trang (mặc định, giữ cho
+    tham chiếu/test); ``POLICY_V1``: DPI chỉ trang 1, OCR chỉ cần một trang
+    có text trong tối đa ``OCR_SCOPE_PAGES`` trang đầu (màu/nén luôn toàn
+    tài liệu). Đổi policy là đổi phạm vi kết luận, không phải tối ưu tương
+    đương.
     """
-    result = PdfAuditResult(path=str(path), quick=quick)
+    v1 = policy == POLICY_V1
+    result = PdfAuditResult(path=str(path), quick=quick, policy=policy)
+    if v1:
+        result.dpi_scope_page = 1
     try:
         result.file_size = os.path.getsize(path)
     except OSError:
@@ -322,6 +433,13 @@ def audit_pdf(path: str | os.PathLike, *, quick: bool = False,
             result.pages = doc.page_count
             result.pdfa = _pdfa_label(doc)
             result.signed = _has_signature(doc)
+            ocr_limit = doc.page_count
+            if not quick and v1:
+                ocr_limit = min(OCR_SCOPE_PAGES, doc.page_count)
+                result.ocr_scope_pages = ocr_limit
+            ocr_stop = False       # v1: tìm thấy text thì ngừng trích
+            text_errors: list[int] = []
+            note_cache: dict[int, str | None] = {}
             for i in range(doc.page_count):
                 if cancel_cb is not None and cancel_cb():
                     result.error = "Đã hủy"
@@ -329,17 +447,13 @@ def audit_pdf(path: str | os.PathLike, *, quick: bool = False,
                 if progress_cb is not None:
                     progress_cb(i, doc.page_count)
                 page = doc.load_page(i)
-                # xrefs=True ép MuPDF GIẢI MÃ toàn bộ ảnh + tính MD5
-                # (~110ms/trang!) chỉ để lấy xref — chỉ bản đầy đủ mới cần
-                # (đọc filter stream). Quét nhanh lấy metadata thuần.
-                try:
-                    infos = page.get_image_info(xrefs=not quick)
-                except Exception:
-                    infos = []
                 # Ảnh dấu/mộc chữ ký (nằm trong appearance của SigField)
                 # không phải nội dung scan — loại khỏi thống kê chất lượng.
                 sig_rects = _signature_widget_rects(page)
-                if sig_rects:
+
+                def _split_stamps(infos: list[dict]) -> list[dict]:
+                    if not sig_rects:
+                        return infos
                     kept = []
                     for im in infos:
                         if _is_signature_stamp_image(
@@ -347,49 +461,99 @@ def audit_pdf(path: str | os.PathLike, *, quick: bool = False,
                             result.stamp_images_skipped += 1
                         else:
                             kept.append(im)
-                    infos = kept
+                    return kept
+
+                if quick:
+                    # xrefs=True ép MuPDF GIẢI MÃ toàn bộ ảnh + tính MD5
+                    # (chiếm ~95% thời gian full!) chỉ để lấy xref — quét
+                    # nhanh lấy metadata thuần.
+                    infos = page.get_image_info(xrefs=False)
+                else:
+                    # Fast-path: đọc filter qua resource list (rẻ) — chỉ
+                    # khi TOÀN BỘ filter an toàn, đủ resource cho mọi
+                    # placement và không có ảnh inline mới né được decode.
+                    # Gặp filter mất dữ liệu/mơ hồ thì decode đúng trang
+                    # đó để kết luận theo placement như đường cũ.
+                    usable, page_filters, res_xrefs = _page_fast_filters(
+                        doc, page)
+                    infos = None
+                    if usable:
+                        meta = page.get_image_info(xrefs=False)
+                        kept_n = _count_kept_placeholders(
+                            meta, sig_rects, page.rect)
+                        # Fast-path chỉ khi đủ resource cho mọi placement
+                        # (trang không ảnh cũng đạt — không cần decode) và
+                        # không có ảnh inline. Trang có ảnh mà thiếu
+                        # resource (inline/form lạ) → decode đúng trang.
+                        if (len(res_xrefs) >= kept_n
+                                and (res_xrefs or not kept_n)
+                                and not _page_has_inline_images(page)):
+                            infos = meta
+                            for f in page_filters:
+                                if f not in result.fast_filters:
+                                    result.fast_filters.append(f)
+                    if infos is None:
+                        infos = page.get_image_info(xrefs=True)
+                        result.pages_decoded += 1
+                infos = _split_stamps(infos)
                 has_image = bool(infos)
                 page_entries = [_image_entry(i + 1, im, doc, quick=quick)
                                 for im in infos]
                 result.images.extend(page_entries)
-                if page_entries and not result.small_page_note:
+                if page_entries and not result.small_page_note \
+                        and (not v1 or i == 0):
                     # Quy định 600 dpi cho khổ nhỏ: cả hai cạnh trang ≤
                     # ~70% A4 (đã chuẩn hóa chiều) mà ảnh < 600 dpi → ghi
                     # chú cảnh báo (không trượt nặng — máy quét cắt lề có
-                    # thể làm khổ đo được lệch).
+                    # thể làm khổ đo được lệch). v1: chỉ cảnh báo trang 1.
                     w_mm = page.rect.width * 25.4 / 72.0
                     h_mm = page.rect.height * 25.4 / 72.0
                     scale = min(min(w_mm, h_mm) / A4_MM[0],
                                 max(w_mm, h_mm) / A4_MM[1])
                     if scale <= A4_SMALL_SCALE:
                         worst = min(e.dpi for e in page_entries)
-                        if worst < DPI_SMALL_PAGE - 1.0:
+                        if worst < DPI_SMALL_PAGE - DPI_TOLERANCE:
                             result.small_page_note = (
                                 f"Trang {i + 1} khổ nhỏ (≈{scale * 100:.0f}"
                                 f"% A4) quét {worst:.0f} dpi — quy định yêu "
-                                "cầu 600 dpi cho khổ nhỏ hơn A4, cân nhắc "
+                                " cầu 600 dpi cho khổ nhỏ hơn A4, cân nhắc "
                                 "quét lại")
                 if not quick:
-                    try:
-                        text = page.get_text("text") or ""
-                    except Exception:
-                        text = ""
-                    chars = len("".join(text.split()))
-                    if chars >= OCR_MIN_CHARS:
-                        result.pages_with_text += 1
-                        if has_image:
-                            result.scanned_pages_with_text += 1
-                        result.text_chars += chars
-                        result.letters += sum(ch.isalpha() for ch in text)
-                        result.vn_letters += len(
-                            _VN_DIACRITIC_RE.findall(text))
+                    chars = 0
+                    extracted = False
+                    if i < ocr_limit and not ocr_stop:
+                        extracted = True
+                        result.ocr_text_pages_tried += 1
+                        try:
+                            text = page.get_text("text") or ""
+                        except Exception:
+                            text = ""
+                            text_errors.append(i + 1)
+                        chars = len("".join(text.split()))
+                        if chars >= OCR_MIN_CHARS:
+                            result.pages_with_text += 1
+                            if has_image:
+                                result.scanned_pages_with_text += 1
+                            result.text_chars += chars
+                            result.letters += sum(ch.isalpha()
+                                                  for ch in text)
+                            result.vn_letters += len(
+                                _VN_DIACRITIC_RE.findall(text))
+                            if v1:
+                                result.ocr_detected_page = i + 1
+                                result.ocr_stop_reason = "found"
+                                ocr_stop = True
                     if has_image:
                         result.pages_with_image += 1
-                    elif chars < OCR_MIN_CHARS:
+                    elif extracted and chars < OCR_MIN_CHARS:
                         result.blank_pages += 1
                 elif has_image:
                     result.pages_with_image += 1
-            _conclude(result, doc)
+            if v1 and not quick and result.ocr_detected_page is None \
+                    and not result.ocr_stop_reason:
+                result.ocr_stop_reason = ("error" if text_errors
+                                          else "limit_reached")
+            _conclude(result, doc, note_cache)
     except Exception as exc:
         result.error = f"Lỗi đọc cấu trúc PDF: {exc}"
     finally:
@@ -398,6 +562,18 @@ def audit_pdf(path: str | os.PathLike, *, quick: bool = False,
         except Exception:
             pass
     return result
+
+
+def _count_kept_placeholders(infos: list[dict], sig_rects: list,
+                             page_rect) -> int:
+    """Số placement còn lại sau khi loại ảnh dấu — KHÔNG đếm vào thống kê
+    (dùng để so chuẩn resource ≥ placement của fast-path, không đè lên
+    ``stamp_images_skipped`` của lượt _split_stamps thật)."""
+    if not sig_rects:
+        return len(infos)
+    return sum(1 for im in infos
+               if not _is_signature_stamp_image(im.get("bbox"), sig_rects,
+                                                page_rect))
 
 
 def _image_entry(page_no: int, im: dict, doc: "fitz.Document",
@@ -524,8 +700,10 @@ def _pdfa_label(doc: "fitz.Document") -> str:
     return part.group(1) + (conf.group(1).upper() if conf else "")
 
 
-def _conclude(result: PdfAuditResult, doc: "fitz.Document"):
-    """Chốt kết luận 4 tiêu chí từ dữ liệu đã quét."""
+def _conclude(result: PdfAuditResult, doc: "fitz.Document",
+              note_cache: dict | None = None):
+    """Chốt kết luận 4 tiêu chí từ dữ liệu đã quét (theo policy của result)."""
+    v1 = result.policy == POLICY_V1
     # --- chế độ màu: CÓ ảnh màu là đạt; 100% ảnh không màu mới trượt ------
     if result.images:
         modes = {im.color_mode for im in result.images}
@@ -533,19 +711,23 @@ def _conclude(result: PdfAuditResult, doc: "fitz.Document"):
                                   else next(iter(modes)))
         result.color_ok = "colour" in modes
     # --- độ nén (bỏ qua với quét nhanh — chưa đọc filter) -----------------
+    # Fast-path đã chứng minh toàn bộ filter trang là an toàn (không có
+    # DCT/JBIG2/JPX trong resource) nên không cần _compression_note; chỉ
+    # ảnh đến từ trang decode mới được chấm note.
     if not result.quick:
-        seen: list[str] = []
+        seen: list[str] = list(result.fast_filters)
         notes: list[str] = []
         compression_unknown = False
         for im in result.images:
             for f in im.filters:
                 if f not in seen:
                     seen.append(f)
-            note = _compression_note(doc, im)
-            if note is None:
-                compression_unknown = True
-            if note and note not in notes:
-                notes.append(note)
+            if im.filters:
+                note = _compression_note(doc, im, note_cache)
+                if note is None:
+                    compression_unknown = True
+                if note and note not in notes:
+                    notes.append(note)
         result.filters = sorted(seen)
         result.compression_ok = (False if notes else
                                  None if compression_unknown or not result.images
@@ -553,15 +735,29 @@ def _conclude(result: PdfAuditResult, doc: "fitz.Document"):
         result.compression_note = (notes[0] if notes else
                                    "Không xác định được chế độ nén JPEG 2000"
                                    if compression_unknown else "")
-    # --- DPI ----------------------------------------------------------------
-    if result.images:
-        result.min_dpi = min(im.dpi for im in result.images)
-        result.max_dpi = max(im.dpi for im in result.images)
-        # Dung sai 1 dpi cho tròn số (2480px/595pt = 300.07…).
-        result.dpi_ok = all(im.dpi >= DPI_MIN - 1.0 for im in result.images)
+    # --- DPI: theo phạm vi policy (legacy mọi ảnh; v1 chỉ trang 1) ---------
+    scope_images = result.dpi_scope_images()
+    if scope_images:
+        result.min_dpi = min(im.dpi for im in scope_images)
+        result.max_dpi = max(im.dpi for im in scope_images)
+        # Trượt đỏ khi dưới 297 dpi (DPI_MIN trừ dung sai máy quét).
+        result.dpi_ok = all(im.dpi >= DPI_MIN - DPI_TOLERANCE
+                            for im in scope_images)
+    # v1: trang 1 không có ảnh scan (trắng/text-only/chỉ ảnh dấu) → N/A,
+    # KHÔNG tìm ảnh trang sau thay thế (phạm vi do người dùng chốt).
     # --- OCR (bỏ qua với quét nhanh — chưa extract text) --------------------
     if not result.quick:
-        if result.pages_with_image == 0:
+        if v1:
+            # Phép kiểm tra tồn tại: một trang trong phạm vi có text là đủ.
+            if result.ocr_detected_page is not None:
+                result.ocr_ok = True
+            elif result.ocr_stop_reason == "error":
+                result.ocr_ok = None      # lỗi đọc — không chốt chắc chắn
+            elif result.pages == 0:
+                result.ocr_ok = None      # PDF rỗng không tự pass
+            else:
+                result.ocr_ok = False     # hết phạm vi, không thấy text
+        elif result.pages_with_image == 0:
             # File sinh từ Word/Excel… không có ảnh scan: có text là đạt.
             result.ocr_ok = result.pages_with_text > 0 or result.pages == 0
         else:
@@ -676,9 +872,15 @@ class TiffAuditResult:
         return out
 
 
-def _tiff_name_check(path: Path) -> tuple[bool | None, str, str]:
+def _tiff_name_check(path: Path, sibling_cache: dict | None = None
+                     ) -> tuple[bool | None, str, str]:
     """Kiểm tra tên + vị trí tệp TIFF. Trả ``(name_ok, name_note,
-    sequence_warning)`` — vi phạm tên/chuỗi trang chỉ CẢNH BÁO."""
+    sequence_warning)`` — vi phạm tên/chuỗi trang chỉ CẢNH BÁO.
+
+    ``sibling_cache``: dict dùng chung cho cả lượt thẩm định (khóa là thư
+    mục) để hồ sơ nhiều trang TIFF không phải liệt kê lại thư mục cho từng
+    tệp (O(N²) khi quét cả cây).
+    """
     parsed = parse_tiff_name(path.name)
     if parsed is None:
         return False, ("không khớp quy ước <MãĐĐ>-<Phông 3 số>-<Mục lục 2 số>"
@@ -693,11 +895,18 @@ def _tiff_name_check(path: Path) -> tuple[bool | None, str, str]:
         bad.append("4 mã đầu của tên file không khớp thư mục hồ sơ chứa")
     if int(parsed.trang) == 0:
         bad.append("số trang phải bắt đầu từ 001")
-    try:
-        siblings = [e for e in path.parent.iterdir()
-                    if e.suffix.lower() in (".tif", ".tiff")]
-    except OSError:
-        siblings = []
+    key = str(path.parent)
+    siblings = None
+    if sibling_cache is not None:
+        siblings = sibling_cache.get(key)
+    if siblings is None:
+        try:
+            siblings = [e for e in path.parent.iterdir()
+                        if e.suffix.lower() in (".tif", ".tiff")]
+        except OSError:
+            siblings = []
+        if sibling_cache is not None:
+            sibling_cache[key] = siblings
     nums: list[int] = []
     for sibling in siblings:
         other = parse_tiff_name(sibling.name)
@@ -723,12 +932,15 @@ def _tiff_name_check(path: Path) -> tuple[bool | None, str, str]:
 
 
 def audit_tiff(path: str | os.PathLike, *, quick: bool = False,
-               progress_cb=None, cancel_cb=None) -> TiffAuditResult:
+               progress_cb=None, cancel_cb=None,
+               sibling_cache: dict | None = None) -> TiffAuditResult:
     """Thẩm định một tệp TIFF trang quét. Chỉ đọc header qua Pillow nên
     rẻ — mọi lượt quét cùng độ sâu; ``quick`` giữ để tương thích chữ ký
-    ``audit_file``. Không ghi/sửa file.
+    ``audit_file``. Không ghi/sửa file. ``sibling_cache`` dùng chung cho cả
+    lượt quét cây để tránh liệt kê lại thư mục theo từng tệp.
 
-    Tiêu chí nặng: DPI ≥ 300, màu (RGB ≥ 3 kênh, 8 bit/kênh — xám/1-bit
+    Tiêu chí nặng: DPI ≥ 300 (trượt khi dưới 297 — dung sai máy quét), màu
+    (RGB ≥ 3 kênh, 8 bit/kênh — xám/1-bit
     trượt như chính sách PDF), đúng 1 trang/tệp, nén không lossy. Cảnh
     báo: nén lossless ("văn bản quy định TIFF không nén"), khổ ≤ ~70% A4
     mà < 600 dpi, tên/chuỗi trang lệch quy ước.
@@ -802,13 +1014,13 @@ def audit_tiff(path: str | os.PathLike, *, quick: bool = False,
 
             if result.dpi_x > 0 and result.dpi_y > 0:
                 dpi_eff = min(result.dpi_x, result.dpi_y)
-                result.dpi_ok = dpi_eff >= DPI_MIN - 1.0
+                result.dpi_ok = dpi_eff >= DPI_MIN - DPI_TOLERANCE
                 w_mm = result.width_px * 25.4 / result.dpi_x
                 h_mm = result.height_px * 25.4 / result.dpi_y
                 scale = min(min(w_mm, h_mm) / A4_MM[0],
                             max(w_mm, h_mm) / A4_MM[1])
                 if result.dpi_ok and scale <= A4_SMALL_SCALE \
-                        and dpi_eff < DPI_SMALL_PAGE - 1.0:
+                        and dpi_eff < DPI_SMALL_PAGE - DPI_TOLERANCE:
                     result.lowres_page_warning = (
                         f"Khổ nhỏ (≈{scale * 100:.0f}% A4) quét "
                         f"{dpi_eff:.0f} dpi — quy định yêu cầu 600 dpi cho "
@@ -824,22 +1036,25 @@ def audit_tiff(path: str | os.PathLike, *, quick: bool = False,
         result.error = f"Không đọc được TIFF: {exc}"
         return result
     result.name_ok, result.name_note, result.sequence_warning = \
-        _tiff_name_check(p)
+        _tiff_name_check(p, sibling_cache)
     return result
 
 
 def audit_file(path: str | os.PathLike, *, quick: bool = False,
-               progress_cb=None, cancel_cb=None):
+               policy: str = DEFAULT_AUDIT_POLICY,
+               progress_cb=None, cancel_cb=None,
+               sibling_cache: dict | None = None):
     """Thẩm định 1 file theo đuôi: ``.pdf`` → ``audit_pdf``, ``.tif``/
     ``.tiff`` → ``audit_tiff`` (hai đuôi cùng định dạng, nhận ngang hàng).
-    Đuôi khác raise ValueError (UI không đưa vào cây)."""
+    Đuôi khác raise ValueError (UI không đưa vào cây). ``policy`` chỉ áp
+    dụng cho PDF (TIFF luôn đủ độ sâu vì đọc header rẻ)."""
     suffix = Path(path).suffix.lower()
     if suffix == ".pdf":
-        return audit_pdf(path, quick=quick, progress_cb=progress_cb,
-                         cancel_cb=cancel_cb)
+        return audit_pdf(path, quick=quick, policy=policy,
+                         progress_cb=progress_cb, cancel_cb=cancel_cb)
     if suffix in (".tif", ".tiff"):
         return audit_tiff(path, progress_cb=progress_cb,
-                          cancel_cb=cancel_cb)
+                          cancel_cb=cancel_cb, sibling_cache=sibling_cache)
     raise ValueError(
         f"Không thẩm định được định dạng \"{suffix or '(không có)'}\": {path}")
 

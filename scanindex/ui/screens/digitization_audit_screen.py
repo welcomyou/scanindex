@@ -16,9 +16,13 @@ CSDL_SOHOA với icon màu tương tự; KHÔNG đổi tên / kéo thả / sửa
     lượng, PDF/A, ghi chú kết luận, cảnh báo ⚠) — chỉ mô tả file.
   * Chạy nền: thẩm định tất cả PDF + TIFF (.tif) dưới thư mục gốc — file
     trượt tiêu chí nặng (PDF: Scan màu/DPI; TIFF: Scan màu/DPI/1 trang/
-    nén lossy) được gắn dấu " !" sau tên + tô đỏ trên cây.
-  * Không cache: mỗi lần quét / chọn file đều đọc lại để phản ánh hiện
-    trạng (file thêm / sửa / xóa luôn được đánh giá lại).
+    nén lossy) được gắn dấu " !" sau tên + tô đỏ trên cây. Thẩm định chạy
+    trên process pool hâm nóng (PyMuPDF không thread-safe); hỏng pool thì
+    tự về tuần tự. File chưa đổi giữa các lượt trong phiên không audit lại
+    (đối chiếu size + mtime_ns) — file thêm / sửa / xóa luôn được xét lại.
+  * Phạm vi thẩm định (policy v1 do người dùng chốt): DPI chỉ trang 1, OCR
+    chỉ cần một trang có text trong tối đa 5 trang đầu; màu/nén toàn tài
+    liệu — thay đổi phạm vi kết luận so với phiên bản xét mọi trang.
 """
 from __future__ import annotations
 
@@ -38,6 +42,7 @@ from PySide6.QtWidgets import (
 
 from scanindex.core import digitization_audit as da
 from scanindex.core import rename_tree as rt
+from scanindex.infra import audit_pool as ap
 from scanindex.infra import translations
 from scanindex.ui.screens.rename_tree_screen import (
     _FOLDER_FALLBACK_COLOR, _LEVEL_COLOR, _dossier_icon, _file_icon,
@@ -70,6 +75,11 @@ _ROLE_BASENAME = Qt.ItemDataRole.UserRole + 6  # tên file không kèm dấu ❗
 
 _DUMMY_TEXT = "\u2026"  # giữ chỗ hiện mũi tên bung trước khi lazy populate
 
+# Phạm vi thẩm định màn hình dùng (người dùng chốt): DPI chỉ trang 1, OCR
+# chỉ cần một trang có text trong tối đa 5 trang đầu; màu/nén toàn tài liệu.
+_AUDIT_POLICY = da.POLICY_V1
+_SELECT_DEBOUNCE_MS = 150
+
 # Màu kết luận (theo theme): fg = chữ giá trị + chấm trạng thái, accent =
 # viền trái thẻ. Nền thẻ luôn thống nhất — chỉ màu trạng thái thay đổi:
 # ĐẠT = xanh; KHÔNG ĐẠT quan trọng (DPI, scan màu) = đỏ; KHÔNG ĐẠT ít quan
@@ -98,34 +108,57 @@ _COLOR_FAIL_FG = _STATUS_LOOK["fail"][0]
 # --------------------------------------------------------------------------- #
 
 class _TreeAuditWorker(QThread):
-    """Một lượt đi duy nhất trên cây: quét nhanh từng file PDF/TIFF (TIFF
-    đọc header rẻ nên luôn đầy đủ; PDF bỏ text/filter) để gắn dấu ❗, đồng
-    thời tích lũy Số tệp / Số trang / Dung lượng theo subtree (chỉ
-    tính PDF + .tif, bỏ qua file khác). Mỗi lần quét đều đọc lại file
-    (không cache) để luôn phản ánh hiện trạng mới nhất."""
+    """Một lượt đi trên cây: quét nhanh từng file PDF/TIFF (TIFF đọc header
+    rẻ nên luôn đầy đủ; PDF bỏ text/filter) để gắn dấu ❗, đồng thời tích
+    luỹ Số tệp / Số trang / Dung lượng theo subtree.
+
+    Thẩm định chạy trên process pool hâm nóng (PyMuPDF không thread-safe),
+    task theo chunk file; pool không khả dụng thì tự về tuần tự trong
+    thread này. ``reuse`` cho phép bỏ qua file chưa đổi (size+mtime_ns khớp
+    kết quả quick cùng policy của lượt trước trong phiên) — kết quả vẫn được
+    phát lại qua ``marked_batch`` để gắn dấu lên cây mới.
+    """
 
     progress = Signal(int, int)          # (đã xét, tổng file) → progress bar
     stats_step = Signal(int, int)        # (tài liệu, trang) đang đếm
-    marked = Signal(str, object, bool)   # (rel, kết quả audit, không đạt?)
+    phase = Signal(str)                  # listing | warming | scanning
+    marked_batch = Signal(list)          # [(rel, kết quả audit, không đạt?)]
     stats_done = Signal(object)          # FolderStats
     done = Signal(int, int)              # không đạt, không xác định
 
-    def __init__(self, root: Path, parent=None):
+    BATCH = 8                            # số kết quả tối thiểu mỗi lô
+    EMIT_INTERVAL = 0.1                  # giây giữa hai lô — phát đều, không
+    # dồn cột cuối lượt (trước đây hàng nghìn event dồn về GUI cùng lúc nên
+    # bar đứng ở "chạy chạy" rồi % nhảy 0→100 trong tích tắc).
+
+    def __init__(self, root: Path, pool: "ap.AuditPool | None" = None,
+                 reuse: dict | None = None, parent=None):
         super().__init__(parent)
         self._root = root
+        self._pool = pool
+        self._reuse = reuse or {}        # abs path → (size, mtime_ns, result)
         self._cancel = False
 
     def cancel(self):
         self._cancel = True
 
     def run(self):
+        import time as _time
+
         # Lượt 1 (rẻ, không mở tệp): scandir liệt kê PDF/TIFF và cộng
         # dung lượng. entry.stat() lấy size từ dir-entry nên
-        # gần như miễn phí.
+        # gần như miễn phí. Trong lúc đi cây phát tiến độ theo mốc để
+        # người dùng thấy ứng dụng đang sống (chưa biết tổng → bar chạy
+        # chạy, nhãn hiển thị số tệp đã tìm thấy tăng dần).
+        self.phase.emit("listing")
         pdfs: list[Path] = []
         dir_rels: set[str] = set()
         direct_size: dict[str, int] = {}   # rel → dung lượng file trực tiếp
 
+        # Lần đầu trong phiên, pool chưa tồn tại: việc spawn worker + nạp
+        # PyMuPDF (vài giây) được executor tự chạy nền khi nhận chunk đầu
+        # tiên — quét KHÔNG chờ warm, bar giữ chế độ chạy cho đến khi có
+        # kết quả thật thì mới chuyển sang %.
         def walk(dirpath: Path, rel: str):
             dir_rels.add(rel)
             size = 0
@@ -147,12 +180,17 @@ class _TreeAuditWorker(QThread):
                             size += e.stat().st_size
                         except OSError:
                             pass
+                        if len(pdfs) % 500 == 0:
+                            self.stats_step.emit(len(pdfs), 0)
                 except OSError:
                     continue
             direct_size[rel] = size
 
         walk(self._root, "")
         total = len(pdfs)
+        # KHÔNG phát progress(0, total) ở đây: giữ bar "chạy chạy" trong
+        # lúc warming — % chỉ xuất hiện khi có kết quả thật đầu tiên, tránh
+        # đứng im ở 0% cả khoảng khởi động.
 
         bad = 0
         unknown = 0
@@ -160,37 +198,118 @@ class _TreeAuditWorker(QThread):
         pages_done = 0
         unreadable: list[str] = []
         pages_by_rel: dict[str, int] = {}
-        for i, path in enumerate(pdfs, 1):
-            if self._cancel:
-                return
-            rel = path.relative_to(self._root).as_posix()
-            result = da.audit_file(
-                str(path), quick=True, cancel_cb=lambda: self._cancel)
-            if self._cancel:
-                return
+
+        def account(rel: str, result) -> bool:
+            """Tích luỹ thống kê cho 1 kết quả; trả False nếu file lỗi."""
+            nonlocal docs_done, pages_done, bad, unknown
             docs_done += 1
             if result.error:
                 unreadable.append(rel)
                 pages_by_rel[rel] = 0
                 unknown += 1
-            else:
-                pages_by_rel[rel] = max(0, result.pages)
-                pages_done += max(0, result.pages)
-                bad_flag = result.hard_fail()
-                if bad_flag:
-                    bad += 1
-                elif (result.color_ok is None or result.dpi_ok is None
-                      or isinstance(result, da.TiffAuditResult)
-                      and (result.single_page_ok is None
-                           or result.compression_status == "unknown")):
-                    unknown += 1
-                self.marked.emit(rel, result, bad_flag)
-            self.progress.emit(i, total)
+                return False
+            pages_by_rel[rel] = max(0, result.pages)
+            pages_done += max(0, result.pages)
+            bad_flag = result.hard_fail()
+            if bad_flag:
+                bad += 1
+            elif (result.color_ok is None or result.dpi_ok is None
+                  or isinstance(result, da.TiffAuditResult)
+                  and (result.single_page_ok is None
+                       or result.compression_status == "unknown")):
+                unknown += 1
+            return bad_flag
+
+        def emit_batch(items: list, done: int):
+            self.marked_batch.emit(items)
+            self.progress.emit(done, total)
             self.stats_step.emit(docs_done, pages_done)
+
+        last_emit = 0.0
+
+        def flush(buffer: list, done: int) -> list:
+            """Tiến độ (%/stats) cập nhật mỗi ≥0,1 s để bar tăng dần đều;
+            dấu/marks phát theo lô ≥ BATCH để giảm số event GUI. Phần marks
+            còn lại caller phát nốt khi kết thúc pha."""
+            nonlocal last_emit
+            now = _time.monotonic()
+            if now - last_emit < self.EMIT_INTERVAL:
+                return buffer
+            last_emit = now
+            self.progress.emit(done, total)
+            self.stats_step.emit(docs_done, pages_done)
+            if len(buffer) >= self.BATCH:
+                self.marked_batch.emit(buffer)
+                return []
+            return buffer
+
+        # ---- nhanh: tái sử dụng kết quả quick hợp lệ của phiên ----------
+        pending: list[Path] = []
+        reused_pairs: list = []
+        reused_done = 0
+        for path in pdfs:
+            if self._cancel:
+                return
+            rel = path.relative_to(self._root).as_posix()
+            hit = self._reuse.get(str(path))
+            if hit is not None:
+                try:
+                    st = path.stat()
+                except OSError:
+                    hit = None
+                else:
+                    if (st.st_size, st.st_mtime_ns) != (hit[0], hit[1]) \
+                            or hit[2].error:
+                        hit = None
+            if hit is None:
+                pending.append(path)
+                continue
+            bad_flag = account(rel, hit[2])
+            reused_pairs.append((rel, hit[2], bad_flag))
+            reused_done += 1
+
+        # Còn file phải audit → nhãn "đang khởi động bộ quét" cho tới khi
+        # chunk đầu tiên hoàn tất (executor tự spawn/nạp worker nền).
+        if pending and self._pool is not None:
+            self.phase.emit("warming")
+
+        # Phát lại kết quả tái sử dụng (nhanh) — bar chạy trong lúc pool
+        # vẫn đang tự lên worker.
+        buffer: list = []
+        for pair in reused_pairs:
+            if self._cancel:
+                return
+            buffer.append(pair)
+            buffer = flush(buffer, docs_done)
+        if buffer:
+            emit_batch(buffer, docs_done)
         if self._cancel:
             return
 
-        # Tích lũy Số tệp / Số trang theo subtree (file lỗi vẫn là 1 tệp,
+        # ---- thẩm định phần còn lại: pool, hỏng thì tuần tự ---------------
+        audit_iter = self._run_pooled(pending)
+        if audit_iter is None:
+            audit_iter = self._run_serial(pending)
+        buffer = []
+        done_count = len(pdfs) - len(pending)
+        scanning_emitted = False
+        for path, result in audit_iter:
+            if self._cancel:
+                return
+            if not scanning_emitted:
+                scanning_emitted = True
+                self.phase.emit("scanning")   # có kết quả thật → % bắt đầu
+            rel = path.relative_to(self._root).as_posix()
+            bad_flag = account(rel, result)
+            buffer.append((rel, result, bad_flag))
+            done_count += 1
+            buffer = flush(buffer, done_count)
+        if buffer:
+            emit_batch(buffer, done_count)
+        if self._cancel:
+            return
+
+        # Tích luỹ Số tệp / Số trang theo subtree (file lỗi vẫn là 1 tệp,
         # 0 trang; TIFF là tệp trang, không suy ra số văn bản trong hồ sơ).
         stats = da.FolderStats(root=str(self._root))
         stats.unreadable = unreadable
@@ -245,19 +364,107 @@ class _TreeAuditWorker(QThread):
         self.stats_done.emit(stats)
         self.done.emit(bad, unknown)
 
+    # ------------------------------------------------------------ pool
+
+    def _run_pooled(self, pending: list[Path]):
+        """Chạy qua process pool; trả iterator ``(path, result)`` đúng thứ
+        tự pending, hoặc None khi pool không khả dụng/lỗi để caller chuyển
+        tuần tự (kết quả dở dang bỏ, không dùng nửa vời)."""
+        if not pending:
+            return iter(())
+        if self._pool is None or not self._pool.ensure_started():
+            return None
+        chunk = ap.DEFAULT_CHUNK
+        try:
+            futures = self._pool.map_chunks(
+                [str(p) for p in pending], quick=True,
+                policy=_AUDIT_POLICY, chunk=chunk)
+        except Exception:
+            return None
+        from concurrent.futures import FIRST_COMPLETED, wait
+
+        out: list = [None] * len(pending)
+        queue = list(zip(futures, range(0, len(pending), chunk)))
+        in_flight: dict = {}
+        max_in_flight = max(2, self._pool.max_workers * 2)
+        try:
+            while queue or in_flight:
+                if self._cancel:
+                    for fut in in_flight:
+                        fut.cancel()
+                    for fut, _ in queue:
+                        fut.cancel()
+                    return None
+                while queue and len(in_flight) < max_in_flight:
+                    fut, start = queue.pop(0)
+                    in_flight[fut] = start
+                if not in_flight:
+                    break
+                done_set, _ = wait(in_flight, timeout=0.25,
+                                   return_when=FIRST_COMPLETED)
+                for fut in done_set:
+                    start = in_flight.pop(fut)
+                    chunk_results = fut.result()
+                    for offset, res in enumerate(chunk_results):
+                        out[start + offset] = res
+        except Exception:
+            return None
+        if any(r is None for r in out):
+            return None
+        return iter(zip(pending, out))
+
+    def _run_serial(self, pending: list[Path]):
+        """Tuần tự trong thread này (fallback khi pool không dùng được)."""
+        sibling_cache: dict = {}
+
+        def gen():
+            for path in pending:
+                if self._cancel:
+                    return
+                result = da.audit_file(
+                    str(path), quick=True, policy=_AUDIT_POLICY,
+                    cancel_cb=lambda: self._cancel,
+                    sibling_cache=sibling_cache)
+                if self._cancel:
+                    return
+                yield path, result
+
+        return gen()
+
 
 class _AuditWorker(QThread):
     """Thẩm định đầy đủ một file PDF/TIFF khi được bấm chọn (đọc cấu
-    trúc, không sửa file). Mỗi lần chọn đều đọc lại — không cache."""
+    trúc, không sửa file). Chạy trên process pool dùng chung; hủy được khi
+    còn ở hàng chờ, job đang chạy sẽ chạy nốt (kết quả cũ bị bỏ theo seq).
+
+    Hiện tại chỉ nhánh pool/tuần tự trong thread — không chặn GUI."""
 
     done = Signal(str, object)  # (path, PdfAuditResult | TiffAuditResult)
 
-    def __init__(self, path: str, parent=None):
+    def __init__(self, path: str, pool: "ap.AuditPool | None" = None,
+                 parent=None):
         super().__init__(parent)
         self._path = path
+        self._pool = pool
+        self._future = None
+
+    def cancel(self):
+        """Hủy nếu còn đang chờ trong pool; job đang chạy bỏ qua (seq check)."""
+        if self._future is not None:
+            self._future.cancel()
 
     def run(self):
-        self.done.emit(self._path, da.audit_file(self._path))
+        result = None
+        if self._pool is not None and self._pool.ensure_started():
+            try:
+                self._future = self._pool.submit_one(
+                    self._path, quick=False, policy=_AUDIT_POLICY)
+                result = self._future.result()
+            except Exception:
+                result = None
+        if result is None or self._future is None or self._future.cancelled():
+            result = da.audit_file(self._path, policy=_AUDIT_POLICY)
+        self.done.emit(self._path, result)
 
 
 class _CheckCard(QFrame):
@@ -374,7 +581,26 @@ class DigitizationAuditScreen(ScreenContent):
         self._current_pdf_abs: str | None = None
         self._preview_pixmap = None           # QPixmap gốc của preview TIFF
         self._last_audit = None               # kết quả thẩm định đang hiển thị
+        # Pool process hâm nóng dùng chung cho quét cây + thẩm định chọn
+        # file; hỏng thì worker tự chạy tuần tự (thẩm định không bao giờ mất).
+        self._pool = ap.AuditPool()
+        # Kết quả quick trong phiên: rel → kết quả; "Làm mới" chỉ audit lại
+        # file đã đổi (size+mtime_ns), phần còn lại phát lại dấu ngay.
+        # Stat-key lưu TẠI THỜI ĐIỂM nhận kết quả — không phải lúc refresh —
+        # để file đổi giữa hai lượt luôn bị xét lại.
+        self._quick_results: dict = {}
+        self._quick_statkeys: dict = {}
+        # Kết quả full theo abs path → ((size, mtime_ns), result); bấm lại
+        # cùng file chưa đổi là hiển thị ngay không audit lại.
+        self._full_cache: dict = {}
+        self._pending_select_item = None      # debounce click trên cây
+        self._scan_pct = 0                    # % quét nền cho dòng trạng thái
+        self._scan_phase = "listing"
         self._build_ui()
+        self._select_timer = QTimer(self)
+        self._select_timer.setSingleShot(True)
+        self._select_timer.setInterval(_SELECT_DEBOUNCE_MS)
+        self._select_timer.timeout.connect(self._open_pending_item)
         self._load_settings()
 
     # ------------------------------------------------------------- layout
@@ -437,10 +663,13 @@ class DigitizationAuditScreen(ScreenContent):
         )
         h.addWidget(self.lbl_audit_stats)
 
-        # Thanh tiến độ quét nền + nút dừng (ẩn khi không chạy).
+        # Thanh tiến độ quét nền + nút dừng (ẩn khi không chạy). Bar hiển
+        # thị % ngay trên bar: chạy chạy khi còn liệt kê file, có % ngay
+        # khi biết tổng số để người dùng biết còn phải chờ bao lâu.
         self.progress_scan = QProgressBar()
-        self.progress_scan.setFixedWidth(180)
-        self.progress_scan.setTextVisible(False)
+        self.progress_scan.setFixedWidth(210)
+        self.progress_scan.setTextVisible(True)
+        self.progress_scan.setFormat("%p%")
         self.progress_scan.setVisible(False)
         h.addWidget(self.progress_scan)
 
@@ -712,6 +941,9 @@ class DigitizationAuditScreen(ScreenContent):
         self._last_tree_counts = None
         self._current_pdf_abs = None
         self._last_audit = None
+        self._quick_results.clear()      # gốc mới — cache phiên hết hiệu lực
+        self._quick_statkeys.clear()
+        self._full_cache.clear()
         self._clear_info_header()
         self.lbl_stats.setText("")
         self.lbl_audit_stats.setText("")
@@ -719,8 +951,6 @@ class DigitizationAuditScreen(ScreenContent):
         self.pdf_viewer.clear()
         self.img_viewer.clear()
         self._reload_root()
-        if self.isVisible():
-            QTimer.singleShot(0, self, self._expand_all_loaded)
         self._start_tree_audit()
         self._save_settings()
         self.log_message.emit(
@@ -737,21 +967,23 @@ class DigitizationAuditScreen(ScreenContent):
         self.pdf_viewer.clear()
         self.img_viewer.clear()
         self._reload_root()
-        self._expand_all_loaded()
         self._start_tree_audit()
 
     def _stop_workers(self):
         self._stop_tree_scan()
+        if self._audit_worker is not None:
+            self._audit_worker.cancel()   # hủy future nếu còn chờ trong pool
         self._audit_seq += 1      # vô hiệu kết quả thẩm định đang chạy
         self._tree_mark_seq += 1  # vô hiệu dấu ❗ của vòng quét cũ
 
     def showEvent(self, event):
-        """Mở chức năng: bung full cây (nạp lazy điều khiển thủ công)."""
+        """Mở chức năng: cây nạp lazy theo nhu cầu, không bung toàn bộ."""
         super().showEvent(event)
-        if self.isVisible() and self._root is not None:
-            QTimer.singleShot(0, self, self._expand_all_loaded)
 
     def _expand_all_loaded(self):
+        """Bung toàn bộ nhánh đã nạp (chỉ dùng thủ công/test — không tự gọi
+        khi mở/refresh vì nạp cả cây trên GUI thread làm đứng máy với kho
+        nhiều thư mục)."""
         if self._root is None:
             return
         self.tree.setUpdatesEnabled(False)
@@ -794,16 +1026,25 @@ class DigitizationAuditScreen(ScreenContent):
     # ------------------------------------------------- quét + thẩm định cây
 
     def _start_tree_audit(self):
-        """Một lượt đi duy nhất trên cây: quét nhanh từng file PDF/TIFF
-        để gắn dấu ❗, đồng thời đếm Số tệp / Số trang / Dung lượng.
-        Luôn đọc lại file — không cache — để phản ánh đúng hiện trạng
-        (thêm/sửa/xóa)."""
+        """Một lượt đi trên cây: quét nhanh từng file PDF/TIFF qua process
+        pool để gắn dấu ❗, đồng thời đếm Số tệp / Số trang / Dung lượng.
+        File chưa đổi (size+mtime_ns khớp kết quả quick trong phiên) không
+        audit lại — dấu được phát lại từ kết quả đã có."""
         if self._root is None:
             return
         self._last_tree_counts = None
+        # Kết quả quick của phiên → worker tái sử dụng cho file chưa đổi
+        # (stat-key chốt lúc nhận kết quả, không phải bây giờ).
+        reuse: dict = {}
+        for rel, r in self._quick_results.items():
+            stat_key = self._quick_statkeys.get(rel)
+            if stat_key is None or getattr(r, "error", ""):
+                continue
+            reuse[str(self._root / rel)] = (stat_key[0], stat_key[1], r)
         # parent=self: Qt đợi thread chạy xong khi dọn dẹp (thoát app) thay
         # vì hủy QThread đang chạy → tránh crash lúc shutdown.
-        self._tree_worker = _TreeAuditWorker(self._root, parent=self)
+        self._tree_worker = _TreeAuditWorker(self._root, self._pool,
+                                             reuse, parent=self)
         self._tree_mark_seq += 1
         seq = self._tree_mark_seq
         w = self._tree_worker
@@ -811,18 +1052,24 @@ class DigitizationAuditScreen(ScreenContent):
             lambda done, total, s=seq: self._on_tree_progress(done, total, s))
         w.stats_step.connect(
             lambda d, p, s=seq: self._on_tree_stats_step(d, p, s))
-        w.marked.connect(
-            lambda rel, r, bad, s=seq: self._on_tree_marked(rel, r, bad, s))
+        w.phase.connect(
+            lambda ph, s=seq: self._on_tree_phase(ph, s))
+        w.marked_batch.connect(
+            lambda items, s=seq: self._on_tree_marked_batch(items, s))
         w.stats_done.connect(
             lambda stats, s=seq: self._on_tree_stats_done(stats, s))
         w.done.connect(
             lambda bad, unknown, s=seq: self._on_tree_done(bad, unknown, s))
         w.start()
-        self.progress_scan.setRange(0, 0)
+        self.progress_scan.setRange(0, 0)     # chạy chạy đến khi biết tổng
         self.progress_scan.setValue(0)
+        self.progress_scan.setFormat("%p%")
+        self._scan_pct = 0
+        self._scan_phase = "listing"
         self.progress_scan.setVisible(True)
         self.btn_stop_scan.setVisible(True)
-        self.lbl_stats.setText(translations.localize_text("Đang quét…"))
+        self.lbl_stats.setText(
+            translations.localize_text("Đang liệt kê tệp…"))
         self.lbl_audit_stats.setText("")
 
     def _stop_tree_scan(self):
@@ -838,21 +1085,54 @@ class DigitizationAuditScreen(ScreenContent):
             return
         self.progress_scan.setRange(0, max(1, total))
         self.progress_scan.setValue(done)
+        self._scan_pct = (done * 100 // total) if total > 0 else 0
+
+    def _on_tree_phase(self, phase: str, seq: int):
+        if seq != self._tree_mark_seq:
+            return
+        self._scan_phase = phase
+        if phase == "warming":
+            # stats_step không phát trong pha này — set nhãn ngay để người
+            # dùng thấy rõ trạng thái trong lúc pool tự lên worker.
+            self.lbl_stats.setText(
+                translations.localize_text("Đang khởi động bộ quét…"))
 
     def _on_tree_stats_step(self, docs: int, pages: int, seq: int):
         if seq != self._tree_mark_seq:
             return
-        self.lbl_stats.setText(translations.localize_text(
-            f"Đang quét… {docs} tệp · {pages} trang"))
+        # Nhãn theo pha: liệt kê (chưa biết tổng) → khởi động pool → quét
+        # có %. % tính từ progress (cùng lô emit nên _scan_pct đã cập nhật).
+        if self._scan_phase == "listing":
+            text = f"Đang liệt kê tệp… {docs} tệp"
+        elif self._scan_phase == "warming":
+            text = "Đang khởi động bộ quét…"
+        else:
+            text = (f"Đang quét… {self._scan_pct}% · "
+                    f"{docs} tệp · {pages} trang")
+        self.lbl_stats.setText(translations.localize_text(text))
 
-    def _on_tree_marked(self, rel: str, result, bad: bool, seq: int):
+    def _on_tree_marked_batch(self, items: list, seq: int):
+        """Nhận một lô kết quả quick (mỗi chunk pool một lô): lưu lại để
+        tái sử dụng/tái hiển thị và gắn dấu lên item cây nếu đã tồn tại
+        (nhánh chưa bung sẽ được gắn lúc `_populate_children`)."""
         if seq != self._tree_mark_seq:
             return
-        if bad:
-            self._bad_rels.add(rel)
-        item = self._item_by_rel.get(rel)
-        if item is not None:
-            self._apply_bad_mark(item, bad)
+        root = self._root
+        for rel, result, bad in items:
+            if not getattr(result, "error", ""):
+                self._quick_results[rel] = result
+                if root is not None:
+                    try:
+                        st = os.stat(root / rel)
+                        self._quick_statkeys[rel] = (st.st_size,
+                                                     st.st_mtime_ns)
+                    except OSError:
+                        self._quick_statkeys.pop(rel, None)
+            if bad:
+                self._bad_rels.add(rel)
+            item = self._item_by_rel.get(rel)
+            if item is not None:
+                self._apply_bad_mark(item, bad)
 
     def _on_tree_stats_done(self, stats, seq: int):
         if seq != self._tree_mark_seq:
@@ -900,10 +1180,11 @@ class DigitizationAuditScreen(ScreenContent):
             )
 
     def cleanup(self) -> None:
-        """Ngưng quét nền khi thoát app (được gọi qua SupportToolsScreen.
-        cleanup trong closeEvent). Không có cache gì cần lưu — mỗi lần quét
-        đều đọc lại file để phản ánh hiện trạng."""
+        """Ngưng quét nền + tắt pool khi thoát app (được gọi qua
+        SupportToolsScreen.cleanup trong closeEvent). Kết quả trong phiên
+        không cần lưu — lượt sau dựa vào stat file quyết định audit lại."""
         self._stop_workers()
+        self._pool.shutdown()
 
     def _apply_bad_mark(self, item: QTreeWidgetItem, bad: bool):
         """Gắn/bỏ dấu ! SAU tên file + tô đỏ tên cho file trượt Scan màu /
@@ -1004,9 +1285,21 @@ class DigitizationAuditScreen(ScreenContent):
 
     def _on_current_changed(self, current: QTreeWidgetItem,
                             _prev: QTreeWidgetItem | None):
+        """Debounce 150 ms: click liên tiếp trên cây không tạo hàng loạt
+        thẩm định full — chỉ item cuối cùng được mở."""
+        self._pending_select_item = current
         if current is None:
+            self._select_timer.stop()
+            self._pending_select_item = None
             self.info_stack.setCurrentIndex(0)
             self._clear_info_header()
+            return
+        self._select_timer.start()
+
+    def _open_pending_item(self):
+        current = self._pending_select_item
+        self._pending_select_item = None
+        if current is None:
             return
         rel = current.data(0, _ROLE_REL)
         if current.data(0, _ROLE_ISDIR):
@@ -1093,9 +1386,34 @@ class DigitizationAuditScreen(ScreenContent):
         self.pdf_viewer.setVisible(True)
         self.img_viewer.setVisible(False)
         self.info_stack.setCurrentIndex(2)
-        self._render_audit(None)  # trạng thái chờ
-        self._start_audit(str(path))
+        # Full cache còn hiệu lực (file chưa đổi) → hiển thị ngay, không
+        # audit lại. Chưa có thì hiện trước kết quả quick của lượt quét cây
+        # (màu/DPI/nén-OCR 'chưa xác định') rồi bổ sung full khi xong.
+        cached = self._cached_full_result(path)
+        if cached is not None:
+            self._render_audit(cached)
+        else:
+            quick = self._quick_results.get(rel)
+            self._render_audit(quick if quick is not None
+                               and not quick.error else None)
+            self._start_audit(str(path))
         self.pdf_viewer.show_pdf(str(path))
+
+    def _cached_full_result(self, path: Path):
+        """Kết quả full cùng policy còn hợp lệ cho file chưa đổi, hoặc None."""
+        try:
+            st = path.stat()
+        except OSError:
+            return None
+        hit = self._full_cache.get(str(path))
+        if hit is None:
+            return None
+        stat_key, result = hit
+        if (st.st_size, st.st_mtime_ns) != stat_key or result.error \
+                or getattr(result, "quick", False) \
+                or getattr(result, "policy", "") != _AUDIT_POLICY:
+            return None
+        return result
 
     def _show_tiff(self, rel: str):
         """Chọn tệp TIFF: preview ảnh (Qt đọc TIFF sẵn) + thẻ chỉ tiêu."""
@@ -1161,10 +1479,13 @@ class DigitizationAuditScreen(ScreenContent):
     # ------------------------------------------------------------ thẩm định
 
     def _start_audit(self, path: str):
-        """Thẩm định đầy đủ file vừa chọn — luôn đọc lại, không cache."""
+        """Thẩm định đầy đủ file vừa chọn trên process pool; kết quả cũ của
+        file khác đến sau bị bỏ theo seq, future chờ trong pool bị hủy."""
         self._audit_seq += 1
         seq = self._audit_seq
-        self._audit_worker = _AuditWorker(path, parent=self)
+        if self._audit_worker is not None:
+            self._audit_worker.cancel()
+        self._audit_worker = _AuditWorker(path, self._pool, parent=self)
         self._audit_worker.done.connect(
             lambda p, r, s=seq: self._on_audit_done(p, r, s))
         self._audit_worker.start()
@@ -1172,6 +1493,13 @@ class DigitizationAuditScreen(ScreenContent):
     def _on_audit_done(self, path: str, result, seq: int):
         if seq != self._audit_seq or path != self._current_pdf_abs:
             return  # người dùng đã chọn file khác — bỏ kết quả cũ
+        if not result.error and not getattr(result, "quick", False):
+            try:
+                st = os.stat(path)
+                self._full_cache[path] = ((st.st_size, st.st_mtime_ns),
+                                          result)
+            except OSError:
+                pass
         self._render_audit(result)
         if result.error:
             self.log_message.emit(
@@ -1236,7 +1564,7 @@ class DigitizationAuditScreen(ScreenContent):
                 translations.localize_text("Đúng" if ok else "Không"))
             statuses.append("pass" if ok else "fail")
 
-        # DPI — lỗi nặng.
+        # DPI — lỗi nặng (v1: chỉ theo ảnh trang 1).
         if result.dpi_ok is None:
             self.card_dpi.set_status("na", "—")
             statuses.append("na")
@@ -1244,11 +1572,12 @@ class DigitizationAuditScreen(ScreenContent):
             self.card_dpi.set_status("pass", f"{result.min_dpi:.0f} dpi")
             statuses.append("pass")
         else:
-            worst = min(result.images, key=lambda im: im.dpi)
+            scope_images = result.dpi_scope_images() or result.images
+            worst = min(scope_images, key=lambda im: im.dpi)
             self.card_dpi.set_status("fail", f"{worst.dpi:.0f} dpi")
             statuses.append("fail")
             notes.append(translations.localize_text(
-                f"DPI dưới ngưỡng {da.DPI_MIN} dpi"
+                f"DPI dưới ngưỡng {da.DPI_MIN - da.DPI_TOLERANCE:.0f} dpi"
                 f" — thấp nhất ở trang {worst.page_no}"))
 
         # Độ nén — lỗi nhẹ.
@@ -1311,6 +1640,13 @@ class DigitizationAuditScreen(ScreenContent):
         else:
             bits.append("không khai báo PDF/A (không bắt buộc)")
         bits += notes
+        # Mô tả phạm vi rà soát để không hiểu nhầm là đã xét mọi tiêu chí
+        # trên mọi trang (v1: DPI trang 1 · OCR tối đa K trang đầu).
+        if getattr(result, "policy", "") == da.POLICY_V1:
+            bits.append(translations.localize_text(
+                f"Phạm vi rà soát: DPI trang 1 · OCR tối đa "
+                f"{max(1, result.ocr_scope_pages)} trang đầu · "
+                "màu/nén toàn tài liệu"))
         warn_segs = [
             f"<span style='color:{_COLOR_WARN_FG};'>⚠ "
             f"{html.escape(_audit_text(w))}</span>"
@@ -1350,7 +1686,7 @@ class DigitizationAuditScreen(ScreenContent):
             statuses.append("pass" if ok else "fail")
             if not ok:
                 notes.append(translations.localize_text(
-                    f"DPI dưới ngưỡng {da.DPI_MIN} dpi"))
+                    f"DPI dưới ngưỡng {da.DPI_MIN - da.DPI_TOLERANCE:.0f} dpi"))
 
         # Độ nén — không nén đạt; lossless chỉ cảnh báo vàng; lossy trượt.
         status = result.compression_status
