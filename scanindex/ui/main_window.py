@@ -75,6 +75,20 @@ DEFAULT_WINDOW_SIZE = QSize(1200, 680)
 WINDOW_SCREEN_MARGIN = 8
 
 
+def _pdf2word_file_threads() -> int:
+    """Số file-thread PDF→Word — chính sách nội bộ, TÁCH KHỎI ô concurrency
+    (mục 12.2.3): ô concurrency chỉ là số worker pool OCR. Mỗi file tự cấp
+    trang tới admission budget, nên vài file-thread là đủ no pool; nhiều hơn
+    chỉ thêm áp lực fitz/GIL trong process chính."""
+    try:
+        from scanindex.core.ocr import direct_engine as _de
+
+        capacity = int(_de.get_parallel_capacity())
+    except Exception:
+        capacity = 2
+    return max(2, min(8, capacity))
+
+
 def per_file_pre_workers(parallel_files: int) -> int:
     """Cap preprocessing thread count so N parallel files don't oversubscribe CPU.
     Each file's pre_process_pdf would otherwise grab cpu_count-1 threads."""
@@ -395,7 +409,7 @@ class MainWindow(QMainWindow):
         self._ui_watchdog_last_report = 0.0
 
         # Parallel OCR at file level. Each file uses ~4 internal ScreenAI workers.
-        self.max_parallel_ocr_files = max(1, (os.cpu_count() or 4) // SCREEN_AI_WORKERS_PER_FILE)
+        self.max_parallel_ocr_files = _pdf2word_file_threads()
         # DOCX export stays single-process; table models are memory-heavy.
         self.max_export_workers = 1
         self.ocr_executor = None
@@ -4286,9 +4300,18 @@ class MainWindow(QMainWindow):
 
         self.stop_event.clear()
         self.set_processing_state(True)
-        self.log(f"Starting Pipeline (Parallel OCR files: {max_w}, ~{max_w * SCREEN_AI_WORKERS_PER_FILE} OCR workers)...")
-
-        self.pipeline = ProcessingPipeline(self, pipeline_items, config)
+        # P1-04: tạo pipeline TRƯỚC khi log thuộc tính của nó — lần chạy đầu
+        # `self.pipeline` là None; khởi tạo thất bại phải trả trạng thái UI.
+        try:
+            self.pipeline = ProcessingPipeline(self, pipeline_items, config)
+        except Exception as exc:
+            self.set_processing_state(False)
+            self.log(f"Không khởi tạo được pipeline: {exc}", "err")
+            return
+        self.log(
+            f"Starting Pipeline (PDF→Word file threads: {self.pipeline.parallel_files}, "
+            f"OCR pool workers: {max_w})"
+        )
         self.pipeline.start()
 
     # ================================================================
@@ -4521,6 +4544,13 @@ class MainWindow(QMainWindow):
     # ================================================================
 
     def closeEvent(self, event):
+        if getattr(self, "_native_shutdown_complete", False):
+            event.accept()
+            return
+        event.ignore()
+        if getattr(self, "_native_shutdown_pending", False):
+            return
+        self._native_shutdown_pending = True
         self.save_settings()
         self.stop_ocr()
         if self.export_executor:
@@ -4538,7 +4568,47 @@ class MainWindow(QMainWindow):
             self.support_tools_screen.cleanup()
         except Exception:
             pass
-        event.accept()
+        # D1: dừng NATIVE worker (W/K/P) HỮU HẠN — shutdown hợp tác grace
+        # ngắn rồi hard-stop tree qua Windows Job Object; KHÔNG join vô hạn
+        # trên Qt thread (chờ tối đa deadline rồi accept close, job bảo đảm
+        # tree chết sau khi cửa sổ tắt). Acceptance mức cần test: phản hồi
+        # ≤1 s, grace 3 s, tổng ≤10 s.
+        try:
+            import threading as _threading
+
+            from scanindex.core.runtime.shutdown import shutdown_all
+
+            result = {}
+            def stop_runtime():
+                try:
+                    result["ok"] = shutdown_all()
+                except Exception:
+                    result["ok"] = False
+            _t = _threading.Thread(target=stop_runtime, name="runtime-shutdown", daemon=True)
+            _t.start()
+            self._native_shutdown_timer = QTimer(self)
+            def poll_shutdown():
+                if _t.is_alive():
+                    return
+                self._native_shutdown_timer.stop()
+                self._native_shutdown_pending = False
+                if result.get("ok") is True:
+                    from scanindex.infra.windows_job import close_app_job
+                    close_app_job()
+                    self._native_shutdown_complete = True
+                    self.close()
+                else:
+                    import logging
+                    logging.getLogger(__name__).error("Không xác nhận được toàn bộ worker đã dừng")
+                    QMessageBox.warning(self, "Chưa thể đóng an toàn",
+                                        "Không xác nhận được toàn bộ worker đã dừng. "
+                                        "Cửa sổ được giữ lại; hãy kiểm tra log.")
+            self._native_shutdown_timer.timeout.connect(poll_shutdown)
+            self._native_shutdown_timer.start(50)
+        except Exception:
+            import logging
+            self._native_shutdown_pending = False
+            logging.getLogger(__name__).exception("runtime shutdown_all lỗi")
 
 
 # ====================================================================
@@ -4569,7 +4639,10 @@ class ProcessingPipeline:
         self.app = app
         self.files = files
         self.config = config
-        self.parallel_files = int(config.get("max_workers", 4))
+        # TÁCH điều phối file khỏi số worker OCR (mục 12.2.3): số file là
+        # chính sách nội bộ — mỗi file tự cấp trang tới admission budget,
+        # pool 48 không cần 48 file-thread tiền xử lý trong process chính.
+        self.parallel_files = _pdf2word_file_threads()
         self.stop_event = threading.Event()
         # Track downstream futures so _run can wait for the whole run.
         self._down_futures: list = []
@@ -4609,7 +4682,7 @@ class ProcessingPipeline:
             if need_ocr:
                 self.app.update_item_status(item["list_type"], item["index"],
                                             "OCR Processing")
-                fut = self.executor.submit(self._ocr_single, f, item)
+                fut = self.executor.submit(self._ocr_and_dispatch, f, item)
                 all_ocr.append(fut)
                 fut.add_done_callback(self._make_ocr_done_cb(item))
             else:
@@ -4636,11 +4709,40 @@ class ProcessingPipeline:
         self.app.log("All files finished.", LOG_SUCCESS)
         self.app.signals.processing_finished.emit()
 
+    def _ocr_and_dispatch(self, f: dict, item: dict):
+        """OCR một file rồi nộp downstream NGAY TRONG task — TRƯỚC khi future
+        resolve.
+
+        Trước đây việc nộp downstream nằm trong done-callback: `wait(all_ocr)`
+        chỉ bảo đảm future RESOLVED, không bảo đảm callback chạy xong — main
+        thread có thể `shutdown()` downstream_executor trước khi callback kịp
+        submit → "cannot schedule new futures after shutdown", file bị đánh
+        dấu Failed dù OCR thành công và correct→metadata→export KHÔNG chạy.
+        Nộp trong task bảo đảm: wait(all_ocr) trả về ⇒ mọi submit đã xong."""
+        res, msg, out_path = self._ocr_single(f, item)
+        if res and not self.stop_event.is_set():
+            f["output_path"] = out_path
+            # QUAN TRỌNG: set trạng thái TRƯỚC khi nộp downstream —
+            # _process_downstream chặn theo f["status"] == "OCR Done" để chạy
+            # correction/metadata/export. Callback (chạy SAU downstream bắt
+            # đầu) chỉ là cập nhật UI, không còn là người set trạng thái.
+            f["status"] = "OCR Done"
+            item["ocr_success"] = True
+            self._submit_downstream(item)
+        return res, msg, out_path
+
     def _submit_downstream(self, item: dict):
         """Queue one file's correct→metadata→export on the downstream pool."""
         if self.stop_event.is_set():
             return
-        fut = self.downstream_executor.submit(self._process_downstream, item)
+        try:
+            fut = self.downstream_executor.submit(self._process_downstream, item)
+        except RuntimeError as exc:
+            # Phòng thủ hi hữu (executor đã đóng vì lý do khác): chạy inline
+            # thay vì mất bước correct→metadata→export của file.
+            self.app.log(f"Downstream pool đã đóng — chạy inline: {exc}")
+            self._process_downstream(item)
+            return
         with self._down_lock:
             self._down_futures.append(fut)
 
@@ -4657,14 +4759,13 @@ class ProcessingPipeline:
                 res, msg, out_path = fut.result()
                 f = item["dnd_item"]
                 if res:
+                    # Nộp downstream đã chạy TRONG task (_ocr_and_dispatch) —
+                    # callback chỉ cập nhật trạng thái UI (an toàn sau shutdown).
                     f["output_path"] = out_path
                     f["status"] = "OCR Done"
                     item["ocr_success"] = True
                     self.app.update_item_status(item["list_type"], item["index"],
                                                 "OCR Done", out_path)
-                    # OCR done → immediately start this file's downstream
-                    # stages without waiting for other files.
-                    self._submit_downstream(item)
                 else:
                     self.app.log(f"OCR Fail: {msg}", LOG_ERROR)
                     f["status"] = "Failed"

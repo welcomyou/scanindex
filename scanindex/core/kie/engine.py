@@ -45,8 +45,8 @@ def normalize_kie_mode(mode: str | None) -> str:
 
 def _resolve_repo_root() -> str:
     try:
-        from scanindex.infra.paths import get_base_dir
-        return get_base_dir()
+        from scanindex.infra.paths import get_app_dir
+        return get_app_dir()
     except Exception:
         return str(Path(__file__).resolve().parents[3])
 

@@ -1304,17 +1304,23 @@ def install_event_filter(app) -> None:
                     # Show/Polish translates the complete new dialog or
                     # screen. Paint handles labels/statuses whose source text
                     # changes later while the widget is already visible.
-                    retranslate_widget_tree(
-                        watched,
-                        include_children=event_type != QEvent.Type.Paint,
-                    )
+                    # Tables which translate their items on insertion only
+                    # need a full pass on Show/Polish or a language change.
+                    # Walking their model on every repaint makes scrolling
+                    # depend on the total number of rows, not visible rows.
+                    if (event_type != QEvent.Type.Paint or not
+                            watched.property("_scanindex_i18n_explicit_items")):
+                        retranslate_widget_tree(
+                            watched,
+                            include_children=event_type != QEvent.Type.Paint,
+                        )
                     # Item views paint their contents on a viewport child;
                     # translate their model/header items through the parent.
                     if event_type == QEvent.Type.Paint:
                         parent = watched.parentWidget()
                         if parent is not None and isinstance(
                             parent, (QTableWidget, QListWidget, QTreeWidget)
-                        ):
+                        ) and not parent.property("_scanindex_i18n_explicit_items"):
                             retranslate_widget_tree(
                                 parent, include_children=False
                             )

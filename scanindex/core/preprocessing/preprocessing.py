@@ -13,7 +13,7 @@ try:
 except Exception:
     ort = None
 
-from scanindex.infra.paths import get_base_dir
+from scanindex.infra.paths import get_base_dir, get_app_dir
 
 APP_BASE_DIR = get_base_dir()
 
@@ -56,7 +56,7 @@ _FULL_PAGE_IMAGE_THRESHOLD = 0.7
 _MEANINGFUL_TEXT_WORDS = 20
 _ORIENTATION_ANALYSIS_MAX_SIDE = 1280
 _ORIENTATION_CLASSIFIER_PATH = os.path.join(
-    APP_BASE_DIR, "models", "orientation", "PP-LCNet_x1_0_doc_ori.onnx"
+    get_app_dir(), "models", "orientation", "PP-LCNet_x1_0_doc_ori.onnx"
 )
 _ORIENTATION_CLASSIFIER_LABELS = ("0", "90", "180", "270")
 _ORIENTATION_CLASSIFIER_RESIZE_SHORT = 256

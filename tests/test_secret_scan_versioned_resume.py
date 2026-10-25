@@ -13,6 +13,27 @@ Bộ test này khớp các tiêu chí nghiệm thu trong REVIEW_secret_scan_vers
 """
 from __future__ import annotations
 
+
+def _artifact_scan(fake):
+    """Bọc fake trả list matches thành fake trả SecretScanArtifact (worker v4
+    gọi `scan_one_file_for_secret_artifact` thay cho wrapper list cũ). Chỉ
+    forward CÁC KWARG HỢP ĐỒNG CŨ (page_limit/run_id) — kwarg nội bộ mới
+    (kie_spool_cb...) không đụng tới fake (fake giả lập tầng scan, không phải
+    tầng spool)."""
+    def wrapped(source_path, rel, file_work, first_page_only, cancel, log, **kw):
+        legacy = {
+            k: v for k, v in kw.items() if k in ("page_limit", "run_id")
+        }
+        matches = fake(source_path, rel, file_work, first_page_only, cancel, log, **legacy)
+        return sfss.SecretScanArtifact(
+            matches=list(matches),
+            source_pdf=source_path,
+            canonical={},
+            status="clean",
+        )
+    return wrapped
+
+
 import json
 import os
 import sys
@@ -377,7 +398,7 @@ def test_worker_resume_rescan_end_to_end(qapp, tmp_path) -> None:
         return []  # f1 giờ là FP (rớt), f2/f3/f4 sạch
 
     monkeypatch_holder = pytest.MonkeyPatch()
-    monkeypatch_holder.setattr(sfss, "scan_one_file_for_secret", fake_scan)
+    monkeypatch_holder.setattr(sfss, "scan_one_file_for_secret_artifact", _artifact_scan(fake_scan))
     try:
         screen = _screen(qapp)
         _restore_rows(screen, prog, folder)
@@ -432,7 +453,7 @@ def test_worker_restart_bypasses_cache(qapp, tmp_path) -> None:
         return []
 
     mp = pytest.MonkeyPatch()
-    mp.setattr(sfss, "scan_one_file_for_secret", fake_scan)
+    mp.setattr(sfss, "scan_one_file_for_secret_artifact", _artifact_scan(fake_scan))
     try:
         screen = _screen(qapp)
         screen.history_checkbox.setChecked(True)
@@ -455,7 +476,7 @@ def test_worker_rescan_failure_keeps_old_rows(qapp, tmp_path) -> None:
         return []
 
     mp = pytest.MonkeyPatch()
-    mp.setattr(sfss, "scan_one_file_for_secret", fake_scan)
+    mp.setattr(sfss, "scan_one_file_for_secret_artifact", _artifact_scan(fake_scan))
     try:
         screen = _screen(qapp)
         _restore_rows(screen, prog, folder)
@@ -495,7 +516,7 @@ def test_worker_cancel_mid_rescan_then_continue(qapp, tmp_path, monkeypatch) -> 
             return [_m(f0, keyword="MẬT", source_version=NEW_VERSION)]
         return []
 
-    monkeypatch.setattr(sfss, "scan_one_file_for_secret", fake_scan)
+    monkeypatch.setattr(sfss, "scan_one_file_for_secret_artifact", _artifact_scan(fake_scan))
     decision = ResumeDecision(
         ResumeDecision.RESUME_RESCAN,
         prog=ssp.SecretScanProgress.load(folder, "fast"),
@@ -521,7 +542,7 @@ def test_worker_cancel_mid_rescan_then_continue(qapp, tmp_path, monkeypatch) -> 
         calls2.append(source_path)
         return []
 
-    monkeypatch.setattr(sfss, "scan_one_file_for_secret", fake_scan2)
+    monkeypatch.setattr(sfss, "scan_one_file_for_secret_artifact", _artifact_scan(fake_scan2))
     decision2 = ResumeDecision(ResumeDecision.RESUME_RESCAN, prog=loaded)
     _run_sync(screen, folder, decision2)
     # Chỉ f1 (rescan dở) + f2 (pending) — f0 không quét lại.
@@ -543,7 +564,7 @@ def test_worker_err_file_single_task(qapp, tmp_path) -> None:
         return []
 
     mp = pytest.MonkeyPatch()
-    mp.setattr(sfss, "scan_one_file_for_secret", fake_scan)
+    mp.setattr(sfss, "scan_one_file_for_secret_artifact", _artifact_scan(fake_scan))
     try:
         screen = _screen(qapp)
         decision = ResumeDecision(
@@ -714,7 +735,7 @@ def test_worker_rescan_mixed_case_filename(qapp, tmp_path, monkeypatch) -> None:
         calls.append(source_path)
         return []
 
-    monkeypatch.setattr(sfss, "scan_one_file_for_secret", fake_scan)
+    monkeypatch.setattr(sfss, "scan_one_file_for_secret_artifact", _artifact_scan(fake_scan))
     prog = ssp.SecretScanProgress.load(str(folder), "fast")
     decision = ResumeDecision(
         ResumeDecision.RESUME_RESCAN,
@@ -764,7 +785,7 @@ def test_worker_rescan_heals_poisoned_pending(qapp, tmp_path, monkeypatch) -> No
         calls.append(source_path)
         return [_m(fa_s, source_version=NEW_VERSION)]
 
-    monkeypatch.setattr(sfss, "scan_one_file_for_secret", fake_scan)
+    monkeypatch.setattr(sfss, "scan_one_file_for_secret_artifact", _artifact_scan(fake_scan))
     loaded = ssp.SecretScanProgress.load(folder_s, "fast")
     assert loaded is not None and loaded.rescan_pending
     decision = ResumeDecision(
@@ -834,7 +855,7 @@ def test_worker_resume_progress_counts_whole_folder(
     def fake_scan(source_path, *args):
         return []
 
-    monkeypatch.setattr(sfss, "scan_one_file_for_secret", fake_scan)
+    monkeypatch.setattr(sfss, "scan_one_file_for_secret_artifact", _artifact_scan(fake_scan))
     decision = ResumeDecision(
         ResumeDecision.RESUME,
         prog=ssp.SecretScanProgress.load(folder, "fast"),
@@ -844,3 +865,1163 @@ def test_worker_resume_progress_counts_whole_folder(
     assert seen and seen[0] == (2, 3)   # khởi động ở 2/3, không phải 0/1
     assert seen[-1] == (3, 3)           # kết thúc đúng 100% toàn thư mục
     assert max(c for c, _ in seen) == 3  # không vượt total
+
+
+# ---------------------------------------------------------------------------
+# Review FIX REPORT (lượt 2) — P1-D: nghĩa vụ retry qua các lượt; P1-E:
+# commit muộn sau khi lượt đóng không được chạm journal.
+#
+# Hai kịch bản này điều phối Qt worker + commit KIE trên pool thread — chạy
+# IN-PROCESS trong pytest tái hiện abort native (PySide/threads/deepcopy —
+# chỉ xảy ra trong môi trường pytest, không tái hiện khi chạy script cùng
+# luồng lệnh: 3/3 sạch). Vì vậy chạy qua SUBPROCESS — cô lập như app thật;
+# kịch bản tự assert và exit 0 khi đạt.
+# ---------------------------------------------------------------------------
+
+_P1D_SCRIPT = """import os, sys, tempfile
+sys.path.insert(0, r"D:\\App\\ocrtool")
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+from PySide6.QtWidgets import QApplication
+app = QApplication.instance() or QApplication([])
+import pytest_shim  # noqa: F401  (đảm bảo import lỗi rõ ràng nếu thiếu)
+"""
+
+
+def _run_worker_scenario(script: str) -> None:
+    import subprocess
+
+    env = dict(os.environ)
+    env["QT_QPA_PLATFORM"] = "offscreen"
+    repo = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    env["PYTHONPATH"] = repo + os.pathsep + env.get("PYTHONPATH", "")
+    r = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=repo, env=env, timeout=600,
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
+    assert r.returncode == 0, (
+        "kịch bản worker thất bại (exit %s):\n%s\n%s"
+        % (r.returncode, r.stdout[-2000:], r.stderr[-2000:])
+    )
+
+
+def test_rescan_retry_keeps_pending_until_metadata_ok(tmp_path) -> None:
+    """P1-D: file quét lại (replace) metadata chưa hoàn tất → rescan_pending
+    phải GIỮ qua các lượt retry — `commit_replace_file` xóa rel khỏi tập thì
+    phải thêm lại ngay (trước đây nhánh replace không thêm lại → lượt retry
+    lỗi xóa nghĩa vụ retry, journal bị discard). Chuỗi 3 lượt: lỗi → lỗi →
+    thành công, reload journal/registry giữa các lượt."""
+    script = """
+import os, sys, tempfile
+sys.path.insert(0, r"%(repo)s")
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+from PySide6.QtCore import QCoreApplication
+from PySide6.QtWidgets import QApplication
+app = QApplication.instance() or QApplication([])
+
+import scanindex.core.secret_scan_progress as ssp
+import scanindex.ui.screens.secret_file_scan_screen as sfss
+from scanindex.ui.screens.secret_file_scan_screen import (
+    SecretScanMatch, ResumeDecision,
+)
+
+NEW_VERSION, OLD_VERSION = "test-9.9.9", "test-0.9.0"
+import scanindex.infra.version as _ver
+_ver.get_version = lambda: NEW_VERSION
+
+tmp = tempfile.mkdtemp()
+folder = os.path.join(tmp, "kho")
+os.makedirs(folder)
+f0 = os.path.join(folder, "f0.pdf")
+open(f0, "wb").write(b"%%PDF-1.4 fake")
+ssp.progress_dir = lambda: os.path.join(tmp, "scan_progress")
+
+prog = ssp.SecretScanProgress.create(folder, "fast", OLD_VERSION)
+prog.record_file("f0.pdf", "ok")
+prog.record_matches([{"source_path": f0, "relative_path": "f0.pdf",
+                      "keyword": "MẬT", "page_number": 1,
+                      "mode": "Trang đầu", "ocr_pdf_path": "", "note": "x"}])
+prog.save(); prog.close()
+prog = ssp.SecretScanProgress.load(folder, "fast")
+prog.set_rescan_pending(["f0.pdf"])
+prog.save(); prog.close()
+
+applied = {"applied": False}
+
+def fake_scan(source_path, rel, file_work, first_page_only, cancel, log, **kw):
+    return sfss.SecretScanArtifact(
+        matches=[SecretScanMatch(
+            source_path=source_path, relative_path=rel, keyword="MẬT",
+            page_number=1, mode="Trang đầu", ocr_pdf_path="",
+        )],
+        source_pdf=source_path, canonical={},
+        status="confirmed_positive", metadata_pending=True,
+        kie_state={"applied": applied["applied"]},
+    )
+
+sfss.scan_one_file_for_secret_artifact = fake_scan
+
+def run_once():
+    screen = sfss.SecretFileScanScreen()
+    screen._busy = True
+    screen._cancel_event.clear()
+    screen._run_worker(folder, True, ResumeDecision(
+        ResumeDecision.RESUME_RESCAN,
+        prog=ssp.SecretScanProgress.load(folder, "fast"),
+        rescan_abs=[ssp._norm_path(f0)],
+    ))
+    for _ in range(200):
+        QCoreApplication.processEvents()
+
+# Lượt 1+2: metadata lỗi → rescan_pending phải GIỮ (nhánh replace)
+for run_idx in (1, 2):
+    run_once()
+    after = ssp.SecretScanProgress.load(folder, "fast")
+    assert after is not None, "lượt dở → journal không được discard"
+    assert "f0.pdf" in after.rescan_pending, (
+        f"lượt {run_idx}: metadata lỗi → file phải còn trong tập quét lại "
+        f"(thấy {after.rescan_pending})"
+    )
+    assert after.needs_continue(), "journal phải được giữ"
+
+# Lượt 3: metadata đủ → nghĩa vụ retry gỡ, registry cache-final
+applied["applied"] = True
+run_once()
+after = ssp.SecretScanProgress.load(folder, "fast")
+if after is not None:
+    assert "f0.pdf" not in after.rescan_pending, (
+        f"metadata đủ → không còn nghĩa vụ quét lại (thấy {after.rescan_pending})"
+    )
+reg = ssp.FileRegistry.load()
+hit = reg.lookup_with_status(
+    f0, os.path.getsize(f0), os.path.getmtime(f0), "fast", NEW_VERSION
+)
+reg.close()
+assert hit is not None, "metadata đủ → phải được cache-final"
+print("P1D-OK")
+""" % {"repo": os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))}
+    _run_worker_scenario(script)
+
+
+def test_late_commit_after_close_touches_nothing(tmp_path) -> None:
+    """P1-E: callback commit muộn sau khi lượt đã đóng (cancel giữa chừng)
+    KHÔNG được mở lại journal/close-file — chỉ được bỏ; file chưa có dòng
+    journal thì lượt sau tự quét lại (trước đây: mở lại journal ghi event
+    'f' không header, reader trả None)."""
+    script = """
+import os, sys, tempfile
+sys.path.insert(0, r"%(repo)s")
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+from PySide6.QtCore import QCoreApplication
+from PySide6.QtWidgets import QApplication
+app = QApplication.instance() or QApplication([])
+
+import scanindex.core.secret_scan_progress as ssp
+import scanindex.ui.screens.secret_file_scan_screen as sfss
+from scanindex.ui.screens.secret_file_scan_screen import ResumeDecision
+
+NEW_VERSION, OLD_VERSION = "test-9.9.9", "test-0.9.0"
+import scanindex.infra.version as _ver
+_ver.get_version = lambda: NEW_VERSION
+
+tmp = tempfile.mkdtemp()
+folder = os.path.join(tmp, "kho")
+os.makedirs(folder)
+f0 = os.path.join(folder, "f0.pdf")
+open(f0, "wb").write(b"%%PDF-1.4 fake")
+ssp.progress_dir = lambda: os.path.join(tmp, "scan_progress")
+
+prog = ssp.SecretScanProgress.create(folder, "fast", OLD_VERSION)
+# f0 CHƯA ghi gì — nằm hàng đợi pending của lượt RESUME (nếu ghi "ok" thì
+# lượt kế thừa bỏ qua, fake scan không bao giờ chạy)
+prog.save(); prog.close()
+
+holder = {}
+
+def fake_scan(source_path, rel, file_work, first_page_only, cancel, log, **kw):
+    art = sfss.SecretScanArtifact(
+        matches=[], source_pdf=source_path, canonical={},
+        status="clean", metadata_pending=True,
+        kie_state={"applied": False},
+    )
+    holder["state"] = art.kie_state
+    cancel.set()  # hủy lượt SAU khi file scan xong — drain cuối lượt bị bỏ
+    return art
+
+sfss.scan_one_file_for_secret_artifact = fake_scan
+
+screen = sfss.SecretFileScanScreen()
+screen._busy = True
+screen._cancel_event.clear()
+screen._run_worker(folder, True, ResumeDecision(
+    ResumeDecision.RESUME, prog=ssp.SecretScanProgress.load(folder, "fast"),
+))
+for _ in range(200):
+    QCoreApplication.processEvents()
+rows_before = screen.table.rowCount()
+state = holder.get("state")
+assert state is not None, "phải có kie_state chờ ACK"
+cb = state.get("on_applied")
+assert cb is not None, "entry phải đăng ký on_applied"
+cb(); cb()  # callback muộn SAU khi lượt đóng — gọi nhiều lần phải an toàn
+for _ in range(50):
+    QCoreApplication.processEvents()
+assert screen.table.rowCount() == rows_before, (
+    "commit muộn sau close không được phát thêm hàng"
+)
+after = ssp.SecretScanProgress.load(folder, "fast")
+if after is not None:
+    assert "f0.pdf" not in after.ok_files(), (
+        "commit muộn sau close không được ghi journal — file phải còn "
+        "nghĩa vụ quét lại ở lượt sau (chưa có dòng ok)"
+    )
+print("P1E-OK")
+""" % {"repo": os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))}
+    _run_worker_scenario(script)
+
+
+def _run_worker_scenario_script(script: str) -> None:
+    import subprocess
+
+    env = dict(os.environ)
+    env["QT_QPA_PLATFORM"] = "offscreen"
+    repo = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    env["PYTHONPATH"] = repo + os.pathsep + env.get("PYTHONPATH", "")
+    r = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=repo, env=env, timeout=600,
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
+    assert r.returncode == 0, (
+        "kịch bản worker thất bại (exit %s):\n%s\n%s"
+        % (r.returncode, r.stdout[-2500:], r.stderr[-2500:])
+    )
+
+
+def test_commit_persist_error_retries_without_duplicate(tmp_path) -> None:
+    """R2-02: persist (prog.save) của commit lỗi MỘT LẦN rồi thành công →
+    đúng 1 hàng UI, đúng 1 match trong journal, scanned=1, failures=0
+    (trước đây retry phát lại emit + append trùng: 2 hàng, match 1→2)."""
+    script = """
+import os, sys, tempfile
+sys.path.insert(0, r"%(repo)s")
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+from PySide6.QtCore import QCoreApplication
+from PySide6.QtWidgets import QApplication
+app = QApplication.instance() or QApplication([])
+
+import scanindex.core.secret_scan_progress as ssp
+import scanindex.ui.screens.secret_file_scan_screen as sfss
+from scanindex.ui.screens.secret_file_scan_screen import (
+    SecretScanMatch, ResumeDecision,
+)
+
+NEW_VERSION, OLD_VERSION = "test-9.9.9", "test-0.9.0"
+import scanindex.infra.version as _ver
+_ver.get_version = lambda: NEW_VERSION
+
+tmp = tempfile.mkdtemp()
+folder = os.path.join(tmp, "kho")
+os.makedirs(folder)
+f0 = os.path.join(folder, "f0.pdf")
+open(f0, "wb").write(b"%%PDF-1.4 fake")
+ssp.progress_dir = lambda: os.path.join(tmp, "scan_progress")
+
+prog = ssp.SecretScanProgress.create(folder, "fast", OLD_VERSION)
+prog.save(); prog.close()
+
+# Fault injection: save THỨ HAI SAU KHI SCAN (persist của commit deferred
+# trong drain — save đầu sau scan là file-worker finally) ném OSError một
+# lần, các lần sau thành công.
+_orig_save = ssp.SecretScanProgress.save
+_save_state = {"after_scan": 0, "scan": False, "failed": False}
+
+def _save_marked(self):
+    if _save_state["scan"]:
+        _save_state["after_scan"] += 1
+        if _save_state["after_scan"] == 2 and not _save_state["failed"]:
+            _save_state["failed"] = True
+            raise OSError("injected fsync failure (commit persist)")
+    _orig_save(self)
+
+ssp.SecretScanProgress.save = _save_marked
+
+summary = {}
+
+def fake_scan(source_path, rel, file_work, first_page_only, cancel, log, **kw):
+    _save_state["scan"] = True
+    return sfss.SecretScanArtifact(
+        matches=[SecretScanMatch(
+            source_path=source_path, relative_path=rel, keyword="MẬT",
+            page_number=1, mode="Trang đầu", ocr_pdf_path="",
+        )],
+        source_pdf=source_path, canonical={},
+        status="confirmed_positive", metadata_pending=True,
+        # applied=False: metadata về TẠI DRAIN (đúng probe R2-02) — save
+        # sau scan: [1] file-worker finally, [2] persist của commit drain.
+        kie_state={"applied": False},
+    )
+
+sfss.scan_one_file_for_secret_artifact = fake_scan
+
+screen = sfss.SecretFileScanScreen()
+screen._scan_finished.connect(lambda s: summary.update(s))
+screen._busy = True
+screen._cancel_event.clear()
+screen._run_worker(folder, True, ResumeDecision(
+    ResumeDecision.RESUME, prog=ssp.SecretScanProgress.load(folder, "fast"),
+))
+for _ in range(200):
+    QCoreApplication.processEvents()
+
+assert screen.table.rowCount() == 1, (
+    f"phải đúng 1 hàng UI dù persist lỗi một lần (thấy {screen.table.rowCount()})"
+)
+assert summary.get("scanned") == 1, f"scanned phải là 1 (thấy {summary})"
+assert summary.get("failures") == 0, (
+    f"persist lỗi một lần phải retry thành công — failures=0 (thấy {summary})"
+)
+after = ssp.SecretScanProgress.load(folder, "fast")
+assert after is not None and len(after.matches) == 1, (
+    f"journal phải đúng 1 match (thấy {len(after.matches) if after else None})"
+)
+assert "f0.pdf" in after.ok_files()
+# applied=False (metadata chưa áp) → KHÔNG cache-final (P1-07) nhưng phải
+# còn nghĩa vụ quét lại; retry persist KHÔNG được phát lại hàng/match.
+assert "f0.pdf" in after.rescan_pending, (
+    f"metadata chưa áp → file phải còn nghĩa vụ quét lại "
+    f"(thấy {after.rescan_pending})"
+)
+reg = ssp.FileRegistry.load()
+hit = reg.lookup_with_status(
+    f0, os.path.getsize(f0), os.path.getmtime(f0), "fast", NEW_VERSION
+)
+reg.close()
+assert hit is None, (
+    "metadata chưa áp → KHÔNG được cache-final (P1-07 giữ nguyên)"
+)
+print("R2-02-OK")
+""" % {"repo": os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))}
+    _run_worker_scenario_script(script)
+
+
+def test_commit_publish_error_keeps_retry_obligation(tmp_path) -> None:
+    """R2-01: ACK-sớm + commit PUBLISH lỗi (lặp) → entry phải còn trong cơ
+    chế retry: failures được đếm, rescan_pending giữ file, journal KHÔNG bị
+    discard — sau reload file phải còn nghĩa vụ quét lại (không mất cả kết
+    quả lẫn nghĩa vụ). Lượt sau (không lỗi) phải chuyển nghĩa vụ thành kết
+    quả bền vững."""
+    script = """
+import os, sys, tempfile
+sys.path.insert(0, r"%(repo)s")
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+from PySide6.QtCore import QCoreApplication
+from PySide6.QtWidgets import QApplication
+app = QApplication.instance() or QApplication([])
+
+import scanindex.core.secret_scan_progress as ssp
+import scanindex.ui.screens.secret_file_scan_screen as sfss
+from scanindex.ui.screens.secret_file_scan_screen import (
+    SecretScanMatch, ResumeDecision,
+)
+
+NEW_VERSION, OLD_VERSION = "test-9.9.9", "test-0.9.0"
+import scanindex.infra.version as _ver
+_ver.get_version = lambda: NEW_VERSION
+
+tmp = tempfile.mkdtemp()
+folder = os.path.join(tmp, "kho")
+os.makedirs(folder)
+f0 = os.path.join(folder, "f0.pdf")
+open(f0, "wb").write(b"%%PDF-1.4 fake")
+ssp.progress_dir = lambda: os.path.join(tmp, "scan_progress")
+
+prog = ssp.SecretScanProgress.create(folder, "fast", OLD_VERSION)
+prog.save(); prog.close()
+
+# Fault injection: journal publish (commit_replace_file) LUÔN lỗi trong
+# lượt 1 — mô phỏng lỗi ghi dữ liệu lặp. Bật/tắt qua file cờ.
+fail_flag = os.path.join(tmp, "fail_commit")
+open(fail_flag, "w").write("1")
+
+_orig_crf = ssp.SecretScanProgress.commit_replace_file
+
+def _crf_marked(self, rel, abs_norm, match_dicts):
+    if os.path.exists(fail_flag):
+        raise OSError("injected journal publish failure")
+    _orig_crf(self, rel, abs_norm, match_dicts)
+
+ssp.SecretScanProgress.commit_replace_file = _crf_marked
+
+applied = {"applied": True}
+summary = {}
+
+def fake_scan(source_path, rel, file_work, first_page_only, cancel, log, **kw):
+    return sfss.SecretScanArtifact(
+        matches=[SecretScanMatch(
+            source_path=source_path, relative_path=rel, keyword="MẬT",
+            page_number=1, mode="Trang đầu", ocr_pdf_path="",
+        )],
+        source_pdf=source_path, canonical={},
+        status="confirmed_positive", metadata_pending=True,
+        kie_state={"applied": applied["applied"]},
+    )
+
+sfss.scan_one_file_for_secret_artifact = fake_scan
+
+def run_once():
+    screen = sfss.SecretFileScanScreen()
+    screen._scan_finished.connect(lambda s: summary.update(s))
+    screen._busy = True
+    screen._cancel_event.clear()
+    screen._run_worker(folder, True, ResumeDecision(
+        ResumeDecision.RESUME_RESCAN,
+        prog=ssp.SecretScanProgress.load(folder, "fast"),
+        rescan_abs=[ssp._norm_path(f0)],
+    ))
+    for _ in range(200):
+        QCoreApplication.processEvents()
+    return screen
+
+# Lượt 1: publish luôn lỗi → failures được đếm, rescan_pending giữ,
+# journal KHÔNG discard (không mất cả kết quả lẫn nghĩa vụ retry).
+screen = run_once()
+assert summary.get("failures", 0) >= 1, (
+    f"commit lỗi lặp phải báo failure (thấy {summary})"
+)
+after = ssp.SecretScanProgress.load(folder, "fast")
+assert after is not None, "còn nghĩa vụ retry → journal phải được giữ"
+assert "f0.pdf" in after.rescan_pending, (
+    f"file phải còn trong tập quét lại (thấy {after.rescan_pending})"
+)
+assert "f0.pdf" not in after.ok_files(), (
+    "publish lỗi → không được coi là đã có kết quả bền vững"
+)
+
+# Lượt 2: hết lỗi → nghĩa vụ chuyển thành kết quả bền vững.
+os.remove(fail_flag)
+applied["applied"] = True
+summary.clear()
+screen = run_once()
+after = ssp.SecretScanProgress.load(folder, "fast")
+if after is not None:
+    assert "f0.pdf" not in after.rescan_pending, (
+        f"lượt thành công → hết nghĩa vụ (thấy {after.rescan_pending})"
+    )
+reg = ssp.FileRegistry.load()
+hit = reg.lookup_with_status(
+    f0, os.path.getsize(f0), os.path.getmtime(f0), "fast", NEW_VERSION
+)
+reg.close()
+assert hit is not None, "lượt 2 thành công → registry phải có kết quả"
+print("R2-01-OK")
+""" % {"repo": os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))}
+    _run_worker_scenario_script(script)
+
+
+# ---------------------------------------------------------------------------
+# Review vòng 4 (R3) — R3-01 registry append, R3-02 cửa sổ đăng ký,
+# R3-05 fingerprint của đúng phiên bản đã đọc. Chạy SUBPROCESS như các test
+# P1-D/P1-E/R2-01/R2-02 (cô lập native abort của pytest-env).
+# ---------------------------------------------------------------------------
+
+def test_registry_record_error_one_shot_retries_via_drain(tmp_path) -> None:
+    """R3-01 (K deferred ON, replace, có entry cũ): registry record lỗi ĐÚNG
+    MỘT lần → lỗi phải đi lên cơ chế commit retry (không nuốt như
+    `except OSError: pass` cũ) — drain thử lại ngay: scanned=1, failures=0,
+    reload registry THẤY kết quả, journal hoàn tất sạch."""
+    script = """
+import os, sys, tempfile
+sys.path.insert(0, r"%(repo)s")
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+from PySide6.QtCore import QCoreApplication
+from PySide6.QtWidgets import QApplication
+app = QApplication.instance() or QApplication([])
+
+import scanindex.core.secret_scan_progress as ssp
+import scanindex.ui.screens.secret_file_scan_screen as sfss
+from scanindex.ui.screens.secret_file_scan_screen import (
+    SecretScanMatch, ResumeDecision,
+)
+
+NEW_VERSION, OLD_VERSION = "test-9.9.9", "test-0.9.0"
+import scanindex.infra.version as _ver
+_ver.get_version = lambda: NEW_VERSION
+
+tmp = tempfile.mkdtemp()
+folder = os.path.join(tmp, "kho")
+os.makedirs(folder)
+f0 = os.path.join(folder, "f0.pdf")
+open(f0, "wb").write(b"%%PDF-1.4 fake")
+ssp.progress_dir = lambda: os.path.join(tmp, "scan_progress")
+
+# Journal bản cũ: f0 đã quét (có entry cũ trong registry — kịch bản replace).
+prog = ssp.SecretScanProgress.create(folder, "fast", OLD_VERSION)
+prog.record_file("f0.pdf", "ok")
+prog.record_matches([{"source_path": f0, "relative_path": "f0.pdf",
+                      "keyword": "MẬT", "page_number": 1,
+                      "mode": "Trang đầu", "ocr_pdf_path": "", "note": "x"}])
+prog.save(); prog.close()
+reg = ssp.FileRegistry.load()
+st0 = os.stat(f0)
+reg.record(f0, st0.st_size, st0.st_mtime, "fast", OLD_VERSION, [])
+reg.save(); reg.close()
+prog = ssp.SecretScanProgress.load(folder, "fast")
+prog.set_rescan_pending(["f0.pdf"])
+prog.save(); prog.close()
+
+# Fault: append event 'r' của registry lỗi ĐÚNG MỘT LẦN — bật TRONG fake_scan
+# (sau đường nâng cấp kế thừa, đúng lúc commit kết quả quét).
+_orig_al = ssp.FileRegistry._append_line
+_fault = {"left": 0}
+
+def _al_marked(self, event):
+    if _fault["left"] > 0 and event.get("t") == "r":
+        _fault["left"] -= 1
+        raise OSError("injected registry append failure")
+    return _orig_al(self, event)
+
+ssp.FileRegistry._append_line = _al_marked
+
+def fake_scan(source_path, rel, file_work, first_page_only, cancel, log, **kw):
+    _fault["left"] = 1
+    return sfss.SecretScanArtifact(
+        matches=[SecretScanMatch(
+            source_path=source_path, relative_path=rel, keyword="MẬT",
+            page_number=1, mode="Trang đầu", ocr_pdf_path="",
+        )],
+        source_pdf=source_path, canonical={},
+        status="confirmed_positive", metadata_pending=True,
+        kie_state={"applied": True},
+    )
+
+sfss.scan_one_file_for_secret_artifact = fake_scan
+
+summary = {}
+screen = sfss.SecretFileScanScreen()
+screen._scan_finished.connect(lambda s: summary.update(s))
+screen._busy = True
+screen._cancel_event.clear()
+screen._run_worker(folder, True, ResumeDecision(
+    ResumeDecision.RESUME_RESCAN,
+    prog=ssp.SecretScanProgress.load(folder, "fast"),
+    rescan_abs=[ssp._norm_path(f0)],
+))
+for _ in range(200):
+    QCoreApplication.processEvents()
+
+assert summary.get("updated") == 1, (
+    f"lỗi một lần phải retry thành công qua drain — nhánh replace đếm "
+    f"updated=1 (thấy {summary})"
+)
+assert summary.get("failures") == 0, (
+    f"lỗi một lần KHÔNG được đếm failure (thấy {summary})"
+)
+after = ssp.SecretScanProgress.load(folder, "fast")
+if after is not None:
+    assert "f0.pdf" not in after.rescan_pending, (
+        f"commit thành công → hết nghĩa vụ quét lại (thấy {after.rescan_pending})"
+    )
+reg = ssp.FileRegistry.load()
+hit = reg.lookup_with_status(f0, os.path.getsize(f0), os.path.getmtime(f0),
+                             "fast", NEW_VERSION)
+reg.close()
+assert hit is not None and hit[0] and hit[0][0]["keyword"] == "MẬT", (
+    "R3-01: kết quả phải NẰM TRÊN ĐĨA sau retry (trước đây bị nuốt → mất)"
+)
+print("R3-01-ONESHOT-OK")
+""" % {"repo": os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))}
+    _run_worker_scenario_script(script)
+
+
+def test_registry_record_error_sync_counts_failure_keeps_journal(tmp_path) -> None:
+    """R3-01 (K OFF — đường đồng bộ, không entry cũ): record lỗi → KHÔNG được
+    `scanned=1, failures=0` rồi mất cả registry lẫn journal: failures >= 1,
+    registry reload KHÔNG có entry ma; lượt sau (hết lỗi) phải chuyển nghĩa
+    vụ thành kết quả bền vững."""
+    script = """
+import os, sys, tempfile
+sys.path.insert(0, r"%(repo)s")
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+from PySide6.QtCore import QCoreApplication
+from PySide6.QtWidgets import QApplication
+app = QApplication.instance() or QApplication([])
+
+import scanindex.core.secret_scan_progress as ssp
+import scanindex.ui.screens.secret_file_scan_screen as sfss
+from scanindex.ui.screens.secret_file_scan_screen import (
+    SecretScanMatch, ResumeDecision,
+)
+
+NEW_VERSION, OLD_VERSION = "test-9.9.9", "test-0.9.0"
+import scanindex.infra.version as _ver
+_ver.get_version = lambda: NEW_VERSION
+
+tmp = tempfile.mkdtemp()
+folder = os.path.join(tmp, "kho")
+os.makedirs(folder)
+f0 = os.path.join(folder, "f0.pdf")
+open(f0, "wb").write(b"%%PDF-1.4 fake")
+ssp.progress_dir = lambda: os.path.join(tmp, "scan_progress")
+
+prog = ssp.SecretScanProgress.create(folder, "fast", OLD_VERSION)
+prog.save(); prog.close()  # f0 chưa quét — hàng đợi pending của RESUME
+
+_orig_al = ssp.FileRegistry._append_line
+_fault = {"left": 0}
+
+def _al_marked(self, event):
+    if _fault["left"] > 0 and event.get("t") == "r":
+        _fault["left"] -= 1
+        raise OSError("injected registry append failure")
+    return _orig_al(self, event)
+
+ssp.FileRegistry._append_line = _al_marked
+
+_runs = {"n": 0}
+
+def fake_scan(source_path, rel, file_work, first_page_only, cancel, log, **kw):
+    _runs["n"] += 1
+    if _runs["n"] == 1:
+        _fault["left"] = 1  # chỉ lượt ĐẦU lỗi; lượt sau phải thành công
+    return sfss.SecretScanArtifact(
+        matches=[SecretScanMatch(
+            source_path=source_path, relative_path=rel, keyword="MẬT",
+            page_number=1, mode="Trang đầu", ocr_pdf_path="",
+        )],
+        source_pdf=source_path, canonical={}, status="clean",
+    )
+
+sfss.scan_one_file_for_secret_artifact = fake_scan
+
+summary = {}
+screen = sfss.SecretFileScanScreen()
+screen._scan_finished.connect(lambda s: summary.update(s))
+screen._busy = True
+screen._cancel_event.clear()
+screen._run_worker(folder, True, ResumeDecision(
+    ResumeDecision.RESUME, prog=ssp.SecretScanProgress.load(folder, "fast"),
+))
+for _ in range(200):
+    QCoreApplication.processEvents()
+
+assert summary.get("failures", 0) >= 1, (
+    f"R3-01: record lỗi phải đếm failure — không được scanned=1/failures=0 "
+    f"(thấy {summary})"
+)
+after = ssp.SecretScanProgress.load(folder, "fast")
+assert after is not None, "chưa có kết quả bền vững → journal phải được giữ"
+reg = ssp.FileRegistry.load()
+hit = reg.lookup_with_status(f0, os.path.getsize(f0), os.path.getmtime(f0),
+                             "fast", NEW_VERSION)
+reg.close()
+assert hit is None, (
+    "record lỗi → registry KHÔNG được có entry ma (RAM phải rollback)"
+)
+
+# Lượt 2: hết lỗi → nghĩa vụ chuyển thành kết quả bền vững.
+sfss.scan_one_file_for_secret_artifact = fake_scan
+summary.clear()
+screen = sfss.SecretFileScanScreen()
+screen._scan_finished.connect(lambda s: summary.update(s))
+screen._busy = True
+screen._cancel_event.clear()
+screen._run_worker(folder, True, ResumeDecision(
+    ResumeDecision.RESUME, prog=ssp.SecretScanProgress.load(folder, "fast"),
+))
+for _ in range(200):
+    QCoreApplication.processEvents()
+after = ssp.SecretScanProgress.load(folder, "fast")
+if after is not None:
+    assert "f0.pdf" not in after.rescan_pending, (
+        f"lượt thành công → hết nghĩa vụ (thấy {after.rescan_pending})"
+    )
+reg = ssp.FileRegistry.load()
+hit = reg.lookup_with_status(f0, os.path.getsize(f0), os.path.getmtime(f0),
+                             "fast", NEW_VERSION)
+reg.close()
+assert hit is not None and hit[0], "lượt 2 thành công → registry phải có kết quả"
+print("R3-01-SYNC-OK")
+""" % {"repo": os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))}
+    _run_worker_scenario_script(script)
+
+
+def test_registry_record_error_repeated_keeps_retry_obligation(tmp_path) -> None:
+    """R3-01 (K deferred ON, lỗi LẶP): entry phải ở lại cơ chế retry —
+    failures được đếm, rescan_pending giữ file, journal KHÔNG discard,
+    registry không có kết quả."""
+    script = """
+import os, sys, tempfile
+sys.path.insert(0, r"%(repo)s")
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+from PySide6.QtCore import QCoreApplication
+from PySide6.QtWidgets import QApplication
+app = QApplication.instance() or QApplication([])
+
+import scanindex.core.secret_scan_progress as ssp
+import scanindex.ui.screens.secret_file_scan_screen as sfss
+from scanindex.ui.screens.secret_file_scan_screen import (
+    SecretScanMatch, ResumeDecision,
+)
+
+NEW_VERSION, OLD_VERSION = "test-9.9.9", "test-0.9.0"
+import scanindex.infra.version as _ver
+_ver.get_version = lambda: NEW_VERSION
+
+tmp = tempfile.mkdtemp()
+folder = os.path.join(tmp, "kho")
+os.makedirs(folder)
+f0 = os.path.join(folder, "f0.pdf")
+open(f0, "wb").write(b"%%PDF-1.4 fake")
+ssp.progress_dir = lambda: os.path.join(tmp, "scan_progress")
+
+prog = ssp.SecretScanProgress.create(folder, "fast", OLD_VERSION)
+prog.record_file("f0.pdf", "ok")
+prog.record_matches([{"source_path": f0, "relative_path": "f0.pdf",
+                      "keyword": "MẬT", "page_number": 1,
+                      "mode": "Trang đầu", "ocr_pdf_path": "", "note": "x"}])
+prog.save(); prog.close()
+prog = ssp.SecretScanProgress.load(folder, "fast")
+prog.set_rescan_pending(["f0.pdf"])
+prog.save(); prog.close()
+
+_fail_flag = os.path.join(tmp, "fail_registry")  # bật TRONG fake_scan
+
+_orig_al = ssp.FileRegistry._append_line
+
+def _al_marked(self, event):
+    if os.path.exists(_fail_flag) and event.get("t") == "r":
+        raise OSError("injected registry append failure (repeated)")
+    return _orig_al(self, event)
+
+ssp.FileRegistry._append_line = _al_marked
+
+def fake_scan(source_path, rel, file_work, first_page_only, cancel, log, **kw):
+    open(_fail_flag, "w").write("1")  # sau đường nâng cấp kế thừa
+    return sfss.SecretScanArtifact(
+        matches=[SecretScanMatch(
+            source_path=source_path, relative_path=rel, keyword="MẬT",
+            page_number=1, mode="Trang đầu", ocr_pdf_path="",
+        )],
+        source_pdf=source_path, canonical={},
+        status="confirmed_positive", metadata_pending=True,
+        kie_state={"applied": True},
+    )
+
+sfss.scan_one_file_for_secret_artifact = fake_scan
+
+summary = {}
+screen = sfss.SecretFileScanScreen()
+screen._scan_finished.connect(lambda s: summary.update(s))
+screen._busy = True
+screen._cancel_event.clear()
+screen._run_worker(folder, True, ResumeDecision(
+    ResumeDecision.RESUME_RESCAN,
+    prog=ssp.SecretScanProgress.load(folder, "fast"),
+    rescan_abs=[ssp._norm_path(f0)],
+))
+for _ in range(200):
+    QCoreApplication.processEvents()
+
+assert summary.get("failures", 0) >= 1, (
+    f"lỗi lặp phải báo failure (thấy {summary})"
+)
+after = ssp.SecretScanProgress.load(folder, "fast")
+assert after is not None, "còn nghĩa vụ retry → journal phải được giữ"
+assert "f0.pdf" in after.rescan_pending, (
+    f"file phải còn nghĩa vụ quét lại (thấy {after.rescan_pending})"
+)
+reg = ssp.FileRegistry.load()
+hit = reg.lookup_with_status(f0, os.path.getsize(f0), os.path.getmtime(f0),
+                             "fast", NEW_VERSION)
+inherited = reg.inherited_count()
+reg.close()
+assert inherited >= 1, (
+    "record lỗi → entry bền vững còn lại phải là entry KẾ THỪA (RAM rollback "
+    "giữ entry cũ); entry kết quả mới KHÔNG được ghi đè bền vững"
+)
+assert hit is not None and hit[0], (
+    "kịch bản replace phải còn entry cũ tra được (không mất dữ liệu cũ)"
+)
+print("R3-01-REPEATED-OK")
+""" % {"repo": os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))}
+    _run_worker_scenario_script(script)
+
+
+def test_commit_records_scan_stat_not_fresh_stat(tmp_path) -> None:
+    """R3-05: nguồn đổi SAU khi quét/validate nhưng TRƯỚC record (fault point
+    của probe chuyên gia) → registry phải record fingerprint của ĐÚNG phiên
+    bản đã đọc (scan_stat) — lookup theo fingerprint nguồn MỚI phải MISS
+    (trước đây stat lại → cache hit cho nội dung chưa hề quét)."""
+    script = """
+import os, sys, tempfile
+sys.path.insert(0, r"%(repo)s")
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+from PySide6.QtCore import QCoreApplication
+from PySide6.QtWidgets import QApplication
+app = QApplication.instance() or QApplication([])
+
+import scanindex.core.secret_scan_progress as ssp
+import scanindex.ui.screens.secret_file_scan_screen as sfss
+from scanindex.ui.screens.secret_file_scan_screen import (
+    SecretScanMatch, ResumeDecision,
+)
+
+NEW_VERSION, OLD_VERSION = "test-9.9.9", "test-0.9.0"
+import scanindex.infra.version as _ver
+_ver.get_version = lambda: NEW_VERSION
+
+tmp = tempfile.mkdtemp()
+folder = os.path.join(tmp, "kho")
+os.makedirs(folder)
+f0 = os.path.join(folder, "f0.pdf")
+open(f0, "wb").write(b"%%PDF-1.4 fake")
+ssp.progress_dir = lambda: os.path.join(tmp, "scan_progress")
+
+prog = ssp.SecretScanProgress.create(folder, "fast", OLD_VERSION)
+prog.save(); prog.close()
+st_scan = os.stat(f0)  # fingerprint của phiên bản SẼ được đọc
+
+# Fault point "sau validation, trước record": nguồn đổi ngay sau khi
+# commit_replace_file chạy (validation đã xong), TRƯỚC khi registry.record.
+_orig_crf = ssp.SecretScanProgress.commit_replace_file
+
+def _crf_mutate(self, rel, abs_norm, match_dicts):
+    _orig_crf(self, rel, abs_norm, match_dicts)
+    with open(_mutate["path"], "ab") as f:
+        f.write(b"-modified-after-scan")
+
+_crf_mutate_path = None
+_mutate = {"path": f0}
+ssp.SecretScanProgress.commit_replace_file = _crf_mutate
+
+def fake_scan(source_path, rel, file_work, first_page_only, cancel, log, **kw):
+    return sfss.SecretScanArtifact(
+        matches=[SecretScanMatch(
+            source_path=source_path, relative_path=rel, keyword="MẬT",
+            page_number=1, mode="Trang đầu", ocr_pdf_path="",
+        )],
+        source_pdf=source_path, canonical={}, status="clean",
+    )
+
+sfss.scan_one_file_for_secret_artifact = fake_scan
+
+summary = {}
+screen = sfss.SecretFileScanScreen()
+screen._scan_finished.connect(lambda s: summary.update(s))
+screen._busy = True
+screen._cancel_event.clear()
+screen._run_worker(folder, True, ResumeDecision(
+    ResumeDecision.RESUME, prog=ssp.SecretScanProgress.load(folder, "fast"),
+))
+for _ in range(200):
+    QCoreApplication.processEvents()
+
+st_after = os.stat(f0)
+assert (st_after.st_size, st_after.st_mtime) != (st_scan.st_size, st_scan.st_mtime), (
+    "kịch bản phải thực sự đổi nguồn sau khi quét"
+)
+reg = ssp.FileRegistry.load()
+hit_new = reg.lookup_with_status(
+    f0, st_after.st_size, st_after.st_mtime, "fast", NEW_VERSION
+)
+hit_scan = reg.lookup_with_status(
+    f0, st_scan.st_size, st_scan.st_mtime, "fast", NEW_VERSION
+)
+reg.close()
+assert hit_new is None, (
+    "R3-05: kết quả của phiên bản ĐÃ ĐỌC không được gắn cho phiên bản MỚI "
+    "(stat lại để record là cache hit cho nội dung chưa quét)"
+)
+assert hit_scan is not None and hit_scan[0], (
+    "fingerprint của phiên bản đã đọc phải trúng cache (kết quả đúng chủ)"
+)
+print("R3-05-OK")
+""" % {"repo": os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))}
+    _run_worker_scenario_script(script)
+
+
+def test_callback_window_race_keeps_retry_entry(tmp_path) -> None:
+    """R3-02: callback KIE chạy TRONG cửa sổ publish/đăng ký (hoặc trước/sau
+    — cả ba lịch ACK) + commit lỗi MỘT lần → entry phải còn trong cơ chế
+    retry (đăng ký TRƯỚC publish): drain thử lại → đúng một kết quả bền.
+    (Bản cũ: callback đặt `committing` rồi worker bỏ qua append → entry
+    không nằm ở đâu cả → mất cả kết quả lẫn nghĩa vụ.)"""
+    script = """
+import os, sys, tempfile, threading
+sys.path.insert(0, r"%(repo)s")
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+from PySide6.QtCore import QCoreApplication
+from PySide6.QtWidgets import QApplication
+app = QApplication.instance() or QApplication([])
+
+import scanindex.core.secret_scan_progress as ssp
+import scanindex.core.secret_scan_kie as ssk
+import scanindex.ui.screens.secret_file_scan_screen as sfss
+from scanindex.ui.screens.secret_file_scan_screen import (
+    SecretScanMatch, ResumeDecision,
+)
+from concurrent.futures import ThreadPoolExecutor
+
+NEW_VERSION, OLD_VERSION = "test-9.9.9", "test-0.9.0"
+import scanindex.infra.version as _ver
+_ver.get_version = lambda: NEW_VERSION
+
+tmp = tempfile.mkdtemp()
+folder = os.path.join(tmp, "kho")
+os.makedirs(folder)
+f0 = os.path.join(folder, "f0.pdf")
+open(f0, "wb").write(b"%%PDF-1.4 fake")
+canon = os.path.join(tmp, "canon.json")
+open(canon, "w").write("{}")
+ssp.progress_dir = lambda: os.path.join(tmp, "scan_progress")
+
+prog = ssp.SecretScanProgress.create(folder, "fast", OLD_VERSION)
+prog.save(); prog.close()
+
+# Fault: journal publish (commit_replace_file) lỗi ĐÚNG MỘT LẦN — đúng điểm
+# inject của probe R3-02 (sau quyết định bỏ đăng ký của bản cũ).
+_orig_crf = ssp.SecretScanProgress.commit_replace_file
+_fault = {"left": 1}
+
+def _crf_marked(self, rel, abs_norm, match_dicts):
+    if _fault["left"] > 0:
+        _fault["left"] -= 1
+        raise OSError("injected journal publish failure")
+    return _orig_crf(self, rel, abs_norm, match_dicts)
+
+ssp.SecretScanProgress.commit_replace_file = _crf_marked
+
+# Coordinator thật (thread pool) — callback chạy trên thread delivery, đua
+# với file-worker ở đoạn publish/đăng ký.
+_coord = ssk.KieCoordinator(
+    processes=1,
+    executor_factory=lambda n: ThreadPoolExecutor(max_workers=n),
+    job_fn=lambda p: {"status": "ready",
+                      "fields_by_source": {0: [{"label": "X"}]}},
+)
+ssk._coordinator = _coord
+
+def fake_scan(source_path, rel, file_work, first_page_only, cancel, log, **kw):
+    state = {"applied": False, "error_code": None, "registered": False,
+             "on_applied": None, "lock": threading.Lock()}
+
+    def _deliver():
+        with state["lock"]:
+            deliver = state.get("on_applied") if state["registered"] else None
+        if deliver is not None:
+            try:
+                deliver()
+            except Exception:
+                pass
+
+    def _on_done(result):
+        state["applied"] = True
+        _deliver()
+
+    accepted, reason = _coord.submit(
+        {"job_id": "j1", "generation": 0, "canonical_path": canon,
+         "selected_ordinals": [0], "model_fp": "", "run_id": ""},
+        _on_done,
+    )
+    assert accepted, f"job phải được nhận ({reason})"
+    return sfss.SecretScanArtifact(
+        matches=[SecretScanMatch(
+            source_path=source_path, relative_path=rel, keyword="MẬT",
+            page_number=1, mode="Trang đầu", ocr_pdf_path="",
+        )],
+        source_pdf=source_path, canonical={},
+        status="confirmed_positive", metadata_pending=True,
+        kie_state=state,
+    )
+
+sfss.scan_one_file_for_secret_artifact = fake_scan
+
+summary = {}
+screen = sfss.SecretFileScanScreen()
+screen._scan_finished.connect(lambda s: summary.update(s))
+screen._busy = True
+screen._cancel_event.clear()
+screen._run_worker(folder, True, ResumeDecision(
+    ResumeDecision.RESUME, prog=ssp.SecretScanProgress.load(folder, "fast"),
+))
+for _ in range(300):
+    QCoreApplication.processEvents()
+
+assert summary.get("scanned") == 1, (
+    f"lỗi một lần phải retry thành công qua drain — scanned=1 (thấy {summary})"
+)
+assert summary.get("failures") == 0, (
+    f"lỗi một lần KHÔNG được đếm failure (thấy {summary})"
+)
+reg = ssp.FileRegistry.load()
+hit = reg.lookup_with_status(f0, os.path.getsize(f0), os.path.getmtime(f0),
+                             "fast", NEW_VERSION)
+reg.close()
+assert hit is not None and hit[0], (
+    "R3-02: đúng MỘT kết quả bền vững phải tồn tại sau retry — entry mất ở "
+    "cửa sổ đăng ký là mất cả kết quả lẫn nghĩa vụ (bản cũ)"
+)
+_coord.shutdown(wait=True)
+print("R3-02-WINDOW-OK")
+""" % {"repo": os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))}
+    _run_worker_scenario_script(script)
+
+
+# ---------------------------------------------------------------------------
+# Review chốt (D2) — durable KIE spool + KIE-only resume: restart chỉ resubmit
+# metadata khi snapshot còn hợp lệ; OCR-call counter PHẢI = 0 (bài bắt buộc
+# #7). Snapshot hỏng/nguồn đổi → quét lại toàn bộ kèm lý do rõ ràng.
+# ---------------------------------------------------------------------------
+
+def test_kie_only_resume_ocr_call_zero_then_full_rescan_when_stale(tmp_path) -> None:
+    script = """
+import hashlib, json, os, sys, tempfile, threading, time
+sys.path.insert(0, r"%(repo)s")
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+from PySide6.QtCore import QCoreApplication
+from PySide6.QtWidgets import QApplication
+app = QApplication.instance() or QApplication([])
+from concurrent.futures import ThreadPoolExecutor
+
+import scanindex.core.secret_scan_progress as ssp
+import scanindex.core.secret_scan_kie as ssk
+import scanindex.ui.screens.secret_file_scan_screen as sfss
+from scanindex.ui.screens.secret_file_scan_screen import (
+    SecretScanMatch, ResumeDecision,
+)
+
+NEW_VERSION, OLD_VERSION = "test-9.9.9", "test-0.9.0"
+import scanindex.infra.version as _ver
+_ver.get_version = lambda: NEW_VERSION
+
+tmp = tempfile.mkdtemp()
+folder = os.path.join(tmp, "kho")
+os.makedirs(folder)
+f0 = os.path.join(folder, "f0.pdf")
+open(f0, "wb").write(b"%%PDF-1.4 fake")
+ssp.progress_dir = lambda: os.path.join(tmp, "scan_progress")
+os.environ["OCRTOOL_KIE_DEFERRED"] = "1"
+os.environ["OCRTOOL_KIE_REFUSED_WAIT_S"] = "0"
+
+st0 = os.stat(f0)
+baseline = [{
+    "source_path": f0, "relative_path": "f0.pdf", "keyword": "MẬT",
+    "page_number": 1, "mode": "Trang đầu", "ocr_pdf_path": "",
+    "note": "PDF gốc; trang đầu",
+}]
+
+# ── dựng spool bền cho f0: canonical snapshot + manifest + kspool record
+spool_dir = os.path.join(tmp, "scan_progress", "kie_spool", "d0test")
+os.makedirs(spool_dir, exist_ok=True)
+canon_snapshot = os.path.join(spool_dir, "canonical.snapshot")
+canon_payload = json.dumps(
+    {"pages": [{"page_index": 0, "lines": [
+        {"text": "ỦY BAN NHÂN DÂN TỈNH A", "bbox": [10, 5, 300, 20]},
+        {"text": "BIÊN BẢN NGÀY 11 THÁNG 2 NĂM 2003", "bbox": [10, 130, 300, 145]},
+        {"text": "NGÀY 12 THÁNG 5 NĂM 1999 (bản sao)", "bbox": [10, 170, 300, 185]},
+        {"text": "NGÀY 13 THÁNG 6 NĂM 2001 (phụ lục)", "bbox": [10, 210, 300, 225]},
+    ]}]},
+    ensure_ascii=False).encode("utf-8")
+with open(canon_snapshot, "wb") as f:
+    f.write(canon_payload); f.flush(); os.fsync(f.fileno())
+canon_hash = hashlib.sha256(canon_payload).hexdigest()
+
+prog = ssp.SecretScanProgress.create(folder, "fast", OLD_VERSION)
+prog.set_kie_spool("f0.pdf", {
+    "canonical": canon_snapshot,
+    "spool_dir": spool_dir,
+    "hash": canon_hash,
+    "ordinals": [0],
+    "matches": baseline,
+    "fp": [st0.st_size, st0.st_mtime],
+    "status": "confirmed_positive",
+})
+prog.save(); prog.close()
+
+# ── OCR-call counter: hàm scan THẬT KHÔNG ĐƯỢC chạy trong KIE-only resume
+ocr_calls = []
+
+def fake_scan(*a, **kw):
+    ocr_calls.append(a[0] if a else "?")
+    return []
+
+def wrapped(source_path, rel, file_work, first_page_only, cancel, log, **kw):
+    legacy = {k: v for k, v in kw.items() if k in ("page_limit", "run_id")}
+    return sfss.SecretScanArtifact(
+        matches=list(fake_scan(source_path, rel, file_work, first_page_only,
+                               cancel, log, **legacy)),
+        source_pdf=source_path, canonical={}, status="clean",
+    )
+
+sfss.scan_one_file_for_secret_artifact = wrapped
+
+kie_fields = [{"label": "PLACE_DATE", "page_index": 0,
+               "text": "ngày 20 tháng 3 năm 2004"}]
+coord = ssk.KieCoordinator(
+    processes=1,
+    executor_factory=lambda n: ThreadPoolExecutor(max_workers=n),
+    job_fn=lambda p: {"status": "ready", "fields_by_source": {0: kie_fields}},
+)
+ssk._coordinator = coord
+
+def run_once():
+    summary = {}
+    screen = sfss.SecretFileScanScreen()
+    screen.log_message.connect(lambda m, lvl="info": print(f"[{lvl}] {m}"))
+    screen._scan_finished.connect(lambda s: summary.update(s))
+    screen.history_checkbox.setChecked(True)
+    screen._busy = True
+    screen._cancel_event.clear()
+    screen._run_worker(folder, True, ResumeDecision(
+        ResumeDecision.RESUME, prog=ssp.SecretScanProgress.load(folder, "fast"),
+    ))
+    for _ in range(300):
+        QCoreApplication.processEvents()
+    return summary
+
+summary = run_once()
+
+# BÀI BẮT BUỘC #7: OCR-call counter PHẢI = 0 khi snapshot còn hợp lệ.
+assert ocr_calls == [], (
+    f"KIE-only resume KHÔNG được OCR lại (OCR-call phải = 0, thấy {ocr_calls})"
+)
+assert summary.get("scanned") == 1, (
+    f"file phải hoàn tất qua KIE-only (thấy {summary})"
+)
+assert summary.get("failures") == 0, f"không được có lỗi (thấy {summary})"
+reg = ssp.FileRegistry.load()
+hit = reg.lookup_with_status(f0, st0.st_size, st0.st_mtime, "fast", NEW_VERSION)
+reg.close()
+assert hit is not None and hit[0] and hit[0][0].get("issue_year") == 2004, (
+    f"metadata KIE phải áp lên kết quả resume (thấy {hit})"
+)
+deadline = time.monotonic() + 5.0
+while time.monotonic() < deadline and coord.telemetry()["outstanding"]:
+    time.sleep(0.05)
+coord.shutdown(wait=True)
+print("D2-KIE-ONLY-OK")
+
+# ── Phụ: snapshot HỎNG (hash lệch) → phải quét lại TOÀN BỘ kèm lý do
+# Đổi nguồn + fp mới (để cache miss — cache hit hợp lệ thì không cần OCR):
+# fp khớp nhưng HASH snapshot lệch → đường KIE-only phải từ chối và quét lại.
+with open(f0, "ab") as f:
+    f.write(b"-v2")
+st0 = os.stat(f0)
+prog2 = ssp.SecretScanProgress.create(folder, "fast", OLD_VERSION)
+prog2.set_kie_spool("f0.pdf", {
+    "canonical": canon_snapshot, "spool_dir": spool_dir,
+    "hash": "0" * 64,  # hash SAI
+    "ordinals": [0], "matches": baseline,
+    "fp": [st0.st_size, st0.st_mtime], "status": "confirmed_positive",
+})
+prog2.save(); prog2.close()
+
+summary2 = run_once()
+assert ocr_calls and ocr_calls[0] == f0, (
+    f"snapshot hỏng → phải quét lại toàn bộ (OCR calls: {ocr_calls})"
+)
+assert summary2.get("scanned") == 1
+print("D2-STALE-FULL-RESCAN-OK")
+""" % {"repo": os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))}
+    _run_worker_scenario_script(script)

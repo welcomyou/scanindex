@@ -38,6 +38,8 @@ import threading
 import time
 import traceback
 from dataclasses import dataclass, field
+
+from scanindex.core.ocr.cancellation import CoreScanCancelled
 from typing import Any, Callable, Optional
 
 
@@ -140,10 +142,22 @@ class BatchPipeline:
         self._in_flight_drain_timeout = in_flight_drain_timeout
         self._pause_ocr_during_kie = bool(pause_ocr_during_kie)
         if max_in_flight_pages is None:
+            # Bỏ trần ẩn 16/4 (mục 12.2.4): mặc định = năng lực pool — giới
+            # hạn TỔNG do admission gate của engine đảm nhiệm; cửa sổ ở đây
+            # chỉ là backpressure cục bộ. Env override giữ nguyên.
             try:
-                max_in_flight_pages = int(os.environ.get("OCRTOOL_MAX_IN_FLIGHT_PAGES", "16"))
+                max_in_flight_pages = int(
+                    os.environ.get("OCRTOOL_MAX_IN_FLIGHT_PAGES", "0")
+                )
             except (TypeError, ValueError):
-                max_in_flight_pages = 16
+                max_in_flight_pages = 0
+            if max_in_flight_pages <= 0:
+                try:
+                    from scanindex.core.ocr import direct_engine as _de
+
+                    max_in_flight_pages = int(_de.get_parallel_capacity())
+                except Exception:
+                    max_in_flight_pages = 16
         self._max_in_flight_pages = max(1, int(max_in_flight_pages))
 
         # Synchronisation primitives
@@ -157,8 +171,8 @@ class BatchPipeline:
         self._correction_q: queue.Queue[FileTask] = queue.Queue()
         self._kie_q: queue.Queue[FileTask] = queue.Queue()
 
-        # In-flight OCR tracking: list of (file_task, page_idx, async_result)
-        self._in_flight: list[tuple[FileTask, int, Any]] = []
+        # In-flight OCR tracking: (file_task, page_idx, async_result, submit_time)
+        self._in_flight: list[tuple[FileTask, int, Any, float]] = []
         self._in_flight_lock = threading.Lock()
 
         # Threads
@@ -267,25 +281,47 @@ class BatchPipeline:
 
             # Submit each page; respect pause flag between submissions
             for page_idx in range(task.num_pages):
-                self._wait_for_in_flight_slot()
-                while not self.feeder_can_run.is_set():
+                ar = None
+                while ar is None:
+                    self._wait_for_in_flight_slot()
+                    while not self.feeder_can_run.is_set():
+                        if self.cancel_event.is_set():
+                            return
+                        self.feeder_can_run.wait(timeout=0.5)
                     if self.cancel_event.is_set():
                         return
-                    self.feeder_can_run.wait(timeout=0.5)
-                if self.cancel_event.is_set():
-                    return
 
-                try:
-                    ar = self._ocr_submit(task.input_path, page_idx)
-                except Exception as e:
-                    task.error = f"submit failed: {e}"
-                    self._on_event(EVENT_FILE_FAILED, task, str(e))
-                    break
+                    try:
+                        # wait_check: pause/cancel xảy ra GIỮA lúc chờ
+                        # admission cũng được tôn trọng (REVIEW v3 3.1) —
+                        # thử lại đúng trang này sau khi resume.
+                        ar = self._ocr_submit(
+                            task.input_path, page_idx, self._gate_wait_check
+                        )
+                    except CoreScanCancelled:
+                        continue
+                    except Exception as e:
+                        task.error = f"submit failed: {e}"
+                        self._on_event(EVENT_FILE_FAILED, task, str(e))
+                        break
+                if ar is None:
+                    break  # submit failed — ngừng cấp trang của task này
 
                 with self._in_flight_lock:
-                    self._in_flight.append((task, page_idx, ar))
+                    self._in_flight.append(
+                        (task, page_idx, ar, time.monotonic())
+                    )
 
             next_idx += 1
+
+    def _gate_wait_check(self) -> bool:
+        """True → tạm ngừng chờ admission: pause chủ đích hoặc hủy lượt.
+
+        Được submit_page gọi ĐỊNH KỲ trong lúc chờ slot — pause/cancel xảy
+        ra giữa chờ không còn bị bỏ lỡ (REVIEW v3 3.1)."""
+        if self.cancel_event.is_set():
+            return True
+        return not self.feeder_can_run.is_set()
 
     def _wait_for_in_flight_slot(self) -> None:
         """Backpressure OCR submissions so long PDFs don't enqueue every page."""
@@ -317,6 +353,9 @@ class BatchPipeline:
         while not self.cancel_event.is_set():
             with self._in_flight_lock:
                 in_flight_snapshot = list(self._in_flight)
+                snapshot_keys = {
+                    (id(t), p) for t, p, _a, _s in in_flight_snapshot
+                }
 
             if not in_flight_snapshot:
                 if self._feeder_done:
@@ -324,12 +363,18 @@ class BatchPipeline:
                 time.sleep(0.05)
                 continue
 
-            still_pending: list[tuple[FileTask, int, Any]] = []
+            still_pending: list[tuple[FileTask, int, Any, float]] = []
             files_done_now: list[FileTask] = []
 
-            for task, page_idx, ar in in_flight_snapshot:
-                if not ar.ready():
-                    still_pending.append((task, page_idx, ar))
+            for task, page_idx, ar, submitted_at in in_flight_snapshot:
+                ready = bool(ar.ready())
+                timed_out = (
+                    self._page_timeout is not None
+                    and not ready
+                    and (time.monotonic() - submitted_at) >= float(self._page_timeout)
+                )
+                if not ready and not timed_out:
+                    still_pending.append((task, page_idx, ar, submitted_at))
                     continue
                 try:
                     _, page_result = ar.get(timeout=0.1)
@@ -342,8 +387,11 @@ class BatchPipeline:
                     self._on_event(EVENT_PAGE_DONE, task,
                                    {"page_idx": page_idx, "ok": True})
                 else:
-                    # Insert empty placeholder so page count stays consistent
+                    # Sentinel giữ NGUYÊN NHÂN lỗi (guard `_assemble_outputs`
+                    # ở runner bắt được cả hai shape — sentinel để truy vết)
                     task.page_results[page_idx] = {
+                        "ocr_error": True,
+                        "error": "worker returned no result",
                         "lines_data": [],
                         "words_data": [],
                         "render_width": 0,
@@ -354,11 +402,14 @@ class BatchPipeline:
                     files_done_now.append(task)
 
             with self._in_flight_lock:
-                # Replace list — we processed the snapshot
-                kept_set = {(id(t), p) for t, p, _ in still_pending}
+                # Rút gọn theo snapshot (giữ nguyên trạng) + GIỮ task mới
+                # feeder thêm vào SAU khi chụp snapshot — không còn race mất
+                # task (REVIEW v2 2.6). Chỉ loại chính xác entry đã xử lý.
+                kept_set = {(id(t), p) for t, p, _a, _s in still_pending}
                 self._in_flight = [
                     triple for triple in self._in_flight
                     if (id(triple[0]), triple[1]) in kept_set
+                    or (id(triple[0]), triple[1]) not in snapshot_keys
                 ]
 
             for task in files_done_now:
@@ -432,7 +483,9 @@ class BatchPipeline:
                 if not self._in_flight:
                     return
                 # Count only pages that aren't already complete
-                still_running = sum(1 for _, _, ar in self._in_flight if not ar.ready())
+                still_running = sum(
+                    1 for _t, _p, ar, _s in self._in_flight if not ar.ready()
+                )
             if still_running == 0:
                 return
             time.sleep(0.1)

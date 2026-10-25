@@ -46,6 +46,21 @@ UI_TEXT_PAIRS: tuple[tuple[str, str], ...] = (
     ("📁  Select folder", "📁  Chọn thư mục"),
     ("📊  Export Excel", "📊  Xuất Excel"),
     ("📊  Load from file", "📊  Load từ file"),
+    ("📄  Copy classified files", "📄  Sao chép file mật"),
+    ("Copy the classified files shown in the table to another folder,\npreserving the original subfolder structure of the scanned folder.", "Sao chép các file mật đang hiển thị ra một thư mục khác,\ngiữ nguyên cấu trúc thư mục con như thư mục đã quét."),
+    ("Choose destination folder", "Chọn thư mục đích"),
+    ("No classified documents have been detected to copy.", "Chưa có văn bản mật nào được phát hiện để sao chép."),
+    ("Destination folder is invalid", "Thư mục đích không hợp lệ"),
+    ("The destination folder is the scanned folder itself.\nChoose a different folder to receive the copies.", "Thư mục đích trùng với thư mục đã quét.\nHãy chọn thư mục khác để nhận bản sao."),
+    ("Destination files already exist", "File đã tồn tại ở đích"),
+    ("{} files with the same name already exist in the destination folder.\nOverwrite them, or skip the existing files?", "Đã có {} file trùng tên trong thư mục đích.\nGhi đè lên chúng hay bỏ qua các file đã có?"),
+    ("Overwrite", "Ghi đè"),
+    ("Skip existing files", "Bỏ qua file đã có"),
+    ("Files copied", "Đã sao chép file mật"),
+    ("Copied {} classified files to:\n{}", "Đã sao chép {} file mật vào:\n{}"),
+    ("\n({} existing files were skipped, not overwritten.)", "\n({} file đã có ở đích được bỏ qua, không ghi đè.)"),
+    ("Could not copy {}/{} files:", "Không sao chép được {}/{} file:"),
+    ("\n(Copied {} files, skipped {} existing files.)", "\n(Đã chép được {} file, bỏ qua {} file đã có.)"),
     ("Reload a list previously exported to Excel (.xlsx) to keep reviewing,\ndeleting files or marking \"not classified\", then export to a NEW file\n(the loaded file is never overwritten).", "Nạp lại danh sách đã xuất ra file Excel (.xlsx) để tiếp tục xem,\nxóa file hoặc xác nhận \"không phải mật\", rồi xuất ra file MỚI\n(file đang load không bao giờ bị ghi đè)."),
     ("Total: 0 classified documents", "Tổng: 0 văn bản mật"),
     ("Total: {} classified documents", "Tổng: {} văn bản mật"),
@@ -1202,6 +1217,16 @@ UI_TEXT_PAIRS: tuple[tuple[str, str], ...] = (
     ("The validator found {} errors:", "Validator phát hiện {} lỗi:"),
     ("POST-SAVE: written file still has errors", "POST-SAVE: file ghi xong vẫn còn lỗi"),
     ("The written file still fails validation after reload — this may be a viewer bug:", "File đã ghi nhưng reload validate vẫn báo lỗi — có thể là bug viewer:"),
+    ("Chỉ các file .pdf trong thư mục (và thư mục con) được nạp. Cấu trúc thư mục con được giữ nguyên ở thư mục đầu ra, tên file sau khi ký không đổi.", "Only .pdf files in the folder (and subfolders) are loaded. The subfolder structure is preserved in the output folder; signed file names stay unchanged."),
+    ("Các file là ảnh scan (chưa có text layer) sẽ được OCR trước khi ký để chữ ký tránh đè lên nội dung văn bản. File PDF điện tử (đã có text) được trích text trực tiếp, không OCR. Nếu tắt, file scan vẫn được dò vùng trắng bằng ảnh trang: kích thước dấu = min(kích thước đã cấu hình, vùng trắng đo được tính từ điểm X/Y).", "Scanned files (no text layer) are OCRed before signing so the signature does not overlap document text. Digital PDFs (already have text) are extracted directly without OCR. If disabled, scanned files still detect blank areas from the page image: stamp size = min(configured size, measured blank area from X/Y)."),
+    (" pt", " pt"),
+    ("Tự động: tính cỡ chữ lớn nhất khớp khung. Chọn số cụ thể (4–28pt) để ép cỡ chữ — dấu và hình sẽ co/giãn đồng bộ để lọt khung.", "Auto: computes the largest font size that fits the frame. Pick a specific size (4–28pt) to force it — stamp and image scale together to fit."),
+    ("Trước khi ký, phần mềm đọc text/OCR trên trang rồi thu nhỏ khung chữ ký theo khoảng trống từ vị trí X/Y, có chừa khoảng hở với text PDF. Nếu trang không có text layer (scan thuần), phần mềm đo vùng trắng từ ảnh trang tính từ điểm X/Y và giới hạn khung chữ ký = min(kích thước đã cấu hình, vùng trắng đo được). Nếu không dò được vùng trắng phù hợp thì dùng vị trí hiện tại.", "Before signing, the app reads the page text/OCR and shrinks the signature frame to the free space from X/Y, keeping a margin from PDF text. If the page has no text layer (pure scan), the app measures the blank area from the page image starting at X/Y and caps the frame at min(configured size, measured blank area). If no suitable blank area is found, the current position is used."),
+    ("Vị trí ký:", "Signing position:"),
+    ("custom: dùng toạ độ X/Y bên trên. 4 góc: đặt dấu vào góc trang tương ứng (chừa lề 10pt), giữ nguyên Rộng/Cao đã cấu hình — các ô X/Y/Rộng/Cao chỉ chỉnh được ở chế độ tuỳ chỉnh.", "custom: uses the X/Y coordinates above. 4 corners: places the stamp at the corresponding page corner (10pt margin), keeping the configured Width/Height — X/Y/Width/Height boxes are editable only in custom mode."),
+    ("Neo theo dòng chữ:", "Anchor to a text line:"),
+    ("Tuỳ chọn — vd: Số:", "Optional — e.g. No.:"),
+    ("Tìm dòng chứa chuỗi này trên trang ký rồi đặt chữ ký NGAY SAU dòng đó (hết chỗ ngang thì đặt xuống dưới). Trang cần có text layer (PDF điện tử hoặc đã OCR). Để trống thì dùng vị trí X/Y như cũ.", "Finds the line containing this string on the signing page and places the signature RIGHT AFTER it (wraps below when out of horizontal space). The page needs a text layer (digital PDF or OCRed). Leave empty to use the X/Y position as before."),
 )
 
 
@@ -1733,8 +1758,8 @@ UI_DIGITIZATION_AUDIT_TEXT_PAIRS: tuple[tuple[str, str], ...] = (
     ("Page sequence", "Chuỗi trang"),
     ("does not match the five-part convention <Identity>-<Fonds>-<Catalog>-<Dossier>-<Order>.pdf",
      "không khớp quy ước 5 đoạn <MãĐĐ>-<Phông>-<Mục lục>-<Hồ sơ>-<STT>.pdf"),
-    ("does not match <Identity>-<3-digit fonds>-<2-digit catalog>-<4-digit storage unit plus optional duplicate suffix>-<3-digit page>.tif",
-     "không khớp quy ước <MãĐĐ>-<Phông 3 số>-<Mục lục 2 số>-<ĐVBC 4 số và ký tự trùng nếu có>-<Trang 3 số>.tif"),
+    ("does not match <Identity>-<Fonds>-<2-digit catalog>-<4-digit storage unit plus optional duplicate suffix>-<3-digit page>.tif",
+     "không khớp quy ước <MãĐĐ>-<Phông>-<Mục lục 2 số>-<ĐVBC 4 số và ký tự trùng nếu có>-<Trang 3 số>.tif"),
     ("page numbers must start at 001", "số trang phải bắt đầu từ 001"),
     ("catalog must be exactly two digits", "mục lục phải là đúng 2 chữ số"),
     ("dossier must be exactly four digits", "hồ sơ phải là đúng 4 chữ số"),
@@ -1748,3 +1773,11 @@ UI_DIGITIZATION_AUDIT_TEXT_PAIRS: tuple[tuple[str, str], ...] = (
 )
 
 UI_TEXT_PAIRS += UI_DIGITIZATION_AUDIT_TEXT_PAIRS
+
+UI_TEXT_PAIRS += (
+    ("Cannot close safely yet", "Chưa thể đóng an toàn"),
+    ("Could not confirm that all workers stopped. The window remains open; check the log.",
+     "Không xác nhận được toàn bộ worker đã dừng. Cửa sổ được giữ lại; hãy kiểm tra log."),
+    ("Incomplete", "Chưa hoàn tất"),
+    ("{} files still need to be retried", "còn {} file chờ xử lý lại"),
+)

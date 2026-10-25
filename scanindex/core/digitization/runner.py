@@ -676,7 +676,7 @@ class ArchiveRunner:
         path_to_task = {t.input_path: t for t in tasks}
 
         # Define stage callables
-        def ocr_submit(input_path: str, page_idx: int):
+        def ocr_submit(input_path: str, page_idx: int, wait_check=None):
             file_id = path_to_id.get(input_path)
             task = path_to_task.get(input_path)
             cache = self._pre_ocr_cache.get(file_id) if file_id else None
@@ -691,7 +691,9 @@ class ArchiveRunner:
                     f"[{file_id}] Step 1 OCR cache missing page {page_idx + 1}; "
                     "refusing to OCR again in Step 2"
                 )
-            return direct_ocr_engine.submit_page(input_path, page_idx)
+            return direct_ocr_engine.submit_page(
+                input_path, page_idx, wait_check=wait_check
+            )
 
         def run_correction(task: FileTask) -> str:
             # Build raw text from page results, run chunked correction

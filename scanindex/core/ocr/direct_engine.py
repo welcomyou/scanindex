@@ -16,6 +16,7 @@ import threading
 import logging
 import atexit
 import unicodedata
+from collections import deque
 
 from scanindex.core.canonical_io import (
     DOCX_EXPORT_PROFILE_V1,
@@ -35,7 +36,8 @@ from scanindex.core.ocr.text_normalizer import (
     OCR_TEXT_NORMALIZATION,
     sanitize_ocr_surface_text as _shared_sanitize_ocr_surface_text,
 )
-from scanindex.infra.paths import get_base_dir
+from scanindex.infra.paths import get_base_dir, get_app_dir
+from scanindex.core.runtime.shutdown import register_stage_stopper
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +84,18 @@ def _env_int(name, default):
     except (TypeError, ValueError):
         return default
 
+
+def _env_int_allow_zero(name, default):
+    """Parser cho cửa sổ staging: 0 = TẮT staging (hợp lệ) — không ép min 1
+    như `_env_int` (P2-2: trước đây 0 bị ép thành 1, nhánh off không chạy)."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
 # ===========================================================================
 # Module-level singleton & hybrid OCR pool
 # ===========================================================================
@@ -113,7 +127,1366 @@ _mp_pool_lock = threading.Lock()
 # Default unchanged; env override exists for long-run leak/RSS measurement
 # only — benchmark before changing the default (higher values trade RSS
 # containment for per-process warm-up).
-_MP_MAXTASKSPERCHILD = _env_int("DIRECT_OCR_MAXTASKSPERCHILD", 100)
+# Giá trị tắt tường minh (B7 — PLAN v5.1 §4.5-B.1): "off"/"none"/"disabled"/
+# "0"/"-1" → None = KHÔNG recycle. Parser trước đây ép max(1, env) nên không
+# thể tắt; sentinel này ánh xạ sang None ngay tại Pool constructor.
+_MP_MAXTASKSPERCHILD_OFF = {"off", "none", "disabled", "-1", "0"}
+
+
+def _parse_maxtasksperchild(name: str = "DIRECT_OCR_MAXTASKSPERCHILD", default: int = 100):
+    raw = os.environ.get(name, "").strip().lower()
+    if raw in _MP_MAXTASKSPERCHILD_OFF:
+        return None
+    return _env_int(name, default)
+
+
+_MP_MAXTASKSPERCHILD = _parse_maxtasksperchild()
+
+# ===========================================================================
+# Admission gate + token registry (v4)
+#
+# Một gate toàn cục cho MỌI submission vào pool (submit_page + collector).
+# - Slot chỉ được nhả khi task NATIVE kết thúc: qua callback/error_callback
+#   của apply_async, hoặc janitor thu hồi token đã terminal mà callback bị lỡ
+#   (worker chết đột ngột có thể không sinh callback nào). KHÔNG nhả theo
+#   deadline — task kẹt giữ slot và được xử lý bằng quy trình phục hồi.
+# - Tuổi thọ tối đa một request chưa xác định kết thúc native:
+#   OCRTOOL_REQUEST_MAX_AGE (giây). Vượt hạn → request đánh dấu mất (caller
+#   nhận PoolResetError hữu hạn) + có thể kích hoạt phục hồi thế hệ pool.
+# - Kill-switch OCRTOOL_DISABLE_GLOBAL_INFLIGHT=1: tắt GIỚI HẠN scheduling;
+#   registry/ janitor/ deferred cleanup vẫn chạy.
+# ===========================================================================
+from scanindex.core.ocr.cancellation import (  # noqa: E402
+    CoreScanCancelled,
+    PoolResetError,
+    SubmissionBusy,
+)
+
+_REQUEST_MAX_AGE = float(_env_int("OCRTOOL_REQUEST_MAX_AGE", 600))
+_ADMISSION_WAIT_S = float(_env_int("OCRTOOL_ADMISSION_WAIT_S", 300))
+# GĐ W (PLAN v5.1 §4.2): staged warmup + supervisor ACK.
+# OCRTOOL_WARMUP_STAGE = k (tối đa k worker nạp DLL/model đồng thời; 0 = tắt
+# staging — initializer tự nạp đầy như trước, chấp nhận rủi ro stampede).
+# OCRTOOL_WARMUP_DEADLINE_S = deadline MỖI worker từ lúc nhận permit tới ACK.
+_WARMUP_STAGE_DEFAULT = _env_int_allow_zero("OCRTOOL_WARMUP_STAGE", 4)
+_WARMUP_DEADLINE_S = float(_env_int("OCRTOOL_WARMUP_DEADLINE_S", 120))
+# P1-01: CHỜ permit nạp khi mọi đường load (warmup, self-load task OCR đầu,
+# recycle respawn) đi qua cùng limiter theo worker incarnation. P1-F (review 2):
+# hết hạn = FAIL-CLOSED (`LoadPermitTimeout`) — task OCR trả sentinel
+# `worker_init_failed` / warmup ACK failed → `_request_pool_recovery`
+# (terminate chứng minh holder dừng) → generation mới, limiter mới, thang
+# retry hữu hạn. Không nạp ngoài budget để "tránh chờ".
+_WARMUP_LOAD_PERMIT_WAIT_S = float(_env_int("OCRTOOL_WARMUP_LOAD_WAIT_S", 300))
+_GATE_DISABLED = os.environ.get("OCRTOOL_DISABLE_GLOBAL_INFLIGHT", "").lower() in {
+    "1", "true"
+}
+_admission_lock = threading.Lock()
+_admission_cond = threading.Condition(_admission_lock)
+_admission_tokens: dict[int, dict] = {}
+_admission_next_id = iter(range(1, 1 << 62))
+_pool_generation = 0
+_gate_sem = None  # BoundedSemaphore, dựng theo thế hệ pool (từ _get_pool)
+# Generation mà `_mp_pool` đang thuộc về (P1-B): None = chưa có pool/chưa theo
+# dõi (đường test giả lập); -1 = pool đang dying (shutdown/recovery) — mọi
+# submission phải bị từ chối cho tới khi pool thế hệ mới được publish.
+_mp_pool_gen: int | None = None
+# Trạng thái vòng đời pool cho telemetry (PLAN v5.1 §4.1 — schema GĐ R).
+_pool_state = "idle"
+_recovering_gen: int | None = None
+_janitor_thread: threading.Thread | None = None
+_janitor_enabled = True  # test có thể tắt thread nền
+_live_inputs: dict[str, int] = {}
+_deferred_cleanups: list[tuple[str, float]] = []
+_admission_metrics = {
+    "submitted": 0,
+    "busy_rejections": 0,
+    "completed": 0,
+    "errors": 0,
+    "reaped": 0,
+    "lost": 0,
+    "resets": 0,
+    "recovery_failures": 0,
+    "queue_wait_ms": deque(maxlen=512),   # submit → worker bắt đầu
+    "admission_wait_ms": deque(maxlen=512),  # caller bắt đầu yêu cầu → có slot
+    "ocr_ms": deque(maxlen=512),          # worker bắt đầu → worker xong
+    # Tổng cộng toàn lượt (P2-H): deque 512 không đủ tính busy%/tổng.
+    "ocr_ms_total": 0,
+    "ocr_ms_count": 0,
+    "run_first_submit_at": None,  # monotonic — mốc wall toàn lượt
+}
+
+
+def _gate_capacity() -> int:
+    """Số slot admission MỤC TIÊU (requested) = số worker pool; env nguyên
+    dương ghi đè.
+
+    KHÔNG dùng `_env_int` ở đây vì nó ép min 1 — cần phân biệt "không đặt
+    override" (dùng capacity) với số nguyên dương do người đo đặt."""
+    raw = os.environ.get("OCRTOOL_GLOBAL_IN_FLIGHT_PAGES", "").strip()
+    if raw:
+        try:
+            value = int(raw)
+        except ValueError:
+            value = 0
+        if value > 0:
+            return value
+    return max(1, get_parallel_capacity())
+
+
+class _AdmissionGate:
+    """Gate admission với capacity THAY ĐỔI ĐƯỢC trong cùng generation (W-6,
+    hợp đồng gate-A của REVIEW_READINESS A).
+
+    - KHÔNG thay object gate giữa chừng → callback của token cũ luôn release
+      vào ĐÚNG gate của thế hệ mình.
+    - `ready=0` ⇒ acquire(blocking=False) luôn False (Busy/warming) — không ép
+      min 1 rồi nộp vào worker chưa sẵn sàng.
+    - `set_capacity()` ghi TARGET mới; admission so `held` với TARGET (P2-1)
+      — shrink không rút token sống nhưng cũng KHÔNG mở lại slot sai: acquire
+      2, target 0, release 1 vẫn bị chặn tới khi target tăng lại.
+    - `_value` giữ tương thích kiểu BoundedSemaphore (test v4 đọc `_value`);
+      `capacity` = mức đồng thời khả dụng hiện tại = max(held, target).
+    """
+
+    def __init__(self, capacity: int):
+        self._lock = threading.Lock()
+        self._cond = threading.Condition(self._lock)
+        self._target = max(0, int(capacity))
+        self._held = 0
+
+    @property
+    def capacity(self) -> int:
+        with self._lock:
+            return max(self._held, self._target)
+
+    @property
+    def target(self) -> int:
+        with self._lock:
+            return self._target
+
+    @property
+    def _value(self) -> int:
+        with self._lock:
+            return max(0, self._target - self._held)
+
+    def set_capacity(self, new_capacity: int) -> None:
+        with self._cond:
+            self._target = max(0, int(new_capacity))
+            self._cond.notify_all()
+
+    def acquire(self, blocking: bool = False, timeout: float | None = None) -> bool:
+        import time as _t
+
+        with self._cond:
+            if blocking:
+                end = None if timeout is None else _t.monotonic() + float(timeout)
+                while self._held >= self._target:
+                    if end is None:
+                        self._cond.wait(0.05)
+                        continue
+                    remaining = end - _t.monotonic()
+                    if remaining <= 0:
+                        return False
+                    self._cond.wait(min(0.05, remaining))
+            else:
+                if self._held >= self._target:
+                    return False
+            self._held += 1
+            return True
+
+    def release(self) -> None:
+        with self._cond:
+            if self._held > 0:
+                self._held -= 1
+            self._cond.notify_all()
+
+
+def _ensure_gate_locked() -> None:
+    """Gate phải tồn tại cùng thế hệ pool — gọi khi tạo pool và khi thiếu."""
+    global _gate_sem
+    if _gate_sem is None:
+        _gate_sem = _AdmissionGate(_gate_capacity())
+
+
+# ---------------------------------------------------------------------------
+# GĐ W — Warmup supervisor: sổ cái permit theo incarnation, ACK, staging.
+# Thiết kế: initializer CHỈ nhẹ (stdio + lưu path); DLL/model do CHÍNH worker
+# tự nạp khi chạy `_warmup_task` (do supervisor post theo đợt k) hoặc khi nhận
+# task OCR đầu tiên (`_ensure_worker_loaded`). Không dùng semaphore liên
+# process (probe 21/10: permit bị mất vĩnh viễn khi holder crash).
+# ---------------------------------------------------------------------------
+_warmup_lock = threading.Lock()
+_warmup = {
+    "generation": None,       # generation đang warmup
+    "requested": 0,           # N worker hiệu lực thế hệ này (sau thang retry)
+    "stage_k": 0,             # cửa sổ nạp đồng thời hiện tại
+    "in_flight": 0,           # số warmup task đã post chưa về
+    # Sổ cái ACK THEO INCARNATION (P1-02): pid -> {rss_mb, t_load_s, ack_at}.
+    # Chỉ pid SỐNG (còn nằm trong pool hiện tại) được tính là ready sống.
+    "acked_pids": {},
+    "failed": [],             # [{pid, error}]
+    "t_start": None,
+    "deadline_timer": None,
+    "done": False,
+    # P1-02: deadline có ready>0 → suy giảm; ACK path VẪN MỞ để worker nạp muộn
+    # tiếp tục ramp gate (dù không còn post warmup task mới). Shutdown/recovery
+    # đặt done mà KHÔNG đặt degraded → ACK bị bỏ hẳn.
+    "degraded": False,
+    "gate": None,             # gate của generation này (set_capacity theo ACK)
+}
+_warmup_retries = 0  # đếm số lần dựng lại generation do warmup hụt deadline
+
+
+def _warmup_stage_plan(requested: int) -> tuple[int, int]:
+    """(số worker hiệu lực, cửa sổ k) theo thang retry hữu hạn của plan:
+    lần đầu N/k=4; retry 1: N/k=1; retry 2: max(1, floor(N/2))/k=1; hết —
+    lần thứ 4 KHÔNG tạo generation mới (fail-loud, `OCRWarmupError`).
+    Staging tắt (`OCRTOOL_WARMUP_STAGE<=0`) → k=N: post đủ một lần, không có
+    cửa sổ (P2-2: trước đây 0 bị ép thành 1 nên nhánh off không chạy đúng)."""
+    attempts = _warmup_retries
+    if attempts == 0:
+        if _WARMUP_STAGE_DEFAULT <= 0:
+            return requested, requested
+        k = _WARMUP_STAGE_DEFAULT
+        return requested, min(k, requested)
+    if attempts == 1:
+        return requested, 1
+    if attempts == 2:
+        return max(1, requested // 2), 1
+    raise OCRWarmupError(
+        f"OCR warmup failed after {attempts} attempts — không tạo generation "
+        "thứ tư (plan v5.1 §4.2.0). Vui lòng khởi động lại ứng dụng."
+    )
+
+
+def _live_worker_pids(pool) -> set | None:
+    """Tập PID worker ĐANG SỐNG của pool (P1-02: liveness cho sổ ACK).
+    Trả None khi không đọc được (pool giả/test/không có `_pool`) — caller
+    ĐẾM MỌI ACK (không prune: prune trên pool giả sẽ xóa nhầm ACK thật)."""
+    try:
+        procs = getattr(pool, "_pool", None)
+        if procs is None:
+            return None  # pool giả/test — không có danh sách process thật
+        live = set()
+        for p in procs:
+            try:
+                pid = p.pid
+                if pid and p.is_alive():
+                    live.add(pid)
+            except Exception:
+                continue
+        return live
+    except Exception:
+        return None
+
+
+def _prune_dead_acks_locked() -> int:
+    """D1 (re-ACK theo incarnation): sổ ACK CHỈ ĐƯỢC ĐẾM worker SỐNG —
+    entry của worker đã chết/recycle bị LOẠI NGAY, không dùng sổ PID lịch sử
+    làm capacity (pid chết còn trong sổ = gate mở rộng oan cho worker không
+    còn native). Gọi giữ `_warmup_lock`. Trả số entry bị loại."""
+    live = _live_worker_pids(_mp_pool)
+    if live is None:
+        return 0
+    dead = [pid for pid in _warmup["acked_pids"] if pid not in live]
+    for pid in dead:
+        _warmup["acked_pids"].pop(pid, None)
+    if dead:
+        logger.warning(
+            "warmup: loại %d ACK của worker đã chết/recycle (còn sống=%d) — "
+            "gate capacity chỉ đếm ready LIVE",
+            len(dead), len(live),
+        )
+    return len(dead)
+
+
+def _ocr_stage_stopper(soft: bool) -> None:
+    """D1 stopper stage W: soft = ngừng nhận việc mới (worker chạy nốt);
+    hard = terminate NGAY toàn bộ worker process (dừng hữu hạn)."""
+    global _mp_pool
+    with _mp_pool_lock:
+        pool = _mp_pool
+        if pool is None:
+            return
+        if not soft:
+            _mp_pool = None
+    from scanindex.core.runtime.shutdown import track_executor
+    track_executor(pool)
+    if soft:
+        pool.close()
+    else:
+        pool.terminate()
+
+
+register_stage_stopper("W-ocr-pool", _ocr_stage_stopper)
+
+
+class OCRWarmupError(RuntimeError):
+    """Warmup pool thất bại sau các lần retry hữu hạn — fail-loud."""
+
+
+def _worker_rss_mb() -> int | None:
+    try:
+        from scanindex.infra.process_metrics import sample_tree
+        return int(sample_tree()["parent_rss_mb"])
+    except Exception:
+        logger.warning("Worker RSS unavailable", exc_info=True)
+        return None
+
+
+def _load_worker_runtime(dll_path: str, model_dir: str) -> None:
+    """Nạp DLL ScreenAI + model trong worker process (gọi MỘT lần/process).
+
+    P1-01: MỌI đường nạp (warmup task, self-load task OCR đầu, recycle respawn)
+    đi qua CÙNG permit nạp do supervisor cấp (`_worker_load_sem`, cửa sổ k)
+    — không còn đường self-load ngoài limiter. P1-F: hết hạn xin permit =
+    fail-closed (`LoadPermitTimeout`) — recovery là đường duy nhất mở lại
+    quyền nạp (terminate chứng minh holder dừng, generation mới có limiter
+    mới), bất biến ≤k không bao giờ bị phá để tránh chờ."""
+    global _worker_ocr, _worker_dll_path, _worker_init_error
+    if _worker_ocr is not None:
+        return
+    with _load_permit_scope():
+        try:
+            ocr = ScreenAIOCR(dll_path=dll_path, model_dir=model_dir)
+            ocr.initialize()
+            _worker_ocr = ocr
+            _worker_dll_path = dll_path
+            _worker_init_error = None
+        except Exception as exc:
+            _worker_ocr = None
+            _worker_dll_path = dll_path
+            _worker_init_error = f"{type(exc).__name__}: {exc}"
+            logger.exception("ScreenAI worker initialization failed")
+            raise
+
+
+class LoadPermitTimeout(RuntimeError):
+    """P1-F (review 2): không xin được permit nạp trong `_WARMUP_LOAD_PERMIT_WAIT_S`
+    — FAIL-CLOSED: KHÔNG được nạp ngoài budget (permit có thể đang được giữ
+    bởi worker còn sống/treo trong DLL). Caller xử lý như `worker_init_failed`
+    → collector/supervisor kích hoạt `_request_pool_recovery` (terminate dừng
+    thật holder treo) → generation mới có limiter mới, theo thang retry hữu
+    hạn. Trước đây nhánh này fail-open (nạp không permit) — phá bất biến ≤k."""
+
+
+def _load_permit_scope():
+    """Context manager giữ permit nạp + cập nhật probe đồng thời (quan sát
+    mức nạp cực đại trong test/telemetry). Không có limiter → no-op.
+
+    P1-F: hết thời gian xin permit → raise `LoadPermitTimeout` (fail-closed),
+    KHÔNG tiếp tục nạp. Thu hồi quyền nạp chỉ qua recovery chứng minh holder
+    dừng (terminate) — không mở tải native ngoài budget để tránh chờ."""
+    import contextlib
+
+    @contextlib.contextmanager
+    def _scope():
+        sem = _worker_load_sem
+        probe = _worker_load_probe
+        permit = None
+        if sem is not None:
+            try:
+                permit = sem.acquire(timeout=_WARMUP_LOAD_PERMIT_WAIT_S)
+            except Exception as exc:
+                raise LoadPermitTimeout("Không nhận được load permit") from exc
+            if not permit:
+                raise LoadPermitTimeout(
+                    f"load permit chờ quá {_WARMUP_LOAD_PERMIT_WAIT_S:.0f}s "
+                    "— fail-closed (holder có thể còn sống/treo); recovery "
+                    "phải chứng minh holder dừng trước khi nạp lại"
+                )
+        if probe is not None:
+            try:
+                with probe.get_lock():
+                    probe.value += 1
+            except Exception:
+                probe = None
+        try:
+            yield
+        finally:
+            if probe is not None:
+                try:
+                    with probe.get_lock():
+                        probe.value -= 1
+                except Exception:
+                    pass
+            if permit and sem is not None:
+                try:
+                    sem.release()
+                except Exception:
+                    pass
+
+    return _scope()
+
+
+def _simulate_worker_load() -> None:
+    """Test-mode (OCRTOOL_WARMUP_TEST_MODE=1): mô phỏng thời gian nạp DLL
+    đi ĐÚNG đường permit/probe như nạp thật — cho phép test giới hạn mức
+    nạp đồng thời với Pool thật mà không đụng DLL."""
+    import time as _t
+
+    sleep_s = float(os.environ.get("OCRTOOL_WARMUP_TEST_SLEEP", "0") or 0)
+    with _load_permit_scope():
+        if sleep_s > 0:
+            _t.sleep(sleep_s)
+
+
+def _ensure_worker_loaded() -> None:
+    """Self-load trong worker (task OCR đầu tiên hoặc warmup task) — an toàn
+    respawn: worker recycle tái khởi tạo nhẹ, lần task kế tự nạp lại. Nạp đi
+    qua permit chung của supervisor (P1-01) — kể cả respawn."""
+    global _worker_ocr
+    if _worker_ocr is not None:
+        return
+    if _worker_dll_path is None:
+        raise RuntimeError("worker runtime paths not initialized")
+    if os.environ.get("OCRTOOL_WARMUP_TEST_MODE") == "1":
+        _simulate_worker_load()
+        _worker_ocr = _SENTINEL_LOADED
+        return
+    _load_worker_runtime(_worker_dll_path, _worker_model_dir)
+
+
+_SENTINEL_LOADED = object()
+
+
+def _warmup_task(gen: int = 0):
+    """Chạy TRONG worker: nạp runtime, trả thống kê ACK (pid/generation/rss/
+    thời gian). Generation gắn TỪ payload để supervisor nhận diện ACK của thế
+    hệ nào (P1-02 — không đối chiếu state toàn cục đang thay đổi).
+    Env `OCRTOOL_WARMUP_TEST_MODE=1` (kế thừa qua spawn) → mô phỏng nạp qua
+    permit, không đụng DLL — dùng cho test supervisor với Pool thật."""
+    import os as _os
+    import time as _t
+
+    t0 = _t.perf_counter()
+    err = None
+    try:
+        _ensure_worker_loaded()
+    except Exception as exc:
+        err = f"{type(exc).__name__}: {exc}"
+    return {
+        "ok": err is None,
+        "pid": _os.getpid(),
+        "generation": int(gen),
+        "rss_mb": _worker_rss_mb(),
+        "t_load_s": round(_t.perf_counter() - t0, 2),
+        "error": err,
+    }
+
+
+def _on_warmup_ack(stats, gen: int) -> None:
+    """ACK warmup — generation bind TẠI LÚC POST (P1-02): callback đối chiếu
+    với generation của chính nó, không đọc lại state toàn cục đang thay đổi
+    (ACK thế hệ cũ không thể lọt vào sổ thế hệ mới). CHỈ bookkeeping nhanh."""
+    import time as _t
+
+    pid = (stats or {}).get("pid")
+    with _warmup_lock:
+        if gen != _pool_generation:
+            return  # ACK của thế hệ khác — bỏ
+        if _warmup["done"]:
+            if not _warmup["degraded"]:
+                return  # shutdown/recovery đã đóng sổ — bỏ
+            # Suy giảm do deadline: KHÔNG post thêm, nhưng ACK muộn vẫn được
+            # nhận để ramp gate (log "ACK hụt tự phục hồi" phải đúng thật).
+            if stats and stats.get("ok") and pid is not None \
+                    and pid not in _warmup["acked_pids"]:
+                _warmup["acked_pids"][pid] = {
+                    "rss_mb": stats.get("rss_mb"),
+                    "t_load_s": stats.get("t_load_s"),
+                    "ack_at": _t.monotonic(),
+                }
+                # D1: gate chỉ ramp theo ready LIVE.
+                _prune_dead_acks_locked()
+                gate = _warmup["gate"]
+                if gate is not None:
+                    gate.set_capacity(
+                        min(len(_warmup["acked_pids"]), _warmup["requested"])
+                    )
+                logger.info(
+                    "warmup late ACK (degraded) %d/%d (pid=%s) — gate ramp",
+                    len(_warmup["acked_pids"]), _warmup["requested"], pid,
+                )
+            return
+        if stats and not stats.get("ok"):
+            _warmup["failed"].append({"pid": pid, "error": stats.get("error")})
+            logger.error("warmup ACK FAILED pid=%s: %s", pid, stats.get("error"))
+        elif pid is not None and pid not in _warmup["acked_pids"]:
+            _warmup["acked_pids"][pid] = {
+                "rss_mb": stats.get("rss_mb"),
+                "t_load_s": stats.get("t_load_s"),
+                "ack_at": _t.monotonic(),
+            }
+            logger.info(
+                "warmup ready %d/%d (pid=%s, rss=%sMB, t_load=%ss)",
+                len(_warmup["acked_pids"]), _warmup["requested"], pid,
+                stats.get("rss_mb"), stats.get("t_load_s"),
+            )
+        _warmup["in_flight"] = max(0, _warmup["in_flight"] - 1)
+        # D1: ready = số ACK của worker CÒN SỐNG — prune dead trước khi đếm.
+        _prune_dead_acks_locked()
+        ready = len(_warmup["acked_pids"])
+        gate = _warmup["gate"]
+        if gate is not None:
+            gate.set_capacity(min(ready, _warmup["requested"]))
+        # P1-01: post TIẾP theo CỬA SỔ k — không post hết remaining sau ACK
+        # đầu (trước đây N=8, k=2 → ACK đầu post 6 task, in_flight=7).
+        _repost_or_finish_locked()
+
+
+def _repost_or_finish_locked() -> None:
+    """Đánh giá lại sau mỗi ACK/error khi đang giữ `_warmup_lock`: post thêm
+    NHIỀU NHẤT một cửa sổ k task (nếu còn dư) hoặc chốt DONE khi đủ N. Dùng
+    chung cho ACK/error; KHÔNG tự gọi lại chính nó (post không repost —
+    đánh giá kế tiếp diễn ra ở ACK/error kế)."""
+    ready = len(_warmup["acked_pids"])
+    remaining = _warmup["requested"] - _warmup["in_flight"] - ready \
+        - len(_warmup["failed"])
+    if remaining > 0:
+        window = _warmup["stage_k"] if _warmup["stage_k"] > 0 else remaining
+        _post_warmup_tasks_locked(min(window, remaining))
+        if _warmup["in_flight"] <= 0 and ready < _warmup["requested"]:
+            logger.error(
+                "warmup: post thất bại toàn bộ (ready=%d, failed=%d) — chờ "
+                "deadline để suy giảm/recovery",
+                ready, len(_warmup["failed"]),
+            )
+    elif ready >= _warmup["requested"]:
+        _finish_warmup_locked()
+    elif _warmup["in_flight"] <= 0:
+        # Chỉ là ngõ cụt THẬT khi không còn gì đang bay; còn in_flight>0 là
+        # trạng thái chờ bình thường (ACK đang về, không post thêm).
+        logger.error(
+            "warmup error: không còn warmup task để post (ready=%d, "
+            "failed=%d) — chờ deadline để suy giảm/recovery",
+            ready, len(_warmup["failed"]),
+        )
+
+
+def _post_warmup_tasks_locked(count: int) -> None:
+    """Post thêm warmup task — gọi khi đang giữ `_warmup_lock`. Generation
+    bind vào callback NGAY TẠI ĐÂY (closure) để ACK muộn sau khi thế hệ đổi
+    không lọt sổ mới. apply_async ném lỗi đồng bộ được xử lý NỘI BỘ (không
+    gọi lại `_on_warmup_error` — nó lấy lại `_warmup_lock` non-reentrant,
+    deadlock — P2-2)."""
+    global _warmup
+    pool = _mp_pool
+    if pool is None or count <= 0:
+        return
+    gen = _pool_generation
+    _warmup["in_flight"] += count
+    for _ in range(count):
+        try:
+            pool.apply_async(
+                _warmup_task, (gen,),
+                callback=lambda s, g=gen: _on_warmup_ack(s, g),
+                error_callback=lambda e, g=gen: _on_warmup_error(e, g),
+            )
+        except Exception as exc:
+            # Xử lý failure NGAY TRONG lock này — không re-enter lock.
+            _warmup["in_flight"] = max(0, _warmup["in_flight"] - 1)
+            _warmup["failed"].append({"pid": None, "error": str(exc)})
+            logger.error("warmup post FAILED (sync): %s", exc)
+
+
+def _on_warmup_error(exc, gen: int = 0) -> None:
+    with _warmup_lock:
+        if gen != _pool_generation:
+            return
+        if _warmup["done"] and not _warmup["degraded"]:
+            return
+        if _warmup["done"]:
+            return  # degraded: không post thêm — bỏ error của task cũ
+        _warmup["failed"].append({"pid": None, "error": str(exc)})
+        _warmup["in_flight"] = max(0, _warmup["in_flight"] - 1)
+        _repost_or_finish_locked()
+
+
+def _finish_warmup_locked() -> None:
+    import time as _t
+
+    if _warmup["done"]:
+        return
+    _warmup["done"] = True
+    timer = _warmup.get("deadline_timer")
+    if timer is not None:
+        timer.cancel()
+    logger.info(
+        "warmup DONE gen=%s ready=%d/%d failed=%d trong %.1fs",
+        _warmup["generation"], len(_warmup["acked_pids"]),
+        _warmup["requested"], len(_warmup["failed"]),
+        (_t.monotonic() - _warmup["t_start"]) if _warmup["t_start"] else 0.0,
+    )
+
+
+def _warmup_deadline_tick() -> None:
+    """Deadline MỖI worker: nếu generation chưa xong warmup sau deadline →
+    0 ACK: quarantine + dựng lại theo thang retry (k=1 rồi N/2) — terminate
+    của recovery là thứ DỪNG thật worker đang init treo (W-3). Có ready>0:
+    suy giảm với capacity=ready (KHÔNG đập generation, KHÔNG hủy timer), và
+    CHỈ ĐỦ: giữ ACK path mở (`degraded`) để worker nạp muộn vẫn ramp gate
+    (P1-02 — trước đây đóng sổ luôn, mâu thuẫn log 'tự phục hồi')."""
+    global _warmup_retries
+    with _warmup_lock:
+        if _warmup["done"] or _warmup["generation"] != _pool_generation:
+            return
+        # D1: ready chỉ đếm worker SỐNG (sổ ACK không phải sổ PID lịch sử).
+        _prune_dead_acks_locked()
+        ready = len(_warmup["acked_pids"])
+        if ready > 0:
+            # Có bộ phận sẵn sàng: KHÔNG đập cả generation — chạy suy giảm
+            # với capacity = ready (log loud), warmup coi như kết thúc.
+            logger.error(
+                "warmup DEADLINE: chỉ %d/%d worker sẵn sàng — chạy suy giảm "
+                "với effective=%d (ACK muộn vẫn ramp gate; worker nạp treo "
+                "sẽ tự nạp ở task đầu hoặc bị recovery sau hụt deadline)",
+                ready, _warmup["requested"], ready,
+            )
+            _warmup["done"] = True
+            _warmup["degraded"] = True
+            timer = _warmup.get("deadline_timer")
+            if timer is not None:
+                timer.cancel()
+                _warmup["deadline_timer"] = None
+            return
+        _warmup_retries += 1
+        logger.error(
+            "warmup DEADLINE sau %.0fs mà 0/%d worker ACK — quarantine thế "
+            "hệ %s, dựng lại theo thang retry (lần %d)",
+            _WARMUP_DEADLINE_S, _warmup["requested"],
+            _warmup["generation"], _warmup_retries,
+        )
+    _request_pool_recovery("warmup deadline exceeded")
+
+
+def _start_warmup_supervisor_locked(requested: int, stage_k: int) -> None:
+    """Khởi động supervisor cho thế hệ vừa publish. Gọi khi đang giữ
+    `_warmup_lock`; gate capacity bắt đầu 0 (ready=0 ⇒ Busy/warming) rồi
+    ramp theo ACK — không bao giờ chặn `_get_pool()`."""
+    import time as _t
+
+    with _admission_lock:
+        gate = _gate_sem
+    _warmup.update({
+        "generation": _pool_generation,
+        "requested": requested,
+        "stage_k": stage_k,
+        "in_flight": 0,
+        "acked_pids": {},
+        "failed": [],
+        "t_start": _t.monotonic(),
+        "deadline_timer": None,
+        "done": False,
+        "degraded": False,
+        "gate": gate,
+    })
+    if gate is not None:
+        gate.set_capacity(0)  # ready=0 ⇒ Busy/warming, hủy được ở caller
+    logger.info(
+        "warmup starting gen=%s requested=%d stage=%d (deadline %.0fs)",
+        _pool_generation, requested, stage_k, _WARMUP_DEADLINE_S,
+    )
+    timer = threading.Timer(_WARMUP_DEADLINE_S, _warmup_deadline_tick)
+    timer.daemon = True
+    timer.start()
+    _warmup["deadline_timer"] = timer
+    _post_warmup_tasks_locked(min(stage_k, requested))
+
+
+
+def _admission_snapshot_metrics() -> str:
+    import time as _t
+
+    def _pct(values, q):
+        ordered = sorted(values)
+        if not ordered:
+            return None
+        return ordered[min(int(len(ordered) * q), len(ordered) - 1)]
+
+    m = _admission_metrics
+
+    def _fmt(name, values):
+        if not values:
+            return f"{name} n/a"
+        p50 = _pct(values, 0.5)
+        p95 = _pct(values, 0.95)
+        return f"{name} p50={p50}ms p95={p95}ms"
+
+    busy = ""
+    first = m.get("run_first_submit_at")
+    if first is not None and m["ocr_ms_count"]:
+        wall_s = max(_t.monotonic() - first, 0.001)
+        cap = max(1, _gate_capacity())
+        # Ước lượng worker-bận trên worker-wall (P2-H): tổng ocr_ms chia
+        # (capacity × wall). Đây là busy% worker-wall, KHÔNG phải CPU%.
+        busy_pct = 100.0 * (m["ocr_ms_total"] / 1000.0) / (cap * wall_s)
+        busy = f" ocr_total={m['ocr_ms_count']} task/{m['ocr_ms_total']}ms worker_busy_est={min(busy_pct, 999):.0f}%"
+    return (
+        f"[admission] gen={_pool_generation} state={_pool_state} "
+        f"submitted={m['submitted']} completed={m['completed']} "
+        f"errors={m['errors']} busy={m['busy_rejections']} "
+        f"reaped={m['reaped']} lost={m['lost']} resets={m['resets']} "
+        f"recovery_failures={m['recovery_failures']}"
+        f"{busy} "
+        f"{_fmt('worker_start_wait', m['queue_wait_ms'])} "
+        f"{_fmt('admission_wait', m['admission_wait_ms'])} "
+        f"{_fmt('ocr_ms', m['ocr_ms'])}"
+    )
+
+
+def admission_metrics_summary() -> str:
+    """Dòng tổng hợp cho log cuối lượt (gọi từ UI thread, chỉ đọc)."""
+    with _admission_lock:
+        return _admission_snapshot_metrics()
+
+
+def _kie_telemetry() -> object:
+    """Backlog KIE từ coordinator GĐ K (nếu đang chạy); không import cứng."""
+    try:
+        from scanindex.core.secret_scan_kie import telemetry as _kie_tel
+
+        return _kie_tel()
+    except Exception:
+        return "n/a (stage K không hoạt động)"
+
+
+def _prep_telemetry() -> object:
+    """Hàng đợi prep từ executor GĐ P (nếu bật); không import cứng."""
+    try:
+        from scanindex.core.preprocessing.prep_worker import telemetry as _p_tel
+
+        return _p_tel()
+    except Exception:
+        return "n/a (stage P không hoạt động)"
+
+
+def pool_telemetry() -> dict:
+    """Telemetry trạng thái pool — schema chung của GĐ R (PLAN v5.1 §4.1).
+
+    Các trường thuộc giai đoạn sau trả "n/a ..." — không bịa số; stage tương
+    ứng cung cấp thay. Chỉ đọc trạng thái nội bộ, gọi từ thread log/UI được."""
+    with _admission_lock:
+        inflight = sum(
+            1 for info in _admission_tokens.values() if not info["done"]
+        )
+        gate = _gate_sem
+        if _GATE_DISABLED or gate is None:
+            effective = 0
+        elif isinstance(gate, _AdmissionGate):
+            effective = gate.capacity
+        else:  # BoundedSemaphore do test gán — capacity ước lượng theo config
+            effective = _gate_capacity()
+    with _warmup_lock:
+        if _warmup["generation"] == _pool_generation:
+            acked = dict.fromkeys(_warmup["acked_pids"])
+            warming = not _warmup["done"]
+        else:
+            acked = None
+            warming = False
+    # P1-02/P2-7: ready sống = ACK ∩ PID worker đang sống của pool hiện tại
+    # (trước đây đếm cả PID đã chết/recycle — 'ever-acked', không phải live).
+    if acked is None:
+        ready_live = None
+    else:
+        with _mp_pool_lock:
+            pool_now = _mp_pool
+        live = _live_worker_pids(pool_now) if pool_now is not None else None
+        ready_live = (
+            len(acked) if live is None
+            else sum(1 for pid in acked if pid in live)
+        )
+    ready_live_disp = (
+        ready_live if ready_live is not None
+        else "n/a (pool chưa publish ở thế hệ này)"
+    )
+    load_probe_val = None
+    if _load_probe_ref is not None:
+        try:
+            load_probe_val = int(_load_probe_ref.value)
+        except Exception:
+            load_probe_val = None
+    return {
+        "generation": _pool_generation,
+        "state": ("warming" if warming else _pool_state),
+        "requested_workers": int(_NUM_PAGE_WORKERS),
+        "effective_capacity": effective,
+        # Stage W ĐÃ TRIỂN KHAI: số worker ACK đang SỐNG của thế hệ hiện tại.
+        "ready_live_workers": ready_live_disp,
+        "warmup_loads_in_flight": load_probe_val,
+        "ocr_inflight": inflight,
+        "leases_held": len(_admission_tokens),
+        "live_inputs": sum(_live_inputs.values()),
+        "recovery_failures": _admission_metrics["recovery_failures"],
+        # Stage K (pipeline KIE): backlog queued/running/chờ-commit + byte.
+        "kie_backlog": _kie_telemetry(),
+        # Stage P (prep process): hàng đợi prep + byte buffer.
+        "prep_backlog": _prep_telemetry(),
+        # Harness benchmark (stage B) đo CPU/RSS cây ngoài process này.
+        "cpu_rss_tree": "n/a (stage B)",
+    }
+
+
+def pool_telemetry_line() -> str:
+    t = pool_telemetry()
+    return (
+        f"[telemetry] gen={t['generation']} state={t['state']} "
+        f"req={t['requested_workers']} eff_cap={t['effective_capacity']} "
+        f"ready={t['ready_live_workers']} inflight={t['ocr_inflight']} "
+        f"leases={t['leases_held']} live_inputs={t['live_inputs']} "
+        f"kie={t['kie_backlog']} prep={t['prep_backlog']} cpu_rss={t['cpu_rss_tree']}"
+    )
+
+
+def _fail_token_locked(token_id: int, exc: Exception,
+                       release_resources: bool = True) -> None:
+    """Đánh dấu request THẤT BẠI hữu hạn: caller nhận lỗi qua error-sink.
+
+    P1-A (REVIEW v2): trạng thái **outcome** (done/error/sink) tách khỏi
+    trạng thái **lease** (token trong registry + gate slot + live-input).
+    `release_resources=False` (request lost, native CÓ THỂ CÒN CHẠY): caller
+    nhận lỗi ngay nhưng lease GIỮ. Lần gọi SAU với `release_resources=True`
+    (shutdown/recovery đã chứng minh native dừng, hoặc janitor thấy `ar.ready`)
+    PHẢI thu được lease dù outcome đã báo trước đó — release idempotent qua
+    pop. Thu hồi lease KHÔNG bị chặn bởi guard done."""
+    info = _admission_tokens.get(token_id)
+    if info is not None and not info["done"]:
+        info["done"] = True
+        info["error"] = exc
+        sink = info.get("sink")
+        if sink is not None:
+            sink.append(exc)
+    if release_resources:
+        _admission_release_locked(token_id)
+
+
+def _janitor_tick() -> None:
+    """Một nhịp janitor: thu hồi token terminal-bị-lỡ, xử lý request quá tuổi
+    thọ (giữ NGUYÊN lease tài nguyên đến khi native kết thúc/thế hệ bị dừng),
+    chạy deferred cleanup."""
+    import time as _t
+
+    now = _t.monotonic()
+    lost_tokens: list[tuple[int, str]] = []
+    with _admission_lock:
+        for token_id, info in list(_admission_tokens.items()):
+            ar = info.get("ar")
+            # (a) task đã terminal (callback bị lỡ HOẶC lost trước đó giờ
+            # native thật sự xong) → nhả lease BẤT KỂ outcome đã báo chưa
+            # (P1-A: janitor được thu lease terminal kể cả khi done=True).
+            if ar is not None and ar.ready():
+                if not info.get("reaped"):
+                    info["reaped"] = True
+                    _admission_metrics["reaped"] += 1
+                _admission_release_locked(token_id)
+                continue
+            if info["done"]:
+                # outcome đã báo; lease chỉ nhả khi native terminal (nhánh a)
+                # hoặc shutdown/recovery chứng minh thế hệ đã dừng.
+                continue
+            # (b) vượt tuổi thọ mà KHÔNG xác định được kết thúc native →
+            # caller nhận lỗi NGAY nhưng slot/live-input GIỮ NGUYÊN (native
+            # có thể còn chạy) — chỉ phục hồi thế hệ mới giải phóng được.
+            if now - info["submitted_at"] > _REQUEST_MAX_AGE:
+                _admission_metrics["lost"] += 1
+                lost_tokens.append((token_id, info.get("page_idx", -1)))
+                _fail_token_locked(
+                    token_id,
+                    PoolResetError(
+                        f"OCR request lost (no terminal state after "
+                        f"{_REQUEST_MAX_AGE:.0f}s), page "
+                        f"{info.get('page_idx', -1) + 1}",
+                    ),
+                    release_resources=False,
+                )
+        _cond_notify_all_locked()
+        # (c) deferred cleanup: chỉ khi KHÔNG còn request sống tham chiếu.
+        remaining = []
+        for path, since in _deferred_cleanups:
+            norm = _norm_path_key(path)
+            if _has_live_input_under(norm):
+                remaining.append((path, since))
+                continue
+            if not _deferred_rmtree(path):
+                remaining.append((path, since))
+        _deferred_cleanups[:] = remaining
+    for token_id, page_idx in lost_tokens:
+        _request_pool_recovery(f"request lost (token {token_id}, page {page_idx + 1})")
+
+
+def _janitor_loop() -> None:
+    import time
+
+    while _janitor_enabled:
+        time.sleep(1.0)
+        try:
+            _janitor_tick()
+        except Exception:
+            logger.exception("admission janitor tick failed")
+
+
+def _ensure_janitor() -> None:
+    global _janitor_thread
+    if _janitor_thread is not None and _janitor_thread.is_alive():
+        return
+    _janitor_thread = threading.Thread(
+        target=_janitor_loop, daemon=True, name="ocr-admission-janitor"
+    )
+    _janitor_thread.start()
+
+
+def _norm_path_key(path: str) -> str:
+    return os.path.normcase(os.path.abspath(str(path)))
+
+
+def _deferred_rmtree(path: str) -> bool:
+    import shutil
+
+    try:
+        if os.path.isdir(path):
+            shutil.rmtree(path)
+        deleted = not os.path.exists(path)
+        if deleted:
+            # Keep storage charged through cleanup deferred by K/P leases.
+            import sys
+            spool = sys.modules.get("scanindex.core.secret_scan_spool")
+            if spool is not None:
+                spool.forget_deleted_tree(path)
+        return deleted
+    except Exception:
+        logger.exception("deferred rmtree failed: %s", path)
+        return False
+
+
+class PagePostOcrError(RuntimeError):
+    """Lỗi lắp record/dò phía caller trong `on_page_done` — lỗi THẬT của trang,
+    phải truyền ra ngoài (không được nuốt thành 'không nộp')."""
+
+    def __init__(self, page_idx: int, cause: str):
+        super().__init__(f"post-OCR page {page_idx + 1}: {cause}")
+        self.page_idx = page_idx
+        self.cause = cause
+
+
+def cleanup_path_when_idle(path: str) -> bool:
+    """Xóa thư mục tạm NGAY nếu không còn request sống tham chiếu (trực tiếp
+    hoặc bên trong); ngược lại ghi vào danh sách dọn muộn. Trả True nếu đã
+    xóa ngay, False nếu defer.
+
+    Cả cleanup từng file lẫn cleanup thư mục cha cuối lượt phải đi qua đây —
+    không được rmtree trực tiếp khi task native có thể còn mở file bên trong."""
+    key = _norm_path_key(path)
+    with _admission_lock:
+        if _has_live_input_under(key):
+            _deferred_cleanups.append((path, 0.0))
+            _ensure_janitor()
+            return False
+        # Serialize lease acquisition against deletion, including external K/P leases.
+        return _deferred_rmtree(path)
+
+
+def _has_live_input_under(key: str) -> bool:
+    """Có request sống mở file == key hoặc nằm BÊN TRONG thư mục key?"""
+    prefix = key.rstrip("\\/") + os.sep
+    for k in _live_inputs:
+        if k == key or k.startswith(prefix):
+            return True
+    return False
+
+
+def acquire_input_lease(path: str) -> None:
+    """Ghi nhận quyền giữ input NGÔIÀ pool OCR (GĐ K/P): coordinator KIE đọc
+    canonical, prep process đọc/ghi chunk — cleanup hai tầng (janitor) phải
+    chờ các lease này nhả trước khi rmtree. Release BẮT BUỘC sau khi dùng xong
+    (finally)."""
+    key = _norm_path_key(path)
+    with _admission_lock:
+        _live_inputs[key] = _live_inputs.get(key, 0) + 1
+
+
+def release_input_lease(path: str) -> None:
+    key = _norm_path_key(path)
+    with _admission_lock:
+        if _live_inputs.get(key):
+            _live_inputs[key] -= 1
+            if _live_inputs[key] <= 0:
+                _live_inputs.pop(key, None)
+        _cond_notify_all_locked()
+
+
+def _cond_notify_all_locked() -> None:
+    _admission_cond.notify_all()
+
+
+def _admission_release_locked(token_id: int) -> None:
+    """Nhả lease một request — IDEMPOTENT (P1-A): token không còn thì bỏ qua.
+
+    P1-D: token thuộc thế hệ CŨ vẫn giữ lease khi recovery terminate thất bại
+    được đánh dấu `foreign_charged` — budget thế hệ mới đã bị TRỪ trước một
+    slot cho nó, nên khi native cũ kết thúc (janitor nhả) slot hoàn về gate
+    hiện tại. Không có flag → chỉ token cùng thế hệ mới được hoàn slot."""
+    info = _admission_tokens.pop(token_id, None)
+    if info is None:
+        return
+    key = info.get("path_key")
+    if key and _live_inputs.get(key):
+        _live_inputs[key] -= 1
+        if _live_inputs[key] <= 0:
+            _live_inputs.pop(key, None)
+    if (
+        not _GATE_DISABLED
+        and _gate_sem is not None
+        and (
+            info["generation"] == _pool_generation
+            or info.get("foreign_charged")
+        )
+    ):
+        try:
+            _gate_sem.release()
+        except ValueError:
+            logger.exception("admission slot over-release (token %s)", token_id)
+    _cond_notify_all_locked()
+
+
+def try_submit_page(
+    input_path: str,
+    page_idx: int,
+    render_annots: bool = True,
+    dpi: int | None = None,
+    *,
+    wait_started_at: float | None = None,
+):
+    """Thử nộp một trang, KHÔNG chờ. Trả về `(state, handle)`:
+
+    - `("submitted", _AdmissionResult)` — đã vào pool (token giữ tới khi task
+      native kết thúc; caller KHÔNG tự nhả slot). `handle.get()` trả
+      `(page_idx, result)` — hợp đồng public 2 phần tử (P1-03).
+    - `("busy", None)` — admission đầy; caller quay lại vòng thu kết quả,
+      KHÔNG được coi là lỗi hay hoàn thành.
+    - `("error", exception)` — lỗi hạ tầng (PoolResetError/file not found/...).
+
+    `wait_started_at` (P2-H): mốc monotonic khi caller BẮT ĐẦU yêu cầu trang
+    này (trước các lần Busy) — `admission_wait_ms` đo từ đó, không chỉ từ lần
+    try thành công. Caller qua vòng retry (submit_page/collector) truyền để
+    metric đúng ngữ nghĩa.
+
+    Giao dịch submission (P1-07): chọn pool + generation → acquire → đăng ký
+    token (kèm error-sink TRƯỚC khi commit) → apply_async trong try — ném lỗi
+    thì rollback token; pool chết giữa chừng → ("error", …)."""
+    if _GATE_DISABLED:
+        return _try_submit_no_gate(input_path, page_idx, render_annots, dpi)
+    import time as _t
+
+    # 0. Quarantine: đang phục hồi → không được chạm pool (tránh dựng pool
+    # mới vô ích giữa lúc thế hệ cũ bị khai tử).
+    if _recovering_gen == _pool_generation:
+        return ("error", PoolResetError("pool generation is recovering"))
+
+    # 1. Pool/generation trước — gate tồn tại cùng thế hệ (P1-02).
+    try:
+        pool = _get_pool()
+    except Exception as exc:
+        return ("error", exc)
+    _ensure_janitor()
+
+    # 2. Handle + sink tồn tại TRƯỚC khi commit (reset sớm không mất lỗi).
+    token_id = next(_admission_next_id)
+    handle = _AdmissionResult(token_id, _pool_generation, None)
+
+    # 3. Đoạn đồng bộ: acquire + đăng ký (không chờ ở đây).
+    attempt_started = wait_started_at if wait_started_at is not None else _t.monotonic()
+    with _admission_lock:
+        if (
+            handle.generation != _pool_generation
+            or _recovering_gen == _pool_generation
+            # P1-B: pool được chọn TRƯỚC khi shutdown/recovery khai tử thế
+            # hệ → mọi generation hiện tại đều không còn pool hợp lệ cho tới
+            # khi pool thế hệ mới được publish (_mp_pool_gen quay lại thật).
+            # None = chưa theo dõi (đường test giả lập `_get_pool`) → bỏ qua.
+            or (_mp_pool_gen is not None and _mp_pool_gen != handle.generation)
+        ):
+            return ("error", PoolResetError("pool generation changed during submit"))
+        _ensure_gate_locked()
+        if not _gate_sem.acquire(blocking=False):
+            _admission_metrics["busy_rejections"] += 1
+            return ("busy", None)
+        info = {
+            "generation": handle.generation,
+            "path_key": _norm_path_key(input_path),
+            "ar": None,
+            "done": False,
+            "error": None,
+            "submitted_at": _t.monotonic(),
+            "page_idx": page_idx,
+            "sink": handle.error_sink,
+        }
+        _admission_tokens[token_id] = info
+        _live_inputs[info["path_key"]] = _live_inputs.get(info["path_key"], 0) + 1
+        m = _admission_metrics
+        m["submitted"] += 1
+        if m["run_first_submit_at"] is None:
+            m["run_first_submit_at"] = attempt_started
+        m["admission_wait_ms"].append(int((_t.monotonic() - attempt_started) * 1000))
+
+    # 4. Commit: apply_async — ném lỗi thì rollback token (P1-07.3).
+    try:
+        ar = pool.apply_async(
+            _worker_ocr_single_tokenized,
+            ((token_id, input_path, page_idx, bool(render_annots), dpi, _t.monotonic()),),
+            callback=_on_pool_task_done,
+            error_callback=_make_error_callback(token_id),
+        )
+    except Exception as exc:
+        with _admission_lock:
+            _admission_release_locked(token_id)
+        return ("error", exc)
+
+    # 5. Gắn ar vào CẢ registry lẫn handle (handle.ar None → caller đọc được
+    # kết quả); nếu reset xảy ra giữa apply_async và lúc này, sink đã nhận
+    # lỗi từ trước (đăng ký sink TRƯỚC commit).
+    handle.ar = ar
+    with _admission_lock:
+        info = _admission_tokens.get(token_id)
+        if info is not None:
+            info["ar"] = ar
+    return ("submitted", handle)
+
+
+def _try_submit_no_gate(input_path, page_idx, render_annots, dpi):
+    """Đường kill-switch: không giới hạn, vẫn đo telemetry qua tokenized task."""
+    import time as _t
+
+    gen_at_select = _pool_generation
+    try:
+        pool = _get_pool()
+    except Exception as exc:
+        return ("error", exc)
+    _ensure_janitor()
+
+    token_id = next(_admission_next_id)
+    handle = _AdmissionResult(token_id, _pool_generation, None)
+    with _admission_lock:
+        if (
+            handle.generation != _pool_generation
+            or _recovering_gen == _pool_generation
+            or gen_at_select != _pool_generation
+        ):
+            # P1-B: pool đã chọn không còn thuộc thế hệ hiện tại — từ chối
+            # thay vì đăng ký token mới-gen lên pool cũ.
+            return ("error", PoolResetError("pool generation changed during submit"))
+        info = {
+            "generation": _pool_generation,
+            "path_key": _norm_path_key(input_path),
+            "ar": None,
+            "done": False,
+            "error": None,
+            "submitted_at": _t.monotonic(),
+            "page_idx": page_idx,
+            "sink": handle.error_sink,
+        }
+        _admission_tokens[token_id] = info
+        m = _admission_metrics
+        m["submitted"] += 1
+        if m["run_first_submit_at"] is None:
+            m["run_first_submit_at"] = _t.monotonic()
+        key = info["path_key"]
+        _live_inputs[key] = _live_inputs.get(key, 0) + 1
+    try:
+        ar = pool.apply_async(
+            _worker_ocr_single_tokenized,
+            ((token_id, input_path, page_idx, bool(render_annots), dpi, _t.monotonic()),),
+            callback=_on_pool_task_done,
+            error_callback=_make_error_callback(token_id),
+        )
+    except Exception as exc:
+        with _admission_lock:
+            _admission_release_locked(token_id)
+        return ("error", exc)
+    handle.ar = ar
+    with _admission_lock:
+        info = _admission_tokens.get(token_id)
+        if info is not None:
+            info["ar"] = ar
+    return ("submitted", handle)
+
+
+def _make_error_callback(token_id):
+    """error_callback của Pool nhận EXCEPTION (không phải payload) — bind
+    token theo request (P2-12)."""
+
+    def _cb(exc):
+        _on_pool_task_error(token_id, exc)
+
+    return _cb
+
+
+def _on_pool_task_done(result):
+    """Callback thành công của apply_async — CHỈ bookkeeping, phải nhanh.
+    Task native XONG → nhả lease (kể cả với token đã đánh dấu lost)."""
+    try:
+        token_id, _page_idx, _result, timing = result
+        with _admission_lock:
+            _admission_metrics["queue_wait_ms"].append(
+                int(timing.get("queue_wait_ms", 0))
+            )
+            ocr_ms = int(timing.get("ocr_ms", 0))
+            _admission_metrics["ocr_ms"].append(ocr_ms)
+            _admission_metrics["ocr_ms_total"] += ocr_ms
+            _admission_metrics["ocr_ms_count"] += 1
+            _admission_metrics["completed"] += 1
+            _admission_release_locked(token_id)
+    except Exception:
+        logger.exception("pool task done callback failed")
+
+
+def _on_pool_task_error(token_id, exc):
+    """Callback lỗi của apply_async — nhả lease, phải nhanh."""
+    try:
+        with _admission_lock:
+            _admission_metrics["errors"] += 1
+            _admission_release_locked(token_id)
+    except Exception:
+        logger.exception("pool task error callback failed")
+
+
+class _AdmissionResult:
+    """Handle kết quả gắn token. `.get()` trả `(page_idx, result)` — HỢP ĐỒNG
+    PUBLIC 2 PHẦN TỬ (token/timing là nội bộ, P1-03). `.get()` có thể raise
+    `PoolResetError` (lost/reset/shutdown) hoặc `multiprocessing.TimeoutError`
+    khi hết hạn chờ."""
+
+    __slots__ = ("token_id", "generation", "ar", "_error", "timing")
+
+    def __init__(self, token_id: int, generation: int, ar):
+        self.token_id = token_id
+        self.generation = generation
+        self.ar = ar
+        self.timing: dict | None = None
+        self._error: list = []  # error-sink: janitor/reset đẩy lỗi vào đây
+
+    @property
+    def error_sink(self) -> list:
+        return self._error
+
+    def ready(self) -> bool:
+        if self._error:
+            return True
+        with _admission_lock:
+            info = _admission_tokens.get(self.token_id)
+            if info is not None and info.get("error") is not None:
+                return True
+        return bool(self.ar.ready()) if self.ar is not None else True
+
+    def get(self, timeout=None):
+        """Chờ kết quả, kiểm tra error-sink ĐỊNH KỲ (≤0,25 s/lượt) để lỗi
+        lost/reset đến đúng hạn thay vì chờ nguyên timeout. Hết hạn raise
+        `multiprocessing.TimeoutError`."""
+        import multiprocessing
+        import time as _t
+
+        deadline = None
+        if timeout is not None:
+            deadline = _t.monotonic() + float(timeout)
+        while True:
+            if self._error:
+                raise self._error[0]
+            with _admission_lock:
+                info = _admission_tokens.get(self.token_id)
+                if info is not None and info.get("error") is not None:
+                    raise PoolResetError(str(info["error"]))
+            if self.ar is None:
+                return (None, None)
+            remaining = None
+            if deadline is not None:
+                remaining = deadline - _t.monotonic()
+                if remaining <= 0:
+                    raise multiprocessing.TimeoutError("OCR result wait timed out")
+            slice_wait = 0.25 if remaining is None else min(0.25, max(remaining, 0.001))
+            try:
+                raw = self.ar.get(timeout=slice_wait)
+            except multiprocessing.TimeoutError:
+                if deadline is not None:
+                    # P1-C: hết MỘT slice ≠ hết deadline tổng — poll tiếp cho
+                    # tới khi có kết quả, terminal outcome hoặc hết deadline
+                    # thật. Đầu vòng lặp đã kiểm tra lại error-sink.
+                    if deadline - _t.monotonic() > 0:
+                        continue
+                    # hết deadline tổng: kiểm tra nốt sink rồi raise kiểu đúng
+                    if self._error:
+                        raise self._error[0]
+                    with _admission_lock:
+                        info = _admission_tokens.get(self.token_id)
+                        if info is not None and info.get("error") is not None:
+                            raise PoolResetError(str(info["error"]))
+                    raise
+                # không deadline: vòng lại kiểm tra sink rồi đợi tiếp
+                continue
+            # raw = (token_id, page_idx, result, timing) từ worker tokenized
+            try:
+                _token_id, page_idx, result, timing = raw
+                self.timing = timing
+                return (page_idx, result)
+            except (TypeError, ValueError):
+                # handle prebaked/hợp đồng cũ trả (page_idx, result)
+                return raw
+
+    def wait(self, timeout=None):
+        try:
+            self.get(timeout=timeout)
+        except Exception:
+            pass
+
+
+def submit_page(
+    input_path: str,
+    page_idx: int,
+    render_annots: bool = True,
+    cancel_check=None,
+    wait_check=None,
+):
+    """Nộp một trang — hợp đồng cũ: trả handle `AsyncResult`-like, caller
+    `.ready()/.get()`. Không bao giờ trả None vì 'bận' (bận chỉ là chờ).
+
+    - `cancel_check`: gọi định kỳ lúc chờ slot; True → raise CoreScanCancelled.
+    - `wait_check`: gọi định kỳ lúc chờ slot; True → tạm dừng chờ (nội bộ
+      feeder dùng để tôn trọng pause chủ đích) — raise CoreScanCancelled khi
+      muốn hủy hẳn. Trả về khi nộp thành công hoặc raise lỗi thật."""
+    import time as _t
+
+    warned = False
+    reset_retries = 0
+    loop_started: float | None = None  # P2-H: mốc "caller bắt đầu yêu cầu"
+    while True:
+        state, handle = try_submit_page(input_path, page_idx, render_annots)
+        if state == "submitted":
+            if loop_started is not None:
+                # Caller đã Busy/chờ qua các lần trước: ghi entry full-wait
+                # (admission_wait đo từ lúc bắt đầu yêu cầu, không chỉ lần
+                # try thành công). Entry attempt-level do try_submit tự ghi.
+                with _admission_lock:
+                    _admission_metrics["admission_wait_ms"].append(
+                        int((_t.monotonic() - loop_started) * 1000)
+                    )
+            return handle
+        if loop_started is None:
+            loop_started = _t.monotonic()
+        if state == "error":
+            if isinstance(handle, PoolResetError) and reset_retries < 3:
+                reset_retries += 1
+                _t.sleep(0.05)
+                if _recovering_gen is None:
+                    continue
+            raise handle
+        # busy → chờ bounded rồi thử lại; tôn trọng pause/cancel trong lúc chờ
+        if not warned:
+            warned = True
+        deadline = _t.monotonic() + 0.05
+        while _t.monotonic() < deadline:
+            if cancel_check is not None and cancel_check():
+                raise CoreScanCancelled("cancelled while waiting for admission")
+            if wait_check is not None and wait_check():
+                raise CoreScanCancelled("paused while waiting for admission")
+            _t.sleep(0.01)
 
 OCR_DPI = 240
 OCR_TEXT_NORMALIZATION = "latin_vi_canonical_v2"
@@ -200,29 +1573,41 @@ def _analyze_combined_layout_regions(page, page_idx, page_w, page_h, analyzers, 
 # --- Worker process state (1 ScreenAI instance per worker process) ---
 _worker_ocr = None       # the worker's ScreenAIOCR instance
 _worker_dll_path = None  # loaded DLL path, kept for diagnostics
+_worker_model_dir = None  # model dir (GĐ W: initializer nhẹ chỉ lưu path)
 _worker_init_error = None
+_worker_load_lock = threading.Lock()
+# P1-01: limiter nạp DÙNG CHUNG mọi đường load trong worker (warmup/self-load/
+# respawn) — cấp bởi supervisor qua initializer, kế thừa cho worker respawn.
+_worker_load_sem = None   # BoundedSemaphore(k) liên process; None = không giới hạn
+_worker_load_probe = None  # Value('i') đếm nạp đang chạy (quan sát/test)
+# Bản tham chiếu PARENT của probe — chỉ để telemetry (worker tự dùng bản kế thừa).
+_load_probe_ref = None
 
 
-def _worker_init(dll_path, model_dir):
-    """Called once per worker process to load ScreenAI from the model dir.
+def _worker_init(dll_path, model_dir, load_sem=None, load_probe=None):
+    """Initializer NHẸ (GĐ W): chỉ patch stdio + LƯU path + nhận limiter nạp —
+    DLL/model do chính worker nạp khi chạy `_warmup_task` (theo đợt k do
+    supervisor kiểm soát) hoặc ở task OCR đầu tiên (`_ensure_worker_loaded`).
+    Nhờ vậy: (i) không bao giờ có N process nạp DLL đồng thời lúc spawn;
+    (ii) worker recycle tái khởi tạo rẻ, lần task kế tự nạp lại — VẪN qua
+    cùng permit nạp (P1-01).
+    D1: TỰ-GÁN Windows Job của parent (ownership tree) TRƯỚC mọi native —
+    recycle respawn cũng vào job (env handle kế thừa)."""
+    global _worker_dll_path, _worker_model_dir, _worker_init_error
+    global _worker_load_sem, _worker_load_probe
 
-    The DLL must stay next to its ScreenAI model/runtime files so Windows can
-    resolve native dependencies from the same directory in frozen builds."""
-    global _worker_ocr, _worker_dll_path, _worker_init_error
-
+    from scanindex.infra.bootstrap import bootstrap_worker
+    bootstrap_worker()
     try:
         from scanindex.infra.mp_safety import ensure_valid_stdio
         ensure_valid_stdio()
-        ocr = ScreenAIOCR(dll_path=dll_path, model_dir=model_dir)
-        ocr.initialize()
-        _worker_ocr = ocr
-        _worker_dll_path = dll_path
-        _worker_init_error = None
-    except Exception as exc:
-        _worker_ocr = None
-        _worker_dll_path = dll_path
-        _worker_init_error = f"{type(exc).__name__}: {exc}"
-        logger.exception("ScreenAI worker initialization failed")
+    except Exception:
+        pass
+    _worker_dll_path = dll_path
+    _worker_model_dir = model_dir
+    _worker_init_error = None
+    _worker_load_sem = load_sem
+    _worker_load_probe = load_probe
 
 
 def _worker_ocr_single(input_path, page_idx, render_annots=True, dpi=None):
@@ -230,14 +1615,33 @@ def _worker_ocr_single(input_path, page_idx, render_annots=True, dpi=None):
 
     ``dpi`` overrides the module-wide OCR_DPI (default 240). Callers like the
     secret-file scanner pass a lower DPI (e.g. 200) for faster stamp detection.
-    """
-    try:
+
+    GĐ W: runtime tự nạp tại đây nếu worker chưa nạp (task đầu tiên hoặc
+    worker recycle mới) — nạp lỗi trả sentinel `worker_init_failed` như cũ
+    (collector điều phối recovery)."""
+    import os as _os
+
+    if _os.environ.get("OCRTOOL_WARMUP_TEST_MODE") == "1":
+        # Hook test integration (Pool thật, không nạp DLL): kết quả OCR giả.
         if _worker_ocr is None:
+            _ensure_worker_loaded()  # Exercise replacement-worker load permits too.
+        return (page_idx, {
+            "lines_data": [{"text": "TEST", "x0": 0, "x1": 10, "y0": 0, "y1": 10}],
+            "words_data": [], "render_width": 10, "render_height": 10,
+        })
+    if _worker_ocr is None:
+        try:
+            with _worker_load_lock:
+                if _worker_ocr is None:
+                    _ensure_worker_loaded()
+        except Exception as exc:
+            logger.exception("ScreenAI worker runtime load failed")
             return (page_idx, {
                 "worker_init_failed": True,
-                "error": _worker_init_error or "ScreenAI worker is not initialized",
+                "error": f"{type(exc).__name__}: {exc}",
             })
 
+    try:
         import fitz
         from PIL import Image
 
@@ -270,9 +1674,25 @@ def _worker_ocr_single(input_path, page_idx, render_annots=True, dpi=None):
             "render_height": render_h,
         })
 
-    except Exception:
+    except Exception as exc:
         logger.exception("ScreenAI worker OCR failed")
-        return (page_idx, None)
+        return (page_idx, {"ocr_error": True,
+                           "error": f"{type(exc).__name__}: {exc}"})
+
+
+def _worker_ocr_single_tokenized(payload):
+    """Wrapper picklable gắn token: đo thời gian chờ hàng đợi + thời gian OCR
+    để telemetry phân biệt 'đã nộp' với 'đang chạy native'. Trả về
+    `(token_id, page_idx, result, timing)` — callback `_on_pool_task_done`
+    dựa vào token_id để nhả slot."""
+    import time as _t
+
+    (token_id, input_path, page_idx, render_annots, dpi, submitted_at) = payload
+    t_start = _t.monotonic()
+    queue_wait_ms = int((t_start - submitted_at) * 1000)
+    result = _worker_ocr_single(input_path, page_idx, render_annots=render_annots, dpi=dpi)[1]
+    ocr_ms = int((_t.monotonic() - t_start) * 1000)
+    return (token_id, page_idx, result, {"queue_wait_ms": queue_wait_ms, "ocr_ms": ocr_ms})
 
 
 def _worker_ocr_batch(args):
@@ -289,10 +1709,23 @@ def _get_pool():
 
     Returns a SINGLE `multiprocessing.Pool` with `_NUM_PAGE_WORKERS` worker
     processes. Each worker is fully independent (one DLL each, no shared
-    state)."""
-    global _mp_pool
+    state).
+
+    GĐ W: initializer NHẸ — DLL/model do supervisor điều phối nạp theo đợt k
+    (`OCRTOOL_WARMUP_STAGE`, mặc định 4) qua `_warmup_task`; gate capacity
+    ramp theo số worker ACK (ready=0 ⇒ Busy/warming). `_get_pool()` KHÔNG
+    bao giờ chờ warmup (trả ngay sau khi publish)."""
+    global _mp_pool, _mp_pool_gen, _pool_state, _load_probe_ref
+    from scanindex.core.runtime.shutdown import accepting_work, track_executor
+    if not accepting_work():
+        raise RuntimeError("Runtime is stopping")
     if _mp_pool is not None:
         return _mp_pool
+    # Thang retry warmup kiểm tra TRƯỚC khi spawn — lần thứ 4 fail-loud
+    # (OCRWarmupError) mà không tạo generation mới (plan §4.2.0).
+    # P1-02: Pool dựng với SỐ PROCESS HIỆU LỰC đã chọn (retry 2 của N=8 là
+    # 4 process, không phải 8) — gate/ready phản ánh đúng RAM/process thật.
+    requested, stage_k = _warmup_stage_plan(_NUM_PAGE_WORKERS)
     with _mp_pool_lock:
         if _mp_pool is not None:
             return _mp_pool
@@ -308,18 +1741,47 @@ def _get_pool():
             raise FileNotFoundError("OCR library not installed")
 
         patch_multiprocessing_spawn_sys_path()
+        from scanindex.infra.windows_job import ensure_app_job
+        ensure_app_job()
+        # P1-01: limiter nạp liên process (cửa sổ k) — mọi đường load của
+        # worker (warmup/self-load/respawn) đi qua một permit duy nhất. Chỉ
+        # dựng khi staging BẬT và k < N (staging tắt hoặc k=N: không cần).
+        load_sem = None
+        load_probe = None
+        if 0 < stage_k < requested:
+            load_sem = multiprocessing.BoundedSemaphore(stage_k)
+            load_probe = multiprocessing.Value("i", 0)
         with sanitized_sys_path_for_spawn():
             pool = multiprocessing.Pool(
-                processes=_NUM_PAGE_WORKERS,
+                processes=requested,
                 initializer=_worker_init,
-                initargs=(dll_path, model_dir),
-                maxtasksperchild=max(1, _MP_MAXTASKSPERCHILD),
+                initargs=(dll_path, model_dir, load_sem, load_probe),
+                maxtasksperchild=_MP_MAXTASKSPERCHILD,  # None = tắt recycle (B7)
             )
 
         _mp_pool = pool
+        track_executor(pool)
+        _load_probe_ref = load_probe
+        # Gate phải tồn tại TỪ THẾ HỆ ĐẦU (P1-02): None = không giới hạn là
+        # lỗi; sau shutdown/lazy-init cũng phải dựng lại trước khi nhận nộp.
+        with _admission_lock:
+            _ensure_gate_locked()
+            # P1-B: công bố generation mà pool này thuộc về — submission vào
+            # thế hệ khác sẽ bị từ chối ở đoạn đồng bộ thay vì nộp nhầm pool.
+            _mp_pool_gen = _pool_generation
+            _pool_state = "ready"
+        # GĐ W: supervisor staged warmup (không semaphore liên process).
+        with _warmup_lock:
+            _start_warmup_supervisor_locked(requested, stage_k)
         logger.info(
-            "Page-level OCR pool ready: %d worker processes (1 DLL each)",
-            _NUM_PAGE_WORKERS,
+            "Page-level OCR pool ready: %d/%d worker processes (1 DLL each, "
+            "admission budget %d, warmup stage=%d, load limiter=%s, "
+            "maxtasksperchild=%s)",
+            requested, _NUM_PAGE_WORKERS,
+            _gate_capacity(),
+            stage_k,
+            "on (k=%d)" % stage_k if load_sem is not None else "off",
+            _MP_MAXTASKSPERCHILD if _MP_MAXTASKSPERCHILD is not None else "off",
         )
         return _mp_pool
 
@@ -327,15 +1789,6 @@ def _get_pool():
 def get_page_pool():
     """Public accessor returning the lazily-initialized page-level pool."""
     return _get_pool()
-
-
-def submit_page(input_path: str, page_idx: int, render_annots: bool = True):
-    """Submit one page to the OCR pool. Returns a `multiprocessing.AsyncResult`.
-
-    Caller can `.get(timeout=...)` to block, or `.ready()` to poll. Result is
-    a tuple `(page_idx, page_dict_or_None)`."""
-    pool = _get_pool()
-    return pool.apply_async(_worker_ocr_single, (input_path, page_idx, bool(render_annots)))
 
 
 class _PrebakedAsyncResult:
@@ -373,12 +1826,17 @@ def ocr_one_page(input_path: str, page_idx: int, timeout: float = 120.0,
                  render_annots: bool = True):
     """Synchronous helper: submit one page and wait for the result.
 
-    Returns the page dict (lines/words/render dims) or None on failure."""
+    Returns the page dict (lines/words/render dims) or None on failure.
+    `worker_init_failed` KHÔNG còn shutdown pool chung — chuyển cho supervisor
+    phục hồi tập trung (trước đây 1 trang init lỗi giết cả pool dùng chung)."""
     ar = submit_page(input_path, page_idx, render_annots=render_annots)
     try:
         _, result = ar.get(timeout=timeout)
         if isinstance(result, dict) and result.get("worker_init_failed"):
-            shutdown_pool()
+            _request_pool_recovery(
+                f"worker init failed on single page {page_idx + 1}: "
+                f"{result.get('error')}"
+            )
             return None
         return result
     except Exception:
@@ -518,18 +1976,185 @@ def replace_canonical_page_with_page_result(
     }
 
 
+def _cancel_warmup_for_generation() -> None:
+    """Đánh dấu warmup của thế hệ hiện tại kết thúc (shutdown/recovery) —
+    ACK về sau bị bỏ (KHÔNG phải degraded: sổ đóng hẳn), deadline timer bị
+    hủy."""
+    with _warmup_lock:
+        _warmup["done"] = True
+        _warmup["degraded"] = False
+        timer = _warmup.get("deadline_timer")
+        if timer is not None:
+            timer.cancel()
+            _warmup["deadline_timer"] = None
+
+
+def _reserve_foreign_budget_locked() -> None:
+    """P1-D: lease thế hệ cũ còn sống (native CÓ THỂ CÒN CHẠY) phải chiếm
+    chỗ trong budget gate hiện tại — tổng request native chưa xong của app
+    không vượt trần. Gọi khi đang giữ `_admission_lock`, sau khi gate mới
+    đã được dựng."""
+    foreign = [
+        info for info in _admission_tokens.values()
+        if info["generation"] < _pool_generation
+    ]
+    if foreign and _gate_sem is not None and not _GATE_DISABLED:
+        reserved = 0
+        for info in foreign:
+            if _gate_sem.acquire(blocking=False):
+                info["foreign_charged"] = True
+                reserved += 1
+            else:
+                break
+        if reserved < len(foreign):
+            logger.warning(
+                "reserve budget cho %d lease cũ chỉ được %d slot (gate đã "
+                "đầy) — submission mới sẽ Busy tới khi lease cũ nhả",
+                len(foreign), reserved,
+            )
+
+
 def shutdown_pool():
-    """Shutdown the OCR pool. Call on app exit (or to release RAM)."""
-    global _mp_pool
+    """Đóng thế hệ pool hiện tại: mọi request chưa terminal của thế hệ đó nhận
+    `PoolResetError` qua error-sink (không ai chờ handle cũ vô hạn), pool
+    terminate/join — terminate xong native chắc chắn dừng → nhả lease. Chỉ
+    đóng — KHÔNG tự dựng pool mới (lần OCR sau sẽ lazy-init).
+
+    P1-B (REVIEW v2): shutdown KHÔNG đụng request của thế hệ khác — snapshot
+    tập token thuộc thế hệ bị đóng ngay khi bắt đầu; pha sau terminate chỉ
+    kết thúc/thu hồi lease đúng các token đó. Request đăng ký vào thế hệ mới
+    (sau khi bump) không bị đánh lỗi, không mất lease.
+
+    P1-03: terminate/join THẤT BẠI KHÔNG phải bằng chứng native đã dừng —
+    KHÔNG nhả lease, KHÔNG mất tham chiếu vô thức: giữ token/lease thế hệ cũ,
+    trừ budget gate thế hệ mới (như recovery-failure), chờ janitor thấy task
+    thật kết thúc (`ar.ready`) hoặc thế hệ sau được chứng minh dừng."""
+    global _mp_pool, _pool_generation, _gate_sem, _mp_pool_gen, _pool_state
+    _cancel_warmup_for_generation()
+    with _admission_lock:
+        old_gen = _pool_generation
+        _pool_generation += 1
+        _gate_sem = None
+        _mp_pool_gen = -1  # pool đang dying — không nhận submission
+        _pool_state = "stopping"
+        _cond_notify_all_locked()
+        # Snapshot thế hệ bị đóng — pha sau KHÔNG quét toàn bộ registry.
+        shutdown_ids = [
+            tid for tid, info in _admission_tokens.items()
+            if info["generation"] == old_gen
+        ]
+        for token_id in shutdown_ids:
+            _fail_token_locked(token_id, PoolResetError("pool shut down"),
+                               release_resources=False)
+    terminate_ok = True
     with _mp_pool_lock:
-        if _mp_pool is not None:
-            try:
-                _mp_pool.terminate()
-                _mp_pool.join()
-            except Exception:
-                pass
-            _mp_pool = None
-            logger.info("OCR pool shut down")
+        pool = _mp_pool
+        _mp_pool = None
+    if pool is not None:
+        from scanindex.core.runtime.shutdown import track_executor
+        track_executor(pool)
+        try:
+            pool.terminate()
+            pool.join()
+        except Exception:
+            terminate_ok = False
+            logger.exception(
+                "OCR pool shutdown: terminate/join FAILED — native có thể "
+                "còn chạy; GIỮ lease tới khi native kết thúc thật (P1-03)"
+            )
+    # Chỉ khi terminate thành công (hoặc không có pool) → native dừng hẳn →
+    # nhả lease của ĐÚNG thế hệ đã snapshot.
+    with _admission_lock:
+        for token_id in shutdown_ids:
+            _fail_token_locked(token_id, PoolResetError("pool shut down"),
+                               release_resources=terminate_ok)
+        _mp_pool_gen = None  # lazy-init kế tiếp sẽ publish thế hệ mới
+        if terminate_ok:
+            _pool_state = "idle"
+        else:
+            _admission_metrics["recovery_failures"] += 1
+            _pool_state = "ready"  # lazy-init thế hệ mới vẫn được phép
+            _ensure_gate_locked()
+            _reserve_foreign_budget_locked()
+        _cond_notify_all_locked()
+
+
+def _request_pool_recovery(reason: str) -> None:
+    """Phục hồi thế hệ pool: quarantine (chặn nộp mới) → terminate/join →
+    nếu terminate THÀNH CÔNG: mọi request của thế hệ cũ — cả chưa terminal
+    LẪN lost-đã-báo-lỗi — đều được kết thúc và NHẢ lease (native đã dừng hẳn,
+    P1-A); nếu terminate THẤT BẠI: báo recovery failure, GIỮ lease, vẫn dựng
+    thế hệ mới nhưng TRỪ budget cho các lease cũ còn sống (P1-D — không vượt
+    trần native toàn app). Single-flight: một lần phục hồi mỗi thế hệ."""
+    global _pool_generation, _gate_sem, _recovering_gen, _mp_pool, _mp_pool_gen
+    global _pool_state
+    _cancel_warmup_for_generation()
+    with _admission_lock:
+        gen = _pool_generation
+        if _recovering_gen == gen:
+            return
+        _recovering_gen = gen
+        _gate_sem = None  # quarantine: try_submit thấy recovering → error
+        _mp_pool_gen = -1
+        _pool_state = "quarantined"
+        _admission_metrics["resets"] += 1
+        _cond_notify_all_locked()
+    logger.warning("OCR pool recovery started: %s (generation %s)", reason, gen)
+    terminate_ok = True
+    with _mp_pool_lock:
+        pool = _mp_pool
+        _mp_pool = None
+    if pool is not None:
+        from scanindex.core.runtime.shutdown import track_executor
+        track_executor(pool)
+        try:
+            pool.terminate()
+            pool.join()
+        except Exception:
+            terminate_ok = False
+            logger.exception("pool terminate during recovery FAILED — giữ lease")
+    with _admission_lock:
+        # Kết thúc mọi request của thế hệ bị đóng; với token lost (done=True)
+        # thì thu lease khi native đã được chứng minh dừng (P1-A).
+        for token_id, info in list(_admission_tokens.items()):
+            if info["generation"] != gen:
+                continue
+            if not info["done"]:
+                _fail_token_locked(
+                    token_id,
+                    PoolResetError(f"pool recovered: {reason}"),
+                    release_resources=terminate_ok,
+                )
+            elif terminate_ok:
+                _admission_release_locked(token_id)
+        _pool_generation = gen + 1
+        _ensure_gate_locked()
+        if not terminate_ok:
+            _admission_metrics["recovery_failures"] += 1
+            # P1-D: các lease thế hệ cũ còn sống phải chiếm chỗ trong budget
+            # thế hệ mới — tổng request native chưa xong của app không vượt
+            # trần. Khi native cũ kết thúc (janitor nhả foreign_charged),
+            # slot hoàn về gate hiện tại.
+            _reserve_foreign_budget_locked()
+        _recovering_gen = None
+        _pool_state = "ready"
+        # Không còn pool (`_mp_pool` đã None): trả `_mp_pool_gen` về None =
+        # "chưa có pool được publish" — lazy-init kế tiếp sẽ publish thế hệ
+        # mới. Giữ -1 ở đây sẽ chặn submission mãi trong đường test giả lập.
+        _mp_pool_gen = None
+        _cond_notify_all_locked()
+    if terminate_ok:
+        logger.warning("OCR pool recovery done: new generation %s", _pool_generation)
+    else:
+        logger.error(
+            "OCR pool recovery INCOMPLETE (native có thể còn chạy) — thế hệ "
+            "mới %s vẫn được dựng với budget trừ cho %d lease cũ; lease giữ "
+            "đến khi native tự kết thúc",
+            _pool_generation,
+            sum(1 for i in _admission_tokens.values()
+                if i["generation"] < _pool_generation),
+        )
+
 
 atexit.register(shutdown_pool)
 
@@ -540,7 +2165,7 @@ def _find_unicode_font():
         os.path.join(os.environ.get("WINDIR", "C:\\Windows"), "Fonts", "arial.ttf"),
         os.path.join(os.environ.get("WINDIR", "C:\\Windows"), "Fonts", "times.ttf"),
         os.path.join(os.environ.get("WINDIR", "C:\\Windows"), "Fonts", "calibri.ttf"),
-        os.path.join(get_base_dir(), "models", "fonts", "NotoSans-Regular.ttf"),
+        os.path.join(get_app_dir(), "models", "fonts", "NotoSans-Regular.ttf"),
     ]
     for path in candidates:
         if os.path.exists(path):
@@ -550,7 +2175,7 @@ def _find_unicode_font():
 
 def _get_model_dir():
     """Get the screen_ai model base directory."""
-    return os.path.join(get_base_dir(), "models", "screen_ai")
+    return os.path.join(get_app_dir(), "models", "screen_ai")
 
 
 def check_ocr_status():
@@ -1619,6 +3244,7 @@ def process_pdf_for_docx_export(input_path, output_path, num_pages=None, update_
                     _attach_docx_manifest_to_page(page_record, manifest_entry)
                     _ensure_page_source_layer(page_record, manifest_entry)
                 elif source_mode_page == "mixed":
+                    _validate_page_result_or_raise(page_idx, all_page_results.get(page_idx))
                     native_page = _pick_native_text_page(original_doc, visual_doc, page_idx)
                     ocr_record, coord_flipped = _ocr_page_record_from_result(
                         page_idx,
@@ -1630,6 +3256,7 @@ def process_pdf_for_docx_export(input_path, output_path, num_pages=None, update_
                     _attach_docx_manifest_to_page(page_record, manifest_entry)
                     _ensure_page_source_layer(page_record, manifest_entry)
                 else:
+                    _validate_page_result_or_raise(page_idx, all_page_results.get(page_idx))
                     page_record, coord_flipped = _ocr_page_record_from_result(
                         page_idx,
                         visual_page,
@@ -2209,15 +3836,69 @@ def _empty_page_ocr_result():
     }
 
 
-def _collect_page_ocr_bounded(input_path, page_indices, total_pages, log,
-                              page_timeout: float = 120.0, dpi=None):
-    """Collect page OCR through a bounded apply_async queue.
+def _validate_page_result_or_raise(page_idx: int, result) -> None:
+    """GĐ 0 (P1-09): trang scan/mixed cần OCR — kết quả sentinel/missing KHÔNG
+    được lắp thành trang không chữ rồi báo thành công."""
+    state = page_result_state(result)
+    if state in {"error", "missing"}:
+        raise RuntimeError(
+            f"OCR thất bại ở trang {page_idx + 1} (state={state}) — "
+            "không xuất trang rỗng thay thế"
+        )
 
-    ``dpi`` is forwarded to each worker (None → OCR_DPI default 240).
-    """
+
+def page_result_state(result) -> str:
+    """Hợp đồng validator dùng chung (GĐ 0): phân biệt kết quả OCR hợp lệ với
+    lỗi — MỌI consumer phải gọi trước khi lắp trang/commit.
+
+    Trả về:
+      - ``"ok_text"``   : có chữ (lines/words không rỗng)
+      - ``"ok_blank"``  : trang trắng HỢP LỆ (0 dòng nhưng render dims > 0)
+      - ``"error"``     : sentinel lỗi / worker_init_failed / shape sai
+      - ``"missing"``   : None / không phải dict / thiếu hẳn
+    ``error`` và ``missing`` KHÔNG BAO GIỜ được lắp thành trang trắng."""
+    if result is None or not isinstance(result, dict):
+        return "missing"
+    if result.get("ocr_error"):
+        return "error"
+    if result.get("worker_init_failed"):
+        return "error"
+    try:
+        width = int(result.get("render_width", 0) or 0)
+        height = int(result.get("render_height", 0) or 0)
+    except (TypeError, ValueError):
+        return "error"
+    has_text = bool(result.get("lines_data") or result.get("words_data"))
+    if has_text:
+        return "ok_text"
+    if width > 0 and height > 0:
+        return "ok_blank"
+    return "error"
+
+
+def _collect_page_ocr_bounded(input_path, page_indices, total_pages, log,
+                              page_timeout: float = 120.0, dpi=None, *,
+                              max_in_flight: int | None = None,
+                              on_page_done=None,
+                              stop_check=None,
+                              cancel_check=None):
+    """Thu thập OCR trang qua admission gate — vòng điều phối liên tục.
+
+    - Không trần ẩn 16 trang: cửa sổ mỗi lượt = `min(số trang, max_in_flight
+      hoặc capacity)`; giới hạn TỔNG do token gate đảm nhiệm (12.2.4).
+    - `on_page_done(page_idx, result) -> bool|None`: gọi ngay khi một trang có
+      kết quả (kể cả sentinel lỗi); trả True → dừng nộp thêm.
+    - `stop_check()` → dừng nộp thêm (dừng sớm); `cancel_check()` → raise
+      `CoreScanCancelled` (hủy nguyên lượt — request đã nộp bỏ qua, token do
+      callback/janitor giải phóng, input tạm được giữ đến hết quyền sử dụng).
+    - Lỗi/timeout trang → sentinel `{"ocr_error": True, "error": …}` — KHÔNG
+      bao giờ thay bằng trang rỗng "thành công".
+    - `Busy` không phải lỗi: khi gate đầy mà pending rỗng, chờ bounded rồi
+      thử lại đúng trang đó — không kết thúc sớm, không fallback.
+
+    Trả về `(results dict theo page_idx, cửa sổ đã dùng)`."""
     import time
 
-    pool = _get_pool()
     page_indices = [
         int(idx) for idx in sorted({int(idx) for idx in page_indices})
         if 0 <= int(idx) < total_pages
@@ -2225,73 +3906,148 @@ def _collect_page_ocr_bounded(input_path, page_indices, total_pages, log,
     if not page_indices:
         return {}, 0
 
-    max_in_flight = min(
-        len(page_indices),
-        _env_int("OCRTOOL_MAX_IN_FLIGHT_PAGES", 16),
-    )
-    pending = []
+    if _GATE_DISABLED:
+        window_cap = max_in_flight or _env_int("OCRTOOL_MAX_IN_FLIGHT_PAGES", 16)
+    else:
+        window_cap = max_in_flight or _gate_capacity()
+    window = min(len(page_indices), max(1, int(window_cap)))
+
+    results: dict[int, dict] = {}
+    pending: list[tuple[int, object, float]] = []  # (page_idx, handle, submitted_at)
+    page_wait_started: dict[int, float] = {}  # P2-H: mốc caller bắt đầu yêu cầu trang
     next_pos = 0
-    results = {}
+    stopping = False
 
-    def submit_until_full():
-        nonlocal next_pos
-        while next_pos < len(page_indices) and len(pending) < max_in_flight:
-            page_idx = page_indices[next_pos]
+    wait_started: float | None = None
+    while True:
+        if cancel_check is not None and cancel_check():
+            raise CoreScanCancelled("cancelled during page OCR")
+
+        # ── pha nộp (try-acquire, không bao giờ block vô hạn) ──
+        while not stopping and next_pos < len(page_indices) and len(pending) < window:
+            if stop_check is not None and stop_check():
+                stopping = True
+                break
+            page_idx_now = page_indices[next_pos]
+            state, handle = try_submit_page(input_path, page_idx_now, dpi=dpi)
+            if state == "busy":
+                if page_idx_now not in page_wait_started:
+                    page_wait_started[page_idx_now] = time.monotonic()
+                break
+            if state == "error":
+                raise handle
+            wait_started = None
+            if page_idx_now in page_wait_started:
+                # P2-H: caller đã Busy chờ trang này — ghi entry full-wait
+                # (admission_wait từ lúc bắt đầu yêu cầu, không chỉ lần try
+                # thành công). Entry attempt-level do try_submit tự ghi.
+                with _admission_lock:
+                    _admission_metrics["admission_wait_ms"].append(
+                        int((time.monotonic() - page_wait_started.pop(page_idx_now)) * 1000)
+                    )
+            pending.append((page_idx_now, handle, time.monotonic()))
             next_pos += 1
-            pending.append((
-                page_idx,
-                pool.apply_async(
-                    _worker_ocr_single,
-                    (input_path, page_idx),
-                    {"dpi": dpi} if dpi is not None else {},
-                ),
-                time.monotonic(),
-            ))
 
-    submit_until_full()
-    while pending:
+        if stopping:
+            # không nộp thêm; vẫn thu nốt các trang đã nộp (giới hạn cửa sổ)
+            if not pending:
+                break
+        elif not pending:
+            if next_pos >= len(page_indices):
+                break
+            # gate đầy từ đầu (caller khác giữ slot) → chờ bounded, thử lại.
+            # Deadline tổng (P2-12): chờ admission quá `_ADMISSION_WAIT_S` →
+            # các trang chưa nộp đánh dấu lỗi rõ ràng (không treo vô hạn).
+            if wait_started is None:
+                wait_started = time.monotonic()
+            elif time.monotonic() - wait_started > _ADMISSION_WAIT_S:
+                raise PoolResetError(
+                    f"admission wait exceeded {_ADMISSION_WAIT_S:.0f}s — "
+                    f"{len(page_indices) - next_pos} trang chưa nộp"
+                )
+            time.sleep(0.05)
+            continue
+
+        # ── pha thu: chọn trang ready hoặc quá hạn ──
         picked = None
         now = time.monotonic()
-        for idx, (page_idx, ar, submitted_at) in enumerate(pending):
-            ready_fn = getattr(ar, "ready", None)
-            ready = bool(ready_fn()) if callable(ready_fn) else idx == 0
+        for idx, (page_idx, handle, submitted_at) in enumerate(pending):
             timed_out = (
-                page_timeout is not None
-                and now - submitted_at >= float(page_timeout)
+                page_timeout is not None and now - submitted_at >= float(page_timeout)
             )
-            if ready or timed_out:
+            if handle.ready() or timed_out:
                 picked = idx
                 break
         if picked is None:
             time.sleep(0.02)
             continue
 
-        page_idx, ar, _submitted_at = pending.pop(picked)
-        try:
-            _, page_result = ar.get(timeout=0.1)
-        except Exception as e:
-            log(f"  Page {page_idx + 1}/{total_pages}: OCR error: {e}", "error")
-            page_result = None
+        page_idx, handle, submitted_at = pending.pop(picked)
+        timed_out = page_timeout is not None and now - submitted_at >= float(page_timeout)
+        page_result = None
+        if handle.ready():
+            try:
+                # nội bộ: đọc RAW 4 phần tử (token/page/result/timing) — hợp
+                # đồng public 2 phần tử chỉ áp cho handle ra ngoài (P1-03)
+                _token_id, _pi, page_result, _timing = handle.ar.get(timeout=0.1)
+            except Exception as e:
+                log(f"  Page {page_idx + 1}/{total_pages}: OCR error: {e}", "error")
+                page_result = {"ocr_error": True, "error": str(e)}
+        elif timed_out:
+            # Caller hết hạn chờ: kết luận "caller thấy" ≠ "native đã xong" —
+            # trả sentinel; token do callback/janitor giải phóng khi task thật
+            # sự kết thúc (không nhả slot giả).
+            log(
+                f"  Page {page_idx + 1}/{total_pages}: OCR error: caller timeout "
+                f"(>{page_timeout:.0f}s)",
+                "error",
+            )
+            page_result = {"ocr_error": True, "error": "caller timeout"}
+        else:
+            # không ready, chưa quá hạn mà được chọn là trạng thái lệch —
+            # vòng sau sẽ chọn lại; bỏ qua nhánh này một cách an toàn.
+            pending.insert(0, (page_idx, handle, submitted_at))
+            time.sleep(0.02)
+            continue
         if isinstance(page_result, dict) and page_result.get("worker_init_failed"):
             detail = page_result.get("error") or "ScreenAI worker initialization failed"
+            _request_pool_recovery(f"worker init failed: {detail}")
             raise RuntimeError(str(detail))
-        if page_result is not None:
-            results[page_idx] = page_result
-            n_lines = len(page_result["lines_data"])
-            log(f"  Page {page_idx + 1}/{total_pages}: {n_lines} lines detected", "debug")
-        else:
-            log(f"  Page {page_idx + 1}/{total_pages}: OCR failed", "error")
-            results[page_idx] = _empty_page_ocr_result()
-        submit_until_full()
+        if isinstance(page_result, dict) and page_result.get("ocr_error"):
+            log(
+                f"  Page {page_idx + 1}/{total_pages}: OCR failed "
+                f"({page_result.get('error')})",
+                "error",
+            )
+        results[page_idx] = page_result
+        if on_page_done is not None:
+            # Lỗi lắp record/dò là lỗi THẬT của trang — bọc PagePostOcrError
+            # truyền ra ngoài (wrapper re-raise, KHÔNG fallback tuần tự):
+            # ngược lại sẽ tạo "submitted nhưng không có kết quả" rồi bị coi
+            # là bỏ qua hợp lệ.
+            try:
+                if on_page_done(page_idx, page_result):
+                    stopping = True
+            except CoreScanCancelled:
+                raise
+            except Exception as e:
+                raise PagePostOcrError(page_idx, str(e))
 
-    return results, max_in_flight
+    return results, window
 
 
-def _process_selected_pages_serial(input_path, doc_in, page_indices, total_pages, log):
-    """Serial OCR for a selected page subset used by page-wise DOCX export."""
+def _process_selected_pages_serial(input_path, doc_in, page_indices, total_pages, log,
+                                   dpi: int | None = None,
+                                   render_annots: bool = True):
+    """Serial OCR for a selected page subset used by page-wise DOCX export.
+
+    ``dpi``/``render_annots`` phải được caller truyền đúng khi fallback để
+    kết quả tuần tự khớp kết quả song song (vd quét mật dùng 200 DPI)."""
     from PIL import Image
 
     ocr = _get_ocr()
+    if dpi is None:
+        dpi = OCR_DPI
     results = {}
     page_indices = sorted({int(idx) for idx in page_indices if 0 <= int(idx) < total_pages})
 
@@ -2303,9 +4059,8 @@ def _process_selected_pages_serial(input_path, doc_in, page_indices, total_pages
         log(f"OCR page {page_idx + 1}/{total_pages}...", "debug")
 
         import fitz
-        dpi = OCR_DPI
         mat = fitz.Matrix(dpi / 72, dpi / 72)
-        pix = page.get_pixmap(matrix=mat, annots=True)
+        pix = page.get_pixmap(matrix=mat, annots=bool(render_annots))
         img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
 
         scale_x = page_w / pix.width
@@ -2332,11 +4087,17 @@ def _process_selected_pages_serial(input_path, doc_in, page_indices, total_pages
 
 
 def _process_selected_pages_parallel(input_path, page_indices, total_pages, log,
-                                     page_timeout: float = 120.0, dpi=None):
+                                     page_timeout: float = 120.0, dpi=None, *,
+                                     max_in_flight: int | None = None,
+                                     on_page_done=None,
+                                     stop_check=None,
+                                     cancel_check=None):
     """Submit only OCR-required pages to the shared page-level pool.
 
     ``dpi`` overrides the worker default (None → OCR_DPI 240).
-    """
+    Lỗi OCR trang là sentinel `{"ocr_error": …}` — validator phía caller quyết.
+    Hủy (`CoreScanCancelled`) truyền nguyên trạng; chỉ lỗi hạ tầng mới
+    shutdown + fallback tuần tự, và fallback giữ đúng ``dpi``."""
     import time
 
     t0 = time.perf_counter()
@@ -2344,7 +4105,11 @@ def _process_selected_pages_parallel(input_path, page_indices, total_pages, log,
 
     try:
         results, max_in_flight = _collect_page_ocr_bounded(
-            input_path, page_indices, total_pages, log, page_timeout, dpi=dpi
+            input_path, page_indices, total_pages, log, page_timeout, dpi=dpi,
+            max_in_flight=max_in_flight,
+            on_page_done=on_page_done,
+            stop_check=stop_check,
+            cancel_check=cancel_check,
         )
 
         dt = time.perf_counter() - t0
@@ -2356,30 +4121,45 @@ def _process_selected_pages_parallel(input_path, page_indices, total_pages, log,
         )
         return results
 
+    except (CoreScanCancelled, PagePostOcrError):
+        raise
     except Exception as e:
+        if isinstance(e, RuntimeError) and "initialization failed" in str(e):
+            raise
         log(f"Parallel OCR failed, falling back to serial: {e}", "error")
         shutdown_pool()
         import fitz
         doc_in = fitz.open(input_path)
         try:
-            return _process_selected_pages_serial(input_path, doc_in, page_indices, total_pages, log)
+            return _process_selected_pages_serial(
+                input_path, doc_in, page_indices, total_pages, log,
+                dpi=dpi, render_annots=True,
+            )
         finally:
             doc_in.close()
 
 
 def _process_pages_parallel(input_path, total_pages, log,
-                              page_timeout: float = 120.0, dpi=None):
+                              page_timeout: float = 120.0, dpi=None, *,
+                              max_in_flight: int | None = None,
+                              on_page_done=None,
+                              stop_check=None,
+                              cancel_check=None):
     """Submit pages to the page-level pool with bounded in-flight work.
 
     ``dpi`` overrides the worker default (None → OCR_DPI 240).
-    """
+    Hủy truyền nguyên trạng; fallback tuần tự giữ đúng ``dpi``."""
     import time
 
     t0 = time.perf_counter()
 
     try:
         results, max_in_flight = _collect_page_ocr_bounded(
-            input_path, range(total_pages), total_pages, log, page_timeout, dpi=dpi
+            input_path, range(total_pages), total_pages, log, page_timeout, dpi=dpi,
+            max_in_flight=max_in_flight,
+            on_page_done=on_page_done,
+            stop_check=stop_check,
+            cancel_check=cancel_check,
         )
 
         dt = time.perf_counter() - t0
@@ -2389,7 +4169,11 @@ def _process_pages_parallel(input_path, total_pages, log,
             "info")
         return results
 
+    except (CoreScanCancelled, PagePostOcrError):
+        raise
     except Exception as e:
+        if isinstance(e, RuntimeError) and "initialization failed" in str(e):
+            raise
         log(f"Parallel OCR failed, falling back to serial: {e}", "error")
         shutdown_pool()
         import fitz

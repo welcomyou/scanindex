@@ -25,21 +25,26 @@ def ensure_writable(path):
             print(f"[Portable] Warning: Failed to set writable permissions for {path}: {e}")
 
 
+def get_app_dir():
+    """Installation/model root, independent of benchmark mutable state."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir, os.pardir))
+
+
 def get_base_dir():
     """
     Get base directory of the application.
     Works for both:
     - Script mode: returns directory containing the script
     - Frozen exe mode: returns directory containing the .exe
+    - Harness/benchmark: ``SCANINDEX_BASE_DIR`` env override (D5) — đo trên
+      data_dir RIÊNG, không đụng scan_progress/settings của app thật.
     """
-    if getattr(sys, 'frozen', False):
-        # Running as compiled executable (PyInstaller)
-        return os.path.dirname(sys.executable)
-    else:
-        # Running as Python script
-        return os.path.abspath(
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, os.pardir)
-        )
+    env_base = os.environ.get("SCANINDEX_BASE_DIR", "").strip()
+    if env_base:
+        return os.path.abspath(env_base)
+    return get_app_dir()
 
 def get_bundle_dir():
     """
@@ -47,8 +52,8 @@ def get_bundle_dir():
     In one-dir builds this is usually <app>/_internal.
     """
     if getattr(sys, 'frozen', False):
-        return getattr(sys, "_MEIPASS", os.path.join(get_base_dir(), "_internal"))
-    return get_base_dir()
+        return getattr(sys, "_MEIPASS", os.path.join(get_app_dir(), "_internal"))
+    return get_app_dir()
 
 def get_resource_path(relative_path):
     """
@@ -58,7 +63,9 @@ def get_resource_path(relative_path):
     executable. Bundled read-only resources can live under PyInstaller's
     _MEIPASS/_internal directory, so use that as a fallback.
     """
-    base_path = os.path.join(get_base_dir(), relative_path)
+    relative_path = os.fspath(relative_path)
+    root = get_app_dir() if relative_path.replace("\\", "/").startswith(("models/", "assets/")) else get_base_dir()
+    base_path = os.path.join(root, relative_path)
     if os.path.exists(base_path):
         return base_path
     bundle_path = os.path.join(get_bundle_dir(), relative_path)
@@ -118,7 +125,7 @@ def setup_offline_mode():
     Configure environment for 100% offline cpu operation.
     MUST be called BEFORE importing transformers, torch, etc.
     """
-    base = get_base_dir()
+    base = get_app_dir()
     
     # 1. Force CPU Only
     os.environ["CUDA_VISIBLE_DEVICES"] = ""

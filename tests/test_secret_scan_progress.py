@@ -427,7 +427,157 @@ def test_clear_all_removes_journal_and_registry() -> None:
     reg.close()
     removed = ssp.clear_all()
 
-    assert removed == len(before)
-    assert os.listdir(directory) == []
+    # D0: file KHÓA single-writer (`registry.writerlock`) không phải lịch sử
+    # — không bị "Xóa lịch sử quét" đụng tới (nó tự nhả khi registry close).
+    lock_file = ssp.FileRegistry._WRITER_LOCK_NAME
+    assert removed == len([n for n in before if n != lock_file])
+    assert os.listdir(directory) == [lock_file]
     assert ssp.SecretScanProgress.load(FOLDER, "fast") is None
     assert ssp.FileRegistry.load().lookup(r"D:\a\c.pdf", 1, 1.0, "fast", VER) is None
+
+
+# ── R3-01: append registry lỗi phải rollback RAM + cắt dòng ghi dở ────────
+
+def test_registry_record_append_failure_rolls_back_ram(tmp_path, monkeypatch) -> None:
+    """R3-01: append event 'r' lỗi MỘT lần → record phải NÂM lỗi (không nuốt),
+    RAM trả về đúng trạng thái đĩa (entry cũ nguyên vẹn khi replace / không
+    có entry mới khi ghi lần đầu), dòng ghi dở được cắt sạch; retry sau đó
+    ghi bền vững và reload đọc được."""
+    real_write = os.write
+    state = {"fail_next": False}
+
+    def flaky_write(fd, data):
+        if state["fail_next"]:
+            state["fail_next"] = False
+            real_write(fd, data[:5])  # ghi DỞ 5 byte rồi lỗi (mô phỏng mất
+            raise OSError("injected registry append failure")  # điện giữa dòng)
+        return real_write(fd, data)
+
+    monkeypatch.setattr(os, "write", flaky_write)
+
+    reg = _reg()
+    path = str(tmp_path / "a.pdf")
+    open(path, "wb").write(b"x")
+    st = os.stat(path)
+
+    # Entry cũ có sẵn (kịch bản replace): lỗi → phải trả về entry CŨ.
+    reg.record(path, st.st_size, st.st_mtime, "fast", VER, [{"m": 1}])
+    reg.save()
+    state["fail_next"] = True
+    with pytest.raises(OSError):
+        reg.record(path, st.st_size, st.st_mtime, "fast", "new-ver", [{"m": 2}])
+    assert reg.lookup(path, st.st_size, st.st_mtime, "fast", "new-ver") is None, (
+        "append lỗi → RAM không được giữ entry mới chưa bền vững"
+    )
+    assert reg.lookup(path, st.st_size, st.st_mtime, "fast", VER) == [{"m": 1}], (
+        "replace: entry cũ phải nguyên vẹn sau khi append mới lỗi"
+    )
+
+    # Ghi lần đầu (chưa có entry cũ): lỗi → không được có entry ma trong RAM.
+    path2 = str(tmp_path / "b.pdf")
+    open(path2, "wb").write(b"y")
+    st2 = os.stat(path2)
+    state["fail_next"] = True
+    with pytest.raises(OSError):
+        reg.record(path2, st2.st_size, st2.st_mtime, "fast", VER, MATCH)
+    assert reg.lookup(path2, st2.st_size, st2.st_mtime, "fast", VER) is None
+
+    # Retry hết lỗi (fault đã tự tắt sau khi bắn một lần) → bền vững;
+    # file phải là JSONL sạch (không đuôi hỏng). LƯU Ý: không gọi
+    # monkeypatch.undo() giữa test — nó tắt luôn fixture _progress_dir.
+    reg.record(path, st.st_size, st.st_mtime, "fast", "new-ver", [{"m": 2}])
+    reg.record(path2, st2.st_size, st2.st_mtime, "fast", VER, MATCH)
+    reg.save()
+    reg.close()
+
+    reloaded = ssp.FileRegistry.load()
+    assert reloaded.lookup(path, st.st_size, st.st_mtime, "fast", "new-ver") == [{"m": 2}]
+    assert reloaded.lookup(path2, st2.st_size, st2.st_mtime, "fast", VER) == MATCH
+    reloaded.close()
+    with open(ssp.registry_path(), encoding="utf-8") as f:
+        for raw in f:
+            if raw.strip():
+                json.loads(raw)  # dòng dở sẽ ném JSONDecodeError
+
+
+# ── R3-06: commit thay thế theo bucket, không duyệt lại toàn bộ matches ───
+
+def test_commit_replace_file_order_matches_legacy_flat_append(tmp_path) -> None:
+    """Thay bucket phải tái tạo đúng thứ tự của bản append phẳng: [a1, b1]
+    → replace a → [b1, a2] (kết quả mới nối CUỐI như cũ), và thứ tự sống
+    sót qua save/reload (replay rpf) giống hệt."""
+    folder = str(tmp_path / "kho")
+    os.makedirs(folder, exist_ok=True)
+    a = os.path.join(folder, "a.pdf")
+    b = os.path.join(folder, "b.pdf")
+    a1 = {"source_path": a, "relative_path": "a.pdf", "keyword": "MẬT",
+          "page_number": 1}
+    a2 = dict(a1, keyword="TỐI MẬT")
+    b1 = {"source_path": b, "relative_path": "b.pdf", "keyword": "MẬT",
+          "page_number": 1}
+
+    prog = _make(folder=folder)
+    prog.record_matches([a1, b1])
+    prog.commit_replace_file("a.pdf", ssp._norm_path(a), [a2])
+    assert prog.matches == [b1, a2], (
+        f"phải giữ semantics nối-cuối của bản cũ (thấy {prog.matches})"
+    )
+    prog.save()
+    prog.close()
+
+    loaded = ssp.SecretScanProgress.load(folder, "fast")
+    assert loaded is not None
+    assert loaded.matches == [b1, a2]
+    loaded.discard()
+
+
+def test_commit_replace_file_no_full_matches_rescan(tmp_path, monkeypatch) -> None:
+    """R3-06: 128 commit file mới sạch trên nền 100 file có sẵn (200 match)
+    phải O(file mới) — KHÔNG chuẩn hóa lại toàn bộ matches trong khóa chung
+    mỗi commit (bản cũ: ≥ 128 × 200 lần `_norm_path`)."""
+    folder = str(tmp_path / "kho")
+    os.makedirs(folder, exist_ok=True)
+    prog = _make(folder=folder)
+    for i in range(100):
+        p = os.path.join(folder, f"old{i}.pdf")
+        prog.record_file(f"old{i}.pdf", "ok")
+        prog.record_matches([
+            {"source_path": p, "relative_path": f"old{i}.pdf",
+             "keyword": "MẬT", "page_number": 1},
+            {"source_path": p, "relative_path": f"old{i}.pdf",
+             "keyword": "TỐI MẬT", "page_number": 2},
+        ])
+
+    real_norm = ssp._norm_path
+    count = {"n": 0}
+
+    def counting_norm(p):
+        count["n"] += 1
+        return real_norm(p)
+
+    monkeypatch.setattr(ssp, "_norm_path", counting_norm)
+    for i in range(128):
+        p = os.path.join(folder, f"new{i}.pdf")
+        prog.commit_replace_file(f"new{i}.pdf", real_norm(p), [])
+    monkeypatch.undo()
+
+    # Cũ: mỗi commit duyệt toàn bộ matches → ≥ 128 × 200 = 25.600 lượt gọi.
+    # Mới: O(1)/commit (bucket key có sẵn) + một vài lượt của test.
+    assert count["n"] < 500, (
+        f"commit phải thay đúng bucket, không duyệt toàn bộ matches "
+        f"(thấy {count['n']} lượt _norm_path)"
+    )
+    assert prog.stats()[3] == 200, "file mới sạch không được thêm/bớt match"
+    # Replace file CÓ kết quả cũ vẫn phải thay đúng bucket của riêng nó.
+    prog.commit_replace_file(
+        "old0.pdf", real_norm(os.path.join(folder, "old0.pdf")),
+        [{"source_path": os.path.join(folder, "old0.pdf"),
+          "relative_path": "old0.pdf", "keyword": "TUYỆT MẬT", "page_number": 1}],
+    )
+    assert prog.stats()[3] == 199, "thay 2 match cũ bằng 1 match mới"
+    keywords_old0 = [
+        d["keyword"] for d in prog.matches
+        if d["relative_path"] == "old0.pdf"
+    ]
+    assert keywords_old0 == ["TUYỆT MẬT"]
+    prog.discard()

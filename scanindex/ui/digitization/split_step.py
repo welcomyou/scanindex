@@ -874,10 +874,19 @@ class ArchiveStep1Split(QWidget):
                     max_in_flight = int(
                         os.environ.get("OCRTOOL_STEP1_MAX_IN_FLIGHT_PAGES")
                         or os.environ.get("OCRTOOL_MAX_IN_FLIGHT_PAGES")
-                        or "16"
+                        or "0"
                     )
                 except (TypeError, ValueError):
-                    max_in_flight = 16
+                    max_in_flight = 0
+                if max_in_flight <= 0:
+                    # Bỏ trần ẩn 16 (mục 12.2.4): mặc định theo năng lực pool
+                    # — giới hạn TỔNG do admission gate đảm nhiệm.
+                    try:
+                        max_in_flight = int(
+                            direct_ocr_engine.get_parallel_capacity()
+                        )
+                    except Exception:
+                        max_in_flight = 16
                 max_in_flight = max(1, min(page_count, max_in_flight))
                 pending = []
                 next_page = 0
@@ -892,7 +901,10 @@ class ArchiveStep1Split(QWidget):
                         try:
                             pending.append((
                                 pi,
-                                direct_ocr_engine.submit_page(path, pi),
+                                direct_ocr_engine.submit_page(
+                                    path, pi,
+                                    cancel_check=lambda: cancel.is_set() or run_id != self._ocr_run_id,
+                                ),
                                 time.monotonic(),
                             ))
                         except Exception as e:
@@ -905,7 +917,10 @@ class ArchiveStep1Split(QWidget):
                 try:
                     submit_until_full()
                 except Exception as e:
-                    self._ocr_finished.emit(run_id, "", "", {}, str(e))
+                    if cancel.is_set() or run_id != self._ocr_run_id:
+                        self._ocr_cancelled.emit(run_id)
+                    else:
+                        self._ocr_finished.emit(run_id, "", "", {}, str(e))
                     return
 
                 while pending:
@@ -939,7 +954,10 @@ class ArchiveStep1Split(QWidget):
                     try:
                         submit_until_full()
                     except Exception as e:
-                        self._ocr_finished.emit(run_id, "", "", {}, str(e))
+                        if cancel.is_set() or run_id != self._ocr_run_id:
+                            self._ocr_cancelled.emit(run_id)
+                        else:
+                            self._ocr_finished.emit(run_id, "", "", {}, str(e))
                         return
 
                 if cancel.is_set() or run_id != self._ocr_run_id:

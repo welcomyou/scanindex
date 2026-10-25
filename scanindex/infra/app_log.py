@@ -63,7 +63,7 @@ def _target_dir() -> Path:
     return fallback
 
 
-def setup() -> bool:
+def setup(*, worker: bool = False) -> bool:
     """Attach the rotating file handler once. Idempotent; never raises."""
     global _logger, _setup_tried
     if _logger is not None:
@@ -73,14 +73,16 @@ def setup() -> bool:
     _setup_tried = True
     try:
         handler = RotatingFileHandler(
-            _target_dir() / "app.log",
-            maxBytes=2_000_000,
-            backupCount=3,
+            _target_dir() / (f"worker-{os.getpid()}.log" if worker else "app.log"),
+            maxBytes=256_000 if worker else 2_000_000,
+            backupCount=1 if worker else 3,
             encoding="utf-8",
         )
         handler.setFormatter(logging.Formatter(
             "%(asctime)s %(levelname)-7s %(name)s | %(message)s"
         ))
+        if worker:
+            handler.setLevel(logging.WARNING)
         logger = logging.getLogger("scanindex")
         logger.setLevel(logging.INFO)
         logger.addHandler(handler)

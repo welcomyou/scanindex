@@ -15,70 +15,15 @@ ensure_valid_stdio()
 sanitize_current_sys_path()
 patch_multiprocessing_spawn_sys_path()
 
+# D4: bootstrap dùng chung (migration, portable paths, app log, CPU-only,
+# six patch + pre-import pandas TRƯỚC PySide6) — app, harness đo và worker
+# cùng một luồng khởi động để không còn lệch import-order giữa harness/app.
+from scanindex.infra.bootstrap import (  # noqa: E402
+    apply_cpu_only_env,
+    bootstrap_app,
+    patch_six_meta_path_importer,
+)
 
-def _patch_six_meta_path_importer():
-    """Avoid PyInstaller/PySide6 inspect crashes on Python 3.12."""
-    try:
-        import six
-    except Exception:
-        return
-    for importer in sys.meta_path:
-        if (
-            importer.__class__.__name__ == "_SixMetaPathImporter"
-            and not hasattr(importer, "_path")
-        ):
-            importer._path = []
-
-
-# Version-per-file migration MUST run before any module reads settings/sign
-# config at import time (theme.py, signing_step.py both do module-level reads).
-# It also must run before ensure_runtime_config_files, which used to seed the
-# bare settings.ini name and would race the migration. We import paths only
-# after the migration so the seeding path is the versioned one.
-try:
-    from scanindex.infra.data_versioning import run_startup_migration
-except Exception as exc:
-    print(f"[Versioning] Warning: migration module import failed: {exc}")
-else:
-    try:
-        run_startup_migration()
-    except Exception as exc:
-        print(f"[Versioning] Warning: startup migration failed: {exc}")
-
-# Portable/offline setup must run before any torch/transformers import.
-try:
-    from scanindex.infra import paths as portable_utils
-except Exception as exc:
-    print(f"[Portable] Warning: portable paths import failed: {exc}")
-else:
-    try:
-        portable_utils.ensure_runtime_config_files()
-    except Exception as exc:
-        print(f"[Portable] Warning: runtime config bootstrap failed: {exc}")
-    try:
-        portable_utils.setup_offline_mode()
-    except Exception as exc:
-        print(f"[Portable] Warning: setup_offline_mode failed: {exc}")
-
-# Durable rotating file log (<base_dir>/logs/app.log). Every UI log message
-# and the scanindex.* loggers land here; setup is idempotent and can never
-# block startup.
-try:
-    from scanindex.infra import app_log
-    app_log.setup()
-except Exception:
-    pass
-
-# FORCE CPU ONLY — must be before any torch import
-os.environ["CUDA_VISIBLE_DEVICES"] = ""
-os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-
-# Pre-import pandas BEFORE PySide6 to avoid shiboken circular import crash
-try:
-    _patch_six_meta_path_importer()
-    import pandas  # noqa: F401
-except ImportError:
-    pass
 
 
 def _apply_ocr_page_worker_setting():
@@ -124,6 +69,13 @@ def _apply_ocr_page_worker_setting():
 
 def main():
     multiprocessing.freeze_support()
+    if sys.argv[1:2] == ["--secret-scan-benchmark"]:
+        from scripts.bench_secret_scan import main as benchmark_main
+        raise SystemExit(benchmark_main(sys.argv[2:]))
+    # Spawn imports this module as __mp_main__: no migration, UI or parent Job there.
+    bootstrap_app()
+    from scanindex.infra.windows_job import ensure_app_job
+    ensure_app_job()
 
     # Apply OCR page-worker count from settings.ini BEFORE any heavy module
     # (direct_engine reads DIRECT_OCR_NUM_PAGE_WORKERS once at import time).
@@ -170,20 +122,19 @@ def main():
     from scanindex.ui.theme import APP_STYLESHEET, FONT_UI
     app.setStyleSheet(APP_STYLESHEET)
     app.setFont(QFont(FONT_UI, 13))
-    splash.set_status("Đang khởi tạo giao diện...")
+    splash.set_status('Đang khởi tạo giao diện...')
     app.processEvents()
 
-    # Construct the main window. Heavy AI modules (OCR engine, correction
-    # model, GMFT, KIE) are loaded lazily by ModelManager only when the user
-    # navigates into a screen that requires them.
+    # Import MainWindow AFTER splash is visible — this is the heaviest import
+    # of the whole startup (every screen module).
     from scanindex.ui.main_window import MainWindow
-    splash.set_status("Đang chuẩn bị màn hình chính...")
+    splash.set_status('Đang chuẩn bị màn hình chính...')
     app.processEvents()
     window = MainWindow()
     window.show()
     splash.close()
-    # Keep reference to prevent GC
-    app._main_window = window
+
+    window._main_window = app
 
     sys.exit(app.exec())
 

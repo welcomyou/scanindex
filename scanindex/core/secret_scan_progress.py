@@ -34,6 +34,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import threading
 import time
 
 STATE_VERSION = 2
@@ -58,10 +59,220 @@ def _norm_path(path: str) -> str:
     return os.path.normcase(os.path.normpath(os.path.abspath(path)))
 
 
+# ---------------------------------------------------------------------------
+# D0 — AtomicJsonlWriter: MỘT owner ghi MỘT file, fail-closed khi phục hồi
+# lỗi ghi thất bại. Hai lớp journal/registry dùng CHUNG để không còn hai bản
+# logic recovery dễ lệch nhau.
+#
+# Hợp đồng (review chốt §3):
+# - Write lỗi (partial write / os.write trả 0 / lỗi I/O): thử cắt file về
+#   offset trước khi ghi; cắt THÀNH CÔNG → state HEALTHY, raise lỗi gốc
+#   (caller retry được — dữ liệu trên đĩa chắc chắn sạch); cắt THẤT BẠI →
+#   state POISONED + đóng handle + TỪ CHỐI mọi append/save kế tiếp — không
+#   bao giờ nhận record mới trên dòng hỏng (reload sẽ dừng ở dòng hỏng và
+#   mất mọi event đứng sau — "ACK giả" của probe review).
+# - fsync lỗi: raise OSError, state giữ HEALTHY (byte đã vào nhân OS, tail
+#   nguyên vẹn — retry fsync an toàn; durability chưa chứng minh nên caller
+#   chưa được ACK).
+# - Recovery có kiểm soát: khóa owner → backup file hỏng (.corrupt-<ts>) →
+#   replay prefix hợp lệ (load tự chữa) → snapshot tmp + fsync + replace.
+# ---------------------------------------------------------------------------
+class WriterPoisonedError(RuntimeError):
+    """Writer đang POISONED — mọi append/save bị từ chối (fail-closed).
+
+    Caller phải coi dữ liệu CHƯA bền vững: không ACK, không discard journal,
+    giữ nghĩa vụ retry; recovery có kiểm soát là đường duy nhất mở lại."""
+
+
+class RegistryBusyError(RuntimeError):
+    """Khóa single-writer registry bị giữ bởi tiến trình khác (D0) — lượt
+    quét chạy KHÔNG cache registry thay vì hai tiến trình cùng ghi/truncate
+    một file mà không phối hợp."""
+
+
+class AtomicJsonlWriter:
+    HEALTHY = "HEALTHY"
+    POISONED = "POISONED"
+    CLOSED = "CLOSED"
+
+    def __init__(self, path: str, label: str = "jsonl"):
+        self._path = path
+        self._label = label
+        self._fd: int | None = None
+        self._state = self.CLOSED
+        # RLock: recovery chạy GIỮ lock và gọi ngược vào callback của owner
+        # (compact → close()) — lock thường sẽ tự deadlock.
+        self._lock = threading.RLock()
+
+    # -- trạng thái ---------------------------------------------------------
+    @property
+    def state(self) -> str:
+        return self._state
+
+    @property
+    def poisoned(self) -> bool:
+        return self._state == self.POISONED
+
+    # -- I/O ----------------------------------------------------------------
+    def _open(self) -> None:
+        if self._fd is not None:
+            return
+        if self._state == self.POISONED:
+            raise WriterPoisonedError(
+                f"[{self._label}] writer bị POISONED — từ chối mở lại "
+                f"({self._path}); cần recovery có kiểm soát"
+            )
+        directory = os.path.dirname(self._path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        # Raw fd (O_APPEND, không buffer) — trạng thái ghi xác định tuyệt đối.
+        self._fd = os.open(
+            self._path, os.O_APPEND | os.O_CREAT | os.O_WRONLY | getattr(os, "O_BINARY", 0)
+        )
+        self._state = self.HEALTHY
+
+    def _close_fd(self) -> None:
+        if self._fd is not None:
+            try:
+                os.close(self._fd)
+            except OSError:
+                pass
+            self._fd = None
+
+    def append_line(self, event: dict) -> None:
+        """Ghi MỘT dòng JSON + '\\n'. Bất đồng, lỗi sẽ được phục hồi hoặc
+        poison — KHÔNG BAO GIỜ trả về bình thường khi đĩa còn đuôi hỏng."""
+        with self._lock:
+            if self._state == self.POISONED:
+                raise WriterPoisonedError(
+                    f"[{self._label}] writer bị POISONED — từ chối append "
+                    f"(event t={event.get('t')!r})"
+                )
+            self._open()
+            data = (json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8")
+            offset = os.fstat(self._fd).st_size
+            try:
+                while data:
+                    written = os.write(self._fd, data)
+                    if written <= 0:
+                        # os.write trả 0 = không tiến triển — coi như lỗi,
+                        # tránh lặp vô hạn (review §3 D0).
+                        raise OSError(
+                            f"os.write trả {written} byte (không tiến triển)"
+                        )
+                    data = data[written:]
+            except BaseException as exc:
+                self._rollback_or_poison(offset, exc)
+                raise
+
+    def sync(self) -> None:
+        """fsync — mốc durability. Lỗi fsync raise nhưng KHÔNG poison: byte
+        chắc chắn đã write() vào nhân OS và tail nguyên vẹn (mọi append đều
+        rollback kiểm chứng), retry fsync là an toàn; durability chỉ được
+        xác nhận khi sync() trả về thành công."""
+        with self._lock:
+            if self._state == self.POISONED:
+                raise WriterPoisonedError(
+                    f"[{self._label}] writer bị POISONED — từ chối fsync"
+                )
+            self._open()
+            os.fsync(self._fd)
+
+    def close(self) -> None:
+        with self._lock:
+            self._close_fd()
+            # POISONED không bị close xóa sạch: state giữ nguyên để mọi lời
+            # gọi kế tiếp vẫn bị từ chối cho đến khi recovery có kiểm soát.
+            if self._state != self.POISONED:
+                self._state = self.CLOSED
+
+    def _rollback_or_poison(self, offset: int, exc: BaseException) -> None:
+        """Cắt file về offset sạch; THÀNH CÔNG → giữ HEALTHY (retry được);
+        THẤT BẠI → POISONED + đóng handle (fail-closed, không nuốt lỗi
+        phục hồi — review §3: truncate fail mà nuốt sẽ để writer nhận thêm
+        record trên dòng hỏng → reload mất kết quả đã ACK)."""
+        try:
+            os.ftruncate(self._fd, offset)
+        except OSError as trunc_exc:
+            self._state = self.POISONED
+            self._close_fd()
+            import logging
+
+            logging.getLogger(__name__).error(
+                "[%s] rollback append THẤT BẠI (%s) sau lỗi ghi (%s) — "
+                "writer POISONED, từ chối mọi ghi tiếp theo tới khi recovery",
+                self._label, trunc_exc, exc,
+            )
+            return
+        # Cắt thành công: đĩa chắc chắn sạch tới offset — HEALTHY, raise lỗi
+        # gốc để caller retry (rollback không nuốt lỗi gốc).
+
+    def recover(self, replay_and_rewrite) -> bool:
+        """Recovery CÓ KIỂM SOÁT (D0): backup file hỏng → `replay_and_rewrite()`
+        (callback của owner: replay prefix hợp lệ + snapshot tmp + fsync +
+        replace) → mở writer mới. Trả True khi mở lại được writer HEALTHY.
+        Gọi khi KHÔNG còn producer nào đang append (owner khóa lâu)."""
+        with self._lock:
+            self._close_fd()
+            backup = f"{self._path}.corrupt-{time.strftime('%Y%m%d_%H%M%S')}"
+            try:
+                if os.path.exists(self._path):
+                    try:
+                        os.replace(self._path, backup)
+                    except OSError:
+                        # Windows: replace đè không được khi đích tồn tại —
+                        # xóa backup cũ (nếu có) rồi thử lại một lần.
+                        try:
+                            os.remove(backup)
+                            os.replace(self._path, backup)
+                        except OSError:
+                            return False
+                ok = False
+                try:
+                    replay_and_rewrite()
+                    ok = True
+                finally:
+                    if not ok:
+                        # Không sửa được: trả lại file gốc để không mất dữ
+                        # liệu — recovery thất bại là có đoán được, mất
+                        # backup thì không.
+                        if os.path.exists(self._path) and os.path.exists(backup):
+                            try:
+                                os.remove(self._path)
+                            except OSError:
+                                pass
+                        try:
+                            os.replace(backup, self._path)
+                        except OSError:
+                            pass
+                if not ok:
+                    return False
+                self._state = self.HEALTHY
+                self._open()
+                return self._state == self.HEALTHY
+            except OSError:
+                return False
+
+
+def _recover_jsonl_replay(path: str, replay_cls, *args) -> None:
+    """Rebuild `path` từ prefix hợp lệ: replay bằng `replay_cls.load` (tự cắt
+    đuôi hỏng + compact) rồi snapshot bền vững. Dùng bởi recovery của hai
+    lớp journal/registry."""
+    obj = replay_cls.load(*args) if args else replay_cls.load()
+    if obj is not None:
+        obj._compact()
+
+
+
 def progress_dir() -> str:
     from scanindex.infra.paths import get_base_dir
-
-    return os.path.join(get_base_dir(), STATE_DIR_NAME)
+    root = os.path.join(get_base_dir(), STATE_DIR_NAME)
+    namespace = os.environ.get("SCANINDEX_PROGRESS_NAMESPACE", "")
+    if namespace:
+        if not namespace.replace("-", "").replace("_", "").isalnum():
+            raise ValueError("Invalid progress namespace")
+        return os.path.join(root, namespace)
+    return root
 
 
 def _journal_key(folder: str, mode: str) -> str:
@@ -92,6 +303,26 @@ def registry_path() -> str:
     return os.path.join(progress_dir(), "file_registry.jsonl")
 
 
+def _backup_corrupt(path: str) -> str | None:
+    """D0: backup file hỏng TRƯỚC khi tự chữa (recovery có kiểm soát phải
+    giữ được bằng chứng gốc). Trả đường dẫn backup, None khi không có gì để
+    backup. Backup KHÔNG dùng tiền tố dọn của clear_all/prune — dữ liệu hỏng
+    chỉ bị xóa tay."""
+    if not os.path.exists(path):
+        return None
+    backup = f"{path}.corrupt-{time.strftime('%Y%m%d_%H%M%S')}"
+    try:
+        with open(path, "rb") as src, open(backup, "wb") as dst:
+            while True:
+                chunk = src.read(1 << 20)
+                if not chunk:
+                    break
+                dst.write(chunk)
+        return backup
+    except OSError:
+        return None
+
+
 def clear_all() -> int:
     """Delete every scan-progress artefact (resume journals + the global
     file registry). Used by the screen's "Xóa lịch sử quét" button and
@@ -99,6 +330,10 @@ def clear_all() -> int:
     directory = progress_dir()
     if not os.path.isdir(directory):
         return 0
+    spool_root = os.path.join(directory, "kie_spool")
+    if os.path.isdir(spool_root):
+        from scanindex.core.secret_scan_spool import get_ledger
+        get_ledger()  # Refuse deletion while another app owns this storage.
     removed = 0
     try:
         entries = os.listdir(directory)
@@ -111,6 +346,9 @@ def clear_all() -> int:
                 removed += 1
             except OSError:
                 pass
+    if os.path.isdir(spool_root):
+        from scanindex.core.ocr.direct_engine import cleanup_path_when_idle
+        cleanup_path_when_idle(spool_root)
     return removed
 
 
@@ -129,7 +367,14 @@ class SecretScanProgress:
         self._done: set[str] = set()
         self._errors: dict[str, str] = {}
         self._skipped: dict[str, str] = {}
-        self.matches: list[dict] = []
+        # R3-06: matches lưu THEO FILE — bucket key là đường dẫn tuyệt đối
+        # đã chuẩn hóa (`_norm_path`). Commit thay thế thay ĐÚNG bucket
+        # O(số match mới) thay vì duyệt + chuẩn hóa lại TOÀN BỘ matches tích
+        # lũy trong khóa chung mỗi file (trước đây O(tổng matches)/commit →
+        # gần bậc hai theo quy mô kho). `.matches` là view phẳng tái tạo
+        # THỨ TỰ cũ: bucket thay thế được pop + gắn lại CUỐI (đúng semantics
+        # "xóa khỏi nơi cũ, nối cuối" của bản append phẳng).
+        self._matches_by_file: dict[str, list[dict]] = {}
         # Version app đã "chấp nhận" kết quả của journal này. Journal bản cũ
         # không có field này → "" → khác version hiện tại.
         self.app_version: str = ""
@@ -140,13 +385,50 @@ class SecretScanProgress:
         # Tập rel path (theo thư mục của journal) các file mật cũ còn chờ
         # quét lại. Chỉ bỏ khỏi tập này khi commit thay thế THÀNH CÔNG.
         self.rescan_pending: set[str] = set()
-        self._fh = None
+        # D2 — durable KIE spool: rel -> {canonical(spool path), hash, ordinals,
+        # matches(baseline), fp, status}. Job KIE đã nhận: OCR xong, metadata
+        # chờ — restart chỉ resubmit KIE (OCR-call = 0) khi snapshot còn hợp
+        # lệ. Bền qua journal event "kspool" (ghi TRƯỚC khi worker thả workdir).
+        self._kie_spool: dict[str, dict] = {}
+        self._writer = AtomicJsonlWriter(
+            journal_path(folder, mode), label="journal"
+        )
         # Lines the journal contained as of the last compaction/load (the
         # fresh header counts as 1) and lines appended since — the compact
         # trigger in save() compares these, so the journal roughly doubles
         # before each rewrite and total compaction writes stay O(n).
         self._lines_at_compact = 1
         self._appended_lines = 0
+
+    # ── matches theo file (R3-06) ──────────────────────────────────────────
+    @property
+    def matches(self) -> list[dict]:
+        """View phẳng theo thứ tự bucket (giữ đúng thứ tự journal cũ)."""
+        out: list[dict] = []
+        for bucket in self._matches_by_file.values():
+            out.extend(bucket)
+        return out
+
+    @staticmethod
+    def _match_key_for(match_dict: dict) -> str:
+        return _norm_path(str(match_dict.get("source_path") or ""))
+
+    def _match_bucket_append(self, match_dicts: list[dict]) -> None:
+        for d in match_dicts:
+            key = self._match_key_for(d)
+            bucket = self._matches_by_file.get(key)
+            if bucket is None:
+                self._matches_by_file[key] = [d]
+            else:
+                bucket.append(d)
+
+    def _match_bucket_replace(
+        self, abs_norm: str, match_dicts: list[dict]
+    ) -> None:
+        """Thay toàn bộ kết quả của ĐÚNG một file: pop bucket + gắn lại cuối
+        — tái tạo đúng vị trí "nối cuối" của bản append phẳng."""
+        self._matches_by_file.pop(abs_norm, None)
+        self._matches_by_file[abs_norm] = list(match_dicts)
 
     # ── lifecycle ─────────────────────────────────────────────────────────
     @classmethod
@@ -274,7 +556,7 @@ class SecretScanProgress:
                     prog._done.discard(rel)
                     prog._skipped.pop(rel, None)
             elif kind == "m" and isinstance(event.get("d"), dict):
-                prog.matches.append(event["d"])
+                prog._match_bucket_append([event["d"]])
             elif kind == "av":
                 prog.app_version = str(event.get("av") or "")
             elif kind == "mig":
@@ -288,6 +570,15 @@ class SecretScanProgress:
                 prog.rescan_pending = {
                     str(rel) for rel in event["p"] if str(rel or "").strip()
                 }
+            elif kind == "kspool":
+                # D2: nghĩa vụ metadata KIE của một file (None = xóa).
+                rel = str(event.get("p") or "")
+                info = event.get("x")
+                if rel:
+                    if isinstance(info, dict) and info:
+                        prog._kie_spool[rel] = info
+                    else:
+                        prog._kie_spool.pop(rel, None)
             elif kind == "rpf":
                 # Commit thay thế THEO FILE, một dòng nguyên vẹn: file ok +
                 # thay toàn bộ matches của file + bỏ khỏi tập quét lại.
@@ -303,39 +594,52 @@ class SecretScanProgress:
                     prog.rescan_pending.discard(rel)
                     prog.rescan_pending.discard(os.path.normcase(rel))
                 if abs_norm:
-                    prog.matches = [
-                        d
-                        for d in prog.matches
-                        if _norm_path(str(d.get("source_path") or "")) != abs_norm
-                    ]
+                    prog._match_bucket_replace(abs_norm, new_dicts)
                 elif rel:
-                    prog.matches = [
-                        d
-                        for d in prog.matches
-                        if str(d.get("relative_path") or "") != rel
-                    ]
-                prog.matches.extend(new_dicts)
+                    # Hi hữu (rpf thiếu "a"): lọc theo relative_path như bản
+                    # cũ, rồi nối kết quả mới vào cuối.
+                    kept: dict[str, list[dict]] = {}
+                    for key, bucket in prog._matches_by_file.items():
+                        bucket2 = [
+                            d
+                            for d in bucket
+                            if str(d.get("relative_path") or "") != rel
+                        ]
+                        if bucket2:
+                            kept[key] = bucket2
+                    prog._matches_by_file = kept
+                    prog._match_bucket_append(new_dicts)
         if header is None:
             return None
         prog.started_at = str(header.get("started_at") or prog.started_at)
         prog._lines_at_compact = lines_seen
         if bad_tail:
-            # Tự chữa: ghi đè lại file chỉ với phần dữ liệu đọc được, nếu
-            # không mọi sự kiện ghi thêm sau này sẽ nằm sau dòng hỏng và
-            # không bao giờ được replay nữa.
+            # Tự chữa (D0: backup file hỏng trước): ghi đè lại file chỉ với
+            # phần dữ liệu đọc được, nếu không mọi sự kiện ghi thêm sau này
+            # sẽ nằm sau dòng hỏng và không bao giờ được replay nữa.
             try:
+                _backup_corrupt(journal_path(folder, mode))
                 prog._compact()
             except OSError:
                 pass
         return prog
 
     def close(self) -> None:
-        if self._fh is not None:
-            try:
-                self._fh.close()
-            except OSError:
-                pass
-            self._fh = None
+        self._writer.close()
+
+    @property
+    def poisoned(self) -> bool:
+        """D0: writer journal đang POISONED — mọi ghi bị từ chối; caller
+        phải giữ nghĩa vụ retry + báo lỗi lưu, KHÔNG được discard journal
+        (còn dữ liệu trên đĩa cần recovery có kiểm soát)."""
+        return self._writer.poisoned
+
+    def recover_writer(self) -> bool:
+        """Recovery CÓ KIỂM SOÁT của writer journal (D0): rebuild snapshot từ
+        RAM (RAM là hợp nhất nhất quán của mọi state đã chốt — event ghi dở
+        trên đĩa bị bỏ khi viết lại) + backup file hỏng. CHỈ gọi khi không
+        producer nào đang append (owner giữ state_lock)."""
+        return self._writer.recover(self._compact)
 
     def discard(self) -> None:
         """Delete the journal — scan no longer resumable."""
@@ -371,7 +675,7 @@ class SecretScanProgress:
         self._append_line(event)
 
     def record_matches(self, match_dicts: list[dict]) -> None:
-        self.matches.extend(match_dicts)
+        self._match_bucket_append(match_dicts)
         for match_dict in match_dicts:
             self._append_line({"t": "m", "d": match_dict})
 
@@ -380,7 +684,7 @@ class SecretScanProgress:
         """Còn việc dở phải tiếp tục: migration chưa xác nhận xong hoặc còn
         file mật chờ quét lại. Resume cùng version vẫn phải tiếp tục các
         việc này — không phụ thuộc hộp thoại chọn 3 lựa chọn."""
-        return bool(self.migration) or bool(self.rescan_pending)
+        return bool(self.migration) or bool(self.rescan_pending) or bool(self.kie_spool_pending())
 
     def begin_migration(self, target: str, choice: int) -> None:
         """Lưu bền vững ý định nâng cấp: target = version mới, choice = 2|3.
@@ -406,6 +710,67 @@ class SecretScanProgress:
         self.rescan_pending = {str(r) for r in rels if str(r or "").strip()}
         self._append_line({"t": "rs", "p": sorted(self.rescan_pending)})
 
+    # ── durable KIE spool (D2) ─────────────────────────────────────────────
+    def set_kie_spool(self, rel: str, info: dict | None) -> None:
+        """Đăng ký/xóa nghĩa vụ metadata KIE của MỘT file. ``info=None`` xóa
+        (file hết nghĩa vụ KIE-only — chuyển quét lại toàn bộ). Event thay
+        thế nguyên record → replay/compact idempotent."""
+        if info is None:
+            self._kie_spool.pop(rel, None)
+        else:
+            from scanindex.core.secret_scan_spool import normalize_record
+            info = normalize_record(info)
+            self._kie_spool[str(rel)] = dict(info)
+        self._append_line({"t": "kspool", "p": str(rel), "x": info})
+
+    def kie_spool(self, rel: str) -> dict | None:
+        info = self._kie_spool.get(rel)
+        if info is None:
+            return None
+        from scanindex.core.secret_scan_spool import normalize_record
+        return normalize_record(info)
+
+    def kie_spool_pending(self) -> set[str]:
+        """Các rel CÒN nghĩa vụ KIE-only: có spool record nhưng CHƯA có kết
+        quả bền vững (chưa trong done/skip). File đã commit (kể cả metadata
+        lỗi → rpf baseline + rescan_pending) tự rời tập — lượt sau quét OCR
+        thật theo luật đã có."""
+        done = self.done_files()
+        return {
+            rel for rel, info in self._kie_spool.items()
+            if rel not in done or rel in self.rescan_pending
+            or not info.get("metadata_applied", False)
+        }
+
+    def kie_spool_gc(self, *, durability_confirmed: bool = False,
+                     rel: str | None = None) -> int:
+        """Dọn spool snapshot của file KHÔNG còn nghĩa vụ (đã done/skip).
+        File còn pending giữ nguyên — restart KIE-only cần snapshot. Trả số
+        thư mục spool đã xóa."""
+        if not durability_confirmed:
+            return 0
+        from scanindex.core.ocr.direct_engine import cleanup_path_when_idle
+        removed = 0
+        root = os.path.realpath(os.path.join(progress_dir(), "kie_spool"))
+        # Per-file ACK cleanup must not scan the whole history.
+        records = ([(rel, self._kie_spool[rel])] if rel in self._kie_spool else []) \
+            if rel is not None else list(self._kie_spool.items())
+        for rel, info in records:
+            pending = ((rel not in self._done and rel not in self._skipped)
+                       or rel in self.rescan_pending
+                       or not info.get("metadata_applied", False))
+            if not pending:
+                spool_dir = str(info.get("spool_dir") or "")
+                if not spool_dir:
+                    continue
+                target = os.path.realpath(spool_dir)
+                if target == root or os.path.commonpath([root, target]) != root:
+                    raise ValueError("KIE spool cleanup outside owned spool root")
+                if cleanup_path_when_idle(spool_dir) and not os.path.exists(spool_dir):
+                    self.set_kie_spool(rel, None)
+                    removed += 1
+        return removed
+
     def commit_replace_file(
         self, rel: str, abs_norm: str, match_dicts: list[dict]
     ) -> None:
@@ -416,6 +781,12 @@ class SecretScanProgress:
         cắt dở vì mất điện — giữ nguyên kết quả cũ và file vẫn còn trong
         tập quét lại. KHÔNG dùng cho kết quả lỗi/hủy/skip: những trường
         hợp đó giữ nguyên hàng cũ và trạng thái chưa cập nhật.
+
+        R3-06: thay ĐÚNG bucket của file (O(số match mới), chuẩn hóa path
+        MỘT lần cho từng match mới) thay vì duyệt + chuẩn hóa TOÀN BỘ
+        matches tích lũy trong khóa chung mỗi commit — phần đó tăng gần
+        bậc hai theo quy mô kho và không song song hóa được. Log rpf giữ
+        nguyên — replay idempotent như cũ.
         """
         self._done.add(rel)
         self._errors.pop(rel, None)
@@ -424,22 +795,31 @@ class SecretScanProgress:
         # giữ rel chữ thường cho đúng file này (tên trên đĩa có chữ HOA).
         self.rescan_pending.discard(rel)
         self.rescan_pending.discard(os.path.normcase(rel))
-        self.matches = [
-            d
-            for d in self.matches
-            if _norm_path(str(d.get("source_path") or "")) != abs_norm
-        ]
-        self.matches.extend(match_dicts)
+        if abs_norm:
+            self._match_bucket_replace(abs_norm, match_dicts)
+        else:
+            # Hi hữu (abs_norm rỗng): lọc theo relative_path như bản cũ.
+            kept: dict[str, list[dict]] = {}
+            for key, bucket in self._matches_by_file.items():
+                bucket2 = [
+                    d
+                    for d in bucket
+                    if str(d.get("relative_path") or "") != rel
+                ]
+                if bucket2:
+                    kept[key] = bucket2
+            self._matches_by_file = kept
+            self._match_bucket_append(match_dicts)
         self._append_line(
             {"t": "rpf", "p": rel, "a": abs_norm, "m": list(match_dicts)}
         )
 
     def save(self) -> None:
-        """Flush + fsync the journal (power-cut durable up to the last
-        event), compacting it when appends have outgrown the snapshot."""
-        self._open_fh()
-        self._fh.flush()
-        os.fsync(self._fh.fileno())
+        """fsync the journal (power-cut durable up to the last event),
+        compacting it when appends have outgrown the snapshot. Writer raw fd
+        (D0): append lỗi đã rollback/poison ở `_append_line`; fsync lỗi raise
+        (durability chưa chứng minh → caller chưa ACK) nhưng không poison."""
+        self._writer.sync()
         if self._appended_lines > max(
             _JOURNAL_FLOOR_LINES, self._lines_at_compact
         ):
@@ -464,20 +844,12 @@ class SecretScanProgress:
             len(self._skipped),
             len(self.matches),
         )
-
     # ── internals ─────────────────────────────────────────────────────────
-    def _open_fh(self) -> None:
-        if self._fh is None:
-            self._fh = open(
-                journal_path(self.folder, self.mode),
-                "a",
-                encoding="utf-8",
-                newline="\n",
-            )
-
     def _append_line(self, event: dict) -> None:
-        self._open_fh()
-        self._fh.write(json.dumps(event, ensure_ascii=False) + "\n")
+        # D0: writer fail-closed dùng chung — append lỗi được rollback về
+        # offset sạch (retry được) hoặc POISONED (từ chối mọi ghi kế tiếp);
+        # không bao giờ để đuôi hỏng giữa file một cách âm thầm.
+        self._writer.append_line(event)
         self._appended_lines += 1
 
     def _compact(self) -> None:
@@ -517,6 +889,17 @@ class SecretScanProgress:
                     )
                     + "\n"
                 )
+            # D2: nghĩa vụ KIE-only sống sót qua compact (các file còn pending).
+            for rel in sorted(self._kie_spool):
+                if rel in self._done or rel in self._skipped:
+                    continue
+                f.write(
+                    json.dumps(
+                        {"t": "kspool", "p": rel, "x": self._kie_spool[rel]},
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
             for rel in sorted(self._done):
                 f.write(
                     json.dumps({"t": "f", "p": rel, "s": "ok"}, ensure_ascii=False)
@@ -532,7 +915,8 @@ class SecretScanProgress:
                 if reason:
                     event["e"] = reason
                 f.write(json.dumps(event, ensure_ascii=False) + "\n")
-            for match_dict in self.matches:
+            flat_matches = self.matches  # view phẳng — flatten đúng 1 lần
+            for match_dict in flat_matches:
                 f.write(
                     json.dumps({"t": "m", "d": match_dict}, ensure_ascii=False)
                     + "\n"
@@ -547,7 +931,7 @@ class SecretScanProgress:
             + len(self._done)
             + len(self._errors)
             + len(self._skipped)
-            + len(self.matches)
+            + len(flat_matches)
         )
         self._appended_lines = 0
 
@@ -577,9 +961,17 @@ class FileRegistry:
         # kết quả quét thật của version này) — chỉ dùng làm nguồn gốc thống
         # kê, không ảnh hưởng lookup.
         self._inherited: set[str] = set()
-        self._fh = None
+        self._writer = AtomicJsonlWriter(registry_path(), label="registry")
+        self._writer_lock_fh = None
+        # D0: True khi khóa single-writer bị giữ bởi tiến trình khác — mọi
+        # record() bị từ chối; lookup vẫn đọc được (fail-safe không cache).
+        self._readonly = False
         self._lines_at_compact = 1
         self._appended_lines = 0
+
+    @property
+    def readonly(self) -> bool:
+        return self._readonly
 
     @staticmethod
     def _key(path: str, mode: str) -> str:
@@ -590,6 +982,18 @@ class FileRegistry:
         """Replay the registry journal. Missing/corrupt data degrades to
         an empty registry — scanning simply proceeds without cache."""
         reg = cls()
+        # D0: khóa single-writer ACQUIRE TRƯỚC khi replay (kể cả khi file
+        # chưa tồn tại — registry trống vẫn phải giữ quyền ghi sắp tới).
+        try:
+            reg._acquire_writer_lock()
+        except RegistryBusyError:
+            import logging
+
+            reg._readonly = True
+            logging.getLogger(__name__).info(
+                "registry: khóa single-writer bị giữ bởi tiến trình khác — "
+                "chạy KHÔNG cache registry (lookup vẫn đọc snapshot cũ)"
+            )
         try:
             with open(registry_path(), encoding="utf-8") as f:
                 raw_lines = f.readlines()
@@ -620,6 +1024,7 @@ class FileRegistry:
                     event.get("m") or 0.0,
                     str(event.get("v") or ""),
                     payload,
+                    str(event.get("st") or "clean"),
                 )
                 if event.get("i"):
                     reg._inherited.add(key)
@@ -627,9 +1032,11 @@ class FileRegistry:
                     reg._inherited.discard(key)
         reg._lines_at_compact = lines_seen
         if bad_tail:
-            # Tự chữa như SecretScanProgress.load — cắt bỏ đuôi hỏng để các
-            # bản ghi thêm sau này vẫn được replay.
+            # Tự chữa như SecretScanProgress.load — backup file hỏng rồi cắt
+            # bỏ đuôi hỏng để các bản ghi thêm sau này vẫn được replay (D0:
+            # recovery có kiểm soát phải backup trước khi sửa).
             try:
+                _backup_corrupt(registry_path())
                 reg._compact()
             except OSError:
                 pass
@@ -639,15 +1046,27 @@ class FileRegistry:
         self, path: str, size: int, mtime: float, mode: str, version: str
     ) -> list[dict] | None:
         """Matches recorded for this exact unchanged file, or None."""
+        hit = self.lookup_with_status(path, size, mtime, mode, version)
+        return None if hit is None else hit[0]
+
+    def lookup_with_status(
+        self, path: str, size: int, mtime: float, mode: str, version: str
+    ) -> tuple[list[dict], str] | None:
+        """(matches, status) cho file không đổi, hoặc None.
+
+        Status được bảo toàn xuyên suốt cache: entry "unconfirmed" (LightGBM
+        lỗi — dương có cảnh báo) KHÔNG bao giờ được đọc lại như kết quả sạch
+        đã hoàn tất."""
         entry = self._entries.get(self._key(path, mode))
         if entry is None:
             return None
-        entry_size, entry_mtime, entry_version, matches = entry
+        entry_size, entry_mtime, entry_version, matches = entry[:4]
+        status = entry[4] if len(entry) > 4 else "clean"
         if entry_size != size or entry_mtime != mtime:
             return None
         if entry_version != version:
             return None
-        return list(matches)
+        return list(matches), str(status)
 
     def record(
         self,
@@ -659,12 +1078,27 @@ class FileRegistry:
         matches: list[dict],
         *,
         inherited: bool = False,
+        status: str = "clean",
     ) -> None:
         """Append one registry record. ``inherited=True`` đánh dấu entry kế
         thừa từ journal bản cũ (lựa chọn 2/3 của resume nâng cấp) — nguồn
-        gốc thống kê, không đổi hành vi lookup."""
+        gốc thống kê, không đổi hành vi lookup. ``status`` đi xuyên suốt
+        cache (clean / confirmed_positive / unconfirmed).
+
+        R3-01: append THẤT BẠI phải trả RAM về ĐÚNG trạng thái đĩa (entry
+        cũ nguyên vẹn / không có entry mới) rồi NÂM lỗi lên caller. Giữ entry
+        trong RAM khi đĩa chưa có sẽ để lookup ăn cache của kết quả chưa bền
+        vững, và `save()` sau đó không tái tạo được event chưa từng ghi được
+        (flush chỉ đẩy buffer sẵn có)."""
+        if self._readonly:
+            raise RegistryBusyError(
+                "registry đang ở chế độ chỉ-đọc (khóa single-writer thuộc "
+                "tiến trình khác) — không ghi kết quả"
+            )
         key = self._key(path, mode)
-        self._entries[key] = (size, mtime, version, list(matches))
+        previous = self._entries.get(key)
+        prev_inherited = key in self._inherited
+        self._entries[key] = (size, mtime, version, list(matches), str(status))
         if inherited:
             self._inherited.add(key)
         else:
@@ -677,9 +1111,22 @@ class FileRegistry:
             "v": version,
             "x": list(matches),
         }
+        if str(status) != "clean":
+            event["st"] = str(status)
         if inherited:
             event["i"] = 1
-        self._append_line(event)
+        try:
+            self._append_line(event)
+        except BaseException:
+            if previous is None:
+                self._entries.pop(key, None)
+            else:
+                self._entries[key] = previous
+            if prev_inherited:
+                self._inherited.add(key)
+            else:
+                self._inherited.discard(key)
+            raise
 
     def bump_versions_exact(
         self, paths, mode: str, version: str
@@ -699,10 +1146,11 @@ class FileRegistry:
             entry = self._entries.get(key)
             if entry is None:
                 continue
-            size, mtime, old_version, matches = entry
+            size, mtime, old_version, matches = entry[:4]
+            status = entry[4] if len(entry) > 4 else "clean"
             if old_version == version:
                 continue
-            self._entries[key] = (size, mtime, version, matches)
+            self._entries[key] = (size, mtime, version, matches, str(status))
             changed += 1
         return changed
 
@@ -718,21 +1166,31 @@ class FileRegistry:
         self._compact()
 
     def save(self) -> None:
-        self._open_fh()
-        self._fh.flush()
-        os.fsync(self._fh.fileno())
+        """fsync journal (power-cut durable up to the last event), compacting
+        it when appends have outgrown the snapshot. Writer raw fd (D0): fsync
+        lỗi raise (durability chưa chứng minh) nhưng không poison."""
+        self._writer.sync()
         if self._appended_lines > max(
             _JOURNAL_FLOOR_LINES, self._lines_at_compact
         ):
             self._compact()
 
     def close(self) -> None:
-        if self._fh is not None:
-            try:
-                self._fh.close()
-            except OSError:
-                pass
-            self._fh = None
+        self._writer.close()
+        self._release_writer_lock()
+
+    @property
+    def poisoned(self) -> bool:
+        """D0: writer registry đang POISONED — mọi ghi bị từ chối; lookup
+        RAM vẫn đọc được (dữ liệu cũ chưa bị phá) nhưng KHÔNG được ACK kết
+        quả mới qua registry này cho tới recovery có kiểm soát."""
+        return self._writer.poisoned
+
+    def recover_writer(self) -> bool:
+        """Recovery CÓ KIỂM SOÁT của writer registry (D0): rebuild snapshot
+        từ RAM + backup file hỏng. CHỈ gọi khi không producer nào đang append
+        (owner giữ state_lock)."""
+        return self._writer.recover(self._compact)
 
     def discard(self) -> None:
         self.close()
@@ -743,15 +1201,53 @@ class FileRegistry:
             except OSError:
                 pass
 
-    def _open_fh(self) -> None:
-        if self._fh is None:
-            path = registry_path()
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            self._fh = open(path, "a", encoding="utf-8", newline="\n")
+    # -- khóa single-writer theo data directory (D0) ------------------------
+    # Registry là sổ TOÀN APP: hai instance không được ghi/truncate cùng file
+    # mà không phối hợp. Khóa = msvcrt.locking 1 byte trên file
+    # `file_registry.jsonl.writerlock`, giữ suốt đời registry, nhả ở close().
+    _WRITER_LOCK_NAME = "registry.writerlock"
+
+    def _acquire_writer_lock(self) -> None:
+        if self._writer_lock_fh is not None or os.name != "nt":
+            return  # nền không Windows: bỏ qua (dev/linux), Windows là đích
+        import msvcrt
+
+        path = os.path.join(progress_dir(), self._WRITER_LOCK_NAME)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fh = open(path, "a+b")
+        try:
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError:
+            fh.close()
+            raise RegistryBusyError(
+                "registry đang được mở bởi một tiến trình ScanIndex khác "
+                "(khóa single-writer) — lượt này chạy KHÔNG cache registry"
+            )
+        self._writer_lock_fh = fh
+
+    def _release_writer_lock(self) -> None:
+        if self._writer_lock_fh is None:
+            return
+        try:
+            import msvcrt
+
+            self._writer_lock_fh.seek(0)
+            msvcrt.locking(
+                self._writer_lock_fh.fileno(), msvcrt.LK_UNLCK, 1
+            )
+        except OSError:
+            pass
+        finally:
+            try:
+                self._writer_lock_fh.close()
+            except OSError:
+                pass
+            self._writer_lock_fh = None
 
     def _append_line(self, event: dict) -> None:
-        self._open_fh()
-        self._fh.write(json.dumps(event, ensure_ascii=False) + "\n")
+        # D0: writer fail-closed dùng chung — append lỗi rollback (retry
+        # được) hoặc POISONED (từ chối mọi ghi kế tiếp tới khi recovery).
+        self._writer.append_line(event)
         self._appended_lines += 1
 
     def _compact(self) -> None:
@@ -762,7 +1258,9 @@ class FileRegistry:
         with open(tmp, "w", encoding="utf-8", newline="\n") as f:
             f.write(json.dumps({"t": "h", "v": STATE_VERSION}) + "\n")
             for key in sorted(self._entries):
-                size, mtime, version, matches = self._entries[key]
+                entry = self._entries[key]
+                size, mtime, version, matches = entry[:4]
+                status = entry[4] if len(entry) > 4 else "clean"
                 event: dict = {
                     "t": "r",
                     "k": key,
@@ -771,6 +1269,8 @@ class FileRegistry:
                     "v": version,
                     "x": matches,
                 }
+                if str(status) != "clean":
+                    event["st"] = str(status)
                 if key in self._inherited:
                     event["i"] = 1
                 f.write(json.dumps(event, ensure_ascii=False) + "\n")

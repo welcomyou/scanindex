@@ -38,6 +38,36 @@ maxexportworkers = 1
 ; (nếu đặt) override key này.
 maxfileworkers = 2
 
+; =====================================================================
+; Biến môi trường nâng cao (đặt TRƯỚC khi mở app; chỉ dành cho đo đạc/
+; xử sự cố — mặc định KHÔNG cần đặt, ứng dụng tự điều tiết cấp trang):
+;   OCRTOOL_MAX_IN_FLIGHT_PAGES     — trần trang đang nộp mỗi lượt gọi
+;                                     (mặc định = số worker pool)
+;   OCRTOOL_STEP1_MAX_IN_FLIGHT_PAGES / OCRTOOL_STEP2_MAX_IN_FLIGHT_PAGES
+;                                   — cửa sổ riêng Số hóa Bước 1/2
+;   SECRET_SCAN_STREAM_CHUNK        — nhóm chuẩn bị trang Tìm kỹ
+;                                     (khởi điểm min(16, số worker))
+;   SECRET_SCAN_MAX_FILE_WORKERS    — override MaxFileWorkers
+;   DIRECT_OCR_MAXTASKSPERCHILD     — recycle worker sau N task (100)
+; Từ build có admission (xem IMPLEMENTATION_REPORT_unified_ocr_pool_admission):
+;   OCRTOOL_GLOBAL_IN_FLIGHT_PAGES  — trần TỔNG trang đang chạy toàn app
+;                                     (mặc định = số worker pool)
+;   OCRTOOL_DISABLE_GLOBAL_INFLIGHT=1 — tắt giới hạn scheduling (giữ registry)
+;   OCRTOOL_REQUEST_MAX_AGE         — tuổi thọ tối đa 1 request chưa có kết
+;                                     quả trước khi tính là mất (giây, 600)
+;   SECRET_SCAN_FILE_INFLIGHT_PAGES — cửa sổ mỗi file ở Tìm kỹ
+; Benchmark riêng: SCANINDEX_BASE_DIR đổi state/config/temp/log, KHÔNG đổi model root.
+;   SCANINDEX_PROGRESS_NAMESPACE   — namespace kết quả mới; không xóa progress đang dùng
+;   OCRTOOL_KIE_DEFERRED=1 / OCRTOOL_KIE_PROCESSES=2 — KIE process có giới hạn
+;   OCRTOOL_KIE_PAYLOAD_BUDGET_MB=512 — byte của job KIE đang xử lý
+;   OCRTOOL_KIE_SPOOL_BUDGET_MB=512   — tổng snapshot giữ lại + đang tạo,
+;                                     gồm lỗi/retry và mọi namespace
+;   OCRTOOL_KIE_SPOOL_WAIT_S=30      — chờ storage có thể hủy; hết thì checkpoint
+;   LAYOUTLMV3_ONNX_THREADS=2       — intra-op mỗi process KIE
+;   OCRTOOL_PREP_MODE=prep-process / OCRTOOL_PREP_PROCESSES=2 — prep process
+;   OCRTOOL_PREP_INNER_WORKERS=4    — trần thread phân tích trong mỗi prep process
+; =====================================================================
+
 [KIE]
 ; Supported mode: layoutlmv3
 ; Full-field LightGBM KIE is disabled; LightGBM is kept only for the archive splitter.

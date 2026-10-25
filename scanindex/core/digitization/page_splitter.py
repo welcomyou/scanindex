@@ -157,9 +157,9 @@ _SURNAME_HINTS = {
 
 def _repo_root() -> Path:
     try:
-        from scanindex.infra.paths import get_base_dir
+        from scanindex.infra.paths import get_app_dir
 
-        return Path(get_base_dir())
+        return Path(get_app_dir())
     except Exception:
         return Path(__file__).resolve().parents[3]
 

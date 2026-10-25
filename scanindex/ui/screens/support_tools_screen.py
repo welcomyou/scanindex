@@ -174,6 +174,9 @@ class SupportToolsScreen(ScreenContent):
         """Persist each tool's state on exit (e.g. the bulk-signing tool's
         stamp image / OCR option). Tools without ``cleanup`` are skipped."""
         for tool in self._tools.values():
+            cancel = getattr(tool, "request_cancel", None)
+            if callable(cancel):
+                cancel()
             cleanup = getattr(tool, "cleanup", None)
             if callable(cleanup):
                 try:

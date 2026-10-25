@@ -196,10 +196,16 @@ class _BatchSignWorker(QThread):
         # Bounded queue — same pattern as archive Step 1 (split_step.py).
         try:
             max_in_flight = int(
-                os.environ.get("OCRTOOL_MAX_IN_FLIGHT_PAGES") or "16"
+                os.environ.get("OCRTOOL_MAX_IN_FLIGHT_PAGES") or "0"
             )
         except (TypeError, ValueError):
-            max_in_flight = 16
+            max_in_flight = 0
+        if max_in_flight <= 0:
+            # Bỏ trần ẩn 16 (mục 12.2.4): mặc định theo năng lực pool.
+            try:
+                max_in_flight = int(direct_engine.get_parallel_capacity())
+            except Exception:
+                max_in_flight = 16
         max_in_flight = max(1, min(page_count, max_in_flight))
 
         page_results: dict[int, object] = {}
@@ -208,7 +214,7 @@ class _BatchSignWorker(QThread):
         done = 0
 
         def submit_until_full():
-            nonlocal next_page
+            nonlocal next_page, done
             while next_page < page_count and len(pending) < max_in_flight:
                 if self._cancelled:
                     return
@@ -217,10 +223,14 @@ class _BatchSignWorker(QThread):
                 try:
                     pending.append((
                         pi,
-                        direct_engine.submit_page(input_path, pi),
+                        direct_engine.submit_page(
+                            input_path, pi, cancel_check=lambda: self._cancelled,
+                        ),
                         _time.monotonic(),
                     ))
                 except Exception:
+                    if self._cancelled:
+                        return
                     # submit failed — treat as a done page with no result so
                     # the overall progress still advances.
                     done += 1
@@ -267,6 +277,19 @@ class _BatchSignWorker(QThread):
 
             if self._cancelled:
                 return False, "đã hủy"
+
+            # Fail-loud trước assembly (GĐ 0, P1-09): trang OCR thiếu HOẶC
+            # mang sentinel lỗi/worker_init_failed KHÔNG được vào assembly
+            # (trước đây chỉ kiểm tra "thiếu key"). Trả lỗi → caller đi nhánh
+            # nghiệp vụ "ký bản gốc + ghi chú OCR thất bại".
+            bad = [
+                pi for pi in range(page_count)
+                if direct_engine.page_result_state(page_results.get(pi)) in {"error", "missing"}
+            ]
+            if bad:
+                shown = ", ".join(str(p + 1) for p in bad[:5])
+                more = "…" if len(bad) > 5 else ""
+                return False, f"OCR thất bại ở trang {shown}{more}"
 
             # assemble_pdf_from_page_results expects a dict {page_idx: result}
             # (it calls all_page_results.get(page_idx)). submit_page returns

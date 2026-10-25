@@ -82,6 +82,12 @@ def _verify_authenticode_google_signed(
     escaped = file_path.replace("'", "''")
     ps_script = (
         "$ErrorActionPreference='Stop';"
+        # Python launched from PowerShell 7 can inherit its module search path,
+        # while powershell.exe is Windows PowerShell 5. Load the matching OS
+        # security module explicitly; never weaken signature verification.
+        "Import-Module (Join-Path $PSHOME "
+        "'Modules\\Microsoft.PowerShell.Security\\Microsoft.PowerShell.Security.psd1') "
+        "-ErrorAction Stop;"
         f"$sig = Get-AuthenticodeSignature -FilePath '{escaped}';"
         "if ($sig.Status -ne 'Valid') {"
         "  Write-Error (\"Authenticode status: \" + $sig.Status);"

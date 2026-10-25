@@ -126,7 +126,7 @@ def test_batch_pipeline_submits_each_page_exactly_once(tmp_path):
         def get(self, timeout=None):
             return self.page_idx, _page_result()
 
-    def submit(input_path, page_idx):
+    def submit(input_path, page_idx, wait_check=None):
         submitted.append((input_path, page_idx))
         return ReadyResult(page_idx)
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import logging
 import math
 import os
 import re
@@ -18,7 +19,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable
 
-from PySide6.QtCore import QRect, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QRect, QSignalBlocker, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QColor, QDesktopServices, QPainter
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -81,8 +82,10 @@ _DOC_NATIVE_FIRST_PAGE_LINE_LIMIT = 70
 _SECRET_SCAN_DPI = 200
 
 
-class _ScanCancelled(Exception):
-    pass
+# Alias (KHÔNG subclass) — engine bắt `CoreScanCancelled` để truyền nguyên
+# trạng lệnh hủy qua các wrapper `except Exception`; nếu tạo subclass tại đây
+# thì instance lớp do engine raise sẽ không bị `except _ScanCancelled` bắt.
+from scanindex.core.ocr.cancellation import CoreScanCancelled as _ScanCancelled
 
 
 class _ScanSkip(Exception):
@@ -91,6 +94,16 @@ class _ScanSkip(Exception):
     Khác với lỗi tạm thời: ghi journal với trạng thái "skip" để resume
     bỏ qua luôn, không thử lại mỗi lượt quét và không đếm là Lỗi."""
     pass
+
+
+class _PrepProcessError(RuntimeError):
+    """Managed prep failed; retry the file without starting native in parent."""
+
+
+class _ArtifactPersistError(RuntimeError):
+    """R3-01: kết quả KHÔNG nằm bền vững trên đĩa (registry record lỗi) —
+    caller phải coi file là CHƯA hoàn tất (vào cơ chế retry / đếm lỗi),
+    không được tăng counter thành công hay discard journal."""
 
 
 # Số file tối đa được submit vào ThreadPoolExecutor cùng lúc. Queuing mọi
@@ -178,6 +191,17 @@ class SecretScanArtifact:
     source_pdf: str
     canonical: dict
     rotations: list[int] | None = None
+    # clean | confirmed_positive | unconfirmed (LightGBM lỗi — dương có cảnh
+    # báo) | error. Đi xuyên suốt journal/registry/Excel, không chỉ nằm ở note.
+    status: str = "clean"
+    # GĐ K: True khi metadata (cơ quan/năm) đang chạy deferred trên pool KIE —
+    # caller HOÃN commit file tới khi coordinator drain (kết thúc lượt tính
+    # đến metadata cuối). Kết luận về dấu KHÔNG phụ thuộc cờ này.
+    metadata_pending: bool = False
+    # GĐ K (P1-07/P1-09): trạng thái metadata deferred — {"applied": bool,
+    # ...} do `_try_deferred_kie` tạo; commit đọc cờ này để KHÔNG cache-final
+    # khi metadata chưa áp xong (drain timeout / KIE lỗi).
+    kie_state: dict | None = None
 
 
 def _iter_supported_files(folder: str) -> Iterable[str]:
@@ -200,7 +224,7 @@ def _windows_font_path() -> str | None:
         path = os.path.join(windir, "Fonts", name)
         if os.path.exists(path):
             return path
-    bundled = os.path.join(get_base_dir(), "models", "fonts", "NotoSans-Regular.ttf")
+    bundled = get_resource_path("models/fonts/NotoSans-Regular.ttf")
     return bundled if os.path.exists(bundled) else None
 
 
@@ -801,7 +825,39 @@ def _preprocess_pdf_for_ocr(
     out_pdf: str,
     log_cb: Callable[[str], None],
     max_workers: int | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> tuple[str, list[int] | None]:
+    # GĐ P (P-b, mặc định OFF): OCRTOOL_PREP_MODE=prep-process → xoay/deskew
+    # chạy trong process riêng (isolate fitz + gối với OCR). Cùng hàm, cùng
+    # tham số với đường inline → parity theo cấu trúc; lỗi executor → fallback
+    # inline, không fail lượt quét. P2-3 (review 2): truyền context hủy của
+    # lượt xuống run_prep — Stop phải ngắt được cả prep đang chờ/chạy.
+    if os.environ.get("OCRTOOL_PREP_MODE", "").strip().lower() == "prep-process":
+        try:
+            from scanindex.core.preprocessing import prep_worker as _pw
+
+            handled, meta, err = _pw.run_prep(
+                pdf_path, out_pdf, max_workers, timeout=600.0,
+                cancel_event=cancel_event,
+            )
+            if handled:
+                rotations = (meta or {}).get("page_rotations") or None
+                log_cb("Preprocess hướng trang chạy ở process prep riêng")
+                return out_pdf, rotations
+            # R2-04: bị hủy (cancel_event hoặc prep báo canceled) → KHÔNG
+            # fallback inline — người dùng đã Stop, chạy thêm preprocess chỉ
+            # kéo dài việc dừng; caller kiểm tra cancel_event ở điểm kế.
+            if cancel_event is not None and cancel_event.is_set():
+                log_cb(f"Prep process dừng theo yêu cầu hủy ({err})")
+                return pdf_path, None
+            if str(err or "").startswith("canceled:"):
+                log_cb(f"Prep process bị hủy ({err})")
+                return pdf_path, None
+            raise _PrepProcessError(f"Prep process chưa hoàn tất ({err}); file giữ để thử lại")
+        except _PrepProcessError:
+            raise
+        except Exception as exc:
+            raise _PrepProcessError(f"Prep process lỗi ({exc}); file giữ để thử lại") from exc
     try:
         from scanindex.core.preprocessing import preprocessing
 
@@ -1046,8 +1102,18 @@ def _process_pdf_per_page(
     *,
     dpi: int = _SECRET_SCAN_DPI,
     json_path: str | None = None,
+    detect_cb: Callable[[dict, int], bool] | None = None,
+    stop_check: Callable[[], bool] | None = None,
+    page_error_policy: Callable[[int], str] | None = None,
+    deferred_errors: dict[int, str] | None = None,
 ) -> dict:
     """Build a canonical document from a PDF, classifying each page.
+
+    ``deferred_errors`` (P1-E, REVIEW v2): khi caller truyền dict, lỗi lắp
+    trang (OCR sentinel/missing) KHÔNG raise/skip ngay tại callback — được
+    ghi ``{rel_page_idx: reason}`` để caller phân loại SAU khi biết dấu được
+    chấp nhận (kết quả nghiệp vụ độc lập thứ tự hoàn tất callback). Bỏ qua
+    tham số → hành vi cũ (raise ngay / policy skip_warn).
 
     Reuses ``classify_pdf_page`` (the same per-page classifier the PDF-to-Word
     feature uses) so each page is handled correctly:
@@ -1056,6 +1122,12 @@ def _process_pdf_per_page(
 
     This avoids the false negative the old fast-path had (scan_ocr_low text
     layer accepted blindly) and the wasted OCR of purely-digital pages.
+
+    v4: trang scan/mixed được lắp vào canonical NGAY khi OCR xong (theo thứ tự
+    hoàn thành; sort theo ``page_index`` trước khi ghi JSON) và ``detect_cb``
+    chạy trên từng trang vừa xong nếu được cung cấp — trả True để dừng nộp
+    trang mới (dừng sớm theo dấu). Lỗi/timeout OCR → raise RuntimeError (không
+    bao giờ lắp trang rỗng). ``_ScanCancelled`` truyền nguyên trạng qua pool.
     """
     import fitz
 
@@ -1092,66 +1164,22 @@ def _process_pdf_per_page(
     )
 
     # OCR scan/mixed pages. Always route through the shared page-level pool so
-    # multiple files (run in parallel file-worker threads) share its workers —
-    # this is what gives real 2-page concurrency. The screen pre-warms the pool
-    # on show, so the DLL load cost is paid up-front. DPI override keeps
-    # _SECRET_SCAN_DPI (200) instead of the engine-wide 240. The single-worker
-    # path is only a fallback if the pool itself fails.
+    # multiple files (run in parallel file-worker threads) share its workers.
+    # DPI override keeps _SECRET_SCAN_DPI (200) instead of the engine-wide 240.
     ocr_pages = [p for p in page_indices if classifications.get(p, "scan") != "digital"]
     ocr_results: dict[int, dict | None] = {}
-    if ocr_pages:
-        use_pool = direct_ocr_engine.get_parallel_capacity() > 1
-        if use_pool:
-            log_cb(
-                f"OCR {len(ocr_pages)}/{len(page_indices)} trang (scan/mixed) @ {dpi} DPI "
-                f"qua pool {direct_ocr_engine.get_parallel_capacity()} worker..."
+
+    def _assemble_scan_page(page_idx: int, result) -> dict:
+        """Helper DÙNG CHUNG (P1-06): lắp record trang scan/mixed — khai báo
+        ngoài nhánh pool để cả đường single-worker lẫn fallback tuần tự đều
+        lắp đúng; sentinel/missing → raise (không trang rỗng)."""
+        state = direct_ocr_engine.page_result_state(result)
+        if state in {"error", "missing"}:
+            reason = (result or {}).get("error") if isinstance(result, dict) else None
+            raise RuntimeError(
+                f"OCR thất bại ở trang {page_idx + 1}: {reason or state}"
             )
-            try:
-                ocr_results = direct_ocr_engine._process_selected_pages_parallel(
-                    pdf_path,
-                    ocr_pages,
-                    total,
-                    lambda msg, lvl="info": (
-                        log_cb(str(msg)) if str(lvl).lower() != "debug" else None
-                    ),
-                    dpi=dpi,
-                )
-            except Exception as exc:
-                log_cb(f"Pool OCR lỗi, chuyển single-worker: {exc}")
-                ocr_results = {}
-        if not ocr_results:
-            log_cb(f"OCR {len(ocr_pages)} trang (scan/mixed) @ {dpi} DPI single-worker...")
-            for pidx in ocr_pages:
-                if cancel_event.is_set():
-                    raise _ScanCancelled()
-                ocr_results[pidx] = _ocr_one_page_single_worker(
-                    direct_ocr_engine, pdf_path, pidx, dpi=dpi
-                )
-    else:
-        log_cb(f"Tất cả {len(page_indices)} trang là digital — bỏ OCR")
-
-    # Assemble canonical pages in the requested order. Digital pages use
-    # native text; scan/mixed pages consume the OCR results above.
-    for page_idx in page_indices:
-        if cancel_event.is_set():
-            raise _ScanCancelled()
-        if page_idx < 0 or page_idx >= total:
-            continue
         page_w, page_h = page_rects[page_idx]
-        source_mode = classifications.get(page_idx, "scan")
-
-        if source_mode == "digital":
-            with _FITZ_LOCK:
-                with fitz.open(pdf_path) as doc:
-                    page = doc[page_idx]
-                    page_record = _build_native_page_record_from_pdf(page, page_idx)
-            page_record["source_mode"] = "digital"
-            canonical["pages"].append(page_record)
-            continue
-
-        result = ocr_results.get(page_idx)
-        if result is None:
-            raise RuntimeError(f"OCR thất bại ở trang {page_idx + 1}")
         lines_data = result.get("lines_data") or []
         words_data = result.get("words_data") or []
         coord_flipped = direct_ocr_engine._normalize_page_coord_to_top_left(
@@ -1171,9 +1199,147 @@ def _process_pdf_per_page(
             page_record["coord_origin_source"] = "normalized_from_bottom_left"
         page_record["lines"] = lines_data
         page_record["words"] = words_data
-        page_record["source_mode"] = source_mode
-        canonical["pages"].append(page_record)
+        page_record["source_mode"] = classifications.get(page_idx, "scan")
+        return page_record
 
+    completed_scan_pages: set[int] = set()
+    skipped_scan_pages: set[int] = set()  # trang bỏ CÓ CHỦ ĐÍCH (dừng sớm)
+
+    if ocr_pages:
+        use_pool = direct_ocr_engine.get_parallel_capacity() > 1
+        if use_pool:
+            log_cb(
+                f"OCR {len(ocr_pages)}/{len(page_indices)} trang (scan/mixed) @ {dpi} DPI "
+                f"qua pool {direct_ocr_engine.get_parallel_capacity()} worker..."
+            )
+
+            def _on_page_done(page_idx: int, result: dict) -> bool:
+                completed_scan_pages.add(page_idx)
+                try:
+                    page_record = _assemble_scan_page(page_idx, result)
+                except RuntimeError as exc:
+                    # P1-E: caller truyền deferred_errors → lỗi trang là MỘT
+                    # outcome được giữ theo index, phân loại SAU khi biết dấu
+                    # được chấp nhận (độc lập thứ tự callback). Không raise
+                    # vội: trang dấu cùng nhóm có thể chưa kịp lắp.
+                    if deferred_errors is not None:
+                        deferred_errors[page_idx] = str(exc)
+                        log_cb(f"{exc} — tạm giữ, phân loại sau khi biết "
+                               "dấu được chấp nhận")
+                        return False
+                    # P1-08 (đường cũ): lỗi trang SAU dấu đã chấp nhận =
+                    # trang thừa → cảnh báo + bỏ qua có ghi nhận; còn lại raise.
+                    if (
+                        page_error_policy is not None
+                        and page_error_policy(page_idx) == "skip_warn"
+                    ):
+                        skipped_scan_pages.add(page_idx)
+                        log_cb(f"{exc} — trang thừa sau dấu đã chấp nhận, "
+                               "bỏ qua có ghi nhận")
+                        return False
+                    raise
+                canonical["pages"].append(page_record)
+                if detect_cb is not None:
+                    if detect_cb(canonical, page_idx):
+                        skipped_scan_pages.update(
+                            p for p in ocr_pages if p not in completed_scan_pages
+                        )
+                        return True
+                return False
+
+            def _pool_log(msg, lvl="info"):
+                if str(lvl).lower() != "debug":
+                    log_cb(str(msg))
+
+            try:
+                ocr_results = direct_ocr_engine._process_selected_pages_parallel(
+                    pdf_path,
+                    ocr_pages,
+                    total,
+                    _pool_log,
+                    dpi=dpi,
+                    on_page_done=_on_page_done,
+                    stop_check=stop_check,
+                    cancel_check=cancel_event.is_set,
+                )
+            except _ScanCancelled:
+                raise
+            except direct_ocr_engine.PagePostOcrError as exc:
+                # Lỗi lắp/dò từng trang — lỗi THẬT, không fallback:
+                # trang phải được tính lỗi (resume quét lại), không bỏ qua.
+                raise RuntimeError(
+                    f"OCR thất bại ở trang {exc.page_idx + 1}: {exc.cause}"
+                )
+            except Exception as exc:
+                log_cb(f"Pool OCR lỗi, chuyển single-worker: {exc}")
+                ocr_results = {}
+        if not ocr_results:
+            log_cb(f"OCR {len(ocr_pages)} trang (scan/mixed) @ {dpi} DPI single-worker...")
+            for pidx in ocr_pages:
+                if cancel_event.is_set():
+                    raise _ScanCancelled()
+                single = _ocr_one_page_single_worker(
+                    direct_ocr_engine, pdf_path, pidx, dpi=dpi
+                )
+                # lắp NGAY qua helper dùng chung (P1-06) — cả Tìm nhanh lẫn
+                # Tìm kỹ đều có record; lỗi sentinel/None → raise đúng trang.
+                try:
+                    page_record = _assemble_scan_page(pidx, single)
+                except RuntimeError as exc:
+                    # P1-E: chế độ deferred — giữ như một outcome, không raise
+                    # tại đây (phân loại ở caller sau khi biết dấu chấp nhận).
+                    if deferred_errors is not None:
+                        deferred_errors[pidx] = str(exc)
+                        log_cb(f"{exc} — tạm giữ, phân loại sau khi biết "
+                               "dấu được chấp nhận")
+                        continue
+                    raise
+                canonical["pages"].append(page_record)
+                completed_scan_pages.add(pidx)
+                if detect_cb is not None:
+                    if detect_cb(canonical, pidx):
+                        skipped_scan_pages.update(
+                            p for p in ocr_pages if p not in completed_scan_pages
+                        )
+                        break
+    else:
+        log_cb(f"Tất cả {len(page_indices)} trang là digital — bỏ OCR")
+
+    # Digital pages: native text. Trang scan CHƯA lắp:
+    #  - có kết quả (kể cả engine fallback tuần tự trả dict) → lắp BÂY GIỜ
+    #    qua helper — không bỏ kết quả OCR hợp lệ (P1-06);
+    #  - không có kết quả và không nằm trong tập bỏ-có-chủ-đích → lỗi thật
+    #    (không được ngầm coi là "bỏ qua có chủ đích").
+    scanned_idx = {p.get("page_index") for p in canonical["pages"]}
+    for page_idx in page_indices:
+        if cancel_event.is_set():
+            raise _ScanCancelled()
+        if page_idx < 0 or page_idx >= total:
+            continue
+        if page_idx in scanned_idx:
+            continue
+        if classifications.get(page_idx, "scan") == "digital":
+            with _FITZ_LOCK:
+                with fitz.open(pdf_path) as doc:
+                    page = doc[page_idx]
+                    page_record = _build_native_page_record_from_pdf(page, page_idx)
+            page_record["source_mode"] = "digital"
+            canonical["pages"].append(page_record)
+            continue
+        if page_idx in skipped_scan_pages:
+            continue  # bỏ CÓ CHỦ ĐÍCH do dừng sớm — không phải lỗi
+        if deferred_errors is not None and page_idx in deferred_errors:
+            continue  # P1-E: lỗi được giữ cho caller phân loại sau — không raise tại đây
+        if page_idx in ocr_results:
+            page_record = _assemble_scan_page(page_idx, ocr_results[page_idx])
+            canonical["pages"].append(page_record)
+            continue
+        raise RuntimeError(
+            f"OCR thất bại ở trang {page_idx + 1}: thiếu kết quả "
+            "(không phải trang bỏ qua có chủ đích)"
+        )
+
+    canonical["pages"].sort(key=lambda r: int(r.get("page_index", 0)))
     return _finalize_canonical(canonical, json_path)
 
 
@@ -1307,13 +1473,12 @@ def _pdf_file_kind(pdf_path: str) -> str:
 
 
 def _stream_chunk_size() -> int:
-    """Số trang mỗi lượt OCR+dò ở chế độ streaming (Tìm kỹ).
-
-    Mặc định = đúng số worker của pool OCR dùng chung toàn app
-    (``direct_engine.get_parallel_capacity()`` — tức settings.ini
-    ``[OCR] MaxConcurrentOCR``): một lượt là một vòng pool, mọi worker đều
-    có việc trong lượt mà mức dừng sớm vẫn granular nhất có thể. Override
-    bằng biến môi trường SECRET_SCAN_STREAM_CHUNK (debug/tinh chỉnh)."""
+    """Số trang mỗi nhóm chuẩn bị (cắt/tiền xử lý) của Tìm kỹ — TÁCH KHỎI số
+    worker pool (mục 12.4): nhóm 8 không có nghĩa pool chỉ có 8 worker; nhiều
+    tài liệu cùng cấp việc cho pool chung. Giá trị khởi điểm ``min(16,
+    capacity)`` chặn chi phí chuẩn bị; trần "sẵn sàng" của file là cửa sổ
+    admission (không còn trần ẩn 16 của collector). Override bằng biến môi
+    trường ``SECRET_SCAN_STREAM_CHUNK`` (thử nghiệm có chủ đích)."""
     raw = os.environ.get("SECRET_SCAN_STREAM_CHUNK", "").strip()
     if raw:
         try:
@@ -1326,7 +1491,7 @@ def _stream_chunk_size() -> int:
         capacity = int(direct_engine.get_parallel_capacity())
     except Exception:
         capacity = 2
-    return max(2, capacity)
+    return max(4, min(16, capacity))
 
 
 def _process_and_detect_streaming(
@@ -1346,16 +1511,20 @@ def _process_and_detect_streaming(
     rotate: bool = False,
     ocr_workers: int | None = None,
     file_work_dir: str = "",
-) -> tuple[dict, list[SecretScanMatch], list[int] | None]:
-    """OCR + dò dấu SONG SONG theo lượt nhỏ thay vì OCR xong hết mới dò.
+) -> tuple[dict, list[SecretScanMatch], list[int] | None, str]:
+    """OCR + dò dấu SONG SONG theo từng trang; dừng sớm theo dấu ĐƯỢC XÁC NHẬN.
 
-    Mỗi lượt ``_stream_chunk_size()`` trang: OCR xong là dò NGAY; gặp trang
-    dấu đầu tiên thì dừng hẳn — các trang còn lại KHÔNG bị OCR. Khi cần xoay
-    trang, từng lượt được cắt riêng rồi xoay riêng (tránh xoay cả file trước
-    khi biết dấu nằm ở đâu). Canonical ghép từ các lượt và ghi json ĐÚNG 1
-    lần ở cuối để pass KIE (năm/cơ quan) đọc đúng trang dấu. Trả về
-    (canonical, matches, rotations) — rotations là metadata kê khai (hiện
-    không có bản đọc), chỉ giữ khi MỌI lượt đều trả về đủ.
+    Mỗi trang OCR xong là được dò NGAY (detect per page). Gặp dấu ứng viên:
+    LightGBM xác nhận NGAY trên canonical hiện có — chấp nhận thì dừng (các
+    trang sau không OCR); bị loại thì TIẾP TỤC xét các trang sau (ứng viên bị
+    loại không làm toàn file thành sạch khi còn trang chưa xét); LightGBM lỗi
+    thì quét phủ đầy phạm vi và giữ ứng viên với chú thích "chưa xác nhận"
+    (không bao giờ âm tính im lặng). Khi cần xoay, từng lượt được cắt riêng
+    rồi xoay riêng; rebase chỉ số theo ``page_index`` của từng record (không
+    ghép vị trí). Canonical giữ prefix liên tục đến trang dấu được chấp nhận
+    (bất biến cho LightGBM/KIE lọc theo ordinal). Trả về
+    ``(canonical, matches, rotations, mark_status)`` với ``mark_status`` ∈
+    ``none | accepted | dropped_continued | lgbm_error_unconfirmed``.
     """
     from scanindex.core.kie.json_utils import make_document_stub
     from scanindex.core.ocr.text_normalizer import OCR_TEXT_NORMALIZATION
@@ -1371,6 +1540,99 @@ def _process_and_detect_streaming(
     chunk_size = _stream_chunk_size()
     matches: list[SecretScanMatch] = []
     rotations: list[int] | None = []
+    current_map: list[int] = []  # rel → abs cho lượt đang xử lý ([] = không xoay)
+    detected_rel: set[int] = set()  # trang đã dò trong lượt hiện tại
+    pending_candidates: list[tuple[SecretScanMatch, int]] = []
+    coverage_incomplete = False
+    # Trạng thái từ TẬP (P1-08) — không dùng một biến "sự kiện cuối cùng":
+    any_accepted = False          # đã có dấu được LightGBM chấp nhận
+    accepted_page: int | None = None
+    lgbm_error = False            # LightGBM lỗi — ứng viên giữ kèm cảnh báo
+    # P1-E (REVIEW v2): lỗi trang trong lượt được GIỮ theo index (rel → reason)
+    # và chỉ phân loại bắt-buộc/thừa SAU khi biết dấu được chấp nhận — kết quả
+    # nghiệp vụ độc lập thứ tự hoàn tất callback.
+    deferred_errors: dict[int, str] = {}
+
+    def _assert_dense_prefix_upto(abs_k: int) -> None:
+        """Bất invariant cho LightGBM/KIE (lọc theo ordinal): canonical phải
+        chứa LIÊN MỊCH các trang nguồn 0..abs_k. Vi phạm là lỗi lập trình."""
+        present = set()
+        for page in canonical.get("pages") or []:
+            try:
+                present.add(int(page.get("page_index", -1)))
+            except (TypeError, ValueError):
+                continue
+        missing = [i for i in range(0, abs_k + 1) if i not in present]
+        if missing:
+            raise RuntimeError(
+                f"canonical thiếu prefix trang nguồn {missing[:5]} — "
+                "LightGBM/KIE sẽ đọc sai ordinal"
+            )
+
+    def _confirm_candidate(match: SecretScanMatch, abs_page_idx: int) -> bool:
+        """LightGBM xác nhận ứng viên trên canonical ĐÃ MERGE (chứa prefix
+        nguồn đến trang ứng viên). Trả True nếu chấp nhận (dừng)."""
+        nonlocal any_accepted, accepted_page, lgbm_error
+        if not json_path:
+            matches.append(match)
+            any_accepted = True
+            accepted_page = abs_page_idx
+            return True
+        _assert_dense_prefix_upto(abs_page_idx)
+        try:
+            _finalize_canonical(canonical, json_path)  # LightGBM đọc từ file
+            doc_start_pages, lgbm_note = _doc_start_pages(json_path)
+        except Exception as exc:
+            log_cb(f"LightGBM lỗi, không xác nhận trang đầu văn bản: {exc}")
+            lgbm_error = True
+            match.note = f"{match.note}; chưa xác nhận LightGBM ({exc})"
+            matches.append(match)
+            return False
+        if abs_page_idx in set(doc_start_pages):
+            match.note = f"{match.note}; {lgbm_note}; xác nhận trang đầu"
+            matches.append(match)
+            any_accepted = True
+            accepted_page = abs_page_idx
+            return True
+        log_cb(
+            f"Bỏ qua dấu {match.keyword} ở trang {match.page_number}: "
+            "LightGBM không xác định là trang đầu văn bản — tiếp tục xét "
+            "các trang sau"
+        )
+        return False
+
+    def _detect_cb(canonical_partial: dict, rel_page_idx: int) -> bool:
+        """Dò từng trang khi OCR xong — chỉ THU ỨNG VIÊN; xác nhận LightGBM
+        chạy SAU khi cả lượt được merge vào canonical tổng (P1-05)."""
+        if cancel_event.is_set():
+            raise _ScanCancelled()
+        detected_rel.add(rel_page_idx)
+        if not _detect_secret_on_page(canonical_partial, rel_page_idx):
+            return False
+        page_hits = _collect_secret_matches(
+            canonical_partial,
+            [rel_page_idx],
+            source_path=source_path,
+            relative_path=relative_path,
+            mode=mode,
+            artifact_path=artifact_path,
+            note=note,
+            cancel_event=cancel_event,
+            stop_on_first=True,
+        )
+        if not page_hits:
+            return False
+        match = page_hits[0]
+        if current_map and 0 <= rel_page_idx < len(current_map):
+            try:
+                match.page_number = int(current_map[rel_page_idx]) + 1
+            except (TypeError, ValueError):
+                pass
+        pending_candidates.append((match, rel_page_idx))
+        return False
+
+    pending_candidates: list[tuple[SecretScanMatch, int]] = []
+
     for start in range(0, len(page_indices), chunk_size):
         if cancel_event.is_set():
             raise _ScanCancelled()
@@ -1379,6 +1641,8 @@ def _process_and_detect_streaming(
         # gán lại chỉ số tuyệt đối sau khi OCR; không xoay thì dùng thẳng
         # chỉ số tuyệt đối trên scan_pdf.
         rel_chunk = list(range(len(abs_chunk))) if rotate else abs_chunk
+        current_map = abs_chunk if rotate else []
+        detected_rel = set()
         log_cb(
             "Dò song song với OCR: xét trang "
             f"{abs_chunk[0] + 1}–{abs_chunk[-1] + 1}..."
@@ -1392,6 +1656,7 @@ def _process_and_detect_streaming(
             )
             work_pdf, chunk_rotations = _preprocess_pdf_for_ocr(
                 work_pdf, pre_pdf, log_cb, max_workers=ocr_workers,
+                cancel_event=cancel_event,
             )
             if chunk_rotations is None:
                 rotations = None
@@ -1404,35 +1669,95 @@ def _process_and_detect_streaming(
             cancel_event,
             log_cb,
             dpi=dpi,
+            detect_cb=_detect_cb,
+            deferred_errors=deferred_errors,
         )
         chunk_pages = chunk_canonical.get("pages") or []
-        for page_record, abs_idx in zip(chunk_pages, abs_chunk):
+        # Fallback dò hậu-lượt: trang đã OCR nhưng chưa được dò (khi
+        # `_process_pdf_per_page` không hỗ trợ detect_cb — vd giả lập test).
+        present_rel = {p.get("page_index") for p in chunk_pages}
+        for rel in rel_chunk:
+            if rel in detected_rel or rel not in present_rel:
+                continue
+            _detect_cb(chunk_canonical, rel)
+        for page_record in chunk_pages:
             try:
-                page_record["page_index"] = int(abs_idx)
+                rel_idx = int(page_record.get("page_index", 0))
             except (TypeError, ValueError):
                 continue
+            if rotate and 0 <= rel_idx < len(abs_chunk):
+                page_record["page_index"] = int(abs_chunk[rel_idx])
         canonical["pages"].extend(chunk_pages)
-        matches.extend(
-            _collect_secret_matches(
-                canonical,
-                abs_chunk,
-                source_path=source_path,
-                relative_path=relative_path,
-                mode=mode,
-                artifact_path=artifact_path,
-                note=note,
-                cancel_event=cancel_event,
-                stop_on_first=stop_on_first,
-            )
-        )
-        if matches and stop_on_first:
+
+        # Coverage check (P1-08): trang bị bỏ/lỗi TRONG LƯỢT mà chưa có dấu
+        # được chấp nhận → coverage chưa đủ; nếu cuối file vẫn không có dấu
+        # được chấp nhận thì file KHÔNG được kết luận sạch.
+        merged_idx = {p.get("page_index") for p in chunk_pages}
+        missing_abs = [a for a in abs_chunk if a not in merged_idx]
+        if missing_abs and not any_accepted:
+            coverage_incomplete = True
+
+        # Xác nhận ứng viên SAU khi lượt đã merge vào canonical tổng —
+        # theo thứ tự trang; prefix nguồn phải hợp lệ trước mỗi lần predict.
+        if pending_candidates:
+            pending_candidates.sort(key=lambda item: item[1])
+            for match, rel_page_idx in pending_candidates:
+                if any_accepted:
+                    break
+                abs_idx = (
+                    current_map[rel_page_idx]
+                    if current_map and 0 <= rel_page_idx < len(current_map)
+                    else rel_page_idx
+                )
+                if _confirm_candidate(match, abs_idx):
+                    break
+            pending_candidates = []
+
+        # P1-E: phân loại lỗi trang ĐÃ GIỮ — giờ đã biết dấu được chấp nhận
+        # hay chưa. Trang lỗi SAU dấu chấp nhận = trang thừa → cảnh báo; còn
+        # lại (kể cả khi ứng viên bị loại/LightGBM lỗi) = lỗi bắt buộc → file
+        # lỗi, resume quét lại (P1-F: không thành unconfirmed/cache hoàn tất).
+        if deferred_errors:
+            for rel_idx in sorted(deferred_errors):
+                reason = deferred_errors[rel_idx]
+                abs_idx = (
+                    current_map[rel_idx]
+                    if current_map and 0 <= rel_idx < len(current_map)
+                    else rel_idx
+                )
+                if (
+                    any_accepted
+                    and accepted_page is not None
+                    and abs_idx > accepted_page
+                ):
+                    log_cb(
+                        f"OCR thất bại ở trang {abs_idx + 1} — trang thừa "
+                        f"sau dấu đã chấp nhận (trang {accepted_page + 1}), "
+                        "bỏ qua có ghi nhận"
+                    )
+                else:
+                    raise RuntimeError(
+                        f"OCR thất bại ở trang {abs_idx + 1}: {reason}"
+                    )
+            deferred_errors.clear()
+        if any_accepted:
             log_cb(
-                f"Phát hiện dấu mật ở trang {matches[0].page_number} — "
+                f"Phát hiện dấu mật ở trang {accepted_page + 1} — "
                 "dừng; các trang sau không OCR/xét nữa."
             )
             break
+        # LightGBM lỗi: KHÔNG dừng sớm vô căn cứ — quét phủ đầy phạm vi,
+        # ứng viên giữ với cảnh báo (status tổng ở caller).
     _finalize_canonical(canonical, json_path)
-    return canonical, matches, rotations
+    if any_accepted:
+        mark_status = "accepted"
+    elif lgbm_error or coverage_incomplete:
+        # LGBM lỗi hoặc còn trang chưa xét (bỏ theo ứng viên tiềm năng đã bị
+        # loại) → chưa đủ cơ sở kết luận sạch — caller xếp unconfirmed.
+        mark_status = "lgbm_error_unconfirmed"
+    else:
+        mark_status = "none"
+    return canonical, matches, rotations, mark_status
 
 
 def _filter_matches_by_doc_start(
@@ -1562,9 +1887,13 @@ _DECLASS_KIE_MIN_CANDIDATES = 3
 _KIE_INFER_LOCK = threading.RLock()
 # Field instances infer theo (file canonical, trang): pass năm và pass tên
 # cơ quan thường cùng chạy trên một trang → cache để không infer 2 lần.
-# Working set mỗi file chỉ vài trang; vượt ngưỡng thì xóa sạch (hi hữu lắm
-# mới mất cache, tệ nhất trả thêm 1 lần infer).
+# Working set mỗi file chỉ vài trang; vượt ngưỡng thì xóa sạch. R3-03: cache
+# CHỈ là tối ưu — kết quả bắt buộc của job deferred được truyền cho applier
+# bằng dữ liệu cục bộ, eviction không được đổi metadata đã nhận.
 _KIE_FIELDS_CACHE_MAX = 256
+# P2-3: run_id của lượt quét ĐANG CHẠY trên thread file-worker — truyền cho
+# `_try_deferred_kie` mà không đổi chữ ký public (tương thích monkeypatch).
+_scan_run_ctx = threading.local()
 _KIE_FIELDS_CACHE: dict[tuple[str, int], list[dict] | None] = {}
 # Sentinel "chưa infer cho trang này" — phân biệt với None ("đã infer nhưng
 # lỗi/không có field"), để pass năm biết có thể tận dụng kết quả sẵn.
@@ -1573,6 +1902,20 @@ _KIE_CACHE_MISS = object()
 
 def _kie_cache_key(canonical_json_path: str, page_index: int) -> tuple[str, int]:
     return (os.path.normcase(os.path.abspath(str(canonical_json_path))), int(page_index))
+
+
+def _kie_cache_store(canonical_json_path: str, page_index: int, fields) -> None:
+    """R2-06: ghi cache field CHỈ QUA ĐÂY — áp giới hạn `_KIE_FIELDS_CACHE_MAX`
+    cho CẢ đường đồng bộ lẫn callback deferred (trước đây deferred ghi thẳng
+    dictionary, vượt giới hạn theo số canonical đã xử lý). Evict theo batch
+    như semantics hiện có. R3-03: cache CHỈ là tối ưu — đường deferred áp
+    fields từ dữ liệu cục bộ của job (`fields_override`), eviction mất cache
+    KHÔNG được làm sai/kthiếu metadata của kết quả vừa nhận."""
+    key = _kie_cache_key(canonical_json_path, page_index)
+    if key not in _KIE_FIELDS_CACHE \
+            and len(_KIE_FIELDS_CACHE) >= _KIE_FIELDS_CACHE_MAX:
+        _KIE_FIELDS_CACHE.clear()
+    _KIE_FIELDS_CACHE[key] = fields
 
 
 def _kie_cached_fields(canonical_json_path: str, page_index: int):
@@ -1618,19 +1961,14 @@ def _kie_fields_for_page(
                 result = None
     except Exception:
         result = None
-    if len(_KIE_FIELDS_CACHE) >= _KIE_FIELDS_CACHE_MAX:
-        _KIE_FIELDS_CACHE.clear()
-    _KIE_FIELDS_CACHE[key] = result
+    _kie_cache_store(canonical_json_path, page_index, result)
     return result
 
 
-def _kie_issue_year(canonical_json_path: str, page_index: int) -> int | None:
-    """Năm ban hành theo field PLACE_DATE của LayoutLM trên đúng trang.
-
-    Trả None khi model không có sẵn / lỗi / không gán nhãn được — caller
-    fallback về kết quả regex.
-    """
-    for field in _kie_fields_for_page(canonical_json_path, page_index) or []:
+def _kie_year_from_fields(fields, page_index: int) -> int | None:
+    """Năm ban hành từ DANH SÁCH field đã có (không infer) — nhãn PLACE_DATE.
+    Trả None khi không gán được."""
+    for field in fields or []:
         if not isinstance(field, dict):
             continue
         if str(field.get("label") or "") != "PLACE_DATE":
@@ -1651,6 +1989,17 @@ def _kie_issue_year(canonical_json_path: str, page_index: int) -> int | None:
     return None
 
 
+def _kie_issue_year(canonical_json_path: str, page_index: int) -> int | None:
+    """Năm ban hành theo field PLACE_DATE của LayoutLM trên đúng trang.
+
+    Trả None khi model không có sẵn / lỗi / không gán nhãn được — caller
+    fallback về kết quả regex.
+    """
+    return _kie_year_from_fields(
+        _kie_fields_for_page(canonical_json_path, page_index), page_index
+    )
+
+
 def _match_meets_declassification(match: SecretScanMatch) -> bool:
     return bool(match.declass_due) or DECLASS_NOTE_LABEL in (match.note or "")
 
@@ -1668,10 +2017,57 @@ def _safe_page_index(page_number) -> int:
         return 0
 
 
+def _deferred_cache_final(
+    artifact,
+    path: str,
+    scan_stat: tuple[int, float] | None,
+    source_unstable: bool = False,
+) -> tuple[bool, str]:
+    """P1-07/P2.5/P2-H: kết quả file có được ghi cache-final không.
+
+    - metadata deferred CHƯA áp xong (drain timeout / KIE lỗi) → KHÔNG:
+      lượt sau phải quét lại thay vì cache-hit kết quả thiếu metadata.
+    - `source_unstable` (nguồn đổi TRONG lúc quét: pre-stat ≠ post-stat) →
+      KHÔNG: kết quả trộn phiên bản, không được hợp thức hóa bằng cách chụp
+      stat lại.
+    - fingerprint chụp trước khi đọc (scan_stat) ≠ hiện tại → KHÔNG (file
+      đổi giữa lúc chờ commit).
+    Trả ``(cache_final, lý_do)`` — lý do rỗng khi đủ điều kiện."""
+    kie_state = getattr(artifact, "kie_state", None)
+    if kie_state is not None and not kie_state.get("applied"):
+        return False, "metadata-pending"
+    if source_unstable:
+        return False, "nguồn-dổi-trong-lúc-quét"
+    if scan_stat is not None:
+        try:
+            st = os.stat(path)
+        except OSError:
+            return False, "source-missing"
+        if (st.st_size, st.st_mtime) != tuple(scan_stat):
+            return False, "source-changed"
+    return True, ""
+
+
+def _strip_declass_note_details(note: str) -> str:
+    """Bỏ mọi đoạn ghi chú "Đáp ứng thời gian giải mật (...)" khỏi note —
+    cho phép áp lại idempotent (baseline regex → KIE nâng cấp năm mà KHÔNG
+    đúp note). Các đoạn note khác giữ nguyên."""
+    if not note:
+        return note
+    segments = [s.strip() for s in note.split(";")]
+    kept = [
+        s for s in segments
+        if s and DECLASS_NOTE_LABEL not in s
+    ]
+    return "; ".join(kept)
+
+
 def _apply_declassification_notes(
     matches: list[SecretScanMatch],
     canonical: dict,
     canonical_json_path: str | None = None,
+    allow_model: bool = True,
+    fields_override: dict[int, list[dict] | None] | None = None,
 ) -> None:
     """Gắn ghi chú "Đáp ứng thời gian giải mật" khi đã quá thời hạn mật.
 
@@ -1684,15 +2080,32 @@ def _apply_declassification_notes(
     ngày ứng viên (nhiễu), hoặc (b) KIE ĐÃ chạy cho trang này vì pass tên
     cơ quan dự phòng — khi đó đọc lại từ cache, không infer thêm. Chỉ chạy
     trên các file đã xác định là mật.
+
+    ``allow_model=False`` (P1-08): chỉ regex — KHÔNG infer, KHÔNG kể cache.
+    Dùng cho baseline-trước-enqueue và callback deferred (không được quay về
+    KIE đồng bộ trong callback). Hàm IDEMPOTENT: ghi chú cũ cùng nhãn bị
+    thay (không đúp) nên gọi nhiều lần an toàn.
+
+    ``fields_override`` (R3-03): fields của job KIE truyền TRỰC TIẾP theo
+    trang — dữ liệu cục bộ còn sống tới khi áp xong, ưu tiên cao nhất. Cache
+    toàn cục chỉ là TỐI ƯU: giữa store và apply, writer khác có thể chạm
+    ngưỡng và clear cache — applier deferred (allow_model=False) không được
+    phép rơi về regex/thiếu fields mà vẫn đánh dấu applied.
     """
     if not matches:
         return
     current_year = time.localtime().tm_year
-    kie_enabled = os.environ.get(
-        "SECRET_SCAN_DISABLE_KIE_YEAR", ""
-    ).lower() not in {"1", "true"}
+    # Cờ env tắt năm-KIE chặn CẢ cache-read lẫn infer; allow_model=False
+    # (baseline/callback deferred) chỉ chặn INFER — cache vẫn đọc được.
+    kie_enabled = (
+        os.environ.get("SECRET_SCAN_DISABLE_KIE_YEAR", "").lower()
+        not in {"1", "true"}
+    )
     year_by_page: dict[int, int] = {}
     for match in matches:
+        # Idempotent: bỏ ghi chú giải mật cũ trước khi tính lại (năm KIE có
+        # thể khác năm regex baseline — chỉ được tồn tại MỘT ghi chú cuối).
+        base_note = _strip_declass_note_details(str(match.note or ""))
         page_idx = _safe_page_index(match.page_number)
         if page_idx not in year_by_page:
             page = (
@@ -1703,19 +2116,49 @@ def _apply_declassification_notes(
             candidates = _issue_date_candidates(page) if page else []
             year = candidates[0][1] if candidates else 0
             if kie_enabled and canonical_json_path:
-                already_inferred = (
-                    _kie_cached_fields(canonical_json_path, page_idx)
-                    is not _KIE_CACHE_MISS
+                override = (
+                    fields_override.get(page_idx, _KIE_CACHE_MISS)
+                    if fields_override is not None
+                    else _KIE_CACHE_MISS
                 )
-                if already_inferred or len(candidates) >= _DECLASS_KIE_MIN_CANDIDATES:
-                    # (b) tận dụng lần infer đã chạy của pass cơ quan —
-                    # _kie_issue_year đọc cache, không tốn model; (a) trang
-                    # nhiễu → infer rồi lấy năm theo nhãn PLACE_DATE.
-                    kie_year = _kie_issue_year(canonical_json_path, page_idx)
-                    if kie_year is not None:
-                        year = kie_year
+                kie_year = None
+                if override is not _KIE_CACHE_MISS:
+                    # R3-03: fields của CHÍNH job này (dữ liệu cục bộ) —
+                    # không phụ thuộc cache còn sống hay không.
+                    kie_year = _kie_year_from_fields(override, page_idx)
+                else:
+                    already_inferred = (
+                        _kie_cached_fields(canonical_json_path, page_idx)
+                        is not _KIE_CACHE_MISS
+                    )
+                    if already_inferred:
+                        # Cache CÓ fields (infer đã chạy trước đó / job KIE
+                        # vừa về) → đọc cache, KHÔNG infer — đường thường
+                        # (allow_model=True) đi đây.
+                        cached = _kie_cached_fields(
+                            canonical_json_path, page_idx
+                        )
+                        kie_year = _kie_year_from_fields(cached, page_idx)
+                    elif allow_model \
+                            and len(candidates) >= _DECLASS_KIE_MIN_CANDIDATES:
+                        # (a) trang nhiễu → infer rồi lấy năm theo nhãn
+                        # PLACE_DATE. allow_model=False (baseline/callback)
+                        # thì KHÔNG BAO GIỜ infer — giữ regex.
+                        kie_year = _kie_issue_year(
+                            canonical_json_path, page_idx
+                        )
+                if kie_year is not None:
+                    year = kie_year
             year_by_page[page_idx] = year
         year = year_by_page[page_idx]
+        match.note = base_note
+        # P1-A (review 2): bộ giá trị derived phải được TÍNH LẠI TOÀN BỘ từ
+        # nguồn hiện tại rồi thay cùng nhau — nâng/cụt năm (đủ hạn ↔ chưa đủ)
+        # hoặc năm không suy được phải XÓA trạng thái cũ của baseline, không
+        # để `declass_due=True` cũ sống sót qua lần tính lại.
+        match.issue_year = 0
+        match.declass_years = 0
+        match.declass_due = False
         if not 1900 <= year <= current_year:
             continue
         years = DECLASS_YEARS_BY_KEYWORD.get((match.keyword or "").strip().upper())
@@ -1729,7 +2172,7 @@ def _apply_declassification_notes(
                 f"{DECLASS_NOTE_LABEL} "
                 f"(văn bản {year}, {match.keyword} {years} năm)"
             )
-            match.note = f"{match.note}; {detail}" if match.note else detail
+            match.note = f"{base_note}; {detail}" if base_note else detail
 
 
 # File "mới" hơn nảy giây → có thể đang được copy/ghi dở trên share:
@@ -1867,6 +2310,8 @@ def scan_one_file_for_secret_artifact(
     ocr_workers: int | None = None,
     *,
     page_limit: int = 0,
+    run_id: str | None = None,
+    kie_spool_cb=None,
 ) -> SecretScanArtifact:
     """Scan one file for classified-document stamps.
 
@@ -1946,11 +2391,13 @@ def scan_one_file_for_secret_artifact(
         _apply_declassification_notes(
             matches, native_canonical, canonical_json_path
         )
+        # GĐ K: nhánh DOCX giữ KIE đồng bộ (deferred chỉ áp PDF quick/thorough).
         return SecretScanArtifact(
             matches=matches,
             source_pdf="",
             canonical=native_canonical,
             rotations=None,
+            status="confirmed_positive" if matches else "clean",
         )
 
     # ── PDF: per-page classify (digital / scan / mixed) ───────────────────
@@ -2009,6 +2456,7 @@ def scan_one_file_for_secret_artifact(
                     pre_pdf,
                     log_cb,
                     max_workers=ocr_workers,
+                    cancel_event=cancel_event,
                 )
                 if os.path.abspath(pre_out) != os.path.abspath(scan_pdf):
                     scan_pdf = pre_out
@@ -2034,19 +2482,30 @@ def scan_one_file_for_secret_artifact(
             cancel_event=cancel_event,
         )
         # Cơ quan dự phòng trước, giải mật sau — xem chú thích nhánh Word.
-        _apply_kie_org_fallback(matches, canonical_json_path)
-        _apply_declassification_notes(matches, canonical, canonical_json_path)
+        # GĐ K: PDF Tìm nhanh có thể deferred (OCRTOOL_KIE_DEFERRED=1).
+        deferred_kie = _try_deferred_kie(
+            matches, canonical, canonical_json_path, run_id=run_id,
+            kie_spool_cb=kie_spool_cb,
+            artifact_status="confirmed_positive" if matches else "clean",
+        )
+        if deferred_kie is None:
+            _apply_kie_org_fallback(matches, canonical_json_path)
+            _apply_declassification_notes(matches, canonical, canonical_json_path)
+        # Tìm nhanh: dò detector trên trang đầu, KHÔNG qua LightGBM (theo
+        # thiết kế) — dấu tìm thấy là mức detector, status phản ánh đúng điều đó.
         return SecretScanArtifact(
             matches=matches,
             source_pdf=scan_pdf,
             canonical=canonical,
             rotations=rotations,
+            status="confirmed_positive" if matches else "clean",
+            metadata_pending=deferred_kie is not None,
+            kie_state=deferred_kie,
         )
 
     # "Tìm kỹ" (cả giới hạn 10 trang lẫn mọi trang): OCR + dò SONG SONG theo
-    # lượt nhỏ thay vì OCR xong hết mới dò — gặp trang dấu đầu tiên là dừng
-    # hẳn, các trang sau KHÔNG bị OCR nữa. Xoay trang cũng theo từng lượt
-    # (tránh xoay cả 300 trang rồi mới biết dấu nằm ở trang 3).
+    # từng trang; dừng sớm khi dấu ứng viên được LightGBM XÁC NHẬN. Xoay trang
+    # cũng theo từng lượt (tránh xoay cả 300 trang rồi mới biết dấu ở trang 3).
     if windowed:
         note = (
             f"{note}; kiểm tối đa {len(page_indices)} trang đầu, "
@@ -2064,7 +2523,7 @@ def scan_one_file_for_secret_artifact(
     )
     if rotate:
         note = f"{note}; đã xoay đúng chiều"
-    canonical, matches, rotations = _process_and_detect_streaming(
+    canonical, matches, rotations, mark_status = _process_and_detect_streaming(
         scan_pdf,
         source_path,
         relative_path,
@@ -2081,15 +2540,33 @@ def scan_one_file_for_secret_artifact(
         ocr_workers=ocr_workers,
         file_work_dir=file_work_dir,
     )
-    matches = _filter_matches_by_doc_start(matches, canonical_json_path, log_cb)
+    # Xác nhận LightGBM đã chạy TỪNG TRANG trong streaming (không còn filter
+    # hậu-hội): matches = dấu đã chấp nhận (+ ứng viên chưa xác nhận khi
+    # LightGBM lỗi). Ba trạng thái: confirmed_positive / unconfirmed / clean.
+    if matches and mark_status == "accepted":
+        artifact_status = "confirmed_positive"
+    elif mark_status == "lgbm_error_unconfirmed":
+        artifact_status = "unconfirmed"
+    else:
+        artifact_status = "clean"
     # Cơ quan dự phòng trước, giải mật sau — xem chú thích nhánh Word.
-    _apply_kie_org_fallback(matches, canonical_json_path)
-    _apply_declassification_notes(matches, canonical, canonical_json_path)
+    # GĐ K: PDF Tìm kỹ có thể deferred (OCRTOOL_KIE_DEFERRED=1) — metadata
+    # điền vào matches trước khi lượt quét commit (drain cuối lượt).
+    deferred_kie = _try_deferred_kie(
+        matches, canonical, canonical_json_path, run_id=run_id,
+        kie_spool_cb=kie_spool_cb, artifact_status=artifact_status,
+    )
+    if deferred_kie is None:
+        _apply_kie_org_fallback(matches, canonical_json_path)
+        _apply_declassification_notes(matches, canonical, canonical_json_path)
     return SecretScanArtifact(
         matches=matches,
         source_pdf=scan_pdf,
         canonical=canonical,
         rotations=rotations,
+        status=artifact_status,
+        metadata_pending=deferred_kie is not None,
+        kie_state=deferred_kie,
     )
 
 
@@ -2204,18 +2681,11 @@ def _org_code_from_filename(source_path: str) -> str:
     return rest.split("-", 1)[0].strip()
 
 
-def _kie_org_fallback_name(canonical_json_path: str, page_index: int) -> str:
-    """Tên cơ quan dự phòng "<cơ quan ban hành> <cơ quan cấp trên>*" theo KIE.
-
-    Bóc 2 nhãn ISSUE_ORG_NAME (cơ quan ban hành) và ISSUE_ORG_SUPERIOR (cơ
-    quan cấp trên) trên đúng trang chứa dấu mật — cũng là trang đầu văn bản
-    mang letterhead. Thiếu cơ quan nào thì bỏ bớt phần đó; không có gì thì
-    trả "". Dấu "*" ở cuối đánh dấu đây là cơ quan theo văn bản, không phải
-    cơ quan xác định rõ qua danh mục madinhdanh.
-    """
+def _kie_org_name_from_fields(fields, page_index: int) -> str:
+    """Tên cơ quan dự phòng từ DANH SÁCH field đã có (không infer)."""
     issuing = ""
     superior = ""
-    for field in _kie_fields_for_page(canonical_json_path, page_index) or []:
+    for field in fields or []:
         if not isinstance(field, dict):
             continue
         label = str(field.get("label") or "")
@@ -2236,6 +2706,14 @@ def _kie_org_fallback_name(canonical_json_path: str, page_index: int) -> str:
             superior = text
     parts = [part for part in (issuing, superior) if part]
     return " ".join(parts) + "*" if parts else ""
+
+
+def _kie_org_fallback_name(canonical_json_path: str, page_index: int) -> str:
+    """Tên cơ quan dự phòng "<cơ quan ban hành> <cơ quan cấp trên>*" theo KIE
+    (infer nếu cache chưa có — chỉ đường ĐỒNG BỘ được gọi hàm này)."""
+    return _kie_org_name_from_fields(
+        _kie_fields_for_page(canonical_json_path, page_index), page_index
+    )
 
 
 def _org_display_name(source_path: str, kie_org_name: str) -> str:
@@ -2283,6 +2761,8 @@ def _format_file_mtime(ts: float) -> str:
 def _apply_kie_org_fallback(
     matches: list[SecretScanMatch],
     canonical_json_path: str | None,
+    allow_model: bool = True,
+    fields_override: dict[int, list[dict] | None] | None = None,
 ) -> None:
     """Điền tên cơ quan dự phòng (KIE) cho file mật không tra được tên.
 
@@ -2296,6 +2776,15 @@ def _apply_kie_org_fallback(
     <cơ quan cấp trên>*" từ chính văn bản. Chỉ chạy trên các dòng đã là mật
     (sau khi lọc); mỗi trang chứa dấu chỉ infer 1 lần (cache dùng chung với
     pass năm ban hành). Tắt bằng SECRET_SCAN_DISABLE_KIE_ORG=1.
+
+    ``allow_model=False`` (P1-08): KHÔNG BAO GIỜ infer — chỉ dùng cache sẵn.
+    Bắt buộc cho baseline-trước-enqueue và cho callback deferred (callback
+    chạy trong thread coordinator; infer trong parent tại đây chính là cửa
+    KIE-đồng-bộ-ngược lài làm `wait_all` mất ý nghĩa).
+
+    ``fields_override`` (R3-03): fields của job truyền TRỰC TIẾP — cache
+    chỉ là tối ưu, không phải nơi giữ duy nhất của kết quả bắt buộc (giữa
+    store và apply, writer khác có thể clear cache).
     """
     if not matches:
         return
@@ -2318,14 +2807,319 @@ def _apply_kie_org_fallback(
                 continue  # tra được tên theo danh mục → không cần dự phòng
             page_idx = _safe_page_index(match.page_number)
             if page_idx not in name_by_page:
-                name_by_page[page_idx] = _kie_org_fallback_name(
-                    canonical_json_path, page_idx
+                override = (
+                    fields_override.get(page_idx, _KIE_CACHE_MISS)
+                    if fields_override is not None
+                    else _KIE_CACHE_MISS
                 )
+                if override is not _KIE_CACHE_MISS:
+                    # R3-03: fields của CHÍNH job này — ưu tiên cao nhất.
+                    name_by_page[page_idx] = _kie_org_name_from_fields(
+                        override, page_idx
+                    )
+                elif allow_model:
+                    name_by_page[page_idx] = _kie_org_fallback_name(
+                        canonical_json_path, page_idx
+                    )
+                else:
+                    # KHÔNG infer — chỉ đọc cache (applier deferred khi job
+                    # không trả fields cho trang này).
+                    cached = _kie_cached_fields(canonical_json_path, page_idx)
+                    name_by_page[page_idx] = (
+                        _kie_org_name_from_fields(cached, page_idx)
+                        if cached is not _KIE_CACHE_MISS else ""
+                    )
             match.kie_org_name = name_by_page[page_idx]
         except Exception:
             # Một dòng rác không được kéo sập cả file: bỏ qua dự phòng của
             # dòng đó, giữ nguyên các dòng đã điền.
             continue
+
+
+def _kie_needed_pages(
+    matches: list[SecretScanMatch],
+    canonical: dict,
+    canonical_json_path: str | None,
+) -> set[int]:
+    """P1-08 (planner): CHỈ các trang THỰC SỰ cần model KIE — giữ nguyên các
+    điều kiện skip của hai pass (tắt bằng SECRET_SCAN_DISABLE_KIE_ORG/_YEAR,
+    tên cơ quan tra được theo danh mục, ngày rõ < 3 ứng viên). Trang đã có
+    cache field (đã infer trước đó) cũng không cần job."""
+    org_enabled = (
+        os.environ.get("SECRET_SCAN_DISABLE_KIE_ORG", "").lower()
+        not in {"1", "true"}
+    )
+    year_enabled = (
+        os.environ.get("SECRET_SCAN_DISABLE_KIE_YEAR", "").lower()
+        not in {"1", "true"}
+    )
+    if not org_enabled and not year_enabled:
+        return set()
+    try:
+        lookup = _org_name_lookup()
+    except Exception:
+        lookup = {}
+    needed: set[int] = set()
+    for match in matches:
+        page_idx = _safe_page_index(match.page_number)
+        if page_idx in needed:
+            continue
+        cached = _kie_cached_fields(canonical_json_path or "", page_idx)
+        already = cached is not _KIE_CACHE_MISS
+        if not already and org_enabled and not match.kie_org_name:
+            org_code = _org_code_from_filename(match.source_path)
+            if not (org_code and lookup.get(org_code)):
+                needed.add(page_idx)
+                continue
+        if not already and year_enabled:
+            page = (
+                _page_for_index(canonical, page_idx)
+                if isinstance(canonical, dict)
+                else None
+            )
+            candidates = _issue_date_candidates(page) if page else []
+            if len(candidates) >= _DECLASS_KIE_MIN_CANDIDATES:
+                needed.add(page_idx)
+    return needed
+
+
+def _kie_refused_state(reason: str, error_code: str = "deferred_refused") -> dict:
+    """D3: trạng thái 'deferred từ chối' — metadata CHƯA đủ (baseline regex
+    đã áp), KHÔNG infer trong parent, KHÔNG cache-final; commit đặt nghĩa vụ
+    quét lại. Job KHÔNG nằm trong coordinator nên drain không chờ nó."""
+    return {
+        "applied": False,
+        "error_code": error_code,
+        "refused_reason": str(reason or ""),
+        "registered": False,
+        "on_applied": None,
+        "lock": threading.Lock(),
+    }
+
+
+def _kie_spool_prepare(canonical_json_path: str, rel: str, mode_key: str,
+                       run_id: str) -> dict | None:
+    """Reserve retained storage before copying; failures remain resumable."""
+    from scanindex.core.secret_scan_spool import prepare_snapshot
+    return prepare_snapshot(
+        canonical_json_path, rel, mode_key, run_id,
+        cancel=getattr(_scan_run_ctx, "cancel_event", None),
+        stop=getattr(_scan_run_ctx, "producer_stop", None),
+    )
+
+
+def _try_deferred_kie(
+    matches: list[SecretScanMatch],
+    canonical: dict,
+    canonical_json_path: str | None,
+    run_id: str | None = None,
+    *,
+    needed_override=None,
+    kie_spool_cb=None,
+    artifact_status: str = "confirmed_positive",
+) -> dict | None:
+    """GĐ K: bàn giao KIE cho coordinator (pool process session riêng) khi
+    bật ``OCRTOOL_KIE_DEFERRED=1``. Trả **state dict** nếu ĐÃ nhận (caller
+    BỎ đường đồng bộ và HOÃN commit file tới khi coordinator drain; state
+    báo ``applied`` khi metadata đã áp — commit theo ACK từng file, P1-09);
+    trả **None** nếu giữ đường đồng bộ (không nhận / không trang nào cần
+    model / lỗi submit).
+
+    P1-08: baseline regex/ghi chú được áp TRƯỚC khi enqueue (không model) và
+    chỉ enqueue các trang thật sự cần model — model thiếu/worker lỗi GIỮ
+    nguyên baseline như đường đồng bộ khi model lỗi, không mất dữ liệu.
+    Callback KHÔNG BAO GIỜ infer trong parent (không KIE đồng bộ ngược).
+
+    D3: coordinator TỪ CHỐI (credit/budget đầy, executor chết) → backpressure
+    hủy được rồi trạng thái `_kie_refused_state` — KHÔNG BAO GIỜ fallback
+    infer trong parent.
+
+    D2: ``kie_spool_cb`` ({"prepare": fn(canonical_path)->info|None,
+    "commit": fn(info)}) — chép canonical snapshot vào spool bền TRƯỚC khi
+    submit (job đọc spool copy) và ghi nghĩa vụ `kspool` vào journal SAU khi
+    nhận — restart chỉ resubmit KIE (OCR-call = 0) khi snapshot còn hợp lệ.
+
+    Kết luận về dấu không phụ thuộc đường này; không bao giờ fail lượt quét."""
+    request_stop = getattr(_scan_run_ctx, "request_producer_stop", None)
+    producer_stop = getattr(_scan_run_ctx, "producer_stop", None)
+    try:
+        from scanindex.core import secret_scan_kie as ssk
+
+        if not ssk.deferred_enabled() or not matches or not canonical_json_path:
+            return None
+        if needed_override is not None:
+            needed = {int(o) for o in needed_override}
+        else:
+            needed = _kie_needed_pages(matches, canonical, canonical_json_path)
+        if not needed:
+            # Không trang nào cần model: đường đồng bộ (regex/lookup) tự xử
+            # — trước đây vẫn tạo job rồi bỏ cả hai pass khi model lỗi.
+            return None
+        # P2-3: run_id của lượt (thread file-worker set trước khi scan).
+        run_id = run_id or str(getattr(_scan_run_ctx, "run_id", "") or "")
+        # Baseline KHÔNG model trước khi bàn giao: năm rõ/ghi chú regex có
+        # sẵn như đường đồng bộ khi model lỗi (sync-on-error == pure regex).
+        _apply_declassification_notes(
+            matches, canonical, canonical_json_path, allow_model=False
+        )
+        # Reserve durable storage before copying/submitting. Failure preserves
+        # detection as resumable and stops this producer.
+        spool_info = None
+        if kie_spool_cb is not None:
+            spool_info = kie_spool_cb["prepare"](canonical_json_path)
+        coord = ssk.ensure_started()
+        state: dict = {
+            "applied": False,      # metadata KIE đã áp xong lên match
+            "error_code": None,
+            "registered": False,   # caller đã đăng ký entry commit
+            "on_applied": None,    # do caller gắn: commit từng file sau ACK
+            "lock": threading.Lock(),
+        }
+        payload = {
+            "job_id": f"k{time.monotonic_ns()}",
+            "generation": 0,
+            "canonical_path": str(
+                spool_info["canonical"] if spool_info else canonical_json_path
+            ),
+            "selected_ordinals": sorted(needed),
+            "model_fp": "",
+            "run_id": run_id or "",
+        }
+
+        def _deliver() -> None:
+            deliver = None
+            with state["lock"]:
+                if state["registered"]:
+                    deliver = state.get("on_applied")
+            if deliver is not None:
+                try:
+                    deliver()
+                except Exception:
+                    logging.getLogger(__name__).exception(
+                        "KIE deferred commit-theo-ACK lỗi (job %s)",
+                        payload["job_id"],
+                    )
+
+        def _on_done(result: dict) -> None:
+            try:
+                if result.get("status") == "ready":
+                    # R3-03: fields của job giữ trong DỮ LIỆU CỤC BỘ và truyền
+                    # thẳng cho hai pass — cache toàn cục chỉ còn là tối ưu
+                    # (giữa store và apply, writer khác có thể chạm ngưỡng
+                    # clear cache; applier allow_model=False không được rơi
+                    # về regex rồi vẫn đánh dấu applied). Ghi cache vẫn làm
+                    # để các lượt/tệp khác tận dụng (R2-06: qua helper giới
+                    # hạn; job nhiều trang tự eviction KHÔNG còn ảnh hưởng
+                    # kết quả vì áp từ dữ liệu cục bộ).
+                    fields_local: dict[int, list[dict] | None] = {}
+                    for src, fields in (
+                        result.get("fields_by_source") or {}
+                    ).items():
+                        try:
+                            fields_local[int(src)] = fields
+                        except (TypeError, ValueError):
+                            continue
+                        _kie_cache_store(canonical_json_path, int(src), fields)
+                    _apply_kie_org_fallback(
+                        matches, canonical_json_path, allow_model=False,
+                        fields_override=fields_local,
+                    )
+                    _apply_declassification_notes(
+                        matches, canonical, canonical_json_path,
+                        allow_model=False,
+                        fields_override=fields_local,
+                    )
+                    # Chốt applied SAU khi đã dùng ĐẦY ĐỦ kết quả job.
+                    state["applied"] = True
+                else:
+                    state["error_code"] = result.get("error_code")
+                    if result.get("error_code") == "model_missing" and request_stop is not None:
+                        request_stop("Không nạp được model KIE; giữ tiến độ để tiếp tục sau khi sửa model")
+                    logging.getLogger(__name__).warning(
+                        "KIE deferred lỗi (%s: %s) — giữ baseline regex đã "
+                        "áp; file sẽ được quét lại lần sau để có metadata "
+                        "đầy đủ",
+                        result.get("error_code"), result.get("error"),
+                    )
+            except Exception:
+                logging.getLogger(__name__).exception(
+                    "KIE deferred on_done lỗi — giữ baseline hiện có"
+                )
+            finally:
+                # Lease canonical do COORDINATOR sở hữu và tự nhả khi terminal
+                # (kể cả cancel/error/dispatch-fail) — callback không nhả hộ.
+                _deliver()
+
+        def _submit_bounded() -> tuple[bool, str | None]:
+            """D3: backpressure CÓ THỂ HỦY khi credit đầy — chờ có giới hạn
+            (`OCRTOOL_KIE_REFUSED_WAIT_S`, mặc định 30 s) cho slot trống rồi
+            thử lại ĐÚNG MỘT lần. KHÔNG bao giờ fallback infer trong parent:
+            hết thời gian → trạng thái `refused` (metadata chưa đủ → nghĩa vụ
+            quét lại), giữ trần process/thread và không có KIE ẩn."""
+            wait_s = 30.0
+            raw = os.environ.get("OCRTOOL_KIE_REFUSED_WAIT_S", "").strip()
+            if raw:
+                try:
+                    wait_s = max(0.0, float(raw))
+                except ValueError:
+                    pass
+            cancel = getattr(_scan_run_ctx, "cancel_event", None)
+            deadline = time.monotonic() + wait_s
+            accepted, reason = coord.submit(payload, _on_done)
+            while not accepted and time.monotonic() < deadline:
+                if ((cancel is not None and cancel.is_set())
+                        or (producer_stop is not None and producer_stop.is_set())
+                        or str(reason or "").startswith("model_missing:")):
+                    break
+                time.sleep(0.25)
+                # Retry theo nhịp poll tới hết budget chờ — mỗi lần từ chối
+                # coordinator tự nhả lease (không tích tài nguyên).
+                accepted, reason = coord.submit(payload, _on_done)
+            return accepted, reason
+
+        accepted, reason = _submit_bounded()
+        if not accepted:
+            if str(reason or "").startswith("model_missing:") and request_stop is not None:
+                request_stop("Không nạp được model KIE; giữ tiến độ để tiếp tục sau khi sửa model")
+            logging.getLogger(__name__).warning(
+                "KIE deferred TỪ CHỐI sau backpressure (%s) — KHÔNG infer "
+                "trong parent: file giữ baseline regex + nghĩa vụ quét lại "
+                "khi còn slot", reason,
+            )
+            if spool_info and kie_spool_cb is not None:
+                try:
+                    kie_spool_cb["discard"](spool_info)
+                except Exception:
+                    pass
+            return _kie_refused_state(reason)
+        if spool_info and kie_spool_cb is not None:
+            try:
+                # D2: nghĩa vụ KIE-only ghi bền SAU khi nhận job — restart
+                # resubmit KIE-only với ĐÚNG spool snapshot job đã đọc.
+                kie_spool_cb["commit"]({
+                    **spool_info,
+                    "ordinals": sorted(needed),
+                    "matches": [asdict(m) for m in matches],
+                    "fp": list(spool_info.get("fp") or []),
+                    "status": artifact_status,
+                })
+            except Exception:
+                logging.getLogger(__name__).exception(
+                    "kie spool commit lỗi — restart sẽ quét lại toàn bộ "
+                    "(không mất đúng/sai, chỉ mất tối ưu KIE-only)"
+                )
+        return state
+    except Exception as exc:
+        from scanindex.core.secret_scan_spool import SpoolBudgetError
+        if isinstance(exc, (SpoolBudgetError, OSError)):
+            if request_stop is not None:
+                request_stop(str(exc))
+            return _kie_refused_state(str(exc), "spool_unavailable")
+        logging.getLogger(__name__).exception(
+            "KIE deferred submit lỗi — trạng thái refused (không infer "
+            "trong parent; file sẽ quét lại lần sau)"
+        )
+        return _kie_refused_state("submit exception", "deferred_submit_error")
 
 
 def export_matches_to_excel(
@@ -2626,6 +3420,120 @@ def _derive_scan_root(matches: list[SecretScanMatch]) -> str:
             return full[: len(full) - len(rel) - 1]
         return ""
     return ""
+
+
+def build_secret_copy_plan(
+    matches: list[SecretScanMatch],
+) -> list[tuple[str, str]]:
+    """Lập kế hoạch "Sao chép": mỗi FILE mật đúng một lần, giữ thứ tự bảng.
+
+    Một file có thể chiếm nhiều dòng bảng (mỗi dấu/trang một dòng) — gộp
+    theo đường dẫn đã chuẩn hóa, giữ dòng đầu tiên. ``relative_path`` (con
+    đường tương đối của file dưới thư mục quét gốc, ghi sẵn trong từng
+    dòng) quyết định cấu trúc thư mục con ở nơi nhận; rỗng/tuyệt đối/leo
+    ra ngoài gốc ("..") thì lùi về tên file để không chép lộn chỗ.
+    Trả về danh sách (đường dẫn nguồn, đường dẫn tương đối).
+    """
+    plan: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for m in matches:
+        src = m.source_path or ""
+        if not src:
+            continue
+        key = _norm(src)
+        if key in seen:
+            continue
+        seen.add(key)
+        rel = os.path.normpath((m.relative_path or "").strip())
+        if not rel or rel == "." or os.path.isabs(rel) or rel.startswith(".."):
+            rel = os.path.basename(src)
+        plan.append((src, rel))
+    return plan
+
+
+def _long_path(p: str) -> str:
+    """Tiền tố \\?\\ cho đường dẫn dài (>260 ký tự) trên Windows."""
+    p = os.path.abspath(p)
+    if os.name == "nt" and not p.startswith("\\\\?\\"):
+        return "\\\\?\\" + p
+    return p
+
+
+def _secret_copy_one(src: str, dst: str, *, overwrite: bool) -> str:
+    """Chép MỘT file; trả "copied" hoặc "skipped" (đích đã có, không đè).
+
+    Ghi đè = thay hẳn nội dung đích bằng nguồn (copy2 giữ nguyên mtime
+    nguồn). Đích trùng chính nguồn → lỗi (thư mục đích trùng thư mục đã
+    quét). File đích read-only trên Windows → gỡ thuộc tính rồi chép lại;
+    đường dẫn dài → thử lại qua \\?\\ — cùng chính sách với _permanent_delete.
+    """
+    if _norm(dst) == _norm(src):
+        raise OSError(
+            "đích trùng chính file nguồn (thư mục đích trùng thư mục đã quét)"
+        )
+    if not overwrite and os.path.exists(dst):
+        return "skipped"
+    try:
+        shutil.copy2(src, dst)
+        return "copied"
+    except PermissionError:
+        # Windows: file đích đang read-only → gỡ thuộc tính rồi thử lại.
+        try:
+            os.chmod(dst, stat.S_IWRITE)
+            shutil.copy2(src, dst)
+            return "copied"
+        except OSError:
+            pass
+    except OSError:
+        pass
+    # Lần hai: sau khi gỡ read-only, hoặc qua \\?\\ cho đường dẫn dài.
+    shutil.copy2(_long_path(src), _long_path(dst))
+    return "copied"
+
+
+def copy_secret_files(
+    plan: list[tuple[str, str]],
+    dest_root: str,
+    *,
+    overwrite: bool = True,
+    progress: "Callable[[int, int, str], None] | None" = None,
+) -> dict:
+    """Sao chép các file mật theo kế hoạch vào ``dest_root``.
+
+    Tạo sẵn mọi thư mục con trung gian để nơi nhận giữ nguyên cấu trúc
+    như thư mục gốc. Lỗi từng file (mất nguồn, đích read-only, đường dẫn
+    dài…) không dừng các file còn lại — gom lại trong ``errors``. Trả về
+    dict {"total", "copied", "skipped", "errors"}: ``skipped`` đếm file bị
+    bỏ qua vì đích đã có khi ``overwrite=False``; ``errors`` là danh sách
+    mô tả "nguồn\\n→ đích\\n lỗi".
+
+    Hàm thuần (không đụng Qt) — chạy được cả ở thread nền lẫn trong test.
+    """
+    total = len(plan)
+    copied = skipped = 0
+    errors: list[str] = []
+    done = 0
+    for src, rel in plan:
+        done += 1
+        dst = os.path.join(dest_root, rel)
+        try:
+            parent = os.path.dirname(dst)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            if _secret_copy_one(src, dst, overwrite=overwrite) == "copied":
+                copied += 1
+            else:
+                skipped += 1
+        except OSError as exc:
+            errors.append(f"{src}\n→ {dst}\n{exc}")
+        if progress is not None:
+            progress(done, total, os.path.basename(dst))
+    return {
+        "total": total,
+        "copied": copied,
+        "skipped": skipped,
+        "errors": errors,
+    }
 
 
 def load_secret_matches_from_excel(xlsx_path: str) -> list[SecretScanMatch]:
@@ -2948,6 +3856,9 @@ class SecretFileScanScreen(ScreenContent):
     _pool_ready = Signal(bool, str)
     # Kết quả convert preview từ thread nền: dict {gen, key, out_pdf, error, note}
     _preview_ready = Signal(object)
+    # Kết quả sao chép file mật từ thread nền:
+    # dict {"total", "copied", "skipped", "errors", "dest"}
+    _copy_finished = Signal(object)
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -2967,22 +3878,38 @@ class SecretFileScanScreen(ScreenContent):
         # bị xóa trong _reset_results để không bám nhầm lần xuất sau.
         self._last_scan_summary: dict | None = None
         self._checked_paths: set[str] = set()
+        # Derived UI counts, maintained alongside row insertion/removal.
+        # The table remains the source of matches for actions and export.
+        self._result_file_keys: set[str] = set()
+        self._result_items_by_file: dict[str, list[QTableWidgetItem]] = {}
+        self._checked_row_ids: set[int] = set()
+        self._visible_checked_rows = 0
+        self._visible_result_rows = 0
+        self._pending_status: str | None = None
+        self._pending_progress: tuple[int, int] | None = None
+        self._feedback_timer = QTimer(self)
+        self._feedback_timer.setSingleShot(True)
+        self._feedback_timer.setInterval(100)
+        self._feedback_timer.timeout.connect(self._flush_worker_feedback)
         self._preview_current: SecretScanMatch | None = None
         self._preview_convert_gen = 0
         self._preview_cache: dict[tuple, str] = {}
+        # Lượt "Sao chép file mật" đang chạy (một lượt mỗi lần, nền thread).
+        self._copy_running = False
         # PDF tạm cho preview chỉ là cache phiên — xoá sạch của lần chạy trước.
         shutil.rmtree(
             os.path.join(get_base_dir(), "temp", "secret_scan_preview"),
             ignore_errors=True,
         )
         self._build_ui()
-        self._status_changed.connect(self._set_status)
-        self._progress_changed.connect(self._set_progress)
+        self._status_changed.connect(self._queue_status)
+        self._progress_changed.connect(self._queue_progress)
         self._result_found.connect(self._add_result)
         self._results_replace.connect(self._on_results_replace)
         self._scan_finished.connect(self._on_finished)
         self._pool_ready.connect(self._on_pool_ready)
         self._preview_ready.connect(self._on_preview_ready)
+        self._copy_finished.connect(self._on_copy_finished)
 
     def is_busy(self) -> bool:
         return self._busy
@@ -3094,6 +4021,17 @@ class SecretFileScanScreen(ScreenContent):
         self.btn_export.clicked.connect(self._export_clicked)
         row.addWidget(self.btn_export)
 
+        self.btn_copy = QPushButton("📄  Sao chép file mật")
+        self.btn_copy.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_copy.setStyleSheet(self._secondary_btn_qss())
+        self.btn_copy.setEnabled(False)
+        self.btn_copy.setToolTip(
+            "Sao chép các file mật đang hiển thị ra một thư mục khác,\n"
+            "giữ nguyên cấu trúc thư mục con như thư mục đã quét."
+        )
+        self.btn_copy.clicked.connect(self._copy_clicked)
+        row.addWidget(self.btn_copy)
+
         self.btn_stop = QPushButton("Dừng")
         self.btn_stop.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_stop.setStyleSheet(self._danger_btn_qss())
@@ -3173,6 +4111,9 @@ class SecretFileScanScreen(ScreenContent):
         layout.addWidget(picker)
 
         self.table = _ResultsTable(0, 9)
+        # Mode/note items are translated when created; full retranslation
+        # still runs when showing the screen or changing the UI language.
+        self.table.setProperty("_scanindex_i18n_explicit_items", True)
         self.table.setHorizontalHeaderLabels(
             [
                 "", "Độ mật", "File", "Mã CQ", "Cơ quan", "Ngày cập nhật",
@@ -3607,7 +4548,9 @@ class SecretFileScanScreen(ScreenContent):
         if prog is None:
             return ResumeDecision(ResumeDecision.RESTART)
         done_count, error_count, skip_count, found = prog.stats()
-        if done_count == 0 and error_count == 0 and skip_count == 0 and found == 0:
+        if (done_count == 0 and error_count == 0 and skip_count == 0 and found == 0
+                and not prog.needs_continue()):
+            prog.close()
             return ResumeDecision(ResumeDecision.RESTART)
 
         from scanindex.infra.version import get_version
@@ -3736,6 +4679,11 @@ class SecretFileScanScreen(ScreenContent):
             not running
             and (self.table.rowCount() > 0 or bool(self._last_scan_summary))
         )
+        self.btn_copy.setEnabled(
+            not running
+            and self.table.rowCount() > 0
+            and not self._copy_running
+        )
         self.btn_run.setVisible(not running)
         self.btn_stop.setVisible(running)
         # Xóa file / "Không phải mật" vẫn dùng được trong lúc quét — xem
@@ -3799,6 +4747,17 @@ class SecretFileScanScreen(ScreenContent):
         registry = (
             ssp.FileRegistry.load() if (use_history or needs_upgrade) else None
         )
+        if registry is not None and getattr(registry, "readonly", False):
+            # D0: khóa single-writer registry thuộc tiến trình khác → chạy
+            # KHÔNG cache (không ghi, không tra) thay vì hai tiến trình cùng
+            # ghi/truncate một file.
+            self.log_message.emit(
+                "Registry đang được mở bởi tiến trình ScanIndex khác — lượt "
+                "này chạy KHÔNG cache registry",
+                "info",
+            )
+            registry.close()
+            registry = None
         use_cache = use_history and not restart
         if registry is None:
             self.log_message.emit("Lịch sử quét: TẮT — không tái dùng kết quả cũ", "info")
@@ -3870,6 +4829,7 @@ class SecretFileScanScreen(ScreenContent):
                             ssp._norm_path(source), []
                         ).append(match_dict)
                 stat_failed: list[str] = []
+                record_failed: list[str] = []
                 bump_paths: list[str] = []
                 for rel in sorted(prog.ok_files()):
                     path = os.path.join(folder, rel)
@@ -3886,27 +4846,42 @@ class SecretFileScanScreen(ScreenContent):
                         except OSError:
                             stat_failed.append(rel)
                             continue
-                        registry.record(
-                            path,
-                            st.st_size,
-                            st.st_mtime,
-                            mode_key,
-                            app_version,
-                            matches_by_abs.get(ssp._norm_path(path), []),
-                            inherited=True,
-                        )
+                        try:
+                            registry.record(
+                                path,
+                                st.st_size,
+                                st.st_mtime,
+                                mode_key,
+                                app_version,
+                                matches_by_abs.get(ssp._norm_path(path), []),
+                                inherited=True,
+                            )
+                        except Exception:
+                            # R3-01: record (append) lỗi → entry KHÔNG bền
+                            # vững; RAM đã rollback trong record. Không được
+                            # nuốt im lặng coi là đã kế thừa — đánh dấu nâng
+                            # cấp chưa xong để lượt sau chạy lại (ý định
+                            # migration đã nằm bền trong journal từ trước).
+                            record_failed.append(rel)
+                            logging.getLogger(__name__).exception(
+                                "nâng cấp lịch sử: record kế thừa lỗi (%s) — "
+                                "giữ việc nâng cấp còn dở để lượt sau chạy lại",
+                                rel,
+                            )
+                            continue
                         inherited_created += 1
                 if registry is not None:
                     registry.bump_versions_exact(
                         bump_paths, mode_key, app_version
                     )
                     registry.snapshot()
-                if stat_failed:
+                if stat_failed or record_failed:
                     upgraded_ok = False
                     self.log_message.emit(
                         f"Nâng cấp lịch sử: {len(stat_failed)} file không đọc "
-                        "được trạng thái đĩa — giữ việc nâng cấp còn dở để "
-                        "lần sau chạy lại.",
+                        f"được trạng thái đĩa, {len(record_failed)} file ghi "
+                        "registry lỗi — giữ việc nâng cấp còn dở để lần sau "
+                        "chạy lại.",
                         "err",
                     )
                 else:
@@ -4003,6 +4978,9 @@ class SecretFileScanScreen(ScreenContent):
         # state_lock: record_*/save trên prog dùng chung phải nguyên tố —
         # hai worker ghi xen kẽ vào cùng file handle sẽ làm hỏng dòng journal.
         state_lock = threading.Lock()
+        # P2-3: nhận diện lượt quét cho luồng hủy KIE có ownership — Stop chỉ
+        # hủy job của LƯỢT NÀY (cancel_run), không đụng coordinator toàn app.
+        run_id = f"r{time.monotonic_ns()}"
         done = [0]
         scanned = [0]
         failures = [0]
@@ -4010,10 +4988,166 @@ class SecretFileScanScreen(ScreenContent):
         updated = [0]
         kept_old = [0]
         cancelled = [False]
+        # GĐ K: các file có metadata KIE đang chạy deferred — commit sau ACK
+        # từng file (P1-09), hoặc ở drain cuối lượt nếu ACK chưa kịp.
+        pending_commits: list[dict] = []
+        # P1-E (review 2): barrier vòng đời lượt — callback commit muộn sau
+        # khi lượt đóng (cancel/scan_finished) KHÔNG được chạm journal/UI.
+        # `run_gate_lock` vừa bảo vệ cờ vừa là barrier: finally giữ lock này
+        # khi đóng lượt ⇒ commit đang bay chắc chắn xong trước khi close.
+        run_gate = {"open": True}
+        run_gate_lock = threading.Lock()
+        producer_stop = threading.Event()
+        producer_stop_reason = [""]
 
-        def process_one(idx: int, path: str, replace: bool = False) -> None:
-            if self._cancel_event.is_set():
+        def request_producer_stop(reason: str) -> None:
+            with progress_lock:
+                first = not producer_stop.is_set()
+                if first:
+                    producer_stop_reason[0] = reason
+                    producer_stop.set()
+            if first:
+                self.log_message.emit(f"Dừng cấp file mới: {reason}", "err")
+
+        def collect_committed_spool(rel: str) -> None:
+            # Only this file: preserve the bucketed commit optimization.
+            with state_lock:
+                prog.kie_spool_gc(durability_confirmed=True, rel=rel)
+                # Metadata/result was fsynced before GC. Its tombstone can
+                # share the next ordinary save: replay of the old applied
+                # descriptor is harmless even if the snapshot is now gone.
+
+        def _stat_fingerprint(path: str) -> tuple[int, float] | None:
+            try:
+                st = os.stat(path)
+                return (st.st_size, st.st_mtime)
+            except OSError:
+                return None
+
+        def persist_scan_artifact() -> None:
+            """R2-02: persist TÁCH KHỎI publish — flush+fsync idempotent, gọi
+            lại được khi fsync lỗi mà không phát lại UI/journal. Caller phân
+            biệt: publish (một lần cho entry) ↔ persist (retry đến khi xong)."""
+            with state_lock:
+                prog.save()
+                if registry is not None:
+                    registry.save()
+
+        def commit_artifact(artifact, rel: str, path: str, replace: bool,
+                            file_log, scan_stat: tuple | None = None,
+                            source_unstable: bool = False,
+                            do_emit: bool = True,
+                            on_emitted=None) -> None:
+            """PUBLISH kết quả MỘT file: phát hàng UI + ghi journal/registry.
+
+            R2-02: journal ghi theo ĐỊNH DANH file (`commit_replace_file` cho
+            CẢ hai nhánh — thay matches theo abs_norm, một dòng rpf nguyên
+            vẹn) nên gọi LẠI sau lỗi không sinh dòng/matches trùng. Persist
+            (fsync) tách riêng qua `persist_scan_artifact` — caller retry
+            persist mà không publish lại. `do_emit=False` khi UI đã phát cho
+            entry này; `on_emitted` được gọi NGAY sau khi emit trả về (emit là
+            nguyên tố — retry sau đó không phát lại UI kể cả khi journal/persist
+            lỗi).
+
+            P1-07/P2.5/P2-H: `cache_final` quyết định có ghi registry không —
+            metadata chưa áp xong / nguồn đổi trong lúc quét / đổi sau quét
+            → KHÔNG cache (file vào tập quét lại, lượt sau chạy lại).
+            P1-D: nghĩa vụ quét lại giữ ở CẢ hai nhánh. MỌI thay đổi journal
+            giữ `state_lock`."""
+            matches = artifact.matches
+            artifact_status = getattr(artifact, "status", "clean") or "clean"
+            for match in matches:
+                try:
+                    match.source_version = app_version
+                except AttributeError:
+                    # match không phải dataclass (dữ liệu ngoài/test) —
+                    # không được chặn commit vì việc gắn version.
+                    pass
+            match_dicts = [asdict(m) for m in matches]
+            # P1-07/P2.5/P2-H: quyết định cache-final TRƯỚC khi ghi gì cả.
+            cache_final, cache_block_reason = _deferred_cache_final(
+                artifact, path, scan_stat, source_unstable=source_unstable
+            )
+            rescan_rel = None
+            if not cache_final:
+                rescan_rel = rel
+                file_log(
+                    f"Kết quả lần này KHÔNG dùng làm cache ({cache_block_reason}"
+                    ") — file sẽ được quét lại lượt sau"
+                )
+            abs_norm = ssp._norm_path(path)
+            if do_emit:
+                if replace:
+                    # Thay thế hàng THEO FILE (phát _results_replace; không
+                    # phát _result_found song song gây trùng).
+                    self._results_replace.emit(
+                        {"path": abs_norm, "matches": match_dicts}
+                    )
+                else:
+                    for match in matches:
+                        self._result_found.emit(match)
+                if on_emitted is not None:
+                    on_emitted()
+            with state_lock:
+                # R2-02: MỘT thao tác journal theo định danh file — replay
+                # idempotent, retry không append trùng matches.
+                prog.commit_replace_file(rel, abs_norm, match_dicts)
+                # R3-01: lỗi registry record KHÔNG được nuốt — stat lỗi và
+                # persist lỗi phải tách nhau; record lỗi phải đi LÊN cơ chế
+                # commit retry/failure (entry ở lại / file đếm lỗi), không
+                # được coi là đã hoàn tất khi kết quả chưa nằm trên đĩa.
+                registry_error: BaseException | None = None
+                if cache_final and registry is not None:
+                    # R3-05: record fingerprint của ĐÚNG phiên bản đã đọc
+                    # (scan_stat chụp TRƯỚC khi đọc nguồn) — stat lại ở đây
+                    # sẽ gắn kết quả của nguồn cũ cho phiên bản mới (cache
+                    # hit cho nội dung chưa hề quét).
+                    if scan_stat is not None:
+                        try:
+                            registry.record(
+                                path,
+                                scan_stat[0],
+                                scan_stat[1],
+                                mode_key,
+                                app_version,
+                                match_dicts,
+                                status=artifact_status,
+                            )
+                        except Exception as exc:
+                            registry_error = exc
+                    else:
+                        # Không có fingerprint lúc đọc — không chứng minh được
+                        # danh tính phiên bản: không cache, giữ nghĩa vụ quét
+                        # lại (fail-closed, hi hữu: stat hỏng ngay đầu lượt).
+                        rescan_rel = rescan_rel or rel
+                if rescan_rel is not None or registry_error is not None:
+                    # P1-D: commit_replace_file vừa XÓA rel khỏi tập quét
+                    # lại — metadata chưa hoàn tất thì nghĩa vụ retry phải
+                    # được THÊM LẠI, không phụ thuộc thao tác thay matches.
+                    pending_rescan = {rel} if registry_error is not None else set()
+                    if rescan_rel is not None:
+                        pending_rescan.add(rescan_rel)
+                    prog.set_rescan_pending(
+                        sorted(set(prog.rescan_pending) | pending_rescan)
+                    )
+                if registry_error is not None:
+                    raise _ArtifactPersistError(
+                        f"registry record lỗi ({registry_error}) — kết quả "
+                        f"chưa bền vững, file quay lại cơ chế retry"
+                    ) from registry_error
+                if cache_final and registry_error is None:
+                    spool = prog.kie_spool(rel)
+                    if spool:
+                        prog.set_kie_spool(rel, {**spool, "metadata_applied": True})
+
+        def process_one(idx: int, path: str, replace: bool = False,
+                        kie_only: bool = False) -> None:
+            if self._cancel_event.is_set() or producer_stop.is_set():
                 return
+            _scan_run_ctx.producer_stop = producer_stop
+            _scan_run_ctx.request_producer_stop = request_producer_stop
+            _scan_run_ctx.cancel_event = self._cancel_event
+            _scan_run_ctx.run_id = run_id
             rel = os.path.relpath(path, folder)
             self._status_changed.emit(
                 f"Đang quét lại {idx}/{total}: {rel}"
@@ -4024,6 +5158,87 @@ class SecretFileScanScreen(ScreenContent):
 
             def file_log(message: str, rel_path=rel) -> None:
                 self.log_message.emit(f"[{rel_path}] {message}", "info")
+
+            def _prepare_spool_for_file(canon_path: str) -> dict | None:
+                # D2: copy canonical vào spool bền TRƯỚC khi submit job
+                # (fp nguồn chụp tại đây — closure đọc pre_stat đã tính).
+                info = _kie_spool_prepare(canon_path, rel, mode_key, run_id)
+                if info is not None:
+                    info["fp"] = list(pre_stat or [])
+                return info
+
+            def _kie_spool_commit(info: dict) -> None:
+                with state_lock:
+                    prog.set_kie_spool(rel, info)
+                    prog.save()
+
+            def _kie_spool_discard(info: dict) -> None:
+                from scanindex.core.ocr.direct_engine import cleanup_path_when_idle
+                spool_dir = str(info.get("spool_dir") or "")
+                if spool_dir:
+                    cleanup_path_when_idle(spool_dir)
+
+            def _resume_kie_only(rel: str, path: str, log):
+                """D2 — resume KIE-only: snapshot còn hợp lệ (nguồn không đổi
+                + spool nguyên vẹn đúng hash) → resubmit metadata job, OCR
+                CALL = 0. Trả (artifact, None) hoặc (None, lý do)."""
+                try:
+                    info = prog.kie_spool(rel)
+                except (TypeError, ValueError) as exc:
+                    return None, f"spool record không hợp lệ: {exc}"
+                if not info:
+                    return None, "không có spool record"
+                fp = list(info.get("fp") or [])
+                try:
+                    st = os.stat(path)
+                except OSError as exc:
+                    return None, f"nguồn không đọc được: {exc}"
+                if fp and (st.st_size, st.st_mtime) != tuple(fp[:2]):
+                    return None, "nguồn đổi từ lúc submit (fingerprint lệch)"
+                spool_canon = str(info.get("canonical") or "")
+                if not spool_canon or not os.path.exists(spool_canon):
+                    return None, "snapshot spool không còn trên đĩa"
+                try:
+                    h = hashlib.sha256()
+                    with open(spool_canon, "rb") as fh:
+                        for chunk in iter(lambda: fh.read(1 << 20), b""):
+                            h.update(chunk)
+                    if h.hexdigest() != str(info.get("hash") or ""):
+                        return None, "hash snapshot lệch"
+                except OSError as exc:
+                    return None, f"đọc snapshot lỗi: {exc}"
+                try:
+                    from scanindex.core.canonical_io import load_canonical
+
+                    canonical = load_canonical(spool_canon)
+                    stored_matches = [
+                        SecretScanMatch(**d)
+                        for d in (info.get("matches") or [])
+                    ]
+                except Exception as exc:
+                    return None, f"snapshot decode lỗi: {exc}"
+                if not stored_matches:
+                    return None, "spool không có match baseline"
+                state = _try_deferred_kie(
+                    stored_matches, canonical, spool_canon, run_id=run_id,
+                    needed_override=info.get("ordinals"),
+                    artifact_status=str(
+                        info.get("status") or "confirmed_positive"
+                    ),
+                )
+                if state is None:
+                    return None, "deferred không nhận job (không trang cần?)"
+                return (
+                    SecretScanArtifact(
+                        matches=stored_matches, source_pdf=path,
+                        canonical=canonical,
+                        status=str(
+                            info.get("status") or "confirmed_positive"
+                        ),
+                        metadata_pending=True, kie_state=state,
+                    ),
+                    None,
+                )
 
             try:
                 # File bị xóa giữa chừng (xóa ngay trong lúc quét): ghi
@@ -4036,25 +5251,38 @@ class SecretFileScanScreen(ScreenContent):
                 # đầu (R5) và nhánh thay thế file mật (entry vừa được đóng
                 # dấu version mới sẽ trúng cache — bắt buộc quét thật).
                 cached_dicts: list[dict] | None = None
+                cached_status: str = "clean"
                 if use_cache and not replace and registry is not None:
                     try:
                         st = os.stat(path)
-                        cached_dicts = registry.lookup(
+                        hit = registry.lookup_with_status(
                             path,
                             st.st_size,
                             st.st_mtime,
                             mode_key,
                             app_version,
                         )
+                        if hit is not None:
+                            cached_dicts, cached_status = hit
                     except OSError:
                         cached_dicts = None
                 if cached_dicts is not None:
                     # Rel tính lại theo thư mục ĐANG quét (R6): match trong
                     # cache của thư mục con mang rel theo thư mục cũ.
+                    # Status được bảo toàn xuyên cache: "unconfirmed" KHÔNG
+                    # được hiển thị/đếm như kết quả sạch đã hoàn tất.
                     fixed_dicts = []
                     for match_dict in cached_dicts:
                         fixed = dict(match_dict)
                         fixed["relative_path"] = rel
+                        if cached_status == "unconfirmed":
+                            note = str(fixed.get("note") or "")
+                            if "chưa xác nhận LightGBM" not in note:
+                                fixed["note"] = (
+                                    f"{note}; chưa xác nhận LightGBM — cần xem lại"
+                                    if note
+                                    else "chưa xác nhận LightGBM — cần xem lại"
+                                )
                         fixed_dicts.append(fixed)
                     for fixed in fixed_dicts:
                         try:
@@ -4070,72 +5298,216 @@ class SecretFileScanScreen(ScreenContent):
                     )
                     return
 
-                # page_limit truyền theo kwargs CHỈ khi chế độ cửa sổ đang
-                # bật — giữ lời gọi 6 tham số vị trí cũ cho các nhánh còn
-                # lại (tương thích monkeypatch trong test).
-                scan_kwargs = (
-                    {"page_limit": page_limit} if page_limit else {}
-                )
-                matches = scan_one_file_for_secret(
-                    path,
-                    rel,
-                    file_work,
-                    first_page_only,
-                    self._cancel_event,
-                    file_log,
-                    **scan_kwargs,
-                )
-                for match in matches:
-                    match.source_version = app_version
-                match_dicts = [asdict(m) for m in matches]
-                if replace:
-                    # Thay thế hàng THEO FILE: bỏ mọi hàng cũ của path rồi
-                    # thêm hàng mới (FP bản cũ rớt khỏi danh sách khi kết quả
-                    # rỗng). Chỉ phát ở nhánh này — không phát _result_found
-                    # song song gây trùng.
-                    abs_norm = ssp._norm_path(path)
-                    self._results_replace.emit(
-                        {"path": abs_norm, "matches": match_dicts}
+                # D2 — resume KIE-only: nghĩa vụ metadata còn spool hợp lệ
+                # → chỉ resubmit KIE (OCR-call = 0). Hết hợp lệ → xóa spool
+                # record và QUÉT LẠI TOÀN BỘ kèm lý do rõ ràng.
+                kie_only_artifact = None
+                if kie_only:
+                    kie_only_artifact, _kie_why = _resume_kie_only(
+                        rel, path, file_log
                     )
-                    with state_lock:
-                        # Một dòng journal = một transaction nguyên vẹn (R2):
-                        # file ok + thay matches + bỏ khỏi tập quét lại.
-                        prog.commit_replace_file(rel, abs_norm, match_dicts)
-                        if registry is not None:
-                            try:
-                                st = os.stat(path)
-                                registry.record(
-                                    path,
-                                    st.st_size,
-                                    st.st_mtime,
-                                    mode_key,
-                                    app_version,
-                                    match_dicts,
-                                )
-                            except OSError:
-                                pass
-                    with progress_lock:
-                        updated[0] += 1
+                    if kie_only_artifact is None:
+                        file_log(
+                            f"KIE-only resume không khả dụng ({_kie_why}) "
+                            "— quét lại toàn bộ"
+                        )
+                        kie_only = False
+                        with state_lock:
+                            prog.set_kie_spool(rel, None)
+
+                if kie_only_artifact is not None:
+                    file_log(
+                        "Resume KIE-only: snapshot hợp lệ — chỉ chạy lại "
+                        "metadata, không OCR lại"
+                    )
+                    info0 = prog.kie_spool(rel) or {}
+                    pre_stat = tuple(list(info0.get("fp") or [])[:2]) or None
+                    post_stat = pre_stat
+                    source_unstable = False
+                    artifact = kie_only_artifact
+                    matches = artifact.matches
+                    artifact_status = (
+                        getattr(artifact, "status", "clean") or "clean"
+                    )
                 else:
-                    for match in matches:
-                        self._result_found.emit(match)
-                    with state_lock:
-                        prog.record_file(rel, "ok")
-                        prog.record_matches(match_dicts)
-                        if registry is not None:
-                            try:
-                                st = os.stat(path)
-                                registry.record(
-                                    path,
-                                    st.st_size,
-                                    st.st_mtime,
-                                    mode_key,
-                                    app_version,
-                                    match_dicts,
+                    # page_limit truyền theo kwargs CHỈ khi chế độ cửa sổ đang
+                    # bật — giữ lời gọi 6 tham số vị trí cũ cho các nhánh còn
+                    # lại (tương thích monkeypatch trong test).
+                    scan_kwargs = (
+                        {"page_limit": page_limit} if page_limit else {}
+                    )
+                    # P2-3: run_id truyền qua thread-local (KHÔNG qua tham số —
+                    # giữ tương thích lời gọi/make-poison trong test). D3: kèm
+                    # cancel_event cho backpressure KIE hủy được theo Stop.
+                    _scan_run_ctx.run_id = run_id
+                    _scan_run_ctx.cancel_event = self._cancel_event
+                    # P2-H: fingerprint chụp TRƯỚC KHI ĐỌC nguồn — so với stat
+                    # sau quét để phát hiện nguồn đổi TRONG lúc quét (kết quả
+                    # trộn phiên bản → không cache).
+                    pre_stat = _stat_fingerprint(path)
+                    artifact = scan_one_file_for_secret_artifact(
+                        path,
+                        rel,
+                        file_work,
+                        first_page_only,
+                        self._cancel_event,
+                        file_log,
+                        kie_spool_cb={
+                            "prepare": _prepare_spool_for_file,
+                            "commit": _kie_spool_commit,
+                            "discard": _kie_spool_discard,
+                        },
+                        **scan_kwargs,
+                    )
+                    post_stat = _stat_fingerprint(path)
+                    source_unstable = (
+                        pre_stat is not None
+                        and post_stat is not None
+                        and pre_stat != post_stat
+                    )
+                    if source_unstable:
+                        file_log(
+                            "File thay đổi TRONG lúc quét — kết quả lần này "
+                            "chỉ mang tham chiếu, không dùng làm cache"
+                        )
+                    matches = artifact.matches
+                    artifact_status = (
+                        getattr(artifact, "status", "clean") or "clean"
+                    )
+                    if artifact_status == "unconfirmed":
+                        file_log(
+                            "Kết quả CHƯA XÁC NHẬN LightGBM (dương có cảnh báo) "
+                            "— cần xem lại"
+                        )
+                if getattr(artifact, "metadata_pending", False):
+                    # GĐ K: metadata (cơ quan/năm) đang chạy trên pool KIE —
+                    # P1-09: commit THEO ACK từng file (không giữ toàn bộ
+                    # artifact tới cuối lượt); file nào ACK chưa kịp sẽ được
+                    # commit ở drain cuối lượt với luật cache-final (P1-07).
+                    # R2-01: entry ĐƯỢC ĐĂNG KÝ TRƯỚC khi phép commit nào
+                    # chạy (kể cả ACK-sớm) — commit lỗi thì entry chắc chắn
+                    # nằm trong danh sách retry của drain.
+                    entry = {
+                        "artifact": artifact, "rel": rel, "path": path,
+                        "replace": replace, "log": file_log,
+                        "stat": pre_stat, "unstable": source_unstable,
+                        "committed": False, "committing": False,
+                        "ui_done": False, "error": None,
+                        "lock": threading.Lock(),
+                    }
+
+                    def _commit_entry(e=entry) -> None:
+                        # P1-E: commit chạy TRONG run_gate_lock — lượt đóng
+                        # (finally) phải chờ commit đang bay xong rồi mới
+                        # save/close; sau khi gate đóng, callback muộn chỉ
+                        # được BỎ (file không có dòng journal thì lượt sau
+                        # tự quét lại), không được chạm journal/UI.
+                        with e["lock"]:
+                            # R2-02: đã committed / đang committing → no-op
+                            # (chống lặp kể cả khi gate vẫn mở).
+                            if e["committed"] or e["committing"]:
+                                return
+                            e["committing"] = True
+                        try:
+                            with run_gate_lock:
+                                if not run_gate["open"]:
+                                    with e["lock"]:
+                                        e["committed"] = True  # bỏ, không retry
+                                        e["artifact"] = None
+                                        e["log"] = None
+                                    with state_lock:
+                                        try:
+                                            pending_commits.remove(e)
+                                        except ValueError:
+                                            pass
+                                    return
+                                # PUBLISH — R2-02: UI phát ĐÚNG MỘT LẦN cho
+                                # entry (ui_done đặt NGAY sau emit qua
+                                # on_emitted — emit là nguyên tố); journal
+                                # idempotent theo định danh file nên publish
+                                # lỗi giữa chừng gọi lại không sinh trùng.
+                                commit_artifact(
+                                    e["artifact"], e["rel"], e["path"],
+                                    e["replace"], e["log"],
+                                    scan_stat=e["stat"],
+                                    source_unstable=e["unstable"],
+                                    do_emit=not e["ui_done"],
+                                    on_emitted=lambda: e.update(ui_done=True),
                                 )
-                            except OSError:
+                                # P2-I/R2-05: persist ngay tại mốc — lỗi
+                                # fsync để entry ở lại, drain thử lại.
+                                persist_scan_artifact()
+                                collect_committed_spool(e["rel"])
+                        except Exception as exc:
+                            with e["lock"]:
+                                e["committing"] = False
+                                e["error"] = str(exc)
+                            logging.getLogger(__name__).exception(
+                                "commit deferred lỗi (%s) — entry ở lại, "
+                                "drain cuối lượt sẽ thử lại",
+                                e["rel"],
+                            )
+                            return
+                        with e["lock"]:
+                            e["committing"] = False
+                            e["committed"] = True
+                            # P2-G: thả tham chiếu artifact/canonical ngay —
+                            # entry đã commit không được giữ RAM tới cuối lượt.
+                            e["artifact"] = None
+                            e["log"] = None
+                        with state_lock:
+                            try:
+                                pending_commits.remove(e)
+                            except ValueError:
                                 pass
-                    with progress_lock:
+                        # R2-02: file commit thành công phải đếm vào summary
+                        # (trước đây commit deferred không tăng counter —
+                        # summary báo 0 dù file đã xong).
+                        with progress_lock:
+                            if e["replace"]:
+                                updated[0] += 1
+                            else:
+                                scanned[0] += 1
+
+                    entry["commit"] = _commit_entry
+                    with state_lock:
+                        # R3-02: đăng ký quyền sở hữu entry TRƯỚC khi publish
+                        # callback — callback có thể chạy NGAY khi
+                        # `state["registered"]` đặt True, tức là TRƯỚC dòng
+                        # kế tiếp của file-worker. Entry phải đã nằm trong
+                        # danh sách retry từ trước (append vô điều kiện: entry
+                        # vừa tạo, chưa ai có thể commit nó; "đang committing"
+                        # KHÔNG phải lý do bỏ đăng ký — callback lỗi khi chưa
+                        # kịp append trước đây làm mất nghĩa vụ retry).
+                        pending_commits.append(entry)
+                    state = getattr(artifact, "kie_state", None)
+                    if state is not None:
+                        # Hợp đồng tối thiểu của kie_state chỉ hứa "applied";
+                        # các khóa điều phối (lock/registered/on_applied) tự
+                        # hoàn thiện nếu caller tạo state trần (test/tooling).
+                        if "lock" not in state:
+                            state["lock"] = threading.Lock()
+                        state.setdefault("registered", False)
+                        state.setdefault("on_applied", None)
+                        with state["lock"]:
+                            state["on_applied"] = _commit_entry
+                            state["registered"] = True
+                            already_applied = state["applied"]
+                    else:
+                        already_applied = False
+                    if already_applied:
+                        # ACK đã về trước cả lúc đăng ký — commit luôn.
+                        _commit_entry()
+                    return
+                commit_artifact(artifact, rel, path, replace, file_log,
+                                scan_stat=pre_stat,
+                                source_unstable=source_unstable)
+                persist_scan_artifact()
+                collect_committed_spool(rel)
+                with progress_lock:
+                    if replace:
+                        updated[0] += 1
+                    else:
                         scanned[0] += 1
             except _ScanCancelled:
                 cancelled[0] = True
@@ -4162,6 +5534,8 @@ class SecretFileScanScreen(ScreenContent):
                 # Nhánh thay thế gặp lỗi: KHÔNG ghi "err" (file vẫn ok với
                 # kết luận cũ) và vẫn nằm trong tập quét lại để lượt sau
                 # thử lại — tránh pending trùng phát hàng cũ + hàng mới.
+                if isinstance(exc, _PrepProcessError):
+                    request_producer_stop(str(exc))
                 if replace:
                     with progress_lock:
                         failures[0] += 1
@@ -4175,10 +5549,25 @@ class SecretFileScanScreen(ScreenContent):
                         prog.record_file(rel, "err", str(exc))
                     with progress_lock:
                         failures[0] += 1
+                    logging.getLogger(__name__).exception(
+                        "scan file lỗi: %s", rel
+                    )
                     self.log_message.emit(f"[{rel}] Lỗi: {exc}", "err")
             finally:
                 if os.path.isdir(file_work):
-                    shutil.rmtree(file_work, ignore_errors=True)
+                    # Qua engine: nếu còn request native sống mở file bên
+                    # trong thì dọn muộn (janitor rmtree sau khi token hết).
+                    # Registry lỗi KHÔNG phải bằng chứng input hết người dùng
+                    # (P1-01) — giữ thư mục và log, không rmtree trực tiếp.
+                    try:
+                        from scanindex.core.ocr import direct_engine as _de
+
+                        if not _de.cleanup_path_when_idle(file_work):
+                            file_log("Dọn thư mục tạm muộn (OCR chưa xong hẳn)")
+                    except Exception as exc:
+                        file_log(
+                            f"Không dọn được thư mục tạm (giữ lại, sẽ dọn sau): {exc}"
+                        )
                 with state_lock:
                     prog.save()
                     if registry is not None:
@@ -4202,13 +5591,21 @@ class SecretFileScanScreen(ScreenContent):
         if mem:
             app_log_write(f"[mem] đầu lượt quét: {mem}", "info")
         try:
+            from scanindex.core import secret_scan_kie as _ssk
+            if _ssk.deferred_enabled():
+                try:
+                    from scanindex.core.secret_scan_spool import get_ledger
+                    get_ledger()  # Recover storage before any resume job can GC.
+                except Exception as exc:
+                    request_producer_stop(str(exc))
             with ThreadPoolExecutor(
                 max_workers=max_file_workers, thread_name_prefix="secret-scan-file"
             ) as executor:
                 # Cửa sổ trượt: chỉ giữ tối đa _SCAN_MAX_INFLIGHT_FILES future
                 # thay vì submit toàn bộ hàng đợi (có thể là 300k+ file) —
                 # chặn việc process chính phình RAM chỉ vì hàng đợi.
-                def run_phase(tasks: list[tuple[int, str]], replace: bool) -> None:
+                def run_phase(tasks: list[tuple[int, str]], replace: bool,
+                              kie_norms: frozenset = frozenset()) -> None:
                     futures: set = set()
                     next_task = 0
 
@@ -4218,11 +5615,14 @@ class SecretFileScanScreen(ScreenContent):
                             next_task < len(tasks)
                             and len(futures) < _SCAN_MAX_INFLIGHT_FILES
                             and not self._cancel_event.is_set()
+                            and not producer_stop.is_set()
                         ):
                             task_idx, task_path = tasks[next_task]
                             futures.add(
                                 executor.submit(
-                                    process_one, task_idx, task_path, replace
+                                    process_one, task_idx, task_path,
+                                    replace,
+                                    ssp._norm_path(task_path) in kie_norms,
                                 )
                             )
                             next_task += 1
@@ -4245,31 +5645,210 @@ class SecretFileScanScreen(ScreenContent):
                         for fut in futures:
                             fut.cancel()
 
+                # D2: file còn nghĩa vụ KIE (spool hợp lệ) tách pha riêng —
+                # chạy TRƯỚC pending thường (rẻ: không OCR), kết thúc trước.
+                kie_only_norms = frozenset(
+                    ssp._norm_path(os.path.join(folder, rel))
+                    for rel in prog.kie_spool_pending()
+                )
+                kie_only_tasks = [
+                    task for task in pending
+                    if _norm(task[1]) in kie_only_norms
+                ]
+                pending = [
+                    task for task in pending
+                    if _norm(task[1]) not in kie_only_norms
+                ]
+                # A fresh deferred failure commits baseline + rescan_pending.
+                # Those files are in rescan_tasks, not pending; they must also
+                # consume their durable KIE snapshot before considering full OCR.
+                kie_rescan_tasks = [
+                    task for task in rescan_tasks if _norm(task[1]) in kie_only_norms
+                ]
+                rescan_tasks = [
+                    task for task in rescan_tasks if _norm(task[1]) not in kie_only_norms
+                ]
+
                 # HAI PHA CÓ RÀO (R6): nhóm quét lại file mật kết thúc HOÀN
                 # TOÀN trước khi nhóm pending bắt đầu — chỉ "đặt trước" trong
                 # cửa sổ 32 future không bảo đảm thứ tự đó.
+                if kie_rescan_tasks:
+                    run_phase(kie_rescan_tasks, True, kie_only_norms)
                 if rescan_tasks:
                     run_phase(rescan_tasks, True)
+                if not self._cancel_event.is_set() and kie_only_tasks:
+                    run_phase(kie_only_tasks, False, kie_only_norms)
                 if not self._cancel_event.is_set():
                     run_phase(pending, False)
+                if pending_commits:
+                    # GĐ K (PLAN v5.1 §4.3): completion = metadata CUỐI —
+                    # chờ pool KIE terminal hết rồi commit phần chưa ACK.
+                    # P1-09: đa số file đã được commit THEO ACK ở trên — ở
+                    # đây chỉ còn những file callback chưa kịp về.
+                    # R2-01: chạy cả khi cancel — entry chưa commit phải được
+                    # chuyển nghĩa vụ retry bền vững, không bị bỏ.
+                    from scanindex.core import secret_scan_kie as _ssk
+
+                    if not self._cancel_event.is_set():
+                        try:
+                            drain_to = float(
+                                os.environ.get("OCRTOOL_KIE_DRAIN_TIMEOUT_S")
+                                or 600
+                            )
+                        except ValueError:
+                            drain_to = 600.0
+                        drained = _ssk.drain(timeout=drain_to)
+                        if not drained:
+                            # P1-07: drain False = metadata CHƯA đủ — commit
+                            # sẽ giữ file resumable (không cache-final),
+                            # không im lặng coi như hoàn tất.
+                            self.log_message.emit(
+                                "KIE deferred: hết thời gian chờ metadata — "
+                                "các file còn pending KHÔNG được cache; sẽ "
+                                "quét lại lượt sau",
+                                "info",
+                            )
+                        # R2-02: TỐI ĐA 2 lượt thử trong drain — lỗi persist
+                        # nhất thời (fsync lỗi một lần) được thử lại ngay,
+                        # publish không phát lại (ui_done + journal idempotent
+                        # theo định danh file). Vẫn lỗi → leftover xử lý bên
+                        # dưới (failure + rescan + giữ journal).
+                        # MỌI entry đều đăng ký `commit` trước khi commit nào
+                        # chạy (R2-01) — không còn nhánh không-commit-fn.
+                        for _drain_attempt in (1, 2):
+                            for entry in list(pending_commits):
+                                entry["commit"]()
+                            with state_lock:
+                                if all(
+                                    e["committed"] for e in pending_commits
+                                ):
+                                    break
+                    # R2-01/R2-02: entry CHƯA commit thành công (persist lỗi
+                    # lặp / callback muộn sau cancel) → KHÔNG được mất cả kết
+                    # quả lẫn nghĩa vụ retry: đếm failure, giữ journal, đưa
+                    # file vào tập quét lại. KHÔNG clear vô điều kiện.
+                    leftover = [
+                        e for e in pending_commits if not e["committed"]
+                    ]
+                    if leftover:
+                        with state_lock:
+                            prog.set_rescan_pending(sorted(
+                                set(prog.rescan_pending)
+                                | {e["rel"] for e in leftover}
+                            ))
+                            try:
+                                prog.save()
+                            except Exception:
+                                logging.getLogger(__name__).exception(
+                                    "save journal khi chốt leftover lỗi — "
+                                    "giữ trạng thái dở để lượt sau chạy lại"
+                                )
+                        with progress_lock:
+                            failures[0] += len(leftover)
+                        self.log_message.emit(
+                            f"KIE deferred: {len(leftover)} file chưa commit "
+                            "được (lỗi ghi dữ liệu) — giữ journal + quét lại "
+                            "lượt sau",
+                            "err",
+                        )
+                        pending_commits.clear()
         finally:
+            if cancelled[0] or self._cancel_event.is_set():
+                # P2-3/P1-05: dừng lượt → hủy job KIE của ĐÚNG lượt này. Job
+                # đang chạy giữ lease tới khi future thật kết thúc (native
+                # không bị tuyên bố dừng oan); input không bị cleanup sớm.
+                try:
+                    from scanindex.core import secret_scan_kie as _ssk
+
+                    n = _ssk.cancel_run(run_id)
+                    if n:
+                        self.log_message.emit(
+                            f"Đã hủy {n} job KIE deferred của lượt quét",
+                            "info",
+                        )
+                except Exception:
+                    # P1-B (review 2): lỗi hủy KHÔNG được nuốt im lặng —
+                    # scanner không báo được vòng đời file nếu cancel hỏng.
+                    logging.getLogger(__name__).exception(
+                        "cancel_run lỗi (run %s) — job KIE có thể còn giữ "
+                        "lease tới khi native tự kết thúc", run_id,
+                    )
+            # P1-E: ĐÓNG quyền commit TRƯỚC khi save/close journal — callback
+            # KIE muộn (future kết thúc sau điểm này) chỉ được bỏ, không được
+            # mở lại journal đã discard/close. run_gate_lock là barrier:
+            # commit đang bay chắc chắn xong trước khi ta chạm journal.
+            with run_gate_lock:
+                run_gate["open"] = False
             with state_lock:
-                done_n, err_n, skip_n, found_n = prog.stats()
                 # Chưa xong hẳn → giữ journal: dừng tay, còn file lỗi, còn
                 # file mật chờ quét lại, hoặc migration nâng cấp chưa xác
                 # nhận xong (R1 — không chỉ đếm lỗi/hủy của lượt hiện tại).
                 incomplete = (
                     cancelled[0]
+                    or producer_stop.is_set()
                     or failures[0] > 0
                     or prog.needs_continue()
                     or not upgraded_ok
                 )
-                if (done_n or err_n or skip_n or found_n) and incomplete:
-                    prog.save()
+                # P2-I: barrier bền — mọi entry đã commit đã save (fsync)
+                # trong commit_artifact; trước khi quyết định discard, chắc
+                # chắn registry đã bền vững phần dữ liệu vừa ghi muộn.
+                if registry is not None:
+                    if registry.poisoned and registry.recover_writer():
+                        self.log_message.emit(
+                            "Lỗi lưu registry đã được phục hồi (rebuild từ "
+                            "snapshot) — dữ liệu không mất",
+                            "info",
+                        )
+                    try:
+                        registry.save()
+                    except Exception:
+                        logging.getLogger(__name__).exception(
+                            "registry save cuối lượt lỗi — giữ journal để "
+                            "lượt sau đối chiếu"
+                        )
+                        incomplete = True
+                # R2-01: giữ journal khi CÓ NGHĨA VỤ chưa xong kể cả khi
+                # stats rỗng (mọi file fail trước khi ghi — trước đây điều
+                # kiện `(done_n or ...) and incomplete` làm discard mất
+                # rescan_pending vừa đặt → mất nghĩa vụ retry).
+                if incomplete:
+                    # D0: writer POISONED → recovery có kiểm soát MỘT lần
+                    # (backup + rebuild snapshot từ RAM) rồi save lại; vẫn
+                    # lỗi → log err, GIỮ journal (không discard dữ liệu còn
+                    # trên đĩa) — lượt sau tự chữa ở load().
+                    if prog.poisoned and prog.recover_writer():
+                        self.log_message.emit(
+                            "Lỗi lưu journal đã được phục hồi (rebuild từ "
+                            "snapshot) — dữ liệu không mất",
+                            "info",
+                        )
+                    try:
+                        prog.save()
+                    except Exception:
+                        logging.getLogger(__name__).exception(
+                            "save journal cuối lượt lỗi (writer poisoned?) — "
+                            "giữ trạng thái dở để lượt sau chạy lại"
+                        )
+                        self.log_message.emit(
+                            "KHÔNG THỂ lưu an toàn trạng thái lượt quét "
+                            "(lỗi đĩa) — kiểm tra ổ đĩa; lượt sau sẽ chạy "
+                            "lại phần dở",
+                            "err",
+                        )
                 else:
                     # Hoàn tất sạch — mọi việc phục hồi đã xong và kết quả
                     # cần giữ đã nằm trong registry.
-                    prog.discard()
+                    try:
+                        prog.save()
+                        prog.kie_spool_gc(durability_confirmed=True)
+                        prog.save()
+                        prog.discard()
+                    except Exception:
+                        incomplete = True
+                        logging.getLogger(__name__).exception(
+                            "Không thể chốt journal/GC — giữ nghĩa vụ phục hồi"
+                        )
                 # Đóng handle ngay — file mở để lâu sẽ chặn "Xóa lịch sử
                 # quét" và backup trên Windows.
                 prog.close()
@@ -4286,7 +5865,12 @@ class SecretFileScanScreen(ScreenContent):
                     "cache_skipped": cache_skipped[0],
                     "junk": junk[0],
                     "failures": failures[0],
+                    "rescan_pending": len(prog.rescan_pending),
+                    "metadata_pending": len(prog.kie_spool_pending()),
+                    "durability_confirmed": not incomplete,
                     "cancelled": cancelled[0],
+                    "producer_stopped": producer_stop.is_set(),
+                    "stop_reason": producer_stop_reason[0],
                     "work_root": work_root,
                     "app_version": app_version,
                     "updated": updated[0],
@@ -4529,11 +6113,8 @@ class SecretFileScanScreen(ScreenContent):
             )
 
     def _first_row_of(self, path: str) -> int | None:
-        key = _norm(path)
-        for r in range(self.table.rowCount()):
-            if _norm(self._row_path(r)) == key:
-                return r
-        return None
+        items = self._result_items_by_file.get(_norm(path), [])
+        return min((item.row() for item in items), default=None)
 
     def _delete_files(self, paths: list[str]) -> None:
         targets = list(dict.fromkeys(p for p in paths if p))
@@ -4852,11 +6433,37 @@ class SecretFileScanScreen(ScreenContent):
         return shown, missing, len(matches) - shown
 
     def _set_status(self, text: str) -> None:
+        self._pending_status = None
         self.status_label.setText(text)
 
     def _set_progress(self, current: int, total: int) -> None:
+        self._pending_progress = None
         self.progress.setMaximum(max(1, total))
         self.progress.setValue(max(0, min(current, max(1, total))))
+
+    def _queue_status(self, text: str) -> None:
+        if not self._busy and not self._copy_running:
+            self._set_status(text)
+            return
+        self._pending_status = text
+        if not self._feedback_timer.isActive():
+            self._feedback_timer.start()
+
+    def _queue_progress(self, current: int, total: int) -> None:
+        if not self._busy and not self._copy_running:
+            self._set_progress(current, total)
+            return
+        self._pending_progress = (current, total)
+        if not self._feedback_timer.isActive():
+            self._feedback_timer.start()
+
+    def _flush_worker_feedback(self) -> None:
+        """Coalesce display-only feedback; results/actions are never queued."""
+        self._feedback_timer.stop()
+        if self._pending_status is not None:
+            self._set_status(self._pending_status)
+        if self._pending_progress is not None:
+            self._set_progress(*self._pending_progress)
 
     def _add_result(
         self, match: SecretScanMatch, missing: bool = False, quiet: bool = False
@@ -4879,7 +6486,10 @@ class SecretFileScanScreen(ScreenContent):
         check_item.setCheckState(Qt.CheckState.Unchecked)
         check_item.setData(Qt.ItemDataRole.UserRole, match.source_path)
         check_item.setData(Qt.ItemDataRole.UserRole + 1, match)
-        self.table.setItem(row, 0, check_item)
+        # Programmatic insertion is not a user checkbox change. In
+        # particular it must not recount every existing checkbox.
+        with QSignalBlocker(self.table):
+            self.table.setItem(row, 0, check_item)
         org_code = _effective_org_code(match)
         org_name = _effective_org_name(match)
         values = [
@@ -4951,7 +6561,22 @@ class SecretFileScanScreen(ScreenContent):
                         f"{match.source_path}\n⚠ File không còn tồn tại trên đĩa"
                     )
                 )
-        self.btn_export.setEnabled(True)
+        if match.source_path:
+            key = _norm(match.source_path)
+            self._result_file_keys.add(key)
+            self._result_items_by_file.setdefault(key, []).append(check_item)
+        terms = self.filter_edit.text().strip().lower().split()
+        haystack = self._row_filter_text(row) if terms else ""
+        visible = all(term in haystack for term in terms)
+        if not visible:
+            self.table.setRowHidden(row, True)
+        else:
+            self._visible_result_rows += 1
+            header = self.table.horizontalHeader()
+            if header.check_state() == Qt.CheckState.Checked:
+                header.set_check_state(Qt.CheckState.PartiallyChecked)
+        self.btn_export.setEnabled(not self._busy)
+        self.btn_copy.setEnabled(not self._busy and not self._copy_running)
         if not quiet:
             self._refresh_totals()
         return True
@@ -4966,12 +6591,25 @@ class SecretFileScanScreen(ScreenContent):
         path = str(payload.get("path") or "")
         if not path:
             return
+        old_items = self._result_items_by_file.get(_norm(path), [])
+        overrides = {}
+        for item in old_items:
+            old = item.data(Qt.ItemDataRole.UserRole + 1)
+            if isinstance(old, SecretScanMatch):
+                overrides[old.page_number] = (old.org_code_override, old.org_name_override)
         self._remove_file_rows(path)
         for match_dict in payload.get("matches") or []:
             try:
-                self._add_result(SecretScanMatch(**match_dict))
+                match = SecretScanMatch(**match_dict)
+                code, name = overrides.get(match.page_number, ("", ""))
+                if code:
+                    match.org_code_override = code
+                if name:
+                    match.org_name_override = name
+                self._add_result(match, quiet=True)
             except (TypeError, ValueError):
                 continue
+        self._refresh_totals()
 
     def _row_path(self, row: int) -> str:
         item = self.table.item(row, 0)
@@ -4993,16 +6631,8 @@ class SecretFileScanScreen(ScreenContent):
 
     def _refresh_totals(self) -> None:
         rows = self.table.rowCount()
-        visible = sum(
-            1 for r in range(rows) if not self.table.isRowHidden(r)
-        )
-        files = len(
-            {
-                _norm(self._row_path(r))
-                for r in range(rows)
-                if self._row_path(r)
-            }
-        )
+        visible = self._visible_result_rows
+        files = len(self._result_file_keys)
         if rows == 0:
             text = translations.localize_text("Tổng: 0 văn bản mật")
         elif rows == files:
@@ -5021,6 +6651,11 @@ class SecretFileScanScreen(ScreenContent):
         self.btn_export.setEnabled(
             not self._busy
             and (rows > 0 or bool(self._last_scan_summary))
+        )
+        self.btn_copy.setEnabled(
+            not self._busy
+            and rows > 0
+            and not self._copy_running
         )
         self._refresh_action_buttons()
 
@@ -5041,10 +6676,19 @@ class SecretFileScanScreen(ScreenContent):
         path = item.data(Qt.ItemDataRole.UserRole)
         if not path:
             return
-        if item.checkState() == Qt.CheckState.Checked:
+        checked = item.checkState() == Qt.CheckState.Checked
+        was_checked = id(item) in self._checked_row_ids
+        if checked:
+            self._checked_row_ids.add(id(item))
             self._checked_paths.add(_norm(path))
         else:
-            self._checked_paths.discard(_norm(path))
+            self._checked_row_ids.discard(id(item))
+            key = _norm(path)
+            if not any(id(other) in self._checked_row_ids
+                       for other in self._result_items_by_file.get(key, [])):
+                self._checked_paths.discard(key)
+        if not self.table.isRowHidden(item.row()):
+            self._visible_checked_rows += int(checked) - int(was_checked)
         self._update_select_all_state()
         self._refresh_action_buttons()
 
@@ -5122,28 +6766,42 @@ class SecretFileScanScreen(ScreenContent):
         state = (
             Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
         )
-        for r in range(self.table.rowCount()):
-            if self.table.isRowHidden(r):
-                continue  # dòng đang ẩn bởi bộ lọc không bị động đến
-            item = self.table.item(r, 0)
-            if item is not None:
-                item.setCheckState(state)
+        # A batch selection should scan the table once, not trigger a
+        # complete header recount for each changed checkbox.
+        touched = set()
+        with QSignalBlocker(self.table):
+            for r in range(self.table.rowCount()):
+                if self.table.isRowHidden(r):
+                    continue  # dòng đang ẩn bởi bộ lọc không bị động đến
+                item = self.table.item(r, 0)
+                if item is not None:
+                    item.setCheckState(state)
+                    if checked:
+                        self._checked_row_ids.add(id(item))
+                    else:
+                        self._checked_row_ids.discard(id(item))
+                    path = item.data(Qt.ItemDataRole.UserRole)
+                    if path:
+                        touched.add(_norm(path))
+                        if checked:
+                            self._checked_paths.add(_norm(path))
+                        else:
+                            self._checked_paths.discard(_norm(path))
+        for key in touched:
+            if any(id(item) in self._checked_row_ids
+                   for item in self._result_items_by_file.get(key, [])):
+                self._checked_paths.add(key)
+            else:
+                self._checked_paths.discard(key)
+        self._visible_checked_rows = self._visible_result_rows if checked else 0
+        self._update_select_all_state()
         self._refresh_action_buttons()
 
     def _update_select_all_state(self) -> None:
         header = self.table.horizontalHeader()
         if not isinstance(header, _CheckAllHeader):
             return
-        total = checked = 0
-        for r in range(self.table.rowCount()):
-            if self.table.isRowHidden(r):
-                continue
-            item = self.table.item(r, 0)
-            if item is None:
-                continue
-            total += 1
-            if item.checkState() == Qt.CheckState.Checked:
-                checked += 1
+        total, checked = self._visible_result_rows, self._visible_checked_rows
         if total and checked == total:
             state = Qt.CheckState.Checked
         elif checked:
@@ -5160,14 +6818,15 @@ class SecretFileScanScreen(ScreenContent):
         """Bộ lọc nhanh: chỉ ẨN dòng không khớp — dữ liệu và "Xuất Excel"
         vẫn giữ toàn bộ danh sách (lọc chỉ thay đổi cách xem)."""
         terms = self.filter_edit.text().strip().lower().split()
+        self._visible_result_rows = 0
+        self._visible_checked_rows = 0
         for r in range(self.table.rowCount()):
-            if not terms:
-                self.table.setRowHidden(r, False)
-                continue
-            haystack = self._row_filter_text(r)
-            self.table.setRowHidden(
-                r, not all(term in haystack for term in terms)
-            )
+            haystack = self._row_filter_text(r) if terms else ""
+            visible = all(term in haystack for term in terms)
+            self.table.setRowHidden(r, not visible)
+            self._visible_result_rows += int(visible)
+            if visible and id(self.table.item(r, 0)) in self._checked_row_ids:
+                self._visible_checked_rows += 1
         self._update_select_all_state()
         self._refresh_totals()
 
@@ -5186,13 +6845,20 @@ class SecretFileScanScreen(ScreenContent):
 
     def _remove_file_rows(self, path: str) -> None:
         key = _norm(path)
-        rows = [
-            r
-            for r in range(self.table.rowCount())
-            if _norm(self._row_path(r)) == key
-        ]
+        items = self._result_items_by_file.pop(key, [])
+        rows = []
+        for item in items:
+            r = item.row()
+            rows.append(r)
+            if id(item) in self._checked_row_ids:
+                if not self.table.isRowHidden(r):
+                    self._visible_checked_rows -= 1
+                self._checked_row_ids.discard(id(item))
         for r in sorted(rows, reverse=True):
+            if not self.table.isRowHidden(r):
+                self._visible_result_rows -= 1
             self.table.removeRow(r)
+        self._result_file_keys.discard(key)
         self._checked_paths.discard(key)
         if (
             self._preview_current is not None
@@ -5215,7 +6881,15 @@ class SecretFileScanScreen(ScreenContent):
         # Bảng đổi nguồn (quét mới / nạp file thay bảng) → minh chứng lượt
         # quét cũ không còn đúng bối cảnh, không được bám vào lần xuất sau.
         self._last_scan_summary = None
+        self._feedback_timer.stop()
+        self._pending_status = None
+        self._pending_progress = None
         self._checked_paths.clear()
+        self._result_file_keys.clear()
+        self._result_items_by_file.clear()
+        self._checked_row_ids.clear()
+        self._visible_checked_rows = 0
+        self._visible_result_rows = 0
         self._preview_current = None
         self._preview_convert_gen += 1  # vô hiệu hoá kết quả convert cũ
         self.table.setRowCount(0)
@@ -5231,9 +6905,11 @@ class SecretFileScanScreen(ScreenContent):
         self._set_preview_banner("", None)
         self._set_preview_busy(False)
         self.btn_export.setEnabled(False)
+        self.btn_copy.setEnabled(False)
         self._refresh_totals()
 
     def _on_finished(self, payload: dict) -> None:
+        self._flush_worker_feedback()
         self._busy = False
         total = int(payload.get("total") or 0)
         scanned = int(payload.get("scanned") or 0)
@@ -5242,6 +6918,9 @@ class SecretFileScanScreen(ScreenContent):
         junk = int(payload.get("junk") or 0)
         failures = int(payload.get("failures") or 0)
         cancelled = bool(payload.get("cancelled"))
+        pending = max(int(payload.get("metadata_pending") or 0),
+                      int(payload.get("rescan_pending") or 0))
+        complete = not failures and not pending and payload.get("durability_confirmed", True)
         updated = int(payload.get("updated") or 0)
         kept_old = int(payload.get("kept_old") or 0)
         app_version = str(payload.get("app_version") or "")
@@ -5253,7 +6932,7 @@ class SecretFileScanScreen(ScreenContent):
             "started": str(payload.get("started") or ""),
             "finished": time.strftime("%d/%m/%Y %H:%M:%S"),
             "mode": str(payload.get("mode") or ""),
-            "status": "Đã dừng giữa chừng" if cancelled else "Hoàn tất",
+            "status": "Đã dừng giữa chừng" if cancelled else ("Hoàn tất" if complete else "Chưa hoàn tất"),
             "total": total,
             "scanned": scanned,
             "skipped": skipped,
@@ -5262,13 +6941,18 @@ class SecretFileScanScreen(ScreenContent):
             "failures": failures,
             "updated": updated,
             "kept_old": kept_old,
+            "stop_reason": str(payload.get("stop_reason") or ""),
             "found": found,
             "app_version": app_version,
         }
         self._set_running_ui(False)
-        prefix = "Đã dừng" if cancelled else "Hoàn tất"
+        prefix = "Đã dừng" if cancelled else ("Hoàn tất" if complete else "Chưa hoàn tất")
         detail = f"quét {scanned + skipped + cache_skipped}/{total} file"
         notes = []
+        if payload.get("stop_reason"):
+            notes.append(str(payload["stop_reason"]))
+        if pending:
+            notes.append(f"còn {pending} file chờ xử lý lại")
         if skipped:
             notes.append(f"kế thừa {skipped} file đã quét")
         if cache_skipped:
@@ -5308,7 +6992,35 @@ class SecretFileScanScreen(ScreenContent):
 
         work_root = payload.get("work_root")
         if work_root and os.path.isdir(work_root):
-            shutil.rmtree(work_root, ignore_errors=True)
+            # Cleanup hai tầng (REVIEW v3 2.2): thư mục cha chỉ xóa khi không
+            # còn request native dùng hậu duệ; ngược lại defer cho janitor.
+            # Registry lỗi → giữ thư mục + log (P1-01), không rmtree trực tiếp.
+            try:
+                from scanindex.core.ocr import direct_engine as _de
+
+                if not _de.cleanup_path_when_idle(work_root):
+                    self.log_message.emit(
+                        "Dọn thư mục tạm của lượt quét muộn (còn OCR chưa "
+                        "kết thúc hẳn) — sẽ tự hoàn tất.",
+                        "info",
+                    )
+            except Exception as exc:
+                self.log_message.emit(
+                    f"Không dọn được thư mục tạm của lượt quét (giữ lại): {exc}",
+                    "info",
+                )
+        try:
+            from scanindex.core.ocr import direct_engine as _de
+
+            summary = _de.admission_metrics_summary()
+            if summary:
+                self.log_message.emit(summary, "info")
+            # Telemetry trạng thái pool (PLAN v5.1 §4.1 — schema GĐ R).
+            telemetry = _de.pool_telemetry_line()
+            if telemetry:
+                self.log_message.emit(telemetry, "info")
+        except Exception:
+            pass
 
     def _clear_history_clicked(self) -> None:
         if self._busy:
@@ -5416,4 +7128,171 @@ class SecretFileScanScreen(ScreenContent):
             translations.localize_text(
                 f"Đã lưu danh sách {len(matches)} dòng văn bản mật vào:\n{dest}"
             ),
+        )
+
+    # ------------------------------------------------------------------
+    # Sao chép file mật sang thư mục khác (giữ cấu trúc thư mục gốc)
+    # ------------------------------------------------------------------
+
+    def _copy_clicked(self) -> None:
+        if self._copy_running:
+            return
+        matches = self._current_matches()
+        if not matches:
+            QMessageBox.information(
+                self,
+                "Chưa có kết quả",
+                "Chưa có văn bản mật nào được phát hiện để sao chép.",
+            )
+            return
+        plan = build_secret_copy_plan(matches)
+        if not plan:
+            return
+        loaded_dir = (
+            os.path.dirname(self._loaded_from) if self._loaded_from else ""
+        )
+        folder = self.folder_edit.text().strip()
+        if loaded_dir and os.path.isdir(loaded_dir):
+            start_dir = loaded_dir
+        elif folder and os.path.isdir(folder):
+            start_dir = folder
+        else:
+            start_dir = os.path.expanduser("~")
+        dest = QFileDialog.getExistingDirectory(
+            self,
+            translations.localize_text("Chọn thư mục đích"),
+            start_dir,
+        )
+        if not dest:
+            return
+        # Chặn chọn nhầm chính thư mục đã quét làm nơi nhận — mọi file đều
+        # "đích trùng nguồn", chẳng chép được gì và dễ nhầm là có lỗi.
+        root = _derive_scan_root(matches)
+        if root and _norm(dest) == _norm(root):
+            QMessageBox.warning(
+                self,
+                "Thư mục đích không hợp lệ",
+                translations.localize_text(
+                    "Thư mục đích trùng với thư mục đã quét.\n"
+                    "Hãy chọn thư mục khác để nhận bản sao."
+                ),
+            )
+            return
+        existing = [
+            os.path.join(dest, rel) for _src, rel in plan
+            if os.path.exists(os.path.join(dest, rel))
+        ]
+        overwrite = True
+        if existing:
+            choice = self._ask_copy_overwrite(len(existing))
+            if choice is None:
+                return
+            overwrite = choice
+        self._copy_running = True
+        self.btn_copy.setEnabled(False)
+        self._set_status(
+            f"Chuẩn bị sao chép {len(plan)} file mật sang: {dest}"
+        )
+        thread = threading.Thread(
+            target=self._copy_worker,
+            args=(plan, dest, overwrite),
+            daemon=True,
+            name="secret-copy-files",
+        )
+        thread.start()
+
+    def _ask_copy_overwrite(self, existing_count: int) -> "bool | None":
+        """Hỏi cách xử lý file trùng tên sẵn có ở đích: True=ghi đè,
+        False=bỏ qua file đã có, None=hủy."""
+        box = QMessageBox(self)
+        box.setWindowTitle(translations.localize_text("File đã tồn tại ở đích"))
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setText(
+            translations.localize_text(
+                f"Đã có {existing_count} file trùng tên trong thư mục đích.\n"
+                "Ghi đè lên chúng hay bỏ qua các file đã có?"
+            )
+        )
+        over = box.addButton(
+            translations.localize_text("Ghi đè"),
+            QMessageBox.ButtonRole.AcceptRole,
+        )
+        skip = box.addButton(
+            translations.localize_text("Bỏ qua file đã có"),
+            QMessageBox.ButtonRole.ActionRole,
+        )
+        box.addButton("Hủy", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is over:
+            return True
+        if clicked is skip:
+            return False
+        return None
+
+    def _copy_worker(
+        self,
+        plan: list[tuple[str, str]],
+        dest: str,
+        overwrite: bool,
+    ) -> None:
+        """Sao chép chạy ở thread nền — KHÔNG đụng vào widget; báo tiến độ
+        qua signal, kết quả tổng hợp trả về qua _copy_finished."""
+
+        def progress(done: int, total: int, name: str) -> None:
+            self._progress_changed.emit(done, total)
+            self._status_changed.emit(f"Đang sao chép {done}/{total}: {name}")
+
+        report = copy_secret_files(
+            plan, dest, overwrite=overwrite, progress=progress
+        )
+        report["dest"] = dest
+        self._copy_finished.emit(report)
+
+    def _on_copy_finished(self, payload: dict) -> None:
+        self._flush_worker_feedback()
+        self._copy_running = False
+        self.btn_copy.setEnabled(self.table.rowCount() > 0)
+        copied = int(payload.get("copied") or 0)
+        skipped = int(payload.get("skipped") or 0)
+        total = int(payload.get("total") or 0)
+        errors = list(payload.get("errors") or [])
+        dest = str(payload.get("dest") or "")
+        if errors:
+            self._set_status(
+                f"Không sao chép được {len(errors)}/{total} file — chi tiết trong hộp thoại lỗi."
+            )
+            self.log_message.emit(
+                f"Quét file mật: sao chép {copied}/{total} file mật vào "
+                f"{dest}, lỗi {len(errors)} file.",
+                "err" if not copied else "info",
+            )
+            intro = translations.localize_text(
+                f"Không sao chép được {len(errors)}/{total} file:"
+            )
+            if copied or skipped:
+                intro += translations.localize_text(
+                    f"\n(Đã chép được {copied} file, bỏ qua {skipped} file đã có.)"
+                )
+            self._show_path_errors(intro, errors)
+            return
+        skipped_note = ""
+        if skipped:
+            skipped_note = translations.localize_text(
+                f"\n({skipped} file đã có ở đích được bỏ qua, không ghi đè.)"
+            )
+        self._set_status(f"Đã sao chép {copied} file mật vào: {dest}")
+        self.log_message.emit(
+            f"Quét file mật: đã sao chép {copied} file mật vào {dest}"
+            + (f" (bỏ qua {skipped} file đã có)" if skipped else "")
+            + ".",
+            "success",
+        )
+        QMessageBox.information(
+            self,
+            "Đã sao chép file mật",
+            translations.localize_text(
+                f"Đã sao chép {copied} file mật vào:\n{dest}"
+            )
+            + skipped_note,
         )
