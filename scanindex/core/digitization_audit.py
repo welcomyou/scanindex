@@ -782,9 +782,12 @@ _TIFF_COMPRESSION_NAMES = {
 }
 
 # TIFF đánh số trang liên tục trong HỒ SƠ, độc lập với số văn bản PDF.
-# ĐVBC gồm 4 chữ số, có thể thêm ký tự phân biệt số trùng (vd. 0123a).
+# Mã định danh/phông TÙ Ý (chỉ cấm dấu "-") thống nhất với quy ước
+# CSDL_SOHOA/PDF — bề rộng chỉ ép cho mục lục/ĐVBC/trang; lệch mã với
+# thư mục cha vẫn bị bắt ở phép so khớp riêng. ĐVBC gồm 4 chữ số, có thể
+# thêm ký tự phân biệt số trùng (vd. 0123a).
 _TIFF_NAME_RE = re.compile(
-    r"^(?P<mdd>[^-]+)-(?P<phong>[0-9]{3})-(?P<ml>[0-9]{2})-"
+    r"^(?P<mdd>[^-]+)-(?P<phong>[^-]+)-(?P<ml>[0-9]{2})-"
     r"(?P<dvbc>[0-9]{4}[A-Za-z]?)-(?P<trang>[0-9]{3})$")
 
 
@@ -883,7 +886,7 @@ def _tiff_name_check(path: Path, sibling_cache: dict | None = None
     """
     parsed = parse_tiff_name(path.name)
     if parsed is None:
-        return False, ("không khớp quy ước <MãĐĐ>-<Phông 3 số>-<Mục lục 2 số>"
+        return False, ("không khớp quy ước <MãĐĐ>-<Phông>-<Mục lục 2 số>"
                        "-<ĐVBC 4 số và ký tự trùng nếu có>-<Trang 3 số>.tif"), ""
     bad: list[str] = []
     parent = rt.parse_dossier_folder_name(path.parent.name)

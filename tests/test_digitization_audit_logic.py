@@ -81,13 +81,31 @@ def test_tiff_name_accepts_duplicate_storage_unit_suffix(tmp_path):
 def test_tiff_name_requires_padded_numbers(tmp_path):
     folder = tmp_path / "A38-011-07-0123"
     folder.mkdir()
-    for name in ("A38-11-07-0123-001.tif",
-                 "A38-011-7-0123-001.tif",
+    for name in ("A38-011-7-0123-001.tif",
                  "A38-011-07-123-001.tif",
                  "A38-011-07-0123-1.tif"):
         path = folder / name
         _save_tiff(path)
         assert audit.audit_tiff(path).name_ok is False
+
+
+def test_tiff_name_accepts_free_form_fonds(tmp_path):
+    # Phông tùy ý (chỉ cấm "-") thống nhất với quy ước PDF/CSDL_SOHOA —
+    # mã phông phân cấp vd. A29.244.01.002 đạt; lệch mã phông với thư
+    # mục cha vẫn trượt.
+    folder = tmp_path / "A29.244.01-A29.244.01.002-01-0001"
+    folder.mkdir()
+    path = folder / "A29.244.01-A29.244.01.002-01-0001-001.tif"
+    _save_tiff(path)
+    assert audit.audit_tiff(path).name_ok is True
+    parsed = audit.parse_tiff_name(path.name)
+    assert parsed.ma_phong == "A29.244.01.002"
+
+    wrong = folder / "A29.244.01-002-01-0001-001.tif"
+    _save_tiff(wrong)
+    result = audit.audit_tiff(wrong)
+    assert result.name_ok is False
+    assert "không khớp thư mục hồ sơ chứa" in result.name_note
 
 
 def test_tiff_sequence_checks_first_page_missing_and_duplicates(tmp_path):
