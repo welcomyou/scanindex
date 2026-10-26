@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from typing import List, Dict, Optional, Tuple
 
 from asn1crypto import x509 as asn1_x509
+from asn1crypto.algos import DSASignature
 
 # ── Win32 constants ─────────────────────────────────────────────────────────
 CERT_SYSTEM_STORE_CURRENT_USER = 0x00010000
@@ -191,7 +192,7 @@ def _is_vgca_signing_certificate(cert: asn1_x509.Certificate, now=None) -> bool:
         if subject_text == issuer_text:
             return False
 
-        if cert.public_key.algorithm != "rsa":
+        if cert.public_key.algorithm not in {"rsa", "ec"}:
             return False
 
         basic_constraints = _extension_value(cert, "basic_constraints") or {}
@@ -212,6 +213,31 @@ def _is_vgca_signing_certificate(cert: asn1_x509.Certificate, now=None) -> bool:
 
 
 # ── Public API ───────────────────────────────────────────────────────────────
+
+def validate_certificate_validity(cert_info: Dict, now=None) -> None:
+    """Reject expired/not-yet-valid certificates before requesting a PIN/key.
+
+    Compare UTC instants, not local date strings. This is only a validity
+    period check, separate from the existing certificate-selection policy.
+    """
+    cert = asn1_x509.Certificate.load(cert_info["der"])
+    validity = cert["tbs_certificate"]["validity"]
+    now = _as_utc(now if now is not None else datetime.now(timezone.utc))
+    not_before = _as_utc(validity["not_before"].native)
+    not_after = _as_utc(validity["not_after"].native)
+    if now < not_before:
+        raise ValueError(
+            "Chứng thư số chưa có hiệu lực "
+            f"(bắt đầu {not_before:%Y-%m-%d %H:%M:%S} UTC). "
+            "Kiểm tra chứng thư và ngày giờ máy tính."
+        )
+    if now > not_after:
+        raise ValueError(
+            "Chứng thư số đã hết hạn "
+            f"(hết hạn {not_after:%Y-%m-%d %H:%M:%S} UTC). "
+            "Kiểm tra chứng thư và ngày giờ máy tính."
+        )
+
 
 def list_certificates(store_name: str = "MY", signing_only: bool = True) -> List[Dict]:
     """
@@ -415,9 +441,13 @@ def sign_data(cert_info: Dict, data: bytes, hash_alg: str = "sha256") -> bytes:
       - CNG keys  → NCryptSignHash (most modern USB tokens)
       - Legacy CSP → CryptSignHash  (older tokens / software certs)
 
-    Returns the raw RSA/ECDSA signature in big-endian byte order, as
-    expected by pyHanko's async_sign_raw().
+    Returns RSA signature bytes or a DER-encoded ECDSA (r, s) pair,
+    as expected by pyHanko's async_sign_raw().
     """
+    validate_certificate_validity(cert_info)
+    key_algorithm = asn1_x509.Certificate.load(cert_info["der"]).public_key.algorithm
+    if key_algorithm not in {"rsa", "ec"}:
+        raise ValueError(f"Unsupported key algorithm: {key_algorithm}")
     p_ctx = cert_info["cert_ctx"]
 
     h_key = wintypes.HANDLE()
@@ -438,8 +468,10 @@ def sign_data(cert_info: Dict, data: bytes, hash_alg: str = "sha256") -> bytes:
     is_cng = dw_key_spec.value == CERT_NCRYPT_KEY_SPEC
     try:
         if is_cng:
-            return _sign_cng(h_key.value, data, hash_alg)
+            return _sign_cng(h_key.value, data, hash_alg, key_algorithm)
         else:
+            if key_algorithm != "rsa":
+                raise ValueError("Chứng thư EC/ECDSA cần driver CNG/KSP hỗ trợ ký EC.")
             return _sign_legacy_csp(h_key.value, dw_key_spec.value, data, hash_alg)
     finally:
         if pf_free.value:
@@ -477,33 +509,50 @@ def _has_private_key(p_ctx) -> Tuple[bool, bool]:
     return True, is_cng
 
 
-def _sign_cng(key_handle: int, data: bytes, hash_alg: str) -> bytes:
-    """NCryptSignHash with PKCS#1 v1.5 padding. Returns big-endian bytes."""
+def _sign_cng(key_handle: int, data: bytes, hash_alg: str, key_algorithm: str = "rsa") -> bytes:
+    """RSA PKCS#1 v1.5 or unpadded ECDSA through Windows CNG.
+
+    CNG returns ECDSA as fixed-width, big-endian r || s (IEEE P1363).
+    CMS needs a DER SEQUENCE of two INTEGERs, including sign/length octets.
+    """
+    if key_algorithm not in {"rsa", "ec"}:
+        raise ValueError(f"Unsupported key algorithm: {key_algorithm}")
     digest = hashlib.new(hash_alg, data).digest()
     alg_name = _BCRYPT_ALG[hash_alg.lower()]
     padding = _BCRYPT_PKCS1_PADDING_INFO(alg_name)
+    padding_info = byref(padding) if key_algorithm == "rsa" else None
+    flags = BCRYPT_PAD_PKCS1 if key_algorithm == "rsa" else 0
 
     sig_len = wintypes.DWORD(0)
     status = _ncrypt.NCryptSignHash(
-        key_handle, byref(padding),
+        key_handle, padding_info,
         digest, len(digest),
         None, 0, byref(sig_len),
-        BCRYPT_PAD_PKCS1,
+        flags,
     )
     if status:
-        raise OSError(f"NCryptSignHash (query size) failed: 0x{status:08X}")
+        raise OSError(f"NCryptSignHash (query size) failed: 0x{status & 0xFFFFFFFF:08X}")
 
     buf = (ctypes.c_ubyte * sig_len.value)()
     status = _ncrypt.NCryptSignHash(
-        key_handle, byref(padding),
+        key_handle, padding_info,
         digest, len(digest),
         buf, sig_len, byref(sig_len),
-        BCRYPT_PAD_PKCS1,
+        flags,
     )
     if status:
-        raise OSError(f"NCryptSignHash failed: 0x{status:08X}")
+        raise OSError(f"NCryptSignHash failed: 0x{status & 0xFFFFFFFF:08X}")
 
-    return bytes(buf[: sig_len.value])   # already big-endian
+    signature = bytes(buf[:sig_len.value])
+    if key_algorithm == "ec":
+        if not signature or len(signature) % 2:
+            raise ValueError("Driver trả về chữ ký ECDSA P1363 không hợp lệ.")
+        half = len(signature) // 2
+        signature = DSASignature({
+            "r": int.from_bytes(signature[:half], "big"),
+            "s": int.from_bytes(signature[half:], "big"),
+        }).dump()
+    return signature
 
 
 def _sign_legacy_csp(h_prov: int, key_spec: int, data: bytes, hash_alg: str) -> bytes:

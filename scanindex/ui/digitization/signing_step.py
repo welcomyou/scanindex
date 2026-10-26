@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import threading
 from dataclasses import dataclass
 from typing import Optional
 
@@ -39,7 +40,7 @@ try:
     from scanindex.core.pdf.signer import (
         DEFAULT_STAMP_TEMPLATE, DEFAULT_TSA_URL, SIG_BOX_DEFAULT, STAMP_TEMPLATE_FIELDS,
         STAMP_TEXT_BELOW, STAMP_TEXT_RIGHT,
-        compute_stamp_natural_size, render_stamp_template, sign_single_pdf,
+        TSASigningError, compute_stamp_natural_size, render_stamp_template, sign_single_pdf,
     )
     _DEPS_OK = True
     _IMPORT_ERR = ""
@@ -172,7 +173,62 @@ def _resolve_page(item: _SignItem, custom_page: int) -> int:
     return max(0, min(page, last_page))
 
 
-class _SignWorker(QThread):
+class _SigningCancelled(Exception):
+    pass
+
+
+class _TsaFallbackWorker(QThread):
+    """Pause a signing worker until the GUI supplies an explicit TSA decision."""
+    tsa_failed = Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._tsa_condition = threading.Condition()
+        self._tsa_action = None
+        self._cancelled = False
+
+    def cancel(self):
+        with self._tsa_condition:
+            self._cancelled = True
+            self._tsa_condition.notify_all()
+
+    def set_tsa_action(self, action: str):
+        with self._tsa_condition:
+            self._tsa_action = action if action in {"retry", "local"} else "cancel"
+            self._tsa_condition.notify_all()
+
+    def _request_tsa_action(self, detail: str) -> str:
+        with self._tsa_condition:
+            self._tsa_action = None
+            if self._cancelled:
+                return "cancel"
+            self.tsa_failed.emit(detail)
+            while self._tsa_action is None and not self._cancelled:
+                self._tsa_condition.wait()
+            return "cancel" if self._cancelled else self._tsa_action
+
+    def _sign_with_tsa_fallback(self, sign_function, *args, **kwargs):
+        while True:
+            if self._cancelled:
+                raise _SigningCancelled()
+            kwargs["tsa_url"] = self._tsa_url
+            try:
+                return sign_function(*args, **kwargs)
+            except TSASigningError as exc:
+                if not self._tsa_url:
+                    raise
+                detail = f"{os.path.basename(args[1])}\n{exc}"
+                action = self._request_tsa_action(detail)
+                if action == "local":
+                    # Explicit consent applies to this file and the rest of
+                    # the batch. Always retry from the original signing input.
+                    self._tsa_url = ""
+                elif action != "retry":
+                    self.cancel()
+                    raise _SigningCancelled() from exc
+
+
+class _SignWorker(_TsaFallbackWorker):
     progress = Signal(int, int, object)
     finished_ok = Signal(object)
     failed = Signal(str)
@@ -220,7 +276,7 @@ class _SignWorker(QThread):
         self._cancelled = False
 
     def cancel(self):
-        self._cancelled = True
+        super().cancel()
 
     def run(self):
         import tempfile
@@ -257,7 +313,7 @@ class _SignWorker(QThread):
                                 f"PDF/A convert failed: {err_a}. "
                                 "Fallback: ký file gốc thay vì PDF/A."
                             )
-                    sign_single_pdf(
+                    self._sign_with_tsa_fallback(sign_single_pdf,
                         sign_input,
                         dst,
                         self._cert_info,
@@ -283,6 +339,8 @@ class _SignWorker(QThread):
                         "error": "",
                         "page": page,
                     }
+                except _SigningCancelled:
+                    break
                 except Exception as exc:
                     result = {
                         "index": idx,
@@ -1069,9 +1127,23 @@ class ArchiveStep3Sign(QWidget):
             parent=self,
         )
         self._worker.progress.connect(self._on_sign_progress)
+        self._worker.tsa_failed.connect(self._on_tsa_failure)
         self._worker.finished_ok.connect(self._on_sign_done)
         self._worker.failed.connect(self._on_sign_failed)
         self._worker.start()
+
+    def _on_tsa_failure(self, detail: str):
+        worker = self._worker
+        action = "cancel"
+        try:
+            action = self._panel._ask_local_time_fallback(detail, during_signing=True)
+            if action == "local":
+                self.log_message.emit(
+                    "Archive Step 3: TSA signing failed; user confirmed local computer time "
+                    "for the current and remaining files"
+                )
+        finally:
+            worker.set_tsa_action(action)
 
     def _on_sign_progress(self, done: int, total: int, result: dict):
         source_path = os.path.abspath(result.get("source_path") or "")

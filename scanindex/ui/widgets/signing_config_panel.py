@@ -1277,15 +1277,14 @@ class SigningConfigPanel(QWidget):
         self.edit_tsa_url.setEnabled(bool(inputs_enabled and self.chk_tsa.isChecked()))
 
     def _check_tsa_connection(self, tsa_url: str) -> tuple[bool, str]:
-        parsed = urlparse(str(tsa_url or "").strip())
-        scheme = parsed.scheme.lower()
-        host = parsed.hostname
-        if scheme not in {"http", "https"} or not host:
-            return False, "Địa chỉ TSA không hợp lệ."
-
-        port = parsed.port or (443 if scheme == "https" else 80)
         sock = None
         try:
+            parsed = urlparse(str(tsa_url or "").strip())
+            scheme = parsed.scheme.lower()
+            host = parsed.hostname
+            if scheme not in {"http", "https"} or not host:
+                return False, "Địa chỉ TSA không hợp lệ."
+            port = parsed.port or (443 if scheme == "https" else 80)
             sock = socket.create_connection(
                 (host, port),
                 timeout=_TSA_CONNECT_TIMEOUT_SECONDS,
@@ -1297,7 +1296,7 @@ class SigningConfigPanel(QWidget):
                 sock = None
             return True, ""
         except Exception as exc:
-            return False, f"{host}:{port} - {exc}"
+            return False, str(exc)
         finally:
             if sock is not None:
                 try:
@@ -1305,13 +1304,15 @@ class SigningConfigPanel(QWidget):
                 except OSError:
                     pass
 
-    def _ask_local_time_fallback(self, detail: str = "") -> str:
+    def _ask_local_time_fallback(self, detail: str = "", *, during_signing: bool = False) -> str:
         current_time = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Icon.Warning)
-        box.setWindowTitle("Không kết nối được TSA")
+        title = "Không lấy được dấu thời gian TSA" if during_signing else "Không kết nối được TSA"
+        box.setWindowTitle(title)
         box.setText(
-            "Không kết nối được máy chủ cấp dấu thời gian (TSA).\n\n"
+            ("Không lấy được dấu thời gian từ máy chủ TSA khi ký.\n\n" if during_signing
+             else "Không kết nối được máy chủ cấp dấu thời gian (TSA).\n\n") +
             "Bạn có thể tiếp tục ký sử dụng thời gian của máy tính nội bộ. "
             "Thời gian này không phải là dấu thời gian tin cậy từ TSA và phụ thuộc "
             "vào thiết lập ngày giờ trên máy tính.\n\n"
@@ -1319,6 +1320,12 @@ class SigningConfigPanel(QWidget):
             "Vui lòng điều chỉnh thời gian chính xác, sau đó chọn Đồng ý để ký "
             "sử dụng thời gian nội bộ."
         )
+        if during_signing:
+            box.setInformativeText(
+                "Nếu đồng ý, tệp hiện tại sẽ được ký lại bằng giờ máy; các tệp còn lại "
+                "trong lượt ký cũng dùng giờ máy. Các tệp đã ký thành công được giữ nguyên. "
+                "Có thể cần nhập PIN lại khi ký lại."
+            )
         if detail:
             box.setDetailedText(str(detail))
         retry_btn = box.addButton("Thử lại TSA", QMessageBox.ButtonRole.ActionRole)

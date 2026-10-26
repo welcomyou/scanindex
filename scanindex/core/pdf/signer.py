@@ -157,7 +157,7 @@ class _CustomTextStampStyle(TextStampStyle):
 # Backwards-compat alias
 _RotatedTextStampStyle = _CustomTextStampStyle
 
-from scanindex.core.pdf.win_cert_store import sign_data
+from scanindex.core.pdf.win_cert_store import sign_data, validate_certificate_validity
 
 
 DEFAULT_STAMP_TEMPLATE = "Xác nhận sao tại kho lưu trữ ... {datetime}"
@@ -1509,6 +1509,7 @@ class WinCSPSigner(_BaseSigner):
     """
 
     def __init__(self, cert_info: dict, digest_algorithm: str = "sha256"):
+        validate_certificate_validity(cert_info)
         self._cert_info = cert_info
         cert = asn1_x509.Certificate.load(cert_info["der"])
 
@@ -1536,7 +1537,9 @@ class WinCSPSigner(_BaseSigner):
         if dry_run:
             # pyhanko uses this to reserve space — return a plausible-sized buffer.
             # RSA-2048 → 256 bytes; RSA-4096 → 512.
-            key_size = self.signing_cert.public_key.bit_size // 8
+            key_size = (self.signing_cert.public_key.bit_size + 7) // 8
+            if self.signing_cert.public_key.algorithm == "ec":
+                key_size = 2 * (key_size + 1) + 8  # upper bound for DER (r, s), including P-521
             return b"\x00" * key_size
 
         loop = asyncio.get_event_loop()
@@ -1787,13 +1790,48 @@ def _load_font_factory(font_size: int):
     return None
 
 
+class TSASigningError(RuntimeError):
+    """A failure in requesting/decoding a TSA token, separate from key/PDF errors."""
+
+
+class _ReportingTimeStamper(HTTPTimeStamper if HTTPTimeStamper is not None else object):
+    async def async_timestamp(self, message_digest, md_algorithm):
+        try:
+            return await super().async_timestamp(message_digest, md_algorithm)
+        except Exception as exc:
+            raise TSASigningError(f"Không lấy được dấu thời gian TSA: {exc}") from exc
+
+
 def _build_timestamper(tsa_url: Optional[str]):
     url = str(tsa_url or "").strip()
     if not url:
         return None
     if HTTPTimeStamper is None:
-        raise RuntimeError("pyHanko timestamp support is not available")
-    return HTTPTimeStamper(url, timeout=10)
+        raise TSASigningError("pyHanko timestamp support is not available")
+    return _ReportingTimeStamper(url, timeout=10)
+
+
+def _next_signature_field_name(writer) -> str:
+    """Choose a new SignatureN field like iText, including non-signature fields."""
+    form = writer.root.get("/AcroForm")
+    form = form.get_object() if form is not None else {}
+    pending = [(ref, "") for ref in form.get("/Fields", [])]
+    names, seen = set(), set()
+    while pending:
+        ref, prefix = pending.pop()
+        field = ref.get_object()
+        if id(field) in seen:
+            continue
+        seen.add(id(field))
+        partial = str(field.get("/T", ""))
+        name = f"{prefix}.{partial}" if prefix and partial else prefix or partial
+        if name:
+            names.add(name)
+        pending.extend((child, name) for child in field.get("/Kids", []))
+    index = 1
+    while any(name == f"Signature{index}" or name.startswith(f"Signature{index}.") for name in names):
+        index += 1
+    return f"Signature{index}"
 
 
 # ── Core signing functions ────────────────────────────────────────────────────
@@ -1820,14 +1858,6 @@ def sign_single_pdf(
     signer = WinCSPSigner(cert_info)
     timestamper = _build_timestamper(tsa_url)
 
-    meta = signers.PdfSignatureMetadata(
-        field_name="Sig1",
-        md_algorithm="sha256",
-        reason=reason or None,
-        location=location or None,
-        certify=False,
-    )
-
     # Full placement chain (corner presets / text anchor / X/Y + white cap)
     # — see resolve_signature_box.
     sig_box = resolve_signature_box(
@@ -1850,6 +1880,14 @@ def sign_single_pdf(
 
     with open(input_path, "rb") as inf:
         writer = IncrementalPdfFileWriter(inf, strict=False)
+        field_name = _next_signature_field_name(writer)
+        meta = signers.PdfSignatureMetadata(
+            field_name=field_name,
+            md_algorithm="sha256",
+            reason=reason or None,
+            location=location or None,
+            certify=False,
+        )
 
         # Detect page rotation so the stamp can compensate for it
         page_obj = writer.root["/Pages"]["/Kids"][page]
@@ -1874,7 +1912,7 @@ def sign_single_pdf(
         fields.append_signature_field(
             writer,
             SigFieldSpec(
-                sig_field_name="Sig1",
+                sig_field_name=field_name,
                 on_page=page,
                 box=pdf_box,
             ),

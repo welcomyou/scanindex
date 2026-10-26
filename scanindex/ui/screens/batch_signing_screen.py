@@ -26,7 +26,7 @@ import json
 import os
 import tempfile
 
-from PySide6.QtCore import Qt, QThread, QTimer, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QFileDialog, QFrame, QGridLayout,
@@ -49,6 +49,7 @@ from scanindex.ui.digitization.signing_step import (
     _DEPS_OK, _IMPORT_ERR,
     _SignItem, _page_count, _pdf_has_digital_signature,
     _safe_pdf_name, _unique_output_path, _resolve_page,
+    _TsaFallbackWorker, _SigningCancelled,
 )
 from scanindex.core.pdf.signer import (
     SIG_BOX_DEFAULT, STAMP_TEXT_BELOW, sign_single_pdf,
@@ -85,7 +86,7 @@ def _mirrored_output_dir(source_path: str, input_dir: str, output_dir: str) -> s
 # Worker: OCR (optional) + sign, per file
 # --------------------------------------------------------------------------- #
 
-class _BatchSignWorker(QThread):
+class _BatchSignWorker(_TsaFallbackWorker):
     """Per-file: classify → (OCR if scan & enabled) → sign.
 
     Separate from ``_SignWorker`` (which archive Step 3 shares) so the OCR
@@ -145,7 +146,7 @@ class _BatchSignWorker(QThread):
         self._cancelled = False
 
     def cancel(self):
-        self._cancelled = True
+        super().cancel()
 
     def _classify(self, path: str) -> str:
         try:
@@ -392,7 +393,7 @@ class _BatchSignWorker(QThread):
                     dst = _unique_output_path(
                         item.source_path, out_dir, item.display_name
                     )
-                    sign_single_pdf(
+                    self._sign_with_tsa_fallback(sign_single_pdf,
                         sign_input,
                         dst,
                         self._cert_info,
@@ -418,6 +419,8 @@ class _BatchSignWorker(QThread):
                         "page": page,
                         "ocr_note": ocr_note,
                     }
+                except _SigningCancelled:
+                    break
                 except Exception as exc:
                     result = {
                         "index": idx,
@@ -1053,6 +1056,7 @@ class BatchSigningScreen(ScreenContent):
             parent=self,
         )
         self._worker.progress.connect(self._on_sign_progress)
+        self._worker.tsa_failed.connect(self._on_tsa_failure)
         self._worker.ocr_page_progress.connect(self._on_ocr_page_progress)
         self._worker.finished_ok.connect(self._on_sign_done)
         self._worker.failed.connect(self._on_sign_failed)
@@ -1062,6 +1066,19 @@ class BatchSigningScreen(ScreenContent):
         self._spinner_idx = 0
         self._spinner_timer.start()
         self._worker.start()
+
+    def _on_tsa_failure(self, detail: str):
+        worker = self._worker
+        action = "cancel"
+        try:
+            action = self._panel._ask_local_time_fallback(detail, during_signing=True)
+            if action == "local":
+                self.log_message.emit(
+                    "Bulk signing: TSA signing failed; user confirmed local computer time "
+                    "for the current and remaining files", "warning",
+                )
+        finally:
+            worker.set_tsa_action(action)
 
     def _on_sign_progress(self, done: int, total: int, result: dict, phase: str):
         source_path = os.path.abspath(result.get("source_path") or "")
