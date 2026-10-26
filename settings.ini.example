@@ -66,6 +66,10 @@ maxfileworkers = 2
 ;   LAYOUTLMV3_ONNX_THREADS=2       — intra-op mỗi process KIE
 ;   OCRTOOL_PREP_MODE=prep-process / OCRTOOL_PREP_PROCESSES=2 — prep process
 ;   OCRTOOL_PREP_INNER_WORKERS=4    — trần thread phân tích trong mỗi prep process
+;   OCRTOOL_AUDIT_WORKERS           — số process quét nhanh PDF/TIFF ở màn
+;                                     Rà soát chất lượng (mặc định theo số
+;                                     nhân CPU, trần 12; đếm file/trang nhanh
+;                                     hơn trên máy nhiều nhân/IO nhanh)
 ; =====================================================================
 
 [KIE]

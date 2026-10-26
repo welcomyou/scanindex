@@ -1660,6 +1660,8 @@ UI_DIGITIZATION_AUDIT_TEXT_PAIRS: tuple[tuple[str, str], ...] = (
      "Đang quét… {}% · {} tệp · {} trang"),
     ("Listing files… {} files", "Đang liệt kê tệp… {} tệp"),
     ("Starting scanner…", "Đang khởi động bộ quét…"),
+    ("Starting scanner… {}/{} scanners ready",
+     "Đang khởi động bộ quét… {}/{} bộ quét sẵn sàng"),
     ("{} files failed", "{} file không đạt"),
     ("{} files undetermined", "{} file chưa xác định"),
     ("All PDF/TIFF files passed", "Tất cả PDF/TIFF đạt"),

@@ -19,23 +19,40 @@ from concurrent.futures import Future, ProcessPoolExecutor
 from dataclasses import dataclass
 
 # 6 worker cho máy nhiều nhân: đo thực nghiệm 48 file đạt ~4,4× với 6
-# worker (4 worker ~3,4×);Floor 2 để một process bận vẫn có suất cho file
-# người dùng đang chọn.
-DEFAULT_WORKERS = max(2, min(6, (os.cpu_count() or 4) - 1))
+# worker (4 worker ~3,4×). Các file độc lập nhau nên thêm worker vẫn tăng
+# gần tuyến tính — mặc định theo số nhân CPU, trần 12 để chi phí spawn/RAM
+# hợp lý; vặn được qua biến môi trường OCRTOOL_AUDIT_WORKERS (kho IO nhanh
+# có thể tăng hơn, trần 32). Floor 2 để một process bận vẫn có suất cho
+# file người dùng đang chọn.
+def _configured_workers() -> int:
+    try:
+        n = int(os.environ.get("OCRTOOL_AUDIT_WORKERS", "0").strip() or "0")
+    except ValueError:
+        n = 0
+    if n >= 1:
+        return min(n, 32)
+    return max(2, min(12, (os.cpu_count() or 4) - 1))
+
+
+DEFAULT_WORKERS = _configured_workers()
 # Task gộp nhiều file để chia nhỏ overhead IPC; tune 1/2/4/8 theo kho
 # thực tế nếu cần (chunk quá lớn làm file đang chọn chờ cả nhóm).
 DEFAULT_CHUNK = 4
 
 
 def _warm_task(_: int) -> int:
-    """Task hâm nóng: buộc process spawn và nạp sẵn PyMuPDF.
+    """Task hâm nóng: buộc process spawn và nạp sẵn toàn bộ phụ thuộc
+    thẩm định (PyMuPDF + module core, kể cả tên file/chuỗi trang TIFF).
 
     Phải ngủ ngắn: task hoàn thành tức thì thì executor tái dùng đúng 1
     worker rảnh và không bao giờ spawn đủ số worker — sau đó các chunk đầu
-    chạy nối tiếp thay vì song song."""
+    chạy nối tiếp thay vì song song. Nạp sẵn module core (chứ không chỉ
+    fitz) để chunk ĐẦU TIÊN không trả thêm chi phí import — lượt quét mới
+    có kết quả hiển thị sớm nhất có thể."""
     import time
 
     import fitz  # noqa: F401  — nạp MuPDF vào worker trước khi đo
+    from scanindex.core import digitization_audit  # noqa: F401
 
     time.sleep(0.25)
     return os.getpid()
@@ -81,6 +98,7 @@ class AuditPool:
     def __init__(self, max_workers: int | None = None):
         self.max_workers = max_workers or DEFAULT_WORKERS
         self._executor: ProcessPoolExecutor | None = None
+        self._warm_futures: list[Future] = []
         self.failed = False
         self.warm_workers = 0
         self._lock = threading.Lock()
@@ -103,13 +121,15 @@ class AuditPool:
                 return True
             try:
                 executor = ProcessPoolExecutor(max_workers=self.max_workers)
-                # 2× warm task: buộc spawn đủ worker + nạp sẵn PyMuPDF trong
-                # từng worker, nằm TRƯỚC các chunk trong FIFO nên chi phí
-                # import được hấp thụ nền, không chặn ai.
-                executor.map(_warm_task, range(self.max_workers * 2),
-                             chunksize=1)
+                # 2× warm task: buộc spawn đủ worker + nạp sẵn phụ thuộc
+                # thẩm định trong từng worker, nằm TRƯỚC các chunk trong
+                # FIFO nên chi phí import được hấp thụ nền, không chặn ai.
+                self._warm_futures = [
+                    executor.submit(_warm_task, i)
+                    for i in range(self.max_workers * 2)]
             except Exception:
                 self.failed = True
+                self._warm_futures = []
                 try:
                     executor.shutdown(wait=False, cancel_futures=True)
                 except Exception:
@@ -118,6 +138,24 @@ class AuditPool:
             self._executor = executor
             self.warm_workers = self.max_workers
             return True
+
+    def warm_ready(self) -> int:
+        """Số worker ĐÃ lên và nạp xong phụ thuộc — đếm pid khác nhau trong
+        các warm task đã hoàn thành (mỗi worker trả đúng pid của nó).
+
+        Cho GUI hiển thị tiến độ khởi động ("N/M bộ quét sẵn sàng") thay vì
+        nhãn đứng im suốt khoảng spawn — lần đầu trên máy có antivirus có
+        thể là hàng chục giây. An toàn gọi từ mọi thread: Future thread-safe,
+        chưa có pool thì trả 0."""
+        futures = self._warm_futures
+        ready: set[int] = set()
+        for fut in futures:
+            if fut.done():
+                try:
+                    ready.add(fut.result())
+                except Exception:
+                    continue
+        return len(ready)
 
     def status(self) -> PoolStatus:
         return PoolStatus(available=self._executor is not None,

@@ -18,8 +18,11 @@ CSDL_SOHOA với icon màu tương tự; KHÔNG đổi tên / kéo thả / sửa
     trượt tiêu chí nặng (PDF: Scan màu/DPI; TIFF: Scan màu/DPI/1 trang/
     nén lossy) được gắn dấu " !" sau tên + tô đỏ trên cây. Thẩm định chạy
     trên process pool hâm nóng (PyMuPDF không thread-safe); hỏng pool thì
-    tự về tuần tự. File chưa đổi giữa các lượt trong phiên không audit lại
-    (đối chiếu size + mtime_ns) — file thêm / sửa / xóa luôn được xét lại.
+    tự về tuần tự. File chưa đổi (size + mtime_ns khớp) không audit lại —
+    kết quả quick giữ trong phiên VÀ ghi cache đĩa sống qua các phiên, nên
+    lượt rà lại kho nguyên vẹn gần như tức thì; file thêm / sửa / xóa luôn
+    được xét lại. Kết quả phát theo luồng từng chunk — nhãn/% cập nhật dần
+    từ giây đầu, không đứng ở "đang khởi động bộ quét" cả lượt.
   * Phạm vi thẩm định (policy v1 do người dùng chốt): DPI chỉ trang 1, OCR
     chỉ cần một trang có text trong tối đa 5 trang đầu; màu/nén toàn tài
     liệu — thay đổi phạm vi kết luận so với phiên bản xét mọi trang.
@@ -29,6 +32,8 @@ from __future__ import annotations
 import html
 import json
 import os
+import threading
+from dataclasses import asdict
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QSize, Qt, QThread, QTimer, Signal
@@ -64,6 +69,12 @@ except Exception:
 
 _SETTINGS_FILE = os.path.join(
     get_base_dir(), "config", "digitization_audit_settings.json")
+# Cache kết quả quick trên đĩa (sống qua các phiên): lượt rà soát lại kho
+# chưa đổi chỉ còn liệt kê + đối chiếu size+mtime_ns, không audit lại file.
+_QUICK_CACHE_FILE = os.path.join(
+    get_base_dir(), "config", "digitization_audit_quick_cache.json")
+_QUICK_CACHE_VERSION = 1            # đổi cấu trúc entry thì tăng — đọc bỏ hết
+_QUICK_CACHE_MAX_ENTRIES = 200_000  # trần entry — chặn file phình vô hạn
 
 _ROLE_REL = Qt.ItemDataRole.UserRole          # path posix tương đối root
 _ROLE_LEVEL = Qt.ItemDataRole.UserRole + 1    # rt.Level | None
@@ -104,6 +115,61 @@ _COLOR_FAIL_FG = _STATUS_LOOK["fail"][0]
 
 
 # --------------------------------------------------------------------------- #
+# Cache quick trên đĩa
+# --------------------------------------------------------------------------- #
+
+def _load_quick_cache(path: str = _QUICK_CACHE_FILE) -> dict:
+    """Đọc cache quick: abs path → entry thô ``{"t","s","m","r"}`` (chưa
+    dựng dataclass — dựng lười đúng file khớp để đỡ tốn với kho lớn).
+
+    Chỉ gọi ở worker thread (file có thể vài chục MB). Sai version/policy
+    hoặc file hỏng → trả rỗng, coi như không có cache."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    if (not isinstance(data, dict)
+            or data.get("v") != _QUICK_CACHE_VERSION
+            or data.get("policy") != _AUDIT_POLICY
+            or not isinstance(data.get("entries"), dict)):
+        return {}
+    return data["entries"]
+
+
+def _revive_quick_result(raw: dict):
+    """Dựng lại dataclass kết quả quick từ entry cache; dữ liệu lệch dạng
+    (cache cũ dở dàng, tay nghịch…) → None để caller coi như cache miss."""
+    try:
+        d = dict(raw.get("r") or {})
+        if raw.get("t") == "tiff":
+            return da.TiffAuditResult(**d)
+        images = [da.ImageInfo(**im) for im in d.pop("images", None) or []]
+        return da.PdfAuditResult(images=images, **d)
+    except Exception:
+        return None
+
+
+def _save_quick_cache(entries: dict, path: str = _QUICK_CACHE_FILE) -> None:
+    """Ghi nguyên file cache (merge do caller lo) — ghi temp rồi replace để
+    crash giữa chừng không mất file cũ. Lỗi đĩa bỏ qua: cache chỉ là tối ưu."""
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"v": _QUICK_CACHE_VERSION,
+                       "policy": _AUDIT_POLICY,
+                       "entries": entries}, f,
+                      ensure_ascii=False, separators=(",", ":"))
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
+# --------------------------------------------------------------------------- #
 # Worker nền
 # --------------------------------------------------------------------------- #
 
@@ -115,7 +181,9 @@ class _TreeAuditWorker(QThread):
     Thẩm định chạy trên process pool hâm nóng (PyMuPDF không thread-safe),
     task theo chunk file; pool không khả dụng thì tự về tuần tự trong
     thread này. ``reuse`` cho phép bỏ qua file chưa đổi (size+mtime_ns khớp
-    kết quả quick cùng policy của lượt trước trong phiên) — kết quả vẫn được
+    kết quả quick cùng policy của lượt trước trong phiên); ``cache_path``
+    nạp thêm cache đĩa cùng cơ chế đối chiếu — kết quả sống qua các phiên,
+    lượt rà lại kho nguyên vẹn gần như tức thì — kết quả vẫn được
     phát lại qua ``marked_batch`` để gắn dấu lên cây mới.
     """
 
@@ -132,11 +200,14 @@ class _TreeAuditWorker(QThread):
     # bar đứng ở "chạy chạy" rồi % nhảy 0→100 trong tích tắc).
 
     def __init__(self, root: Path, pool: "ap.AuditPool | None" = None,
-                 reuse: dict | None = None, parent=None):
+                 reuse: dict | None = None, parent=None,
+                 cache_path: str | None = None):
         super().__init__(parent)
         self._root = root
         self._pool = pool
         self._reuse = reuse or {}        # abs path → (size, mtime_ns, result)
+        self._cache_path = cache_path    # cache đĩa: kết quả sống qua phiên
+        self._disk_entries: dict = {}    # entry thô đĩa nạp được lúc chạy
         self._cancel = False
 
     def cancel(self):
@@ -155,10 +226,14 @@ class _TreeAuditWorker(QThread):
         dir_rels: set[str] = set()
         direct_size: dict[str, int] = {}   # rel → dung lượng file trực tiếp
 
-        # Lần đầu trong phiên, pool chưa tồn tại: việc spawn worker + nạp
-        # PyMuPDF (vài giây) được executor tự chạy nền khi nhận chunk đầu
-        # tiên — quét KHÔNG chờ warm, bar giữ chế độ chạy cho đến khi có
-        # kết quả thật thì mới chuyển sang %.
+        # Spawn worker + nạp phụ thuộc chạy SONG SONG với lúc liệt kê
+        # (ensure_started không chờ — chỉ xếp task warm vào executor):
+        # hết thời gian liệt kê là worker đã sẵn sàng, chunk đầu trả kết
+        # quả gần như ngay → % xuất hiện sớm, không đứng ở nhãn "đang khởi
+        # động bộ quét" thêm khoảng spawn như trước.
+        if self._pool is not None:
+            self._pool.ensure_started()
+
         def walk(dirpath: Path, rel: str):
             dir_rels.add(rel)
             size = 0
@@ -243,7 +318,12 @@ class _TreeAuditWorker(QThread):
                 return []
             return buffer
 
-        # ---- nhanh: tái sử dụng kết quả quick hợp lệ của phiên ----------
+        # Nạp cache đĩa SAU khi liệt kê (file vài chục MB, không cản walk):
+        # file chưa đổi từ lượt trước — kể cả phiên app trước — không audit.
+        if self._cache_path:
+            self._disk_entries = _load_quick_cache(self._cache_path)
+
+        # ---- nhanh: tái sử dụng kết quả quick hợp lệ của phiên + đĩa ----
         pending: list[Path] = []
         reused_pairs: list = []
         reused_done = 0
@@ -251,16 +331,25 @@ class _TreeAuditWorker(QThread):
             if self._cancel:
                 return
             rel = path.relative_to(self._root).as_posix()
-            hit = self._reuse.get(str(path))
-            if hit is not None:
+            abspath = str(path)
+            hit = self._reuse.get(abspath)
+            raw = self._disk_entries.get(abspath) if hit is None else None
+            st = None
+            if hit is not None or raw is not None:
                 try:
                     st = path.stat()
                 except OSError:
-                    hit = None
-                else:
-                    if (st.st_size, st.st_mtime_ns) != (hit[0], hit[1]) \
-                            or hit[2].error:
-                        hit = None
+                    st = None
+            if hit is not None and (st is None
+                                    or (st.st_size, st.st_mtime_ns)
+                                    != (hit[0], hit[1]) or hit[2].error):
+                hit = None
+            if hit is None and st is not None and raw is not None:
+                result = _revive_quick_result(raw)
+                if (result is not None and not result.error
+                        and (st.st_size, st.st_mtime_ns)
+                        == (raw.get("s"), raw.get("m"))):
+                    hit = (st.st_size, st.st_mtime_ns, result)
             if hit is None:
                 pending.append(path)
                 continue
@@ -269,7 +358,9 @@ class _TreeAuditWorker(QThread):
             reused_done += 1
 
         # Còn file phải audit → nhãn "đang khởi động bộ quét" cho tới khi
-        # chunk đầu tiên hoàn tất (executor tự spawn/nạp worker nền).
+        # chunk đầu tiên hoàn tất. Pool đã được lên từ ĐẦU lượt (song song
+        # lúc liệt kê) nên khoảng này thường chỉ còn phần trăm giây — hết
+        # kết quả thật đầu tiên là chuyển sang nhãn "Đang quét… X%".
         if pending and self._pool is not None:
             self.phase.emit("warming")
 
@@ -368,8 +459,14 @@ class _TreeAuditWorker(QThread):
 
     def _run_pooled(self, pending: list[Path]):
         """Chạy qua process pool; trả iterator ``(path, result)`` đúng thứ
-        tự pending, hoặc None khi pool không khả dụng/lỗi để caller chuyển
-        tuần tự (kết quả dở dang bỏ, không dùng nửa vời)."""
+        tự pending, phát NGAY khi từng chunk hoàn tất (chunk sau xong trước
+        vẫn chờ tới lượt để giữ thứ tự file khớp dấu ❗ trên cây). Trả None
+        khi pool không khả dụng để caller chuyển tuần tự; pool lỗi GIỮA
+        LÚC thì phần đã phát giữ nguyên, đoạn chưa phát tự nối tuần tự.
+
+        Bản cũ gom đủ MỌI kết quả mới trả iterator: với kho lớn cả lượt
+        quét nằm trong hàm này nên nhãn đứng ở "đang khởi động bộ quét",
+        bar chạy chạy tới khi xong mới nhảy 0→100."""
         if not pending:
             return iter(())
         if self._pool is None or not self._pool.ensure_started():
@@ -383,35 +480,59 @@ class _TreeAuditWorker(QThread):
             return None
         from concurrent.futures import FIRST_COMPLETED, wait
 
-        out: list = [None] * len(pending)
         queue = list(zip(futures, range(0, len(pending), chunk)))
         in_flight: dict = {}
         max_in_flight = max(2, self._pool.max_workers * 2)
-        try:
-            while queue or in_flight:
-                if self._cancel:
-                    for fut in in_flight:
-                        fut.cancel()
-                    for fut, _ in queue:
-                        fut.cancel()
-                    return None
-                while queue and len(in_flight) < max_in_flight:
-                    fut, start = queue.pop(0)
-                    in_flight[fut] = start
-                if not in_flight:
-                    break
-                done_set, _ = wait(in_flight, timeout=0.25,
-                                   return_when=FIRST_COMPLETED)
-                for fut in done_set:
-                    start = in_flight.pop(fut)
-                    chunk_results = fut.result()
-                    for offset, res in enumerate(chunk_results):
-                        out[start + offset] = res
-        except Exception:
-            return None
-        if any(r is None for r in out):
-            return None
-        return iter(zip(pending, out))
+        next_idx = 0                     # file đầu chưa phát
+        done_chunks: dict[int, list] = {}   # start chunk → list kết quả
+
+        def gen():
+            nonlocal next_idx
+            fail = False
+            try:
+                while queue or in_flight:
+                    if self._cancel:
+                        for fut in in_flight:
+                            fut.cancel()
+                        for fut, _ in queue:
+                            fut.cancel()
+                        return
+                    while queue and len(in_flight) < max_in_flight:
+                        fut, start = queue.pop(0)
+                        in_flight[fut] = start
+                    if not in_flight:
+                        break
+                    done_set, _ = wait(in_flight, timeout=0.25,
+                                       return_when=FIRST_COMPLETED)
+                    for fut in done_set:
+                        start = in_flight.pop(fut)
+                        try:
+                            chunk_results = fut.result()
+                        except Exception:
+                            fail = True
+                            break
+                        # Chunk phải đủ kết quả cho đúng số file (chunk cuối
+                        # có thể ngắn) — lệch coi như lỗi chunk.
+                        if len(chunk_results) != min(chunk,
+                                                     len(pending) - start):
+                            fail = True
+                            break
+                        done_chunks[start] = chunk_results
+                        while next_idx in done_chunks:
+                            for res in done_chunks.pop(next_idx):
+                                yield pending[next_idx], res
+                                next_idx += 1
+                    if fail:
+                        break
+            except Exception:
+                fail = True
+            # Lỗi pool/chunk: phần đã phát giữ nguyên, đoạn chưa phát (kể
+            # cả chunk lỗi) nối tuần tự — nối ĐÚNG MỘT LẦN, ngoài try để
+            # serial lỗi giữa chừng không bị nối lặp từ cùng vị trí.
+            if fail or next_idx < len(pending):
+                yield from self._run_serial(pending[next_idx:])
+
+        return gen()
 
     def _run_serial(self, pending: list[Path]):
         """Tuần tự trong thread này (fallback khi pool không dùng được)."""
@@ -590,6 +711,14 @@ class DigitizationAuditScreen(ScreenContent):
         # để file đổi giữa hai lượt luôn bị xét lại.
         self._quick_results: dict = {}
         self._quick_statkeys: dict = {}
+        # Cache đĩa: entry thô đĩa lần gần nhất worker nạp + kết quả phiên
+        # đang chờ ghi (abs path → (tag, size, mtime_ns, result)). Ghi nền
+        # ở thread riêng, lock chặn hai saver ghi đè nhau.
+        self._quick_cache_disk: dict = {}
+        self._quick_cache_new: dict = {}
+        self._cache_save_lock = threading.Lock()
+        self._cache_save_busy = False
+        self._cache_save_dirty = False
         # Kết quả full theo abs path → ((size, mtime_ns), result); bấm lại
         # cùng file chưa đổi là hiển thị ngay không audit lại.
         self._full_cache: dict = {}
@@ -601,6 +730,10 @@ class DigitizationAuditScreen(ScreenContent):
         self._select_timer.setSingleShot(True)
         self._select_timer.setInterval(_SELECT_DEBOUNCE_MS)
         self._select_timer.timeout.connect(self._open_pending_item)
+        # Nhãn tiến độ khởi động pool — cập nhật 0,3 s/lần trong pha warming.
+        self._warm_timer = QTimer(self)
+        self._warm_timer.setInterval(300)
+        self._warm_timer.timeout.connect(self._update_warm_label)
         self._load_settings()
 
     # ------------------------------------------------------------- layout
@@ -1044,7 +1177,8 @@ class DigitizationAuditScreen(ScreenContent):
         # parent=self: Qt đợi thread chạy xong khi dọn dẹp (thoát app) thay
         # vì hủy QThread đang chạy → tránh crash lúc shutdown.
         self._tree_worker = _TreeAuditWorker(self._root, self._pool,
-                                             reuse, parent=self)
+                                             reuse, parent=self,
+                                             cache_path=_QUICK_CACHE_FILE)
         self._tree_mark_seq += 1
         seq = self._tree_mark_seq
         w = self._tree_worker
@@ -1073,12 +1207,57 @@ class DigitizationAuditScreen(ScreenContent):
         self.lbl_audit_stats.setText("")
 
     def _stop_tree_scan(self):
-        """Ngưng quét nền (nút Dừng / rời màn / chọn gốc mới / thoát app)."""
-        if self._tree_worker is not None:
-            self._tree_worker.cancel()
-            self._tree_worker = None
+        """Ngưng quét nền (nút Dừng / rời màn / chọn gốc mới / thoát app).
+        Kết quả quick đã nhận tới đâu vẫn đáng ghi cache — lượt sau đỡ xét
+        lại phần đó, dù lượt này bị dừng giữa chừng."""
+        w = self._tree_worker
+        if w is not None:
+            w.cancel()
+            disk = getattr(w, "_disk_entries", None)
+            if disk:
+                self._quick_cache_disk = disk
+        self._tree_worker = None
+        self._schedule_quick_cache_save()
+        self._warm_timer.stop()
         self.progress_scan.setVisible(False)
         self.btn_stop_scan.setVisible(False)
+
+    # ------------------------------------------------- cache đĩa (ghi nền)
+
+    def _schedule_quick_cache_save(self):
+        """Xếp ghi cache đĩa vào thread nền; đang ghi thì chỉ đánh dấu bẩn,
+        saver chạy nốt vòng nữa thay vì hai thread cùng ghi một file."""
+        if not self._quick_cache_new:
+            return
+        with self._cache_save_lock:
+            if self._cache_save_busy:
+                self._cache_save_dirty = True
+                return
+            self._cache_save_busy = True
+        threading.Thread(target=self._quick_cache_saver,
+                         daemon=True).start()
+
+    def _quick_cache_saver(self):
+        while True:
+            with self._cache_save_lock:
+                pending = self._quick_cache_new
+                self._quick_cache_new = {}
+            entries = dict(self._quick_cache_disk)
+            for abspath, (tag, size, mtime, result) in pending.items():
+                entries[abspath] = {"t": tag, "s": size, "m": mtime,
+                                    "r": asdict(result)}
+            if len(entries) > _QUICK_CACHE_MAX_ENTRIES:
+                for k in list(entries)[:len(entries)
+                                       - _QUICK_CACHE_MAX_ENTRIES]:
+                    del entries[k]
+            # Đường dẫn đọc TẠI LÚC GỌI (không default tham số) để test
+            # monkeypatch được file cache.
+            _save_quick_cache(entries, _QUICK_CACHE_FILE)
+            with self._cache_save_lock:
+                if not self._cache_save_dirty:
+                    self._cache_save_busy = False
+                    return
+                self._cache_save_dirty = False
 
     def _on_tree_progress(self, done: int, total: int, seq: int):
         if seq != self._tree_mark_seq:
@@ -1093,9 +1272,25 @@ class DigitizationAuditScreen(ScreenContent):
         self._scan_phase = phase
         if phase == "warming":
             # stats_step không phát trong pha này — set nhãn ngay để người
-            # dùng thấy rõ trạng thái trong lúc pool tự lên worker.
+            # dùng thấy rõ trạng thái trong lúc pool tự lên worker; timer
+            # 0,3 s đếm worker sẵn sàng để nhãn tăng dần thay vì đứng im.
             self.lbl_stats.setText(
                 translations.localize_text("Đang khởi động bộ quét…"))
+            self._warm_timer.start()
+        elif phase == "scanning":
+            self._warm_timer.stop()
+
+    def _update_warm_label(self):
+        """Nhãn tiến độ khởi động pool: N/M worker đã nạp xong phụ thuộc.
+        Trước đây nhãn đứng im suốt khoảng spawn — lần đầu trên máy có
+        antivirus có thể hàng chục giây, không biết app còn sống hay treo."""
+        if self._scan_phase != "warming":
+            self._warm_timer.stop()
+            return
+        total = self._pool.max_workers if self._pool is not None else 0
+        ready = self._pool.warm_ready() if self._pool is not None else 0
+        self.lbl_stats.setText(translations.localize_text(
+            f"Đang khởi động bộ quét… {ready}/{total} bộ quét sẵn sàng"))
 
     def _on_tree_stats_step(self, docs: int, pages: int, seq: int):
         if seq != self._tree_mark_seq:
@@ -1114,7 +1309,8 @@ class DigitizationAuditScreen(ScreenContent):
     def _on_tree_marked_batch(self, items: list, seq: int):
         """Nhận một lô kết quả quick (mỗi chunk pool một lô): lưu lại để
         tái sử dụng/tái hiển thị và gắn dấu lên item cây nếu đã tồn tại
-        (nhánh chưa bung sẽ được gắn lúc `_populate_children`)."""
+        (nhánh chưa bung sẽ được gắn lúc `_populate_children`). Kết quả
+        không lỗi cũng xếp vào hàng chờ ghi cache đĩa."""
         if seq != self._tree_mark_seq:
             return
         root = self._root
@@ -1126,6 +1322,10 @@ class DigitizationAuditScreen(ScreenContent):
                         st = os.stat(root / rel)
                         self._quick_statkeys[rel] = (st.st_size,
                                                      st.st_mtime_ns)
+                        self._quick_cache_new[str(root / rel)] = (
+                            "tiff" if isinstance(result, da.TiffAuditResult)
+                            else "pdf",
+                            st.st_size, st.st_mtime_ns, result)
                     except OSError:
                         self._quick_statkeys.pop(rel, None)
             if bad:
@@ -1157,6 +1357,12 @@ class DigitizationAuditScreen(ScreenContent):
         self.btn_stop_scan.setVisible(False)
         self._last_tree_counts = (bad, unknown)
         self._render_tree_summary(bad, unknown)
+        w = self._tree_worker
+        if w is not None:
+            disk = getattr(w, "_disk_entries", None)
+            if disk:
+                self._quick_cache_disk = disk
+        self._schedule_quick_cache_save()
 
     def _render_tree_summary(self, bad: int, unknown: int):
         if bad or unknown:
