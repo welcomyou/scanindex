@@ -714,6 +714,8 @@ def _secrecy_match_kind(line_text: str, keyword: str) -> str | None:
       keyword, ngắn, in hoa).
     - ``"number"``: chỉ dẫn độ mật bằng chữ trong dòng số ký hiệu
       ("Số .../MẬT") — tính chất chữ nghĩa, tồn tại ở mọi vị trí trên trang.
+      Từ khóa nằm giữa dòng dài (trước + sau đều còn chữ, ≥4 từ) là chữ
+      trong đoạn văn/tiêu đề, bị loại.
     """
     tokens = _tokenize_for_stamp_match(line_text)
     kw_tokens = _tokenize_for_stamp_match(keyword)
@@ -730,6 +732,12 @@ def _secrecy_match_kind(line_text: str, keyword: str) -> str | None:
                 marker_at = idx
                 break
     if marker_at is None:
+        return None
+    # Chữ mật "dính hai bên" trong dòng ≥4 từ — trước và sau đều còn chữ —
+    # chắc chắn là chữ thường trong đoạn/tiêu đề ("... MỘT SỐ MẶT HẠN CHẾ
+    # ..."), không phải dòng số ký hiệu: dòng số thật ("Số 15/TB-MẬT") luôn
+    # kết thúc bằng từ khóa.
+    if marker_at + len(kw_tokens) < len(tokens) and len(tokens) >= 4:
         return None
     if "SO" not in tokens[:marker_at]:
         return None

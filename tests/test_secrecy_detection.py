@@ -64,6 +64,33 @@ def test_detects_secret_marker_in_document_number_line() -> None:
     assert detect_secrecy_mark(_doc(DOC_NUMBER_SECRET_SUFFIX, [40, 450, 160, 475])) == MAT
 
 
+def test_rejects_secret_word_glued_on_both_sides_of_long_line() -> None:
+    """Từ khóa mật có chữ ở CẢ HAI bên trong dòng ≥4 từ là chữ trong đoạn
+    văn/tiêu đề — không phải dấu mật hay dòng số ký hiệu (dòng số thật luôn
+    kết thúc bằng từ khóa). Các dòng dưới đây lấy từ 20 file bị nhận nhầm
+    thực tế (kho mistake 2026-11-08)."""
+    assert detect_secrecy_mark(_doc(
+        "THỐNG KÊ SỐ LIỆU VỀ VIỆC MẤT HỒ SƠ ĐẢNG VIÊN", [40, 40, 400, 60],
+    )) is None
+    assert detect_secrecy_mark(_doc(
+        "I. MỘT SỐ KẾT QUẢ ĐẠT ĐƯỢC VÀ MẶT HẠN CHẾ", [40, 40, 380, 60],
+    )) is None
+    assert detect_secrecy_mark(_doc(
+        "VÀ SƠ KẾT CÔNG TÁC MẶT TRẬN 6 THÁNG ĐẦU NĂM PHƯƠNG HƯỚNG",
+        [40, 40, 420, 60],
+    )) is None
+    assert detect_secrecy_mark(_doc(
+        "II. MỘT SỐ MẶT CÒN TỒN TẠI, HẠN CHẾ TRONG CÔNG TÁC", [40, 40, 420, 60],
+    )) is None
+
+
+def test_number_line_with_keyword_at_end_still_flagged_when_long() -> None:
+    """Từ khóa ở CUỐI dòng số ký hiệu vẫn được nhận dù dòng dài hơn 4 từ."""
+    assert detect_secrecy_mark(_doc(
+        "Số: 25/TB-VP-MẬT", [40, 450, 220, 475],
+    )) == MAT
+
+
 MTTQ_HEADER = "ỦY BAN MTTQ VIỆT NAM"
 SPELLT_FRONT_HEADER = "ỦY BAN MẶT TRẬN TỔ QUỐC VIỆT NAM"
 SEAL_FRAGMENT = "MAT"
