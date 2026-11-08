@@ -6081,24 +6081,75 @@ class SecretFileScanScreen(ScreenContent):
         if self._preview_current is None:
             return
         path = self._preview_current.source_path
-        row = self._first_row_of(path)
+        next_row = self._successor_row_snapshot(path)
         self._delete_files([path])
+        if self._first_row_of(path) is not None:
+            return  # Hủy / xóa lỗi (file bị khóa) — giữ nguyên file đang xem
         # Tự chuyển sang dòng kế (hoặc dòng cuối) như đã hứa trong tooltip.
-        if row is not None and self.table.rowCount() > 0:
-            target = min(row, self.table.rowCount() - 1)
-            self._select_result_row(target)
-            self._show_preview(target)
+        self._jump_to_successor(path, next_row)
 
     def _preview_not_secret_clicked(self) -> None:
         if self._preview_current is None:
             return
         path = self._preview_current.source_path
-        row = self._first_row_of(path)
+        next_row = self._successor_row_snapshot(path)
         self._mark_not_secret([path])
-        if row is not None and self.table.rowCount() > 0:
-            target = min(row, self.table.rowCount() - 1)
-            self._select_result_row(target)
-            self._show_preview(target)
+        if self._first_row_of(path) is not None:
+            return  # bấm Hủy trong hộp thoại — không gỡ gì, không nhảy dòng
+        self._jump_to_successor(path, next_row)
+
+    def _successor_row_snapshot(self, path: str) -> int | str | None:
+        """Chốt "dòng kế" của file trước khi bỏ dòng của nó khỏi bảng.
+
+        Trả về đường dẫn của file kế (danh tính ổn định) nếu có, ngược lại
+        trả về index dòng cuối hiện tại làm phương án dự phòng (file đang
+        xét là file cuối bảng → sau khi loại, chuyển sang dòng cuối, đúng
+        như tooltip hứa). None nếu file không còn dòng nào trên bảng.
+
+        Vì sao chốt bằng đường dẫn: hộp thoại xác nhận phía dưới chạy
+        ``exec()`` — bơm event loop, signal từ thread quét (``_results_replace``
+        rút/chèn dòng, ``_result_found`` chèn dòng) được chuyển tiếp trong lúc
+        dialog mở, làm index chụp trước đó lệch. Đường dẫn thì không bao giờ
+        lệch: sau khi xử lý xong, tra lại dòng hiện tại của file kế qua
+        ``_first_row_of`` là đúng vị trí mới.
+        """
+        first = self._first_row_of(path)
+        if first is None:
+            return None
+        key = _norm(path)
+        for r in range(first + 1, self.table.rowCount()):
+            other = self._row_path(r)
+            if other and _norm(other) != key:
+                return other
+        # Không có file nào phía dưới → fallback dòng cuối bảng hiện tại.
+        return self.table.rowCount() - 1
+
+    def _jump_to_successor(
+        self, removed_path: str, next_row: int | str | None
+    ) -> None:
+        """Chọn + xem trước dòng kế sau khi loại ``removed_path``.
+
+        ``next_row`` là kết quả của ``_successor_row_snapshot`` chụp trước
+        khi loại: đường dẫn file kế thì tra lại vị trí MỚI trên bảng (an
+        toàn trước lệch index do signal worker chen lúc dialog mở); fallback
+        index chỉ dùng khi file kế không còn trên bảng, và phải là một dòng
+        khác file vừa xử lý thì mới nhảy để không xem lại file cũ.
+        """
+        if next_row is None or self.table.rowCount() <= 0:
+            return
+        key = _norm(removed_path)
+        target: int | None = None
+        if isinstance(next_row, str):
+            target = self._first_row_of(next_row)
+        if target is None and isinstance(next_row, int):
+            candidate = min(next_row, self.table.rowCount() - 1)
+            fallback_path = self._row_path(candidate)
+            if fallback_path and _norm(fallback_path) != key:
+                target = candidate
+        if target is None or not 0 <= target < self.table.rowCount():
+            return
+        self._select_result_row(target)
+        self._show_preview(target)
 
     def _select_result_row(self, row: int) -> None:
         """Chọn dòng (cột File) và cuộn vào giữa bảng để phím mũi tên
@@ -6849,12 +6900,32 @@ class SecretFileScanScreen(ScreenContent):
         rows = []
         for item in items:
             r = item.row()
+            if not 0 <= r < self.table.rowCount():
+                continue  # item đã không còn trên bảng — bỏ, đừng removeRow(r) nhầm dòng khác
             rows.append(r)
             if id(item) in self._checked_row_ids:
                 if not self.table.isRowHidden(r):
                     self._visible_checked_rows -= 1
                 self._checked_row_ids.discard(id(item))
         for r in sorted(rows, reverse=True):
+            if not self.table.isRowHidden(r):
+                self._visible_result_rows -= 1
+            self.table.removeRow(r)
+        # Lưới an toàn: map path→dòng vì lý do nào lệch (item stale, entry
+        # thiếu) thì dòng của file vẫn phải biến mất — quét nốt bảng, gỡ mọi
+        # dòng còn sót của đúng file này. Xác nhận rồi mà dòng vẫn hiện là
+        # lỗi người dùng bắt gặp trực tiếp nên không được phép xảy ra.
+        stale = [
+            r
+            for r in range(self.table.rowCount() - 1, -1, -1)
+            if _norm(self._row_path(r)) == key
+        ]
+        for r in stale:
+            item0 = self.table.item(r, 0)
+            if item0 is not None and id(item0) in self._checked_row_ids:
+                if not self.table.isRowHidden(r):
+                    self._visible_checked_rows -= 1
+                self._checked_row_ids.discard(id(item0))
             if not self.table.isRowHidden(r):
                 self._visible_result_rows -= 1
             self.table.removeRow(r)
